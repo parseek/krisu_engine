@@ -1,0 +1,10 @@
+[package]
+name = "rjw_render"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = "0.20"
+winit = "0.30.13"
+pollster = "0.4"
+log = "0.4.33"

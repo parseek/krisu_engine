@@ -1,0 +1,12 @@
+[package]
+name = "eg260729"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = "0.20"
+rjw_main = { path = "../../crates/rjw_main" }
+rjw_render = { path = "../../crates/rjw_render" }
+rjw_color = { path = "../../crates/rjw_color", features = ["wgpu"] }
+env_logger = "0.11.11"
+log = "0.4.33"

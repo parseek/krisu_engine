@@ -1,0 +1,10 @@
+[package]
+name = "rjw_main"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.30.13"
+rjw_time = { path = "../rjw_time" }
+rjw_keyboard = { path = "../rjw_keyboard" }
+rjw_mouse = { path = "../rjw_mouse" }
