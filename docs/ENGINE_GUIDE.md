@@ -28,7 +28,7 @@
 
 ## 1. 引擎是什么 / 模块地图
 
-`krusie` 是一个 **Rust + wgpu** 的 2D 游戏/渲染引擎（视觉验证为主的工作区，含可运行 examples）。
+`krusie` 是一个 **Rust + wgpu (30.0.0)** 的 2D 游戏/渲染引擎（视觉验证为主的工作区，含可运行 examples）。
 
 ```
 crates/

@@ -23,7 +23,7 @@ impl Default for RenderConfig {
     fn default() -> Self {
         Self {
             // DX12-Only when using windows
-            backends: if cfg!(target_os = "windows") { wgpu::Backends::DX12 } else { wgpu::Backends::all() },
+            backends: if cfg!(target_os = "windows") { wgpu::Backends::DX12 | wgpu::Backends::GL } else { wgpu::Backends::all() },
             vsync: true,
             desired_format: None,
         }

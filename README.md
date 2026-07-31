@@ -57,6 +57,7 @@ cargo check --workspace
 
 ## 📖 文档
 
+- **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** —— API 参考手册（免读源码版）：`Color` / `Transform2D` / `Camera2D`（含 `walk_xy` 等） / `SpriteRect` / `Render2D` / `ClearConfig` 的函数定义、用法与简单示例
 - **[docs/ENGINE_GUIDE.md](docs/ENGINE_GUIDE.md)** —— 引擎「使用 + 维护」指南（人机皆宜）
   - 坐标系（**Camera2D：中心原点、Y+ 向下**）等易混淆概念
   - KeyState 边沿语义（`pressed` vs `down_edge`）
