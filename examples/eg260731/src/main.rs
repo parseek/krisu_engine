@@ -1,7 +1,7 @@
 use rjw_2d_render::{ArcTextureWrapped, ClearConfig, Render2D, SpriteRect};
 use rjw_color::Color;
 use rjw_main::*;
-use rjw_render::{RenderConfig, RenderContext};
+use rjw_render::{RenderConfig, RenderContext, wgpu};
 use rjw_transform::{Camera2D, Transform2D};
 
 struct SpriteDemo {

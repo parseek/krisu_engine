@@ -3,6 +3,9 @@ pub use texture::{ArcTextureWrapped, TextureWrapped};
 
 use winit::window::Window;
 
+// Re-export wgpu in case that version mismatching.
+pub use wgpu;
+
 /// Configuration for the render context.
 #[derive(Clone, Debug)]
 pub struct RenderConfig {

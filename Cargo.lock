@@ -491,7 +491,20 @@ dependencies = [
  "rjw_main",
  "rjw_render",
  "rjw_transform",
- "wgpu",
+]
+
+[[package]]
+name = "eg260731RPG"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "glam",
+ "log",
+ "rjw_2d_render",
+ "rjw_color",
+ "rjw_main",
+ "rjw_render",
+ "rjw_transform",
 ]
 
 [[package]]
