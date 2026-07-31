@@ -1,0 +1,14 @@
+[package]
+name = "rjw_2d_render"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rjw_render = { path = "../rjw_render" }
+rjw_color = { path = "../rjw_color" }
+rjw_transform = { path = "../rjw_transform" }
+wgpu = "30.0.0"
+glam = "0.33.2"
+ordered-float = "4.2"
+log = "0.4.33"
+bytemuck = { version = "1.25.2", features = ["derive"] }

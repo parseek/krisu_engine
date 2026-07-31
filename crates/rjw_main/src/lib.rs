@@ -87,6 +87,10 @@ struct MainHandler<T: App> {
 use winit::application::ApplicationHandler;
 impl<T: App> ApplicationHandler for MainHandler<T> {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // 防止 resumed 重复触发（部分平台会多次回调）时重复建窗 / 重复调用 on_init。
+        if self.ctx.primary_window.is_some() {
+            return;
+        }
         let window = event_loop.create_window(self.app.primary_window_attrib()).expect("Initalizing the primary window failed");
         self.ctx.primary_window = Some(window);
         self.app.on_init(&mut self.ctx);

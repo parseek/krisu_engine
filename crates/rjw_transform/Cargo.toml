@@ -1,0 +1,11 @@
+[package]
+name = "rjw_transform"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glam = { version = "0.33.2", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde", "glam/serde"]

@@ -4,11 +4,11 @@ fn default_alpha() -> f32 { 1.0 }
 #[derive(Debug, PartialEq, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Color {
-    r: f32,
-    g: f32,
-    b: f32,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
     #[cfg_attr(feature = "serde", serde(default="default_alpha"))]
-    a: f32,
+    pub a: f32,
 }
 
 impl Color {

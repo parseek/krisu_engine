@@ -60,6 +60,7 @@ impl App for ClearScreen {
                 label: Some("clear pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear),
@@ -69,6 +70,7 @@ impl App for ClearScreen {
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None,
             });
             // RenderPass drops here, finishing the pass.
         }

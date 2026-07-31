@@ -1,3 +1,6 @@
+pub mod texture;
+pub use texture::{ArcTextureWrapped, TextureWrapped};
+
 use winit::window::Window;
 
 /// Configuration for the render context.
@@ -49,9 +52,10 @@ impl RenderContext {
     /// In typical usage with `rjw_main`, this is guaranteed because the
     /// window lives until the event loop exits.
     pub fn new(window: &Window, config: &RenderConfig) -> Self {
+        // wgpu 30: InstanceDescriptor no longer implements Default.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: config.backends,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         // SAFETY: The framework (rjw_main) holds the Window alive until
@@ -63,6 +67,8 @@ impl RenderContext {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            // wgpu 30 new field.
+            apply_limit_buckets: false,
         }))
         .expect("Failed to find a suitable adapter");
 
@@ -71,8 +77,11 @@ impl RenderContext {
                 label: None,
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
+                // wgpu 30 new fields (all have Default).
+                experimental_features: Default::default(),
+                memory_hints: Default::default(),
+                trace: Default::default(),
             },
-            None,
         ))
         .expect("Failed to create device");
 
@@ -95,6 +104,8 @@ impl RenderContext {
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            // wgpu 30 new field (Auto = historical SDR behavior).
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &surface_config);
 
@@ -106,18 +117,32 @@ impl RenderContext {
         }
     }
 
-    /// Begin a new frame. Returns `None` if the surface is outdated (e.g. window is minimized/resized).
+    /// Begin a new frame. Returns `None` if the surface is not currently
+    /// presentable (e.g. window is minimized/occluded/outdated).
     /// Returns `Some((surface_texture, texture_view))` on success.
     pub fn begin_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
         let texture = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                // Acquired, but the surface config no longer matches; reconfigure
+                // and keep rendering to this texture.
+                self.surface.configure(&self.device, &self.config);
+                t
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
                 // Reconfigure the surface and skip this frame.
                 self.surface.configure(&self.device, &self.config);
                 return None;
             }
-            Err(e) => {
-                log::error!("wgpu get_current_texture error: {e:?}");
+            wgpu::CurrentSurfaceTexture::Lost => {
+                log::error!("wgpu surface lost; reconfiguring");
+                self.surface.configure(&self.device, &self.config);
+                return None;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => {
+                // Skip this frame and try again later.
                 return None;
             }
         };
@@ -128,7 +153,8 @@ impl RenderContext {
     /// Submit a command encoder and present the frame.
     pub fn end_frame(&mut self, surface_texture: wgpu::SurfaceTexture, encoder: wgpu::CommandEncoder) {
         self.queue.submit(std::iter::once(encoder.finish()));
-        surface_texture.present();
+        // wgpu 30: presenting is done via the queue.
+        self.queue.present(surface_texture);
     }
 
     /// Recreate the swapchain when the window is resized.
@@ -146,6 +172,16 @@ impl RenderContext {
     /// Access the queue (e.g. for writing to buffers, submitting).
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    /// Access the surface (e.g. for Render2D to present).
+    pub fn surface(&self) -> &wgpu::Surface<'static> {
+        &self.surface
+    }
+
+    /// Current surface size in pixels. / 当前表面尺寸（像素）。
+    pub fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
     }
 
     /// Current surface format.
