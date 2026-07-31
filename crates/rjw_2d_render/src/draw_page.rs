@@ -11,7 +11,7 @@ use crate::data::{SpriteRect, TriIndicies, VertexP3U2C4, QUAD_TRI_INDICIES, QUAD
 // ─── 常量 ─────────────────────────────────────────────────────
 
 /// 实例化上限：单次 `draw_indexed` 的实例数量
-pub const MAX_INSTANCES_PER_DRAW: usize = 4096;
+pub const MAX_INSTANCES_PER_DRAW: usize = 8192;
 
 /// 深度/模板纹理格式
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
@@ -90,8 +90,10 @@ pub(crate) struct MeshDrawItem {
 ///（`DrawOp::Sprite.range` 为 `Range<u32>`，不 `Copy`，故这里用 `Clone`。）
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DrawOp {
-    /// 实例化 sprite 批次：纹理 + 实例范围（`buf_instances` 下标；实例缓冲已按序全量写入）
+    /// 实例化 sprite 批次：纹理 + 所在实例页（`DrawPage::instance_pages` 下标）
+    /// + **页内**实例范围（相对该页缓冲起始；单批 ≤ MAX_INSTANCES_PER_DRAW）。
     Sprite {
+        page: u32,
         tex_uid: Option<u64>,
         range: Range<u32>,
     },
@@ -109,8 +111,13 @@ pub(crate) struct DrawPage {
     pub(crate) quad_vb: wgpu::Buffer,
     /// 不可变四边形索引
     pub(crate) quad_ib: wgpu::Buffer,
-    /// 动态实例缓冲（实例化渲染）
-    pub(crate) instance_buffer: wgpu::Buffer,
+    /// 实例缓冲**页池**：每页容量固定 = `MAX_INSTANCES_PER_DRAW`。
+    /// 单帧实例总数超过一页时，`prepare()` 自动把实例按顺序摊入多页，
+    /// `draw()` **逐页**写入（每页只写一次、offset 0）并绑定对应页绘制——
+    /// 页与页之间数据独立，规避 `Queue::write_buffer` 全部先于绘制执行导致的
+    /// 同缓冲覆盖问题，同时天然支持单帧 >4096 实例。
+    /// 页池在帧初（prepare 阶段）按需一次性增长，创建后永久复用，不阻塞渲染循环。
+    pub(crate) instance_pages: Vec<wgpu::Buffer>,
     /// 动态 VP 矩阵缓冲
     pub(crate) vp_buffer: wgpu::Buffer,
     /// VP 绑定组
@@ -147,12 +154,12 @@ impl DrawPage {
             contents: bytemuck::cast_slice(&QUAD_TRI_INDICIES),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("instance buffer"),
+        let instance_pages = vec![device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("instance page 0"),
             size: (InstanceData::SIZE * max_instances) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })];
         let vp_data = VPBuffer { vp: vp.to_cols_array_2d() };
         let vp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vp buffer"),
@@ -183,7 +190,7 @@ impl DrawPage {
         Self {
             quad_vb,
             quad_ib,
-            instance_buffer,
+            instance_pages,
             vp_buffer,
             vp_bind_group,
             mesh_vb,
@@ -199,12 +206,41 @@ impl DrawPage {
         queue.write_buffer(&self.vp_buffer, 0, bytemuck::bytes_of(&vp_data));
     }
 
-    /// 更新实例数据（`instances.len()` 必须 ≤ 缓冲容量）。
-    pub(crate) fn update_instances(&self, queue: &wgpu::Queue, instances: &[InstanceData]) {
+    /// 确保页池至少 `count` 页。仅当不足时创建新页（每页容量 =
+    /// `MAX_INSTANCES_PER_DRAW`）；创建后页面**永久保留**，按需一次性增长，
+    /// 不在渲染循环中反复分配。
+    pub(crate) fn ensure_instance_pages(&mut self, device: &wgpu::Device, count: usize) {
+        let existing = self.instance_pages.len();
+        if count <= existing {
+            return;
+        }
+        let size = (InstanceData::SIZE * MAX_INSTANCES_PER_DRAW) as u64;
+        self.instance_pages.reserve(count - existing);
+        for i in existing..count {
+            self.instance_pages.push(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("instance page {i}")),
+                size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+    }
+
+    /// 写入第 `page` 页的实例数据（从该页缓冲起始 offset 0）。
+    /// `instances.len()` 必须 ≤ `MAX_INSTANCES_PER_DRAW`，且 `page` 已由
+    /// `ensure_instance_pages` 保证存在。每页**只写一次**、页间独立，
+    /// 因此多次写入（各页）与绘制之间的执行顺序互不影响。
+    pub(crate) fn update_instances_page(&self, queue: &wgpu::Queue, page: usize, instances: &[InstanceData]) {
         if instances.is_empty() {
             return;
         }
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
+        debug_assert!(page < self.instance_pages.len(), "instance page {page} out of range");
+        queue.write_buffer(&self.instance_pages[page], 0, bytemuck::cast_slice(instances));
+    }
+
+    /// 返回第 `page` 页的实例缓冲（供 `set_vertex_buffer` 绑定）。
+    pub(crate) fn instance_page_buffer(&self, page: usize) -> &wgpu::Buffer {
+        &self.instance_pages[page]
     }
 
     /// 确保 Mesh 动态缓冲容量可容纳 `verts` 个顶点与 `tris` 个三角形（按 2× 扩容重建）。

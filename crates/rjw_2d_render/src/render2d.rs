@@ -748,35 +748,52 @@ impl Render2D {
         // Mesh 在序列中插入占位符（稍后替换为 DrawOp::Mesh）——
         // 因此 buf_ops 中 Sprite/Mesh 严格按 (layer, states) 排序交错，
         // 修复「先画全部 Sprite 再画全部 Mesh → Mesh 恒盖 Sprite」的层级 bug。
+        // 实例按顺序**分页摊入**：每页容量固定 = MAX_INSTANCES_PER_DRAW。
+        // `page` = 当前批次所在页；`page_start` = 该页起始的全局实例序号；
+        // `run_start` = 当前同纹理 run 起始的全局实例序号（≤ page 内容量）。
+        // DrawOp::Sprite 记录 **页号 + 页内范围**（相对该页缓冲，单批 ≤ 一页）。
+        // 跨页切点仅在「当前页已满」时发生——页与页之间数据独立、每页只写一次，
+        // 规避 `Queue::write_buffer` 在 submit 前全部执行引起的同缓冲覆盖问题，
+        // 同时天然支持单帧总实例数 > 4096。
         let mut current_tex: Option<u64> = None;
         let mut run_start: usize = 0;
+        let mut page: u32 = 0;
+        let mut page_start: usize = 0;
+
+        /// 结批辅助：把 `[run_start, buf_instances.len())` 生成 DrawOp::Sprite（页内相对范围）。
+        macro_rules! close_run {
+            ($tex:expr) => {{
+                if self.buf_instances.len() > run_start {
+                    self.buf_ops.push(DrawOp::Sprite {
+                        page,
+                        tex_uid: $tex,
+                        range: ((run_start - page_start) as u32)..((self.buf_instances.len() - page_start) as u32),
+                    });
+                }
+            }};
+        }
 
         for (cmd, _layer, states) in self.command_queue.iter() {
             let tex_uid = states.and_then(|s| s.texture_uid);
             match cmd {
                 DrawCommand::Sprite2D { rect, color, transform } => {
-                    // 状态变化时先结批。
-                    if tex_uid != current_tex {
-                        if self.buf_instances.len() > run_start {
-                            self.buf_ops.push(DrawOp::Sprite {
-                                tex_uid: current_tex,
-                                range: (run_start as u32)..(self.buf_instances.len() as u32),
-                            });
-                        }
+                    // 状态变化 或 当前页已满 → 先结批。
+                    let page_full = self.buf_instances.len() - page_start >= MAX_INSTANCES_PER_DRAW;
+                    if tex_uid != current_tex || page_full {
+                        close_run!(current_tex);
                         current_tex = tex_uid;
                         run_start = self.buf_instances.len();
+                        if page_full {
+                            page += 1;
+                            page_start = self.buf_instances.len();
+                        }
                     }
                     let data = InstanceData::from_sprite(rect, *color, *transform);
                     self.buf_instances.push(data);
                 }
                 DrawCommand::Mesh { vert, tri_index } => {
                     // Mesh 非实例化：先结批实例，再登记 Mesh 命令 + 占位符。
-                    if self.buf_instances.len() > run_start {
-                        self.buf_ops.push(DrawOp::Sprite {
-                            tex_uid: current_tex,
-                            range: (run_start as u32)..(self.buf_instances.len() as u32),
-                        });
-                    }
+                    close_run!(current_tex);
                     current_tex = None;
                     run_start = self.buf_instances.len();
                     self.buf_ops.push(DrawOp::MeshPlaceholder);
@@ -785,20 +802,30 @@ impl Render2D {
             }
         }
         // 收尾最后一批。
-        if self.buf_instances.len() > run_start {
-            self.buf_ops.push(DrawOp::Sprite {
-                tex_uid: current_tex,
-                range: (run_start as u32)..(self.buf_instances.len() as u32),
-            });
-        }
+        close_run!(current_tex);
 
-        // 实例数上限：实例缓冲容量固定为 MAX_INSTANCES_PER_DRAW。
-        // 超过上限时在这里直接报错（release 下写缓冲会越界，明确失败更安全）。
-        assert!(
-            self.buf_instances.len() <= MAX_INSTANCES_PER_DRAW,
-            "too many instances in one frame: {} > {MAX_INSTANCES_PER_DRAW}",
-            self.buf_instances.len()
-        );
+        // 按已使用的页数确保页池容量（帧初一次性增长、永久复用；不足时创建新页）。
+        let page_count = page as usize + 1;
+        self.draw_page.ensure_instance_pages(&self.device, page_count);
+
+        // **每页整页只写入一次**（offset 0）：按页切分 buf_instances 写入对应页缓冲。
+        // 页与页相互独立，规避 `Queue::write_buffer` 在 submit 前全部执行
+        // 导致「同一缓冲最后一次写入覆盖先前批次」的问题（此前曾使所有精灵
+        // 位置全部变成与最后一屏 UI 相同的 NDC 位置）。页池缓冲跨帧复用。
+        {
+            let mut page_idx = 0usize;
+            let mut start = 0usize;
+            while start < self.buf_instances.len() {
+                let end = (start + MAX_INSTANCES_PER_DRAW).min(self.buf_instances.len());
+                self.draw_page.update_instances_page(
+                    &self.queue,
+                    page_idx,
+                    &self.buf_instances[start..end],
+                );
+                page_idx += 1;
+                start = end;
+            }
+        }
 
         // ── Mesh：按排序顺序将顶点/索引组装后整批写入 DrawPage 动态缓冲 ──
         if !self.buf_mesh_cmds.is_empty() {
@@ -890,11 +917,11 @@ impl Render2D {
             return;
         }
 
-        // 实例数据按排序顺序**一次性写入** instance buffer（offset 0，无重叠写），
-        // 每个 Sprite 批次用真实实例范围绘制 → 批次间互不覆盖；数量已由 prepare() 保证 ≤ 上限。
-        if !self.buf_instances.is_empty() {
-            self.draw_page.update_instances(&self.queue, &self.buf_instances);
-        }
+        // 实例缓冲**页池**：prepare() 已把实例按 MAX_INSTANCES_PER_DRAW 分页，
+        // 每个 DrawOp::Sprite 记录 页号 + 页内范围。**每页只写入一次**（offset 0），
+        // 绘制时绑定该页缓冲 → 页与页之间数据独立，规避 `Queue::write_buffer`
+        // 在 submit 前全部执行导致「最后一次写入覆盖先前批次」的图形错误
+        //（此前曾出现：所有精灵位置全变成与最后一屏 UI 相同的 NDC 位置）。
 
         // 连续相邻的 DrawOp::Mesh（中间无 Sprite 打断）合并为**一次** draw_indexed：
         // prepare() 已把 mesh 顶点/索引按排序顺序**连续**写入 mesh_vb/mesh_ib，
@@ -903,13 +930,20 @@ impl Render2D {
         let mut i = 0usize;
         while i < self.buf_ops.len() {
             match &self.buf_ops[i] {
-                DrawOp::Sprite { tex_uid, range } => {
+                DrawOp::Sprite { page, tex_uid, range } => {
                     let count = range.end - range.start;
                     if count != 0 {
                         pass.set_pipeline(&self.sprite_pipeline);
                         pass.set_bind_group(0, &self.draw_page.vp_bind_group, &[]);
                         pass.set_vertex_buffer(0, self.draw_page.quad_vb.slice(..));
-                        pass.set_vertex_buffer(1, self.draw_page.instance_buffer.slice(..));
+                        // 绑定本批次所在实例页；实例范围 = 页内相对偏移
+                        // （prepare() 已把每页实例整页写入对应页缓冲，offset 0）。
+                        pass.set_vertex_buffer(
+                            1,
+                            self.draw_page
+                                .instance_page_buffer(*page as usize)
+                                .slice(..),
+                        );
                         pass.set_index_buffer(
                             self.draw_page.quad_ib.slice(..),
                             wgpu::IndexFormat::Uint16,
