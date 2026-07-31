@@ -10,6 +10,8 @@
 
 目前仅实现了基础的 2D 渲染器，计划加入**文本渲染**、**静态瓦片**、**高级特效**等，这些都需要作者（和他用的 Cline 以及里面的 DeepSeek 酱）的辛勤努力  
 
+好在有不少东西都是继承自 [`krjw_rust`](https://github.com/parseek/krjw_rust) 的，不用重复造轮子，yay（
+
 你说音频？直接套 `kira` crate 就够了（
 
 ## ✨ 特性
