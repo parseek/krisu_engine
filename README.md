@@ -2,6 +2,8 @@
 
 一个用 **Rust + wgpu** 编写的 2D 游戏/渲染引擎（工作区名 `krusie`），以可运行的 examples 作为视觉验证与教学载体。
 
+本项目继承自[`krjw_rust`](https://github.com/parseek/krjw_rust)，部分 crate 直接使用了该项目的代码，部分实现则借鉴了其思路。
+
 目的为开箱即用，并且可以自由搭配不同的 crate 食用
 
 后续会引入更多功能，但是现在所拥有的已经足够你去实现一个项目了
