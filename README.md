@@ -18,8 +18,10 @@
 
 ## ✨ 特性
 
-- 🎨 **Batch2D 批渲染**（`rjw_2d_render`）：Sprite 实例化合批 + Mesh 多边形，按 (layer, states) 排序
-- 📦 **实例缓冲页池**：单帧精灵数量可远超单批上限（4096），自动分页绘制，不阻塞帧、无运行时扩张
+- 🎨 **Batch2D 批渲染**（`rjw_2d_render`）：Sprite/Mesh **统一管线** + RStates 渲染状态 bitfield（u64），按 (layer, states) 排序
+- 🔗 **Builder 责任链**：`add_sprite2d(...).blend(Additive).depth_test(true)` 按对象定制渲染状态；不链式 = 全局默认
+- 🎛️ **渲染状态 RStates**：Blend / Sampler / Cull+Raster / Depth / Stencil 6 域 bitfield，三级控制（全局默认 → 单条绘制 → 批量描述符）
+- 📦 **实例缓冲页池**：单帧精灵数量可远超单批上限（8192），自动分页绘制，不阻塞帧、无运行时扩张
 - 🎥 **2D 正交相机**（`rjw_transform::Camera2D`）：中心原点、Y+ 向下、VP 矩阵直接透传、屏幕↔世界坐标互转
 - 📐 **变换系统**（`Transform2D`）：位置/缩放/旋转、父子组合、命中检测
 - ⌨️ **输入**：键盘（`KeyState` 边沿：pressed / down_edge / true_edge）+ 鼠标（位置/增量/滚轮/按钮）
@@ -32,7 +34,7 @@
 |---|---|
 | `rjw_main` | 入口 `run_app(App)`、事件循环、窗口、`MainContext`（键盘/鼠标/计时） |
 | `rjw_render` | 底层 `RenderContext`、纹理 `TextureWrapped`、wgpu 重导出 |
-| `rjw_2d_render` | ★ 2D 批渲染器 `Render2D`、`SpriteRect`、`Mesh`、**分页实例缓冲** |
+| `rjw_2d_render` | ★ 2D 批渲染器 `Render2D`、`RStates`、Builder 责任链、`SpriteRect`、`Mesh`、分页实例缓冲、**统一管线缓存** |
 | `rjw_transform` | `Transform2D` + `Camera2D`（正交投影、坐标转换） |
 | `rjw_color` | `Color`(f32) / `ColorF64`(f64) + 常用常量 |
 | `rjw_keyboard` / `rjw_keystate` | 键盘输入与边沿状态机 |

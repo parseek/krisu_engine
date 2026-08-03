@@ -14,15 +14,16 @@
 4. [绘制模型：Render2D 的批处理管线](#4-绘制模型render2d-的批处理管线)
 5. [Layer 语义与 y-sort 惯用法](#5-layer-语义与-y-sort-惯用法)
 6. [纹理与合批](#6-纹理与合批)
-7. [输入：键盘 / 鼠标](#7-输入键盘--鼠标)
-8. [Transform2D 变换](#8-transform2d-变换)
-9. [颜色：Color 与 ColorF64](#9-颜色color-与-colorf64)
-10. [时间：DeltaTimer](#10-时间deltatimer)
-11. [窗口与事件循环](#11-窗口与事件循环)
-12. [视口 / 缩放 / 高 DPI](#12-视口--缩放--高-dpi)
-13. [性能与内存约定](#13-性能与内存约定)
-14. [对 AI 的维护约定](#14-对-ai-的维护约定)
-15. [快速速查表](#15-快速速查表)
+7. [渲染状态（RStates）与 Builder 责任链](#7-渲染状态rstates与-builder-责任链)
+8. [输入：键盘 / 鼠标](#8-输入键盘--鼠标)
+9. [Transform2D 变换](#9-transform2d-变换)
+10. [颜色：Color 与 ColorF64](#10-颜色color-与-colorf64)
+11. [时间：DeltaTimer](#11-时间deltatimer)
+12. [窗口与事件循环](#12-窗口与事件循环)
+13. [视口 / 缩放 / 高 DPI](#13-视口--缩放--高-dpi)
+14. [性能与内存约定](#14-性能与内存约定)
+15. [对 AI 的维护约定](#15-对-ai-的维护约定)
+16. [快速速查表](#16-快速速查表)
 
 ---
 
@@ -34,7 +35,7 @@
 crates/
 ├─ rjw_main        # 入口：run_app(App) + 事件循环 + 窗口 + MainContext(键盘/鼠标/计时)
 ├─ rjw_render      # 底层渲染上下文：RenderContext / 纹理 TextureWrapped / wgpu 重导出
-├─ rjw_2d_render   # ★ 2D 批渲染器：Render2D / SpriteRect / Mesh / 分页实例缓冲
+├─ rjw_2d_render   # ★ 2D 批渲染器：Render2D / SpriteRect / Mesh / RStates / 分页实例缓冲 / 统一管线
 ├─ rjw_transform   # Transform2D + Camera2D（正交相机、VP 矩阵、坐标转换）
 ├─ rjw_color       # Color(f32) / ColorF64(f64) + 常用常量（RED/GREEN/...）
 ├─ rjw_keyboard    # 键盘输入 → KeyState
@@ -56,7 +57,7 @@ App (impl rjw_main::App)
  └─ about_to_wait（每帧）:
      读输入(键盘/鼠标) → 更新逻辑 → 摆相机(Camera2D)
      → render2d.set_mvp(cam.vp_matrix())
-     → 录制绘制命令(add_sprite2d_* / add_mesh / add_polygon_fan)
+     → 录制绘制命令(add_sprite2d* / add_mesh / add_polygon_*) + 可选链式 RStates
      → render2d.render(&ClearConfig)
 ```
 
@@ -82,7 +83,7 @@ impl App for App {
     fn primary_window_attrib(&self) -> WindowAttributes {
         WindowAttributes::default()
             .with_title("my app")
-            .with_inner_size(LogicalSize::new(1280.0, 720.0)) // 逻辑大小，高DPI下会进行转换，请注意
+            .with_inner_size(LogicalSize::new(1280.0, 720.0))
     }
 
     fn on_init(&mut self, ctx: &mut MainContext) {
@@ -90,7 +91,6 @@ impl App for App {
         self.render = Some(RenderContext::new(window, &RenderConfig::default()));
         let render = self.render.as_ref().unwrap();
         self.r2d = Some(Render2D::new(render));
-        // camera 视口 = 表面物理尺寸（高 DPI 安全）
         let (w, h) = render.size();
         let mut cam = Camera2D::new(Vec2::new(w as f32, h as f32));
         cam.set_vp(Vec2::new(w as f32, h as f32), Vec2::ZERO);
@@ -107,11 +107,12 @@ impl App for App {
         let r2d = self.r2d.as_mut().unwrap();
         r2d.set_mvp(self.cam.vp_matrix());
         // 在屏幕中心画一个 100×100 绿色方块（世界坐标）
-        r2d.add_sprite2d_default_solid(
+        // add_sprite2d_solid 返回 Sprite2DBuilder；不链式调用 = 使用默认渲染状态
+        r2d.add_sprite2d_solid(
             SpriteRect::from_texture(Vec2::splat(-50.0), Vec2::splat(100.0)),
             Color::GREEN,
             Transform2D::default(),
-            0.0, // layer
+            0.0,
         );
         r2d.render(&ClearConfig { color: Some(wgpu::Color { r: 0.1, g: 0.1, b: 0.2, a: 1.0 }), depth: None, stencil: None });
     }
@@ -119,10 +120,7 @@ impl App for App {
 
 fn main() -> Result<(), EventLoopError> {
     env_logger::init();
-    rjw_main::run_app(App {
-        render: None, r2d: None,
-        cam: Camera2D::default(),
-    })
+    rjw_main::run_app(App { render: None, r2d: None, cam: Camera2D::default() })
 }
 ```
 
@@ -165,8 +163,8 @@ pub struct Camera2D {
 ```
 
 - `Camera2D::new(window_size_px)`：建一个覆盖整窗的相机；**之后必须 `set_vp(size, pos)`** 才能用正确投影。
-- `vp_matrix() = projection_matrix() * view_matrix()`，**列主序**，可直接喂给 `render2d.set_mvp(...)`（无需转置——Render2D 直接透传）。
-- `screen_to_world(screen_px)` / `world_to_screen(world)`：屏幕像素 ↔ 世界坐标互转。**内部会做 Y 翻转**（屏幕像素 Y↓，世界 Y↓ 恰好一致，转换中无需自己再翻）。
+- `vp_matrix() = projection_matrix() * view_matrix()`，**列主序**，可直接喂给 `render2d.set_mvp(...)`（无需转置）。
+- `screen_to_world(screen_px)` / `world_to_screen(world)`：屏幕像素 ↔ 世界坐标互转。
 - `world_transform()`：把相机当作 `Transform2D`（用于 UI 反父级运算）。
 
 ### 3.3 窗口中心 ↔ 世界
@@ -174,7 +172,6 @@ pub struct Camera2D {
 **游戏画面在窗口中心** = 相机锁定玩家：
 
 ```rust
-// 每帧让相机平滑跟随玩家：玩家=世界点，相机重心=窗口中心 ⇒ 画面居中
 self.cam.position += (player.pos - self.cam.position) * (1.0 - (-20.0 * dt).exp());
 ```
 
@@ -183,31 +180,42 @@ self.cam.position += (player.pos - self.cam.position) * (1.0 - (-20.0 * dt).exp(
 ## 4. 绘制模型：Render2D 的批处理管线
 
 ```
-【每帧】  add_sprite2d_* / add_mesh / add_polygon_*（命令录制）
-              │
+【每帧】  add_sprite2d* / add_mesh / add_polygon_*（命令录制，返回 Builder）
+              │ (可选链式 .blend(...).depth_test(...) 设置 RStates)
+              │ (Builder Drop → push 到 DrawCommandQueue)
               ▼
         Render2D::render(&ClearConfig)
               │
    ① prepare()：sort_layer_then_states() 排序
-   ② 实例数据按 MAX_INSTANCES_PER_DRAW(4096) 分页
-   ③ draw()：逐页绑定缓冲 → draw_indexed（多次绘制，合批）
-   ④ 提交并呈现
+   ② RStates resolve（None → default_rstates）
+   ③ 实例数据按 MAX_INSTANCES_PER_DRAW(8192) 分页
+   ④ draw()：按 DrawOp.rstates 从管线缓存取/创建管线 → 逐页绑定 → draw_indexed
+   ⑤ 提交并呈现
 ```
 
-### 4.1 两种绘制路径
+### 4.1 统一管线架构
 
-| 路径 | 方法 | 说明 |
-|---|---|---|
-| **Sprite（实例化）** | `add_sprite2d_default(rect,color,transform,layer,texture)` | 同纹理相邻批次可合批，性能最优 |
-| **Sprite（纯色）** | `add_sprite2d_default_solid(...)` | 内部用 1×1 白色纹理 |
-| **Mesh（非实例化）** | `add_mesh(verts, tris, color, layer)` | 世界坐标顶点直通 VP；适合圆/多边形/图形 |
-| **Mesh（便捷）** | `add_polygon_fan` / `add_polygon_strip` / `add_mesh_fn*` | 画圆、线、任意网格 |
+Sprite 与 Mesh **共用同一 `vs_main` 入口 + slot0(顶点)/slot1(实例) 布局**。
 
-### 4.2 `SpriteRect`（位置/大小/UV）
+- **Sprite**：slot1 绑定实例页缓冲 → `draw_indexed(quad_indices, 0, N_instances)`
+- **Mesh**：slot1 绑定"身份实例缓冲"（mesh_tl=0, mesh_wh=1, model=I）→ `draw_indexed(mesh_indices, 0, 1)` —— 等效于非实例化直通 VP
+
+渲染状态（Blend / DepthStencil / Cull / Polygon / FrontFace / Conservative）全部**按 RStates 从管线缓存中自动获取或创建**，无需手动管理管线。
+
+### 4.2 两种绘制类别
+
+| 类别 | 方法 | Builder | 说明 |
+|---|---|---|---|
+| **Sprite（贴纹理）** | `add_sprite2d(rect,color,transform,layer,&tex)` | `Sprite2DBuilder` | 同纹理+同 RStates 合批 |
+| **Sprite（纯色）** | `add_sprite2d_solid(rect,color,transform,layer)` | `Sprite2DBuilder` | 内部用 1×1 白纹理 |
+| **Mesh** | `add_mesh(verts, tris, color, layer)` | `MeshBuilder` | 世界坐标顶点直通 VP |
+| **Mesh（便捷）** | `add_polygon_fan` / `add_polygon_strip` / `add_mesh_fn*` | `MeshBuilder` | 画圆、线、任意网格 |
+
+### 4.3 `SpriteRect`（位置/大小/UV）
 
 ```rust
 SpriteRect {
-    mesh_tl: Vec2,   // 世界坐标左上角（本地 space 的 rect 左下 → 最终位置）
+    mesh_tl: Vec2,   // 世界坐标左上角
     mesh_wh: Vec2,   // 世界尺寸
     uv_tl:   Vec2,   // 归一化 UV 左上
     uv_wh:   Vec2,   // 归一化 UV 尺寸
@@ -215,9 +223,9 @@ SpriteRect {
 ```
 
 - `from_texture(tl, wh)`：整张纹理铺满。
-- `from_texture_px(tl, wh, uv_tl_px, uv_wh_px, inv_tex_wh)`：按像素取纹理子区域（sprite sheet）。
+- `from_texture_px(tl, wh, uv_tl_px, uv_wh_px, inv_tex_wh)`：按像素取纹理子区域。
 
-### 4.3 `ClearConfig`
+### 4.4 `ClearConfig`
 
 ```rust
 ClearConfig { color: Option<wgpu::Color>, depth: Option<f32>, stencil: Option<u32> }
@@ -235,7 +243,7 @@ layer = 0      最早画（最底层）
 layer = 10     后画
 layer = 100    最后画（最顶层）
 ```
-Sort 是稳定的 (layer, states) 排序——**同 layer 按录制顺序**；不同纹理决定是否合批。
+Sort 是稳定的 (layer, states) 排序——states 包含 RStates(u64) + texture_uid。
 UI 应给一个**很大的固定值**（如 `1e7`），避免被 y-sort 世界坐标覆盖。
 
 ### 5.2 y-sort：RPG 纵深感的标准做法
@@ -243,32 +251,104 @@ UI 应给一个**很大的固定值**（如 `1e7`），避免被 y-sort 世界�
 想让「屏幕下方的世界物体盖住上方的物体」：
 
 ```rust
-const LAYER_Y_SORT_BASE: f32 = 10.0;   // 所有“立绘”从这里起步
+const LAYER_Y_SORT_BASE: f32 = 10.0;
 fn y_layer(foot_y: f32) -> f32 { LAYER_Y_SORT_BASE + foot_y }
 
 // 绘制时传 foot_y（脚底世界 Y）：
-add_sprite2d_default(rect, color, tf, y_layer(entity.foot_y), &tex);
+render2d.add_sprite2d(rect, color, tf, y_layer(entity.foot_y), &tex);
 ```
 
-引擎对 (layer, states) 排序后，Y 大（靠下）的物体自动盖住 Y 小（靠上）的物体——**无需手动穿插绘制调用**。同 Y 的细节遮挡用小数偏移：本体 `+0.0`、血条 `+0.1/+0.2`、攻击弧 `+0.3`。
-
-> ⚠️ 若图层里有 UI：UI 必须用远超 `y_layer` 上限的常量层（本 RPG 用 `1e7`）。
+引擎对 (layer, states) 排序后，Y 大（靠下）的物体自动盖住 Y 小（靠上）的物体。同 Y 的细节遮挡用小数偏移。
 
 ---
 
 ## 6. 纹理与合批
 
-- 创建：`render2d.create_texture(label, &rgba8_data, w, h)`（RGBA8，`len == w*h*4` 否则 panic）。返回 `ArcTextureWrapped`。
-- 合批：**同一 `ArcTextureWrapped` 的相邻（同 states）Sprite 自动合批**；换纹理即断批。
+- 创建：`render2d.create_texture(label, &rgba8_data, w, h)`（RGBA8，`len == w*h*4` 否则 panic）。
+- 合批：**同一纹理 + 同一 RStates 的连续 Sprite 自动合批**。
 - 纹理池：`Render2D.textures` 持有 `Arc`，防止释放。
-
-**关于 1×1 白色纹理**：纯色 Sprite 使用 `white_texture`（uid 独立），`add_sprite2d_default_solid` 就是克隆它来录制的。
+- 1×1 白色纹理：纯色 Sprite 使用 `white_texture`。
 
 ---
 
-## 7. 输入：键盘 / 鼠标
+## 7. 渲染状态（RStates）与 Builder 责任链
 
-### 7.1 键盘——`KeyState`（重点：边沿）
+`RStates` 是一个 u64 bitfield，涵盖 6 个渲染控制域：
+
+| 域 | 字段 | 示例 |
+|---|---|---|
+| Blend | `BlendMode` (Alpha/Additive/Multiply/Premultiplied) | `.blend(Additive)` |
+| Sampler | mag/min/mip filter + addr_u/v/w | `.samp_addr_u(Repeat).samp_mag(Nearest)` |
+| Cull+Raster | cull + polygon + front_face + conservative | `.cull(Back).polygon(Line)` |
+| Depth | test + write + compare | `.depth_test(true).depth_write(true)` |
+| Stencil | test + write + compare | `.stencil_test(true).stencil_compare(Always)` |
+
+### 7.1 三级控制
+
+| 级别 | 使用方式 | 作用范围 |
+|---|---|---|
+| **全局默认** | `render2d.default_blend(Additive).default_depth_test(true).set_mvp(...)` | 所有不链式调用的 add_* |
+| **单条绘制** | `render2d.add_sprite2d(...).blend(Multiply)` | 该条命令 |
+| **批量设置** | `.blend_state(BlendDesc{...}).samp_state(SamplerDesc{...}).depth_state(DepthState{...})` | 同上 |
+
+### 7.2 Builder 使用
+
+```rust
+// 不链式 = 使用 default_rstates（默认 Alpha Blend + Linear + No Cull）
+render2d.add_sprite2d(rect, Color::WHITE, tf, 0.0, &tex);
+
+// 链式覆盖
+render2d.add_sprite2d(rect, Color::WHITE, tf, 0.0, &tex)
+    .blend(BlendMode::Additive)
+    .samp_addr_u(AddressMode::Repeat)
+    .samp_mag(FilterMode::Nearest);
+
+// Mesh 还可以 set_texture（覆盖默认白色纹理）
+render2d.add_polygon_fan(&verts, Color::CYAN, 96.0)
+    .set_texture(&tex)
+    .blend(BlendMode::Multiply);
+
+// 批量设置
+use rjw_2d_render::{BlendDesc, BlendMode, DepthState, CompareFunc};
+render2d.add_sprite2d(rect, Color::WHITE, tf, 0.0, &tex)
+    .depth_state(DepthState { test: true, write: true, compare: CompareFunc::Less });
+
+// 全局默认（责任链风格，返回 &mut Render2D）
+render2d
+    .default_blend(BlendMode::Additive)
+    .default_depth_test(true)
+    .default_depth_write(true)
+    .default_depth_compare(CompareFunc::Less);
+```
+
+### 7.3 MeshBuilder 特有的 `.set_texture()`
+
+```rust
+// Mesh 默认白色纹理；set_texture 覆盖
+render2d.add_mesh(&verts, &tris, Color::WHITE, 96.0)
+    .set_texture(&my_tex)
+    .blend(BlendMode::Alpha);
+```
+
+### 7.4 重要类型
+
+| 类型 | 说明 |
+|---|---|
+| `RStates` | u64 bitfield，含全部 6 个控制域 |
+| `BlendMode` | Alpha / Additive / Multiply / Premultiplied |
+| `FilterMode` | Linear / Nearest |
+| `AddressMode` | ClampToEdge / Repeat / MirrorRepeat |
+| `CullMode` | None / Front / Back |
+| `PolygonMode` | Fill / Line / Point |
+| `FrontFaceWinding` | Ccw / Cw |
+| `CompareFunc` | Never / Less / Equal / LessEq / Greater / NotEq / GreaterEq / Always |
+| `BlendDesc` / `SamplerDesc` / `RasterState` / `DepthState` / `StencilState` | 批量设置描述符 |
+
+---
+
+## 8. 输入：键盘 / 鼠标
+
+### 8.1 键盘——`KeyState`（重点：边沿）
 
 `ctx.keyboard.get(KeyCode::KeyW)` 返回 `KeyState`：
 
@@ -276,31 +356,27 @@ add_sprite2d_default(rect, color, tf, y_layer(entity.foot_y), &tex);
 |---|---|
 | `.pressed()` | 当前是否按住 |
 | `.released()` | 是否没按 |
-| `.down_edge()` | **本轮“按下”边沿**（按下的那一刻触发一次，操作系统可能会在你按下时触发多次，不想要可以使用 `down_true_edge()`） |
-| `.up_edge()` | **本轮“松开”边沿**（同上） |
-| `.true_edge()` / `.down_true_edge()` | 真实边沿（按住的时候不会反复触发） |
+| `.down_edge()` | **本轮"按下"边沿**（按下的那一刻触发一次，可能重复） |
+| `.up_edge()` | **本轮"松开"边沿**（同上） |
+| `.true_edge()` / `.down_true_edge()` | 真实边沿（按住时不会反复触发） |
 | `.sudden_up()` | 突然松开（未在上一帧处于按下状态） |
 
-> ⚠️ **易混淆**：`pressed()` 是「按住」，每帧都 true；`down_edge()` 只在「按下动作发生的那一帧」true——**攻击/跳跃等瞬时操作必须用 `down_edge()`**，否则每帧触发多次。
+> ⚠️ **攻击/跳跃等瞬时操作必须用 `down_edge()`**，否则每帧触发多次。
 
-键盘常量：`KeyCode::KeyW/KeyA/KeyS/KeyD`、`KeyCode::ArrowUp/...`、`KeyCode::Space`、`KeyCode::Escape`、`KeyCode::KeyR` 等（winit `KeyCode`，经 `rjw_main` 重导出）。
-
-### 7.2 鼠标
+### 8.2 鼠标
 
 ```rust
 ctx.mouse.get_mouse_position()                        // (x,y) 窗口像素
 ctx.mouse.get_mouse_delta()                           // 本帧移动增量
-ctx.mouse.get_mouse_button_state(MouseButton::Left)   // KeyState（同理用 down_edge 表示“点击”）
+ctx.mouse.get_mouse_button_state(MouseButton::Left)   // KeyState
 ctx.mouse.get_wheel_delta()                           // (x, y) 滚轮
 ctx.mouse.get_pixel_wheel()                           // 触控板像素级滚轮
 ctx.mouse.in_window()                                 // 是否在窗口内
 ```
 
-世界坐标系下用 `cam.screen_to_world(Vec2::new(mouse.0, mouse.1))` 得到鼠标指向的世界点。
-
 ---
 
-## 8. Transform2D 变换
+## 9. Transform2D 变换
 
 ```rust
 pub struct Transform2D {
@@ -311,24 +387,21 @@ pub struct Transform2D {
 ```
 
 - 构建器：`with_pos(..)` / `with_scale(..)` / `with_rot(..)` / `with_move_by` / `with_walk_by` / `with_scale_by` / `with_rotate_by`。
-- **旋转中心**：`rotation` 绕 **变换原点**（即 `pos`）旋转——所以精灵要「绕中心转」，矩形应写成 `SpriteRect { mesh_tl: Vec2::splat(-w/2), mesh_wh: Vec2::splat(w) }`，Transform 的 pos 落在中心。
+- **旋转中心**：旋转绕 `pos` —— 精灵要「绕中心转」，矩形写 `mesh_tl: Vec2::splat(-w/2)`。
 - `transform_point` / `inverse_transform_point`：局部 ↔ 父空间点变换。
-- `with_transform(&parent)`：组合父子层级；UI 命中检测可用 `inverse_transform_point`。
 
 ---
 
-## 9. 颜色：Color 与 ColorF64
+## 10. 颜色：Color 与 ColorF64
 
 | 类型 | 存储 | 常用构造 | 用途 |
 |---|---|---|---|
-| `Color` | `f32` ×4 | `rgba(r,g,b,a)`、`rgba_u8(..)`、`rgb(..)`、`rgb_u8(..)`、常量 `RED/GREEN/...` | 绘制命令 |
-| `ColorF64` | `f64` ×4 | `rgba(f64,..)` | 可直接 `.into()` `wgpu::Color`（清屏） |
-
-> `Color` 与 `wgpu::Color` 不直接互转；清屏用 `ColorF64(...).into()` 或手写 `wgpu::Color`（不建议）。
+| `Color` | `f32` ×4 | `rgba(r,g,b,a)`、`rgba_u8(..)`、常量 `RED/GREEN/...` | 绘制命令 |
+| `ColorF64` | `f64` ×4 | `rgba(f64,..)` | 可 `.into()` `wgpu::Color`（清屏） |
 
 ---
 
-## 10. 时间：DeltaTimer
+## 11. 时间：DeltaTimer
 
 ```rust
 ctx.timer.dt()              // 帧间隔秒（Duration）
@@ -336,81 +409,82 @@ ctx.timer.dt().get_f32()    // 帧间隔秒（Duration）的 f32 转换
 ctx.timer.get_fps()         // 当前 FPS
 ```
 
-每帧用 `dt` 做位移：`pos += vel * dt`；注意 `dt` 在窗口拖动时可能很大，建议 `dt.min(0.05)` 防跳变。
+每帧用 `dt` 做位移：`pos += vel * dt`；建议 `dt.min(0.05)` 防跳变。
 
 ---
 
-## 11. 窗口与事件循环
+## 12. 窗口与事件循环
 
-- 入口：`run_app(App::new())`，`App` trait 必须实现 `primary_window_attrib`（可选）、`on_init`、`about_to_wait`；`on_resized` 可选。
+- 入口：`run_app(App::new())`，`App` trait 必须实现 `on_init`、`about_to_wait`；`on_resized` 可选。
 - `MainContext`：`keyboard` / `mouse` / `timer` / `primary_window()` / `request_exit()`。
-- `on_init` 中创建 `RenderContext` + `Render2D`（注意：`Render2D` 持有 surface 的 `'static` 引用，`RenderContext` 必须比 Render2D 活得久——本框架中 RenderContext 存活到事件循环结束，天然满足）。
-- `on_resized`：`render.resize(w,h)` + 更新相机视口 `cam.set_vp`。
-- 窗口属性：`.with_title(...)` / `.with_inner_size(LogicalSize::new(...))`——**LogicalSize 是逻辑像素**，高 DPI 屏会自动映射为更大的物理像素。
+- `on_init` 中创建 `RenderContext` + `Render2D`（`RenderContext` 必须比 `Render2D` 活得久）。
+- `on_resized`：`render.resize(w,h)` + 更新相机视口。
 
 ---
 
-## 12. 视口 / 缩放 / 高 DPI
+## 13. 视口 / 缩放 / 高 DPI
 
 | 概念 | 说明 |
 |---|---|
-| **LogicalSize** | 窗口逻辑尺寸（对人/布局友好） |
+| **LogicalSize** | 窗口逻辑尺寸 |
 | **物理像素** | 实际屏幕像素 = 逻辑 × DPI scale |
-| **`render.size()`** | **物理像素**，必须用它建相机视口和 `set_vp`，否则高 DPI 下画面偏移 |
-| 相机 `viewport_size` | 物理像素；窗口 resize 时经 `on_resized` 同步 |
+| **`render.size()`** | **物理像素**，必须用它建相机视口，否则高 DPI 下画面偏移 |
+| 相机 `viewport_size` | 物理像素 |
 
-> ⚠️ **最容易翻车**：拿 `LogicalSize` 直接当相机视口 → 高 DPI 笔记本上画面偏左上、尺寸不对。一律用 `render.size()`。
-
-**缩放**（滚轮放大缩小）：
+**缩放**（滚轮）：
 ```rust
-let wheel = ctx.mouse.get_wheel_delta();  // (x, y)
 cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 ```
 
 ---
 
-## 13. 性能与内存约定
+## 14. 性能与内存约定
 
-- `Render2D` 内部 `buf_*` 全部常驻复用（`clear()` 只清长度不释放），避免每帧堆分配。
-- **实例缓冲是“页池”**：单帧总实例数可远超 4096，`prepare()` 自动按 `MAX_INSTANCES_PER_DRAW` 分页、`draw()` 逐页绑定/绘制——**不要自己砍精灵数量去“凑”4096**。（注：实际容量已经加到了 8192，正考虑更好的扩容方式，对于静态瓦片地图，可以考虑一下静态方式，但目前尚未给出，敬请期待）
-- 页池按需一次性增长、永久复用，不在渲染循环中反复分配。
-- Mesh 顶点走 u16 索引，单帧顶点数 ≤ 65535；顶点/索引缓冲按需 2× 扩容。
-- 每帧录制命令数不设硬上限，但推荐：可见性剔除（相机外的瓦片不要画）——见 `examples/eg260731RPG` 的 `draw_tiles`（按相机 AABB 裁剪）。
+- `Render2D` 内部 `buf_*` 全部常驻复用（`clear()` 只清长度不释放）。
+- **实例缓冲是"页池"**：单帧总实例数可远超 8192，自动分页；**不要自己裁减数量去凑**。
+- **统一管线缓存**：`DrawPage` 按 `RStates::raw()` keys 缓存 `RenderPipeline`，首次遇新状态时创建、后续帧直接命中。HashMap 常驻，Query 事件循环保持不变。
+- **builder 不产生堆分配**：`Sprite2DBuilder` / `MeshBuilder` 均为栈上 struct，Drop 时直接转移到 `DrawCommandQueue` 的 Vec。
+- 页池按需一次性增长、永久复用。
+- Mesh 顶点走 u16 索引，单帧顶点数 ≤ 65535。
 
 ---
 
-## 14. 对 AI 的维护约定
+## 15. 对 AI 的维护约定
 
 给接手改代码的 AI 助手的清单：
 
-1. **坐标系**：Y+ 向下。写“向上移动”用 `y -=`。
-2. **逻辑像素 ≠ 物理像素**：相机一律用 `render.size()`（物理）。别拿 `LogicalSize` 直接做相机视口。
+1. **坐标系**：Y+ 向下。写"向上移动"用 `y -=`。
+2. **逻辑像素 ≠ 物理像素**：相机一律用 `render.size()`（物理）。
 3. **瞬时操作用 `down_edge()`**；持续操作用 `pressed()`。
-4. **透明覆盖问题（大坑）**：`Queue::write_buffer` 在 `submit` 前会**全部先执行**。往同一个实例缓冲反复写入多批会导致最后一批覆盖前面的——**所以引擎用“页池”：每页只写一次、绑定对应页**。改 `draw()` 时不要退回“单缓冲逐批写”。
+4. **透明覆盖问题（大坑）**：`Queue::write_buffer` 在 `submit` 前会**全部先执行**——所以引擎用"页池"：每页只写一次、绑定对应页。
 5. **Layer 数值小先画**；RPG 里实体/地形用 y-sort 动态 layer，UI 用 ≥1e7 固定层。
-6. **纹理合批**：相邻同 `ArcTextureWrapped` 才合批；夹别的纹理就断批。
-7. 纹理数据长度必须 `w*h*4`；`create_texture` 会对不上 panic。
-8. 改公共 crate（`rjw_2d_render` 等）后，务必 `cargo check --workspace` 防回归。
-9. 新增瓦片/实体时，确认 `Tile::is_blocked` / 绘制 `match` 分支 / 纹理创建三点一致 +1。
-10. 敌人 AI、波次等逻辑都在 `update()`；绘制分离在 `draw_*`，两者不要互相穿插状态变更。
+6. **RStates resolve**：`prepare()` 中 `States.rstates: None` → `default_rstates`；`Some(r)` → 直接用 `r.raw()`。
+7. **Builder 是责任链，Drop 自动 push**：`add_*` 返回 builder，不链式调用也自动 push（`rstates: None`）。不要手动 push。
+8. **统一管线**：不再有 `sprite_pipeline` / `mesh_pipeline` 分支。所有绘制走 `get_or_create_pipeline(rst_raw)`，Mesh 绑定 identity instance buffer。
+9. **管线缓存 key = RStates::raw()**：u64 哈希，同一个 raw 值只创建一次管线。
+10. 改 `rstates.rs` 的 bitfield 布局时务必更新 `to_blend()` / `to_depth_stencil()` / `to_cull()` 等解包方法。
+11. 纹理数据长度必须 `w*h*4`。
+12. 改公共 crate 后，务必 `cargo check --workspace`。
 
 ---
 
-## 15. 快速速查表
+## 16. 快速速查表
 
 | 要做的事 | 代码 |
 |---|---|
 | 键盘 W 按住 | `ctx.keyboard.get(KeyCode::KeyW).pressed()` |
-| 空格“按下那一下” | `ctx.keyboard.get(KeyCode::KeySpace).down_edge()` |
-| 空格“只是按下那一下，按着的时候不会连续触发” | `ctx.keyboard.get(KeyCode::KeySpace).down_true_edge()` |
+| 空格"按下那一下" | `ctx.keyboard.get(KeyCode::KeySpace).down_edge()` |
 | 鼠标左键点击 | `ctx.mouse.get_mouse_button_state(MouseButton::Left).down_edge()` |
 | 鼠标世界坐标 | `cam.screen_to_world(Vec2::new(mx, my))` |
-| 圆心在 `p`、半径 `r` 的圆 | `add_polygon_fan(&[p, p+r*(cos,sin)...], color, layer)`（见 RPG `draw_circle`） |
-| 绕中心旋转的精灵 | `SpriteRect{mesh_tl: Vec2::splat(-w/2),...}` + `Transform2D::with_pos(c).with_rot(a)` |
-| 让画面跟随玩家（居中） | `cam.position += (player.pos - cam.position) * (1-exp(-k*dt))` |
-| UI 固定最顶层 | `layer = 1e7`（超过任何 y_layer 上限，理论上） |
+| 绕中心旋转的精灵 | `SpriteRect{mesh_tl: Vec2::splat(-w/2),...}` + `pos` 在中心 |
+| 让画面跟随玩家 | `cam.position += (player.pos - cam.position) * (1-exp(-k*dt))` |
+| UI 固定最顶层 | `layer = 1e7` |
 | 退出 | `Esc` → `ctx.request_exit()` |
-| 程序化纹理 | `create_texture(label, &rgba_vec, w, h)` |
+| 加性混合 Sprite | `.blend(BlendMode::Additive)` |
+| 全局启用深度测试 | `render2d.default_depth_test(true).default_depth_write(true)` |
+| Mesh 贴纹理 | `.set_texture(&tex)` |
+| 设置采样器重复 | `.samp_addr_u(AddressMode::Repeat).samp_addr_v(AddressMode::Repeat)` |
+| 延迟丢弃 builder（显式绑定变量） | `let _b = render2d.add_sprite2d(...).blend(...);` —— `_b` 在作用域结束时 Drop |
 
 ---
 

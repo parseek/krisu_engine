@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use rjw_transform::Transform2D;
 
-use crate::data::SpriteRect;
+use crate::{data::SpriteRect, rstates::RStates};
 
 // ─── 绘制命令 / 排序 ──────────────────────────────────────────
 
@@ -43,6 +43,7 @@ impl From<f32> for Layer {
 /// 实现排序 trait，相邻相同状态可合批。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct States {
+    pub(crate) rstates: Option<RStates>,
     pub(crate) texture_uid: Option<u64>,
 }
 
@@ -51,7 +52,7 @@ pub(crate) struct States {
 pub(crate) struct DrawCommandQueue {
     commands: Vec<DrawCommand>,
     layers: Vec<Layer>,
-    states: Vec<Option<States>>,
+    states: Vec<States>,
     cmd_indicies: Vec<usize>,
 
     dirty: bool,
@@ -71,7 +72,7 @@ impl DrawCommandQueue {
         self.cmd_indicies.len()
     }
 
-    pub(crate) fn push(&mut self, command: DrawCommand, layer: Layer, states: Option<States>) {
+    pub(crate) fn push(&mut self, command: DrawCommand, layer: Layer, states: States) {
         self.cmd_indicies.push(self.len());
         self.commands.push(command);
         self.layers.push(layer);
@@ -108,9 +109,9 @@ impl DrawCommandQueue {
     }
 
     #[inline]
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&DrawCommand, Layer, Option<&States>)> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&DrawCommand, Layer, &States)> {
         self.cmd_indicies
             .iter()
-            .map(|&i| (&self.commands[i], self.layers[i], self.states[i].as_ref()))
+            .map(|&i| (&self.commands[i], self.layers[i], &self.states[i]))
     }
 }

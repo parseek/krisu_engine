@@ -42,24 +42,6 @@ fn vs_main(in: VertexIn) -> VertexOut {
     return out;
 }
 
-/// Mesh/Polygon 非实例化顶点输入（仅 slot0 三属性，避免要求 location 3..11 绑定）。
-struct MeshVertex {
-    @location(0) pos: vec3<f32>,
-    @location(1) uv: vec2<f32>,
-    @location(2) color: vec4<f32>,
-};
-
-/// Mesh/Polygon 非实例化顶点入口：
-/// 顶点 `pos` 即**世界坐标**，直接经 VP 输出；颜色来自顶点内置（per-vertex color）。
-@vertex
-fn vs_mesh(in: MeshVertex) -> VertexOut {
-    var out: VertexOut;
-    out.clip_pos = vp * vec4<f32>(in.pos, 1.0);
-    out.uv = in.uv;
-    out.color = in.color;
-    return out;
-}
-
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let sampled = textureSample(tex, samp, in.uv);

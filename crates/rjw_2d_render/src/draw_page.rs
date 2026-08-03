@@ -1,12 +1,13 @@
-//! GPU 实例数据 / 缓冲页：实例化数据、VP、Mesh 动态缓冲与统一绘制操作。
+//! `DrawPage`：设备缓冲管理（顶点/索引）+ VP BindGroup + 管线缓存 + 统一绘制。
 
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range};
 
 use rjw_color::Color;
 use rjw_transform::Transform2D;
 use wgpu::util::DeviceExt;
 
 use crate::data::{SpriteRect, TriIndicies, VertexP3U2C4, QUAD_TRI_INDICIES, QUAD_VERTS};
+use crate::rstates::RStates;
 
 // ─── 常量 ─────────────────────────────────────────────────────
 
@@ -18,6 +19,21 @@ pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth2
 
 /// Mesh 顶点数上限（u16 索引）
 pub(crate) const MAX_MESH_VERTS: usize = u16::MAX as usize;
+
+/// 身份实例常量（Mesh 绘制时用作 slot1 占位，使 world pos 直通 VP）
+const IDENTITY_INSTANCE: InstanceData = InstanceData {
+    mesh_tl: [0.0, 0.0],
+    mesh_wh: [1.0, 1.0],
+    uv_tl: [0.0, 0.0],
+    uv_wh: [0.0, 0.0],
+    color: [1.0, 1.0, 1.0, 1.0],
+    model: [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+};
 
 // ─── GPU 实例数据 / 缓冲页 ────────────────────────────────────
 
@@ -43,8 +59,6 @@ impl InstanceData {
 
     pub(crate) fn from_sprite(rect: &SpriteRect, color: Color, transform: Transform2D) -> Self {
         let (sin, cos) = transform.rotation.sin_cos();
-        // 2D 变换矩阵（列主序）：
-        //   [cos*sx, sin*sx]  [-sin*sy, cos*sy]  [pos.x, pos.y]
         let model = glam::Mat4::from_cols_array_2d(&[
             [cos * transform.scale.x, sin * transform.scale.x, 0.0, 0.0],
             [-sin * transform.scale.y, cos * transform.scale.y, 0.0, 0.0],
@@ -72,75 +86,62 @@ pub(crate) struct VPBuffer {
 /// 一帧中单个 Mesh 在 DrawPage 动态缓冲中的定位（由 `prepare` 生成）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct MeshDrawItem {
-    /// 在 `DrawPage::mesh_vb` 中的首顶点偏移（元素数；预留：无索引时用 `draw` 定位）
     #[allow(dead_code)]
     pub(crate) first_vertex: u32,
-    /// 顶点数量（肯定不会超过 65535；预留）
     #[allow(dead_code)]
     pub(crate) vertex_count: u16,
-    /// 在 `DrawPage::mesh_ib` 中的起始**三角形**游标（TriIndicies 元素数；×3 得 draw_indexed 索引起始）
     pub(crate) tri_index_start: u32,
-    /// 三角形数量（TriIndicies 元素数；×3 得 draw_indexed 索引数）
     pub(crate) tri_index_count: u16,
 }
 
-/// 统一绘制操作：由 `prepare()` 按 (layer, states) 排序后生成，
-/// Sprite 批次与 Mesh **交错**排列，`draw()` 严格按此顺序切换管线 /
-/// 绑定组 / 顶点缓冲，保证跨类别（Sprite ↔ Mesh）的层级（layer）正确。
-///（`DrawOp::Sprite.range` 为 `Range<u32>`，不 `Copy`，故这里用 `Clone`。）
+/// 统一绘制操作：`prepare()` 阶段已 resolve `rstates` 为 `RStates::raw()`，
+/// `draw()` 直接用于管线缓存查找。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DrawOp {
-    /// 实例化 sprite 批次：纹理 + 所在实例页（`DrawPage::instance_pages` 下标）
-    /// + **页内**实例范围（相对该页缓冲起始；单批 ≤ MAX_INSTANCES_PER_DRAW）。
     Sprite {
         page: u32,
         tex_uid: Option<u64>,
         range: Range<u32>,
+        rstates: u64,
     },
-    /// 非实例化 mesh：指向 `mesh_vb`/`mesh_ib` 中重定位后的数据
     Mesh {
         item: MeshDrawItem,
+        rstates: u64,
     },
-    /// 占位标记：在 mesh 组装阶段被替换为 `DrawOp::Mesh`（保持 op 顺序与排序一致）
     MeshPlaceholder,
 }
 
-/// GPU 缓冲页：四边形 + 实例化 + VP + Mesh 动态缓冲
+/// GPU 缓冲页 + 管线缓存 + 身份实例缓冲
 pub(crate) struct DrawPage {
-    /// 不可变单位四边形顶点
     pub(crate) quad_vb: wgpu::Buffer,
-    /// 不可变四边形索引
     pub(crate) quad_ib: wgpu::Buffer,
-    /// 实例缓冲**页池**：每页容量固定 = `MAX_INSTANCES_PER_DRAW`。
-    /// 单帧实例总数超过一页时，`prepare()` 自动把实例按顺序摊入多页，
-    /// `draw()` **逐页**写入（每页只写一次、offset 0）并绑定对应页绘制——
-    /// 页与页之间数据独立，规避 `Queue::write_buffer` 全部先于绘制执行导致的
-    /// 同缓冲覆盖问题，同时天然支持单帧 >4096 实例。
-    /// 页池在帧初（prepare 阶段）按需一次性增长，创建后永久复用，不阻塞渲染循环。
     pub(crate) instance_pages: Vec<wgpu::Buffer>,
-    /// 动态 VP 矩阵缓冲
     pub(crate) vp_buffer: wgpu::Buffer,
-    /// VP 绑定组
     pub(crate) vp_bind_group: wgpu::BindGroup,
 
-    // ── Mesh 动态缓冲（按排序顺序拷贝/重定位） ──
-    /// 动态 Mesh 顶点缓冲
+    // ── Mesh 动态缓冲 ──
     pub(crate) mesh_vb: wgpu::Buffer,
-    /// 动态 Mesh 索引缓冲
     pub(crate) mesh_ib: wgpu::Buffer,
-    /// 当前容量（顶点元素数）
     pub(crate) mesh_capacity_verts: usize,
-    /// 当前容量（索引元素数）
     pub(crate) mesh_capacity_indices: usize,
+
+    // ── 统一管线缓存（key = RStates::raw()） ──
+    pipeline_layout: wgpu::PipelineLayout,
+    shader: wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    pipeline_cache: HashMap<u64, wgpu::RenderPipeline>,
+
+    // ── 身份实例缓冲（1 条 InstanceData，Mesh 绘制时绑定 slot1） ──
+    identity_instance_buf: wgpu::Buffer,
 }
 
 impl DrawPage {
-    /// 创建 GPU 缓冲页。
-    ///
-    /// `vp_bind_group_layout`: group(0) 的绑定组布局（仅 uniform VP）。
     pub(crate) fn new(
         device: &wgpu::Device,
         vp_bind_group_layout: &wgpu::BindGroupLayout,
+        tex_bind_group_layout: &wgpu::BindGroupLayout,
+        shader: wgpu::ShaderModule,
+        surface_format: wgpu::TextureFormat,
         max_instances: usize,
         vp: glam::Mat4,
     ) -> Self {
@@ -160,7 +161,9 @@ impl DrawPage {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })];
-        let vp_data = VPBuffer { vp: vp.to_cols_array_2d() };
+        let vp_data = VPBuffer {
+            vp: vp.to_cols_array_2d(),
+        };
         let vp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vp buffer"),
             contents: bytemuck::bytes_of(&vp_data),
@@ -174,7 +177,21 @@ impl DrawPage {
                 resource: vp_buffer.as_entire_binding(),
             }],
         });
-        // Mesh 动态缓冲初始容量 0（首次使用前由 ensure_mesh_capacity 创建）。
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("unified pipeline layout"),
+            bind_group_layouts: &[Some(vp_bind_group_layout), Some(tex_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let default_pipeline = Self::create_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            surface_format,
+            RStates::default(),
+        );
+
         let mesh_vb = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mesh vb"),
             size: 4,
@@ -187,6 +204,16 @@ impl DrawPage {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+
+        let identity_instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("identity instance"),
+            contents: bytemuck::cast_slice(&[IDENTITY_INSTANCE]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let mut pipeline_cache = HashMap::with_capacity(8);
+        pipeline_cache.insert(RStates::default().raw(), default_pipeline.clone());
+
         Self {
             quad_vb,
             quad_ib,
@@ -197,18 +224,116 @@ impl DrawPage {
             mesh_ib,
             mesh_capacity_verts: 0,
             mesh_capacity_indices: 0,
+            pipeline_layout,
+            shader,
+            surface_format,
+            pipeline_cache,
+            identity_instance_buf,
         }
+    }
+
+    /// 获取或创建管线（按 RStates::raw() 缓存）。
+    pub(crate) fn get_or_create_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        raw: u64,
+    ) -> &wgpu::RenderPipeline {
+        use std::collections::hash_map::Entry;
+        match self.pipeline_cache.entry(raw) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let rst = RStates::from_raw(raw);
+                let pipeline = Self::create_pipeline(
+                    device,
+                    &self.pipeline_layout,
+                    &self.shader,
+                    self.surface_format,
+                    rst,
+                );
+                e.insert(pipeline)
+            }
+        }
+    }
+
+    fn create_pipeline(
+        device: &wgpu::Device,
+        pipeline_layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+        surface_format: wgpu::TextureFormat,
+        rst: RStates,
+    ) -> wgpu::RenderPipeline {
+        let vertex_layout_quad = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<VertexP3U2C4>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![
+                0 => Float32x3,
+                1 => Float32x2,
+                2 => Float32x4,
+            ],
+        };
+        let instance_attr_array = wgpu::vertex_attr_array![
+            3 => Float32x2,
+            4 => Float32x2,
+            5 => Float32x2,
+            6 => Float32x2,
+            7 => Float32x4,
+            8 => Float32x4,
+            9 => Float32x4,
+            10 => Float32x4,
+            11 => Float32x4,
+        ];
+        let vertex_layout_instance = wgpu::VertexBufferLayout {
+            array_stride: InstanceData::SIZE as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &instance_attr_array,
+        };
+
+        let blend = rst.to_blend();
+        let depth_stencil = rst.to_depth_stencil();
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("unified pipeline"),
+            layout: Some(pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(vertex_layout_quad), Some(vertex_layout_instance)],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: rst.to_front_face(),
+                cull_mode: rst.to_cull(),
+                unclipped_depth: false,
+                polygon_mode: rst.to_polygon(),
+                conservative: rst.to_conservative(),
+            },
+            depth_stencil,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
     }
 
     /// 更新 VP 缓冲（写整个矩阵）。
     pub(crate) fn update_vp(&self, queue: &wgpu::Queue, vp: glam::Mat4) {
-        let vp_data = VPBuffer { vp: vp.to_cols_array_2d() };
+        let vp_data = VPBuffer {
+            vp: vp.to_cols_array_2d(),
+        };
         queue.write_buffer(&self.vp_buffer, 0, bytemuck::bytes_of(&vp_data));
     }
 
-    /// 确保页池至少 `count` 页。仅当不足时创建新页（每页容量 =
-    /// `MAX_INSTANCES_PER_DRAW`）；创建后页面**永久保留**，按需一次性增长，
-    /// 不在渲染循环中反复分配。
     pub(crate) fn ensure_instance_pages(&mut self, device: &wgpu::Device, count: usize) {
         let existing = self.instance_pages.len();
         if count <= existing {
@@ -226,24 +351,35 @@ impl DrawPage {
         }
     }
 
-    /// 写入第 `page` 页的实例数据（从该页缓冲起始 offset 0）。
-    /// `instances.len()` 必须 ≤ `MAX_INSTANCES_PER_DRAW`，且 `page` 已由
-    /// `ensure_instance_pages` 保证存在。每页**只写一次**、页间独立，
-    /// 因此多次写入（各页）与绘制之间的执行顺序互不影响。
-    pub(crate) fn update_instances_page(&self, queue: &wgpu::Queue, page: usize, instances: &[InstanceData]) {
+    pub(crate) fn update_instances_page(
+        &self,
+        queue: &wgpu::Queue,
+        page: usize,
+        instances: &[InstanceData],
+    ) {
         if instances.is_empty() {
             return;
         }
-        debug_assert!(page < self.instance_pages.len(), "instance page {page} out of range");
-        queue.write_buffer(&self.instance_pages[page], 0, bytemuck::cast_slice(instances));
+        debug_assert!(
+            page < self.instance_pages.len(),
+            "instance page {page} out of range"
+        );
+        queue.write_buffer(
+            &self.instance_pages[page],
+            0,
+            bytemuck::cast_slice(instances),
+        );
     }
 
-    /// 返回第 `page` 页的实例缓冲（供 `set_vertex_buffer` 绑定）。
     pub(crate) fn instance_page_buffer(&self, page: usize) -> &wgpu::Buffer {
         &self.instance_pages[page]
     }
 
-    /// 确保 Mesh 动态缓冲容量可容纳 `verts` 个顶点与 `tris` 个三角形（按 2× 扩容重建）。
+    /// 身份实例缓冲（Mesh 绘制时绑定 slot1，使 world pos = mesh_tl + pos * mesh_wh = pos）。
+    pub(crate) fn identity_instance_buffer(&self) -> &wgpu::Buffer {
+        &self.identity_instance_buf
+    }
+
     pub(crate) fn ensure_mesh_capacity(&mut self, device: &wgpu::Device, verts: usize, tris: usize) {
         if verts > self.mesh_capacity_verts {
             let new_cap = (self.mesh_capacity_verts.max(1) * 2).max(verts);

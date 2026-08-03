@@ -23,13 +23,18 @@ pub mod command;
 pub mod data;
 pub mod draw_page;
 pub mod render2d;
+pub mod rstates;
 
 // ─── 对外重导出（保持既有 API 不变） ──────────────────────────
 
 pub use command::Layer;
 pub use data::{Index, MeshSink, SpriteRect, TriIndicies, Vertex, VertexP3U2C4};
 pub use draw_page::MAX_INSTANCES_PER_DRAW;
-pub use render2d::{ClearConfig, Render2D};
+pub use render2d::{ClearConfig, MeshBuilder, Render2D, Sprite2DBuilder};
+pub use rstates::{
+    AddressMode, BlendDesc, BlendMode, CompareFunc, CullMode, DepthState, FilterMode,
+    FrontFaceWinding, PolygonMode, RStates, RasterState, SamplerDesc, StencilState,
+};
 
 // 纹理类型重导出（兼容旧路径 `rjw_2d_render::TextureWrapped` 等）。
 pub use rjw_render::{ArcTextureWrapped, TextureWrapped};
