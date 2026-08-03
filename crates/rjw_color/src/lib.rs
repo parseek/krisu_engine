@@ -69,6 +69,7 @@ impl Default for ColorF64 {
     }
 }
 
+pub mod from_hex;
 pub mod casts;
 pub mod consts;
 
