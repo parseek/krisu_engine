@@ -117,28 +117,28 @@ impl App for SpriteDemo {
 
         // ── 坐标系指示线（验证 X+ 右 / Y+ 下）──
         // X+ 右（红）
-        render2d.add_sprite2d_default_solid(
+        render2d.add_sprite2d_solid(
             SpriteRect::from_texture(glam::Vec2::new(0.0, -2.0), glam::Vec2::new(axis_len, 4.0)),
             Color::RED,
             Transform2D::default(),
             95.0,
         );
         // X- 左（暗红）
-        render2d.add_sprite2d_default_solid(
+        render2d.add_sprite2d_solid(
             SpriteRect::from_texture(glam::Vec2::new(-axis_len, -2.0), glam::Vec2::new(axis_len, 4.0)),
             Color::rgba(0.5, 0.0, 0.0, 1.0),
             Transform2D::default(),
             95.0,
         );
         // Y+ 下（绿）
-        render2d.add_sprite2d_default_solid(
+        render2d.add_sprite2d_solid(
             SpriteRect::from_texture(glam::Vec2::new(-2.0, 0.0), glam::Vec2::new(4.0, axis_len)),
             Color::GREEN,
             Transform2D::default(),
             95.0,
         );
         // Y- 上（暗绿）
-        render2d.add_sprite2d_default_solid(
+        render2d.add_sprite2d_solid(
             SpriteRect::from_texture(glam::Vec2::new(-2.0, -axis_len), glam::Vec2::new(4.0, axis_len)),
             Color::rgba(0.0, 0.4, 0.0, 1.0),
             Transform2D::default(),
@@ -155,7 +155,7 @@ impl App for SpriteDemo {
                 .with_pos(glam::Vec2::new(0.0, 0.0))
                 .with_rot(t * 0.8)
                 .with_scale(glam::Vec2::splat(1.0 + 0.2 * t.sin()));
-            render2d.add_sprite2d_default(rect, Color::WHITE, tf, 0.0, tex);
+            render2d.add_sprite2d(rect, Color::WHITE, tf, 0.0, tex);
         }
 
         // 2. 8 个纯色矩形（不同层级），验证 solid 包装（原 BUG：只有 7 个）。
@@ -180,7 +180,7 @@ impl App for SpriteDemo {
                 0.9 - i_mapped * 0.7,
                 0.7,
             );
-            render2d.add_sprite2d_default_solid(rect, color, tf, (i%COUNTW) as f32 / COUNTW as f32 * 192.0 + 1.0);
+            render2d.add_sprite2d_solid(rect, color, tf, (i%COUNTW) as f32 / COUNTW as f32 * 192.0 + 1.0);
         }
 
         // 3. 凸多边形便捷接口（auto fan；世界坐标顶点）。
@@ -210,7 +210,7 @@ impl App for SpriteDemo {
 
         // 4. 左上 UI 面板（最大层级，最上层）—— 世界坐标左上角 (-half_w+10, -half_h+10)。
         let ui_tl = glam::Vec2::new(-half_w + 10.0, -half_h + 10.0);
-        render2d.add_sprite2d_default_solid(
+        render2d.add_sprite2d_solid(
             SpriteRect::from_texture(ui_tl, glam::Vec2::new(220.0, 60.0)),
             Color::rgba(0.1, 0.1, 0.1, 0.8),
             Transform2D::default(),

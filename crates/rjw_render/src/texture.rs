@@ -101,4 +101,9 @@ impl TextureWrapped {
             uid: NEXT_TEXTURE_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
+
+    /// 访问纹理视图（供自定义绑定组 / 采样器组合使用）。
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
 }

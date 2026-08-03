@@ -330,7 +330,7 @@ impl Render2D {
     // ── 绘制命令录制 ──
 
     /// 录制一个带纹理的 Sprite（实例化渲染、可合批）
-    pub fn add_sprite2d_default(
+    pub fn add_sprite2d(
         &mut self,
         rect: SpriteRect,
         color: Color,
@@ -346,8 +346,8 @@ impl Render2D {
         );
     }
 
-    /// 录制一个纯色 Sprite（`add_sprite2d_default` 的包装：使用默认白色纹理）
-    pub fn add_sprite2d_default_solid(
+    /// 录制一个纯色 Sprite（`add_sprite2d` 的包装：使用默认白色纹理）
+    pub fn add_sprite2d_solid(
         &mut self,
         rect: SpriteRect,
         color: Color,
@@ -355,7 +355,7 @@ impl Render2D {
         layer: impl Into<Layer>,
     ) {
         let white = self.white_texture.clone();
-        self.add_sprite2d_default(rect, color, transform, layer, &white);
+        self.add_sprite2d(rect, color, transform, layer, &white);
     }
 
     /// 录制一个通用网格（Mesh，非实例化路径）。

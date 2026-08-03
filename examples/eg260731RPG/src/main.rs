@@ -599,7 +599,7 @@ fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Textures, game: &Game) {
             let o = Vec2::new(tx as f32 * TILE, ty as f32 * TILE);
             match tile {
                 Tile::Grass => {
-                    r2d.add_sprite2d_default(
+                    r2d.add_sprite2d(
                         SpriteRect::from_texture(o, Vec2::splat(TILE)),
                         Color::WHITE,
                         Transform2D::default(),
@@ -608,7 +608,7 @@ fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Textures, game: &Game) {
                     );
                 }
                 Tile::Water => {
-                    r2d.add_sprite2d_default(
+                    r2d.add_sprite2d(
                         SpriteRect::from_texture(o, Vec2::splat(TILE)),
                         Color::WHITE,
                         Transform2D::default(),
@@ -618,7 +618,7 @@ fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Textures, game: &Game) {
                 }
                 Tile::Field => {
                     // 麦田：基础草地 + 金色条纹
-                    r2d.add_sprite2d_default(
+                    r2d.add_sprite2d(
                         SpriteRect::from_texture(o, Vec2::splat(TILE)),
                         Color::WHITE,
                         Transform2D::default(),
@@ -627,7 +627,7 @@ fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Textures, game: &Game) {
                     );
                 }
                 Tile::Sand => {
-                    r2d.add_sprite2d_default(
+                    r2d.add_sprite2d(
                         SpriteRect::from_texture(o, Vec2::splat(TILE)),
                         Color::WHITE,
                         Transform2D::default(),
@@ -637,7 +637,7 @@ fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Textures, game: &Game) {
                 }
                 Tile::Flower => {
                     // 花丛：草地 + 随机小花瓣
-                    r2d.add_sprite2d_default(
+                    r2d.add_sprite2d(
                         SpriteRect::from_texture(o, Vec2::splat(TILE)),
                         Color::WHITE,
                         Transform2D::default(),
@@ -668,7 +668,7 @@ fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Textures, game: &Game) {
                     );
                 }
                 Tile::Stone => {
-                    r2d.add_sprite2d_default(
+                    r2d.add_sprite2d(
                         SpriteRect::from_texture(o, Vec2::splat(TILE)),
                         Color::WHITE,
                         Transform2D::default(),
@@ -686,7 +686,7 @@ fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Textures, game: &Game) {
                     );
                 }
                 Tile::Tree => {
-                    r2d.add_sprite2d_default(
+                    r2d.add_sprite2d(
                         SpriteRect::from_texture(o, Vec2::splat(TILE)),
                         Color::WHITE,
                         Transform2D::default(),
@@ -696,7 +696,7 @@ fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Textures, game: &Game) {
                     let c = o + Vec2::splat(TILE * 0.5);
                     // 树干（脚底 = 树心 y + 15，y-sort 基准）
                     let trunk_foot = c.y + 15.0;
-                    r2d.add_sprite2d_default_solid(
+                    r2d.add_sprite2d_solid(
                         SpriteRect::from_texture(c + Vec2::new(-5.0, 7.0), Vec2::new(10.0, 14.0)),
                         Color::rgba(0.45, 0.3, 0.16, 1.0),
                         Transform2D::default(),
@@ -707,7 +707,7 @@ fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Textures, game: &Game) {
                     let sway =
                         (game.elapsed + (tx * 13 + ty * 7) as f32 * 0.35).sin() * 1.5;
                     let tf = Transform2D::default().with_pos(c + Vec2::new(sway, 0.0));
-                    r2d.add_sprite2d_default(
+                    r2d.add_sprite2d(
                         SpriteRect::from_texture(Vec2::splat(-24.0), Vec2::splat(48.0)),
                         Color::WHITE,
                         tf,
@@ -731,7 +731,7 @@ fn draw_entities(r2d: &mut Render2D, tex: &Textures, game: &Game) {
     };
     let p_foot = p.pos.y + 14.0;
     let tf = Transform2D::default().with_pos(p.pos).with_rot(p.facing_angle);
-    r2d.add_sprite2d_default(
+    r2d.add_sprite2d(
         SpriteRect::from_texture(Vec2::splat(-15.0), Vec2::splat(30.0)),
         color,
         tf,
@@ -752,7 +752,7 @@ fn draw_entities(r2d: &mut Render2D, tex: &Textures, game: &Game) {
             .with_pos(e.pos)
             .with_rot(toward)
             .with_scale(Vec2::new(1.0 + 0.1 * squash, 1.0 - 0.08 * squash));
-        r2d.add_sprite2d_default(
+        r2d.add_sprite2d(
             SpriteRect::from_texture(Vec2::splat(-16.0), Vec2::splat(32.0)),
             Color::WHITE,
             tf,
@@ -763,13 +763,13 @@ fn draw_entities(r2d: &mut Render2D, tex: &Textures, game: &Game) {
         let bar_w = 32.0;
         let bar_tl = e.pos + Vec2::new(-bar_w * 0.5, -27.0);
         let frac = e.hp as f32 / 3.0;
-        r2d.add_sprite2d_default_solid(
+        r2d.add_sprite2d_solid(
             SpriteRect::from_texture(bar_tl, Vec2::new(bar_w, 4.0)),
             Color::rgba(0.0, 0.0, 0.0, 0.7),
             Transform2D::default(),
             y_layer(e_foot) + 0.1,
         );
-        r2d.add_sprite2d_default_solid(
+        r2d.add_sprite2d_solid(
             SpriteRect::from_texture(bar_tl + Vec2::new(0.5, 0.5), Vec2::new((bar_w - 1.0) * frac, 3.0)),
             Color::rgba(0.95, 0.25, 0.2, 1.0),
             Transform2D::default(),
@@ -795,7 +795,7 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, game: &Game) {
     let tl = cam.position - Vec2::new(half_w, half_h);
 
     // 面板
-    r2d.add_sprite2d_default_solid(
+    r2d.add_sprite2d_solid(
         SpriteRect::from_texture(tl + Vec2::new(12.0, 12.0), Vec2::new(242.0, 62.0)),
         Color::rgba(0.08, 0.08, 0.14, 0.72),
         Transform2D::default(),
@@ -805,7 +805,7 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, game: &Game) {
     // 生命条
     let bar_pos = tl + Vec2::new(26.0, 26.0);
     let bar_wh = Vec2::new(204.0, 16.0);
-    r2d.add_sprite2d_default_solid(
+    r2d.add_sprite2d_solid(
         SpriteRect::from_texture(bar_pos, bar_wh),
         Color::rgba(0.15, 0.0, 0.0, 1.0),
         Transform2D::default(),
@@ -818,7 +818,7 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, game: &Game) {
         } else {
             Color::rgba(0.95, 0.32, 0.25, 1.0)
         };
-        r2d.add_sprite2d_default_solid(
+        r2d.add_sprite2d_solid(
             SpriteRect::from_texture(
                 bar_pos + Vec2::new(2.0, 2.0),
                 Vec2::new((bar_wh.x - 4.0) * frac, bar_wh.y - 4.0),
@@ -835,7 +835,7 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, game: &Game) {
     // 金币数量条（10 格）
     for i in 0..10 {
         let lit = game.coins > i * 3;
-        r2d.add_sprite2d_default_solid(
+        r2d.add_sprite2d_solid(
             SpriteRect::from_texture(coin + Vec2::new(18.0 + i as f32 * 9.0, -4.0), Vec2::new(6.0, 8.0)),
             if lit {
                 Color::rgba(1.0, 0.82, 0.2, 1.0)
@@ -852,7 +852,7 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, game: &Game) {
     draw_circle(r2d, kill + Vec2::new(5.0, 0.0), 6.0, Color::rgba(0.95, 0.3, 0.3, 1.0), LAYER_UI + 0.6);
     for i in 0..10 {
         let lit = game.kills > i;
-        r2d.add_sprite2d_default_solid(
+        r2d.add_sprite2d_solid(
             SpriteRect::from_texture(kill + Vec2::new(18.0 + i as f32 * 9.0, -4.0), Vec2::new(6.0, 8.0)),
             if lit {
                 Color::rgba(0.95, 0.3, 0.3, 1.0)
@@ -866,7 +866,7 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, game: &Game) {
 
     // 游戏结束覆盖
     if game.state == GameState::GameOver {
-        r2d.add_sprite2d_default_solid(
+        r2d.add_sprite2d_solid(
             SpriteRect::from_texture(
                 tl,
                 Vec2::new(cam.viewport_size.x / cam.zoom.x, cam.viewport_size.y / cam.zoom.y),
