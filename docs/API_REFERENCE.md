@@ -266,6 +266,37 @@ r2d.add_polygon_fan(&verts, Color::CYAN, 96.0)
 
 > 💡 `MeshBuilder` 独有 `.set_texture(&ArcTextureWrapped)`——mesh 默认白色纹理，此方法覆盖。
 
+### 5.4.1 外部自定义绘制（`add_custom` / `CustomDraw`，返回 `CustomBuilder`）
+
+| 函数 | 用法 | 说明 |
+|---|---|---|
+| `add_custom` | `r2d.add_custom(layer, \|pass\| { ... })` | 注入一段原生 wgpu 绘制调用，参与 (layer, states) 排序 |
+
+```rust
+// 闭包直接传（blanket impl）—— pass 是 &mut wgpu::RenderPass
+r2d.add_custom(1.0, |pass| {
+    // 这里可以用任意原生 wgpu API：set_pipeline / draw / 自行绑定缓冲……
+    // 注意：pass 管理器已在引擎内打开，不要 begin_render_pass
+});
+
+// 或实现 CustomDraw trait 的结构体
+struct MyFx;
+impl rjw_2d_render::CustomDraw for MyFx {
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        // 自定义绘制……
+    }
+}
+r2d.add_custom(1.0, MyFx);
+```
+
+要点：
+
+- **签名**：`add_custom<CD: CustomDraw + 'static>(&mut self, layer, cd) -> CustomBuilder<'_>`；`CustomDraw: Send + Sync`，闭包 `Fn(&mut wgpu::RenderPass) + Send + Sync` 自动实现。
+- **排序位置**：返回的 `CustomBuilder` 可链式设置 RStates（`.blend(...)` / `.depth_test(...)` 等，但注意 `CustomBuilder` **没有** `.set_texture()`），这些值参与 `(layer, states)` 排序，决定该闭包在 Sprite/Mesh 之间的**执行顺序**。
+- **执行时机**：闭包在 `render()` 或 `flush()` 的 `draw()` 阶段被调用；`buf_custom_draws` 每帧结束后 `clear()`，**请勿**跨帧持有 `add_custom` 内部状态。
+- **适用场景**：引擎封装之外的管线（自定义 shader、线框调试、后处理、自定义顶点格式等）。
+- 若不链式调用 RStates，则 `CustomBuilder` 仍按 `default_rstates` 参与排序（resolve 后为整数值相加大致落在默认位置）。
+
 ### 5.5 提交
 
 | 函数 | 用法 | 说明 |
@@ -430,6 +461,8 @@ pub struct StaticAtlas  // (serde feature only)
 | `ArcTextureWrapped.uid` | `rjw_render` | 纹理唯一 ID |
 | `Sprite2DBuilder<'a>` | `rjw_2d_render` | add_sprite2d* 返回 |
 | `MeshBuilder<'a>` | `rjw_2d_render` | add_mesh / add_polygon_* 返回 |
+| `CustomDraw` | `rjw_2d_render` | 外部绘制 trait（闭包 blanket impl） |
+| `CustomBuilder<'a>` | `rjw_2d_render` | add_custom 返回，可链式 RStates |
 
 ---
 

@@ -234,6 +234,56 @@ ClearConfig { color: Option<wgpu::Color>, depth: Option<f32>, stencil: Option<u3
 ```
 `color: Some(...)` 清屏 / `None` 保留旧内容。深度/模板需要时自动建纹理。
 
+### 4.5 外部自定义绘制（`add_custom` / `CustomDraw`）
+
+引擎的**逃逸舱口**：在 `Render2D` 自带的统一管线之外，注入任意原生 wgpu 绘制调用，如自定义 shader、线框调试、后处理或特殊顶点格式。
+
+#### 核心 API
+
+| 项 | 说明 |
+|---|---|
+| `CustomDraw` trait | `fn draw(&self, pass: &mut wgpu::RenderPass<'_>)`；`Send + Sync` 约束 |
+| blanket impl | 闭包 `Fn(&mut wgpu::RenderPass) + Send + Sync` 自动实现该 trait |
+| `add_custom(layer, cd)` | 返回 `CustomBuilder`，可链式设 RStates 参与排序 |
+| `CustomBuilder` | 与 `Sprite2DBuilder`/`MeshBuilder` 相同的责任链（无 `.set_texture()`） |
+
+#### 用法
+
+```rust
+// ① 闭包形式（最常用）
+r2d.add_custom(1.0, |pass| {
+    // pass 已由引擎打开——不要调用 begin_render_pass / end
+    // 可以 set_pipeline、set_vertex_buffer、draw 等
+});
+
+// ② 结构体形式（可复用、持有共享资源）
+#[derive(Clone)]
+struct Wireframe { mdl: wgpu::RenderPipeline }
+impl rjw_2d_render::CustomDraw for Wireframe {
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_pipeline(&self.mdl);
+        // ...
+    }
+}
+r2d.add_custom(96.0, Wireframe { mdl });
+```
+
+> ⚠️ **pass 生命周期**：`add_custom` 的闭包在 `render()` / `flush()` 内部的 `draw()` 阶段调用。此时 RenderPass 已 `begin`，请在闭包内**使用**，而不要再 `begin_render_pass`。
+
+#### 排序与执行时机
+
+- 排序键 = `(layer, states)`，与 Sprite/Mesh 一致。`CustomBuilder` 链式的 `.blend(...)` 等 RStates 决定其在同一 layer 内相对 Sprite/Mesh 的先后。
+- 每帧 `render()` 结束时 `buf_custom_draws.clear()`——**不要在闭包中缓存跨帧状态**；需要持久资源请 `Arc` 捕获并在 `CustomDraw` 结构体中保存。
+- `flush()` 同样执行 custom draws（用于用户自建 pass 的内部子 pass）。
+
+#### 与引擎管线的边界
+
+| 场景 | 推荐 |
+|---|---|
+| 普通 Sprite/Mesh（引擎已覆盖） | 直接用 `add_sprite2d*` / `add_mesh*`（可合批、状态缓存） |
+| 特殊混合/着色、调试线框、后处理 | `add_custom` 注入原生 wgpu |
+| 完全独立于 `Render2D` 的渲染 | 用 `begin_frame()` / `flush()` + 自建 pass，或直接在事件循环自建 encoder |
+
 ---
 
 ## 5. Layer 语义与 y-sort 惯用法
@@ -682,7 +732,11 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 | 加性混合 Sprite | `.blend(BlendMode::Additive)` |
 | 全局启用深度测试 | `render2d.default_depth_test(true).default_depth_write(true)` |
 | Mesh 贴纹理 | `.set_texture(&tex)` |
+| Mesh 多边形带 UV | `r2d.add_polygon_fan_uv(&verts, &uvs, color, layer)` / `add_polygon_strip_uv` |
 | 设置采样器重复 | `.samp_addr_u(AddressMode::Repeat).samp_addr_v(AddressMode::Repeat)` |
+| 反转混合 Sprite | `.blend(BlendMode::Inverse)` |
+| 关闭混合 | `.blend(BlendMode::Disabled)` |
+| 注入原生 wgpu 绘制 | `r2d.add_custom(1.0, \|pass\| { ... })` |
 | 延迟丢弃 builder（显式绑定变量） | `let _b = render2d.add_sprite2d(...).blend(...);` —— `_b` 在作用域结束时 Drop |
 | Atlas 一行绘制 | `tex.draw(r2d, &tex.grass, tl, wh, color, tf, layer)` |
 | 纯色用 white 合批 | `tex.draw(r2d, &tex.white, tl, wh, color, tf, layer)` |
