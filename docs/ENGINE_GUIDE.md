@@ -14,16 +14,17 @@
 4. [绘制模型：Render2D 的批处理管线](#4-绘制模型render2d-的批处理管线)
 5. [Layer 语义与 y-sort 惯用法](#5-layer-语义与-y-sort-惯用法)
 6. [纹理与合批](#6-纹理与合批)
-7. [渲染状态（RStates）与 Builder 责任链](#7-渲染状态rstates与-builder-责任链)
-8. [输入：键盘 / 鼠标](#8-输入键盘--鼠标)
-9. [Transform2D 变换](#9-transform2d-变换)
-10. [颜色：Color 与 ColorF64](#10-颜色color-与-colorf64)
-11. [时间：DeltaTimer](#11-时间deltatimer)
-12. [窗口与事件循环](#12-窗口与事件循环)
-13. [视口 / 缩放 / 高 DPI](#13-视口--缩放--高-dpi)
-14. [性能与内存约定](#14-性能与内存约定)
-15. [对 AI 的维护约定](#15-对-ai-的维护约定)
-16. [快速速查表](#16-快速速查表)
+7. [运行时图集：DynamicAtlas 与 StaticAtlas（rjw_atlas）](#7-运行时图集dynamicatlas-与-staticatlasrjw_atlas)
+8. [渲染状态（RStates）与 Builder 责任链](#8-渲染状态rstates与-builder-责任链)
+9. [输入：键盘 / 鼠标](#9-输入键盘--鼠标)
+10. [Transform2D 变换](#10-transform2d-变换)
+11. [颜色：Color 与 ColorF64](#11-颜色color-与-colorf64)
+12. [时间：DeltaTimer](#12-时间deltatimer)
+13. [窗口与事件循环](#13-窗口与事件循环)
+14. [视口 / 缩放 / 高 DPI](#14-视口--缩放--高-dpi)
+15. [性能与内存约定](#15-性能与内存约定)
+16. [对 AI 的维护约定](#16-对-ai-的维护约定)
+17. [快速速查表](#17-快速速查表)
 
 ---
 
@@ -36,6 +37,7 @@ crates/
 ├─ rjw_main        # 入口：run_app(App) + 事件循环 + 窗口 + MainContext(键盘/鼠标/计时)
 ├─ rjw_render      # 底层渲染上下文：RenderContext / 纹理 TextureWrapped / wgpu 重导出
 ├─ rjw_2d_render   # ★ 2D 批渲染器：Render2D / SpriteRect / Mesh / RStates / 分页实例缓冲 / 统一管线
+├─ rjw_atlas       # ★ 运行时图集：DynamicAtlas（Skyline + 寿命 + clamp_margin）+ StaticAtlas（TOML）
 ├─ rjw_transform   # Transform2D + Camera2D（正交相机、VP 矩阵、坐标转换）
 ├─ rjw_color       # Color(f32) / ColorF64(f64) + 常用常量（RED/GREEN/...）
 ├─ rjw_keyboard    # 键盘输入 → KeyState
@@ -271,7 +273,204 @@ render2d.add_sprite2d(rect, color, tf, y_layer(entity.foot_y), &tex);
 
 ---
 
-## 7. 渲染状态（RStates）与 Builder 责任链
+## 7. 运行时图集：DynamicAtlas 与 StaticAtlas（`rjw_atlas`）
+
+`rjw_atlas` 提供两种图集——**运行时动态图集**（Skyline 打包 + 自动分页）与**静态预排布图集**（TOML 反序列化）。图集将多张精灵纹理合入一或数张大纹理页中，使同一页内的绘制天然满足同一纹理的合批条件。
+
+> 引擎内部通过全局纹理注册表 `rjw_render::TEXTURES`（`DashMap`）按纹理 uid 查找页纹理，完全解耦 `rjw_2d_render`。
+
+### 7.1 DynamicAtlas —— 运行时在线打包
+
+```
+插入精灵 → Skyline 分配器找空位 → 单页满了自动建新页 → 写到 GPU 纹理
+```
+
+核心类型：
+
+| 类型 | 说明 |
+|---|---|
+| `DynamicAtlas<const N: u32>` | 主结构体，泛型 `N` 为单页像素尺寸，默认 2048 |
+| `AtlasConfig` | 配置：`max_pages`（最大页数）、`padding`（精灵间距）、`lifetime`（帧寿命） |
+| `AtlasRegion` | 图集区域描述：`tl_px`（像素左上角）、`wh_px`（尺寸）、`origin_px`（原点偏移）、`page_uid`（所在页纹理 uid） |
+
+#### 创建与配置
+
+```rust
+use rjw_atlas::{DynamicAtlas, AtlasConfig};
+
+let mut atlas = DynamicAtlas::new(
+    device,
+    queue,
+    layout,   // wgpu::BindGroupLayout（从 Render2D 获取：render2d.bind_group_layout()）
+    AtlasConfig {
+        max_pages: 2,      // 最多 2 张 2048×2048 页
+        padding: 0,        // 精灵之间无间距
+        lifetime: 200,     // 200 帧未 get() 即视为不再需要
+        ..Default::default()
+    },
+);
+```
+
+约束：`DynamicAtlas::new` 需要 `device: &wgpu::Device`、`queue: &wgpu::Queue`、`layout: &wgpu::BindGroupLayout`。必须从 `RenderContext` 获取前三者，从 `Render2D` 获取布局。
+
+#### 插入精灵
+
+```rust
+// insert(name, rgba_data, w, h, origin_px, clamp_margin) → Option<AtlasRegion>
+let grass = atlas.insert(device, queue, layout, "grass", &grass_rgba, 32, 32, (0, 0), true).unwrap();
+```
+
+参数说明：
+
+| 参数 | 含义 |
+|---|---|
+| `name` | 精灵名（可重复插入，已存在则更新寿命并返回旧 region） |
+| `rgba` | RGBA8 字节切片，长度 `w * h * 4` |
+| `w, h` | 精灵宽高（像素） |
+| `origin_px` | 原点偏移（通常 `(0, 0)`） |
+| `clamp_margin` | `true` 则自动在四周扩 1px 边界像素复制（防止 GPU 采样到相邻精灵） |
+
+`insert` 返回 `None` 表示所有页均已满（达到 `max_pages` 限制）。
+
+#### 插入白色像素
+
+```rust
+let white = atlas.insert_white(device, queue, layout);
+```
+
+插入 1×1 纯白像素，用于纯色填充的 Sprite 合批到同一图集页内，避免纯色绘制使用独立纹理打断合批。
+
+#### 获取 / 刷新寿命
+
+```rust
+if let Some(region) = atlas.get("grass") {
+    // region.lifetime 被重置为 config.lifetime
+}
+```
+
+`get()` 命中后刷新该条目的寿命，若 `end_frame()` 倒计时归零则标记可以移出（逻辑踢出，纹理页不回收）。
+
+#### 帧尾
+
+```rust
+atlas.end_frame(); // 寿命衰减 → 移除到期条目
+```
+
+`compact()` 重建 Skyline 自由列表（不回收纹理页），可选在 `end_frame()` 后调用以减少碎片。
+
+#### 获取页信息
+
+```rust
+atlas.page_count();   // 当前页数
+atlas.page_size();    // 单页尺寸（= N，如 2048）
+```
+
+### 7.2 StaticAtlas —— 静态预排布（`spr.toml`）
+
+适合打包好的精灵表（sprite sheet），一次性加载。需要 `serde` feature。
+
+```rust
+use rjw_atlas::StaticAtlas;
+
+let toml_str = std::fs::read_to_string("spr.toml").unwrap();
+let sa = StaticAtlas::from_toml(&toml_str).unwrap();
+let region = sa.get("my_sprite").unwrap();
+```
+
+TOML 格式（`spr.toml`）：
+
+```toml
+[my_sprite]
+tex = "my_sheet"     # 对应已注册纹理标签
+lt = [0, 0]          # 左上角像素
+wh = [32, 32]        # 宽高
+or = [0, 0]          # 原点偏移
+```
+
+- `tex` 必须在加载前已通过 `TEXTURES` 注册（例如 `render2d.create_texture(...)` 或 `TextureWrapped` 手动注册）。
+- 未找到纹理时返回 `StaticAtlasError::TexNotFound`。
+
+### 7.3 简便绘制封装 —— `Tex::draw()` 模式
+
+图集的核心价值是**一行绘制**——把 `AtlasRegion` 转成 `SpriteRect` 再调 `render2d.add_sprite2d()` 的全套操作封装为一个方法。这是 `eg260731RPG` 的实践，推荐所有项目复制使用。
+
+```rust
+// ═══ 封装结构体（项目级，不放引擎） ═══
+use rjw_render::TEXTURES;
+use rjw_2d_render::{Render2D, Sprite2DBuilder, SpriteRect};
+use rjw_atlas::{DynamicAtlas, AtlasRegion};
+use rjw_color::Color;
+use rjw_transform::Transform2D;
+use glam::Vec2;
+
+struct Tex {
+    atlas: DynamicAtlas,        // 持有图集（保证页纹理存活）
+    grass: AtlasRegion,         // 各精灵区域...
+    player: AtlasRegion,
+    white: AtlasRegion,
+}
+
+impl Tex {
+    fn create(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) -> Self {
+        let mut atlas = DynamicAtlas::new(device, queue, layout, AtlasConfig::default());
+        let white  = atlas.insert_white(device, queue, layout);
+        let grass  = atlas.insert(device, queue, layout, "grass", &make_grass(), 32, 32, (0,0), true).unwrap();
+        let player = atlas.insert(device, queue, layout, "player", &make_player(), 32, 32, (0,0), true).unwrap();
+        Self { atlas, grass, player, white }
+    }
+
+    /// 一行绘制图集精灵。
+    /// `world_tl` = 世界左上角，`world_wh` = 世界尺寸。
+    /// 返回 `Sprite2DBuilder`，可继续链式 `.blend(...).depth_test(...)`。
+    fn draw<'a>(
+        &self,
+        r2d: &'a mut Render2D,
+        region: &AtlasRegion,
+        world_tl: Vec2,
+        world_wh: Vec2,
+        color: Color,
+        transform: Transform2D,
+        layer: impl Into<Layer> + 'a,
+    ) -> Sprite2DBuilder<'a> {
+        let ps = self.atlas.page_size() as f32;
+        let inv = Vec2::new(1.0 / ps, 1.0 / ps);
+        let spr = SpriteRect::from_texture_px(
+            world_tl,
+            world_wh,
+            Vec2::new(region.tl_px.0 as f32, region.tl_px.1 as f32),
+            Vec2::new(region.wh_px.0 as f32, region.wh_px.1 as f32),
+            inv,
+        );
+        let tex_ref = TEXTURES.get(region.page_uid).expect("atlas page texture must be registered");
+        r2d.add_sprite2d(spr, color, transform, layer, &tex_ref)
+    }
+}
+```
+
+**使用示例**：
+
+```rust
+// 绘制草地瓦片 —— 一行调用
+tex.draw(r2d, &tex.grass, world_tl, Vec2::splat(32.0), Color::WHITE, Transform2D::default(), 10.0);
+
+// 绘制纯色 UI 条（与草地同属图集页 = 合批）
+tex.draw(r2d, &tex.white, bar_pos, bar_wh, Color::rgba(0.9, 0.2, 0.2, 1.0), Transform2D::default(), LAYER_UI);
+
+// 带混合模式
+tex.draw(r2d, &tex.slime, tl, wh, Color::WHITE, tf, y_layer(foot))
+    .blend(BlendMode::Additive);
+```
+
+**关键设计要点**：
+
+1. `Tex` 结构体**持有 `DynamicAtlas`**，确保图集页纹理不会被释放。
+2. `AtlasRegion` 字段直接存为 `Tex` 的成员，方便 `tex.grass` / `tex.white` 语义化引用。
+3. `draw()` 内部通过 `TEXTURES.get(uid)` 查找页纹理，返回值直接喂给 `add_sprite2d`——与 `create_texture` 路径的纹理使用完全统一。
+4. 返回 `Sprite2DBuilder`，与 `Render2D::add_sprite2d` 接口一致，支持链式 RStates。
+
+---
+
+## 8. 渲染状态（RStates）与 Builder 责任链
 
 `RStates` 是一个 u64 bitfield，涵盖 6 个渲染控制域：
 
@@ -283,7 +482,7 @@ render2d.add_sprite2d(rect, color, tf, y_layer(entity.foot_y), &tex);
 | Depth | test + write + compare | `.depth_test(true).depth_write(true)` |
 | Stencil | test + write + compare | `.stencil_test(true).stencil_compare(Always)` |
 
-### 7.1 三级控制
+### 8.1 三级控制
 
 | 级别 | 使用方式 | 作用范围 |
 |---|---|---|
@@ -291,7 +490,7 @@ render2d.add_sprite2d(rect, color, tf, y_layer(entity.foot_y), &tex);
 | **单条绘制** | `render2d.add_sprite2d(...).blend(Multiply)` | 该条命令 |
 | **批量设置** | `.blend_state(BlendDesc{...}).samp_state(SamplerDesc{...}).depth_state(DepthState{...})` | 同上 |
 
-### 7.2 Builder 使用
+### 8.2 Builder 使用
 
 ```rust
 // 不链式 = 使用 default_rstates（默认 Alpha Blend + Linear + No Cull）
@@ -321,7 +520,7 @@ render2d
     .default_depth_compare(CompareFunc::Less);
 ```
 
-### 7.3 MeshBuilder 特有的 `.set_texture()`
+### 8.3 MeshBuilder 特有的 `.set_texture()`
 
 ```rust
 // Mesh 默认白色纹理；set_texture 覆盖
@@ -330,7 +529,7 @@ render2d.add_mesh(&verts, &tris, Color::WHITE, 96.0)
     .blend(BlendMode::Alpha);
 ```
 
-### 7.4 重要类型
+### 8.4 重要类型
 
 | 类型 | 说明 |
 |---|---|
@@ -346,9 +545,9 @@ render2d.add_mesh(&verts, &tris, Color::WHITE, 96.0)
 
 ---
 
-## 8. 输入：键盘 / 鼠标
+## 9. 输入：键盘 / 鼠标
 
-### 8.1 键盘——`KeyState`（重点：边沿）
+### 9.1 键盘——`KeyState`（重点：边沿）
 
 `ctx.keyboard.get(KeyCode::KeyW)` 返回 `KeyState`：
 
@@ -363,7 +562,7 @@ render2d.add_mesh(&verts, &tris, Color::WHITE, 96.0)
 
 > ⚠️ **攻击/跳跃等瞬时操作必须用 `down_edge()`**，否则每帧触发多次。
 
-### 8.2 鼠标
+### 9.2 鼠标
 
 ```rust
 ctx.mouse.get_mouse_position()                        // (x,y) 窗口像素
@@ -376,7 +575,7 @@ ctx.mouse.in_window()                                 // 是否在窗口内
 
 ---
 
-## 9. Transform2D 变换
+## 10. Transform2D 变换
 
 ```rust
 pub struct Transform2D {
@@ -392,7 +591,7 @@ pub struct Transform2D {
 
 ---
 
-## 10. 颜色：Color 与 ColorF64
+## 11. 颜色：Color 与 ColorF64
 
 | 类型 | 存储 | 常用构造 | 用途 |
 |---|---|---|---|
@@ -401,7 +600,7 @@ pub struct Transform2D {
 
 ---
 
-## 11. 时间：DeltaTimer
+## 12. 时间：DeltaTimer
 
 ```rust
 ctx.timer.dt()              // 帧间隔秒（Duration）
@@ -413,7 +612,7 @@ ctx.timer.get_fps()         // 当前 FPS
 
 ---
 
-## 12. 窗口与事件循环
+## 13. 窗口与事件循环
 
 - 入口：`run_app(App::new())`，`App` trait 必须实现 `on_init`、`about_to_wait`；`on_resized` 可选。
 - `MainContext`：`keyboard` / `mouse` / `timer` / `primary_window()` / `request_exit()`。
@@ -422,7 +621,7 @@ ctx.timer.get_fps()         // 当前 FPS
 
 ---
 
-## 13. 视口 / 缩放 / 高 DPI
+## 14. 视口 / 缩放 / 高 DPI
 
 | 概念 | 说明 |
 |---|---|
@@ -438,7 +637,7 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 
 ---
 
-## 14. 性能与内存约定
+## 15. 性能与内存约定
 
 - `Render2D` 内部 `buf_*` 全部常驻复用（`clear()` 只清长度不释放）。
 - **实例缓冲是"页池"**：单帧总实例数可远超 8192，自动分页；**不要自己裁减数量去凑**。
@@ -449,7 +648,7 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 
 ---
 
-## 15. 对 AI 的维护约定
+## 16. 对 AI 的维护约定
 
 给接手改代码的 AI 助手的清单：
 
@@ -468,7 +667,7 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 
 ---
 
-## 16. 快速速查表
+## 17. 快速速查表
 
 | 要做的事 | 代码 |
 |---|---|
@@ -485,6 +684,10 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 | Mesh 贴纹理 | `.set_texture(&tex)` |
 | 设置采样器重复 | `.samp_addr_u(AddressMode::Repeat).samp_addr_v(AddressMode::Repeat)` |
 | 延迟丢弃 builder（显式绑定变量） | `let _b = render2d.add_sprite2d(...).blend(...);` —— `_b` 在作用域结束时 Drop |
+| Atlas 一行绘制 | `tex.draw(r2d, &tex.grass, tl, wh, color, tf, layer)` |
+| 纯色用 white 合批 | `tex.draw(r2d, &tex.white, tl, wh, color, tf, layer)` |
+| Atlas 插入精灵（clamp_margin） | `atlas.insert(device, queue, layout, name, &rgba, w, h, (0,0), true)` |
+| Atlas 插入白色像素 | `atlas.insert_white(device, queue, layout)` |
 
 ---
 
