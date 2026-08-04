@@ -429,6 +429,44 @@ atlas.page_count();   // 当前页数
 atlas.page_size();    // 单页尺寸（= N，如 2048）
 ```
 
+### 7.1.1 精灵生命周期与自动复活
+
+`DynamicAtlas` 支持精灵**踢出→复活**机制：
+
+- **寿命系统**：每个非永久精灵有 `config.lifetime` 帧的倒计时，每次 `get()` / `get_or_revive()` 命中时重置
+- **墓碑**：`end_frame()` 将到期且保存了源数据的精灵移入 `tombstones`（携带 RGBA + 宽高 + 原点）
+- **复活**：`get_or_revive(name)` 若在 entries 中找不到 → 从 tombstones 取出 RGBA → 重新 `insert_inner()` 写入图集 → 返回引用
+- **常驻精灵**：用 `insert_permanent()` 或 `insert_ex_permanent()` 插入的精灵 `source: None`，到期直接删除，不可复活
+
+```rust
+// 普通精灵（可复活）
+atlas.insert_ex("grass", &grass_rgba, 32, 32);
+
+// 若干帧后被踢出…
+atlas.end_frame();
+
+// 下次使用时自动复活
+let region = atlas.get_or_revive("grass"); // ← 自动重新插入图集
+```
+
+### 7.1.2 TOML 批量导入/导出
+
+从 sprite sheet TOML 文件（`spr.toml`）批量导入到动态图集：
+
+```rust
+// 加载 TOML，裁剪指定子区并插入图集
+let count = atlas.load_toml(
+    &toml_str,
+    |tex_name| {
+        // 返回 (完整纹理RGBA, 宽度, 高度)
+        data.get(tex_name).cloned()  // HashMap 查找
+    },
+).unwrap();
+
+// 导出当前布局
+let exported = atlas.export_toml().unwrap();
+```
+
 ### 7.2 StaticAtlas —— 静态预排布（`spr.toml`）
 
 适合打包好的精灵表（sprite sheet），一次性加载。需要 `serde` feature。
@@ -756,7 +794,11 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 | Atlas 一行绘制 | `tex.draw(r2d, &tex.grass, tl, wh, color, tf, layer)` |
 | 纯色用 white 合批 | `tex.draw(r2d, &tex.white, tl, wh, color, tf, layer)` |
 | Atlas 插入精灵 | `atlas.insert_ex(name, &rgba, w, h).unwrap()` |
+| Atlas 常驻精灵 | `atlas.insert_ex_permanent(name, &rgba, w, h)` |
 | Atlas 插入白色像素 | `atlas.insert_white()` |
+| Atlas 自动复活查找 | `atlas.get_or_revive(name)` |
+| Atlas 从 TOML 批量导入 | `atlas.load_toml(toml_str, \|k\| data.get(k).cloned())` |
+| Atlas 导出 TOML | `atlas.export_toml()` |
 
 ---
 

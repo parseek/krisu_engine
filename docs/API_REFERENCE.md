@@ -439,14 +439,20 @@ pub struct StaticAtlas  // (serde feature only)
 |---|---|
 | `DynamicAtlas::new(device, queue, layout, config)` | 创建空图集 |
 | `insert(name, rgba, w, h, origin_px, clamp_margin)` | 插入/替换精灵（完整参数） |
-| `insert_ex(name, rgba, w, h)` | ★ 最常用：origin=(0,0), clamp_margin=true |
+| `insert_ex(name, rgba, w, h)` | ★ 最常用：origin=(0,0), clamp_margin=true，自动保存源数据 |
 | `insert_ex_origin(name, rgba, w, h, origin_px)` | 指定原点，clamp_margin=true |
+| `insert_ex_permanent(name, rgba, w, h)` | 常驻精灵（不会过期踢出） |
+| `insert_dyn(name, w, h, origin_px, clamp_margin, regen)` | 动态再生精灵（每次复活调生成器） |
 | `insert_no_clamp(name, rgba, w, h)` | origin=(0,0), clamp_margin=false |
 | `insert_white()` | 插入 1×1 白像素 |
-| `get(name)` | 查找（重置寿命） |
-| `end_frame()` | 寿命-1，归零踢出 |
+| `get(name)` | 查找（重置寿命，不触发复活） |
+| `get_or_revive(name)` | ★ 查找；若被踢出则自动复活 |
+| `load_toml(toml_str, rgba_provider)` | 从 TOML 批量导入（闭包提供源纹理 RGBA） |
+| `export_toml()` | 导出当前 entries 为 TOML 文本 |
+| `end_frame()` | 寿命-1，有源数据→墓碑；常驻直接删除 |
 | `compact()` | 重建 skyline |
 | `page_size()` / `page_count()` / `texture_uid_of(name)` | 查询 |
+| `parse_toml_entries(toml_str)` | 辅助：解析 TOML 返回原始条目表 |
 | `StaticAtlas::from_toml(s)` | 从 TOML 反序列化 |
 | `StaticAtlas::get(name)` | 查找 |
 
