@@ -306,7 +306,7 @@ impl<const N: u32> DynamicAtlas<N> {
     // ── 生命周期 / 踢出 ──
 
     pub fn end_frame(&mut self) {
-        // 收集到期条目：有 source 的移入墓碑，无 source（常驻）的直接删除
+        // 收集到期条目：有 source 的移入墓碑，永久精灵（source: None）忽略寿命
         let mut to_tomb: Vec<(String, Tombstone)> = Vec::new();
         let mut remove_keys: Vec<String> = Vec::new();
         for (k, e) in &self.entries {
@@ -317,14 +317,19 @@ impl<const N: u32> DynamicAtlas<N> {
                         origin_px: e.region.origin_px,
                         clamp_margin: true,
                     }));
+                    remove_keys.push(k.clone());
                 }
-                remove_keys.push(k.clone());
+                // source: None = 永久，忽略寿命
             }
         }
         for k in &remove_keys { self.entries.remove(k); }
         for (k, t) in to_tomb { self.tombstones.insert(k, t); }
 
-        for e in self.entries.values_mut() { e.lifetime = e.lifetime.saturating_sub(1); }
+        for e in self.entries.values_mut() {
+            if e.source.is_some() {
+                e.lifetime = e.lifetime.saturating_sub(1);
+            }
+        }
         if !self.entries.is_empty() || self.dirty { self.dirty = true; }
     }
 
