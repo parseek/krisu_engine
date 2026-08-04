@@ -30,7 +30,7 @@ pub mod rstates;
 pub use command::Layer;
 pub use data::{Index, MeshSink, SpriteRect, TriIndicies, Vertex, VertexP3U2C4};
 pub use draw_page::MAX_INSTANCES_PER_DRAW;
-pub use render2d::{ClearConfig, MeshBuilder, Render2D, Sprite2DBuilder};
+pub use render2d::{ClearConfig, CustomBuilder, CustomDraw, MeshBuilder, Render2D, Sprite2DBuilder};
 pub use rstates::{
     AddressMode, BlendDesc, BlendMode, CompareFunc, CullMode, DepthState, FilterMode,
     FrontFaceWinding, PolygonMode, RStates, RasterState, SamplerDesc, StencilState,

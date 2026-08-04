@@ -74,6 +74,18 @@ impl InstanceData {
             model: model.to_cols_array_2d(),
         }
     }
+
+    /// 高级 Sprite：直接传入列主序 Mat4，跳过 Transform2D → Mat4 推导。
+    pub(crate) fn from_sprite_matrix(rect: &SpriteRect, color: Color, model: glam::Mat4) -> Self {
+        Self {
+            mesh_tl: rect.mesh_tl.to_array(),
+            mesh_wh: rect.mesh_wh.to_array(),
+            uv_tl: rect.uv_tl.to_array(),
+            uv_wh: rect.uv_wh.to_array(),
+            color: color.into(),
+            model: model.to_cols_array_2d(),
+        }
+    }
 }
 
 /// 全局 VP（视图投影）矩阵
@@ -108,7 +120,13 @@ pub(crate) enum DrawOp {
         item: MeshDrawItem,
         rstates: u64,
     },
+    /// 外部自定义绘制调用（`draw()` 中执行）。
+    /// `idx` 指向 `Render2D::buf_custom_draws`。
+    Custom {
+        idx: usize,
+    },
     MeshPlaceholder,
+    CustomPlaceholder,
 }
 
 /// GPU 缓冲页 + 管线缓存 + 身份实例缓冲

@@ -1,5 +1,5 @@
 pub mod texture;
-pub use texture::{ArcTextureWrapped, TextureWrapped};
+pub use texture::{ArcTextureWrapped, TextureRegistry, TextureWrapped, TEXTURES};
 
 use winit::window::Window;
 

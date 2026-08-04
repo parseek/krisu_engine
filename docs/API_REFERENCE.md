@@ -19,7 +19,8 @@
 - [5. Render2D（2D 批渲染器）](#5-render2d2d-批渲染器)
 - [6. RStates 渲染状态与 Builder 责任链](#6-rstates-渲染状态与-builder-责任链)
 - [7. ClearConfig（清屏配置）](#7-clearconfig清屏配置)
-- [8. 其他常用小类型速查](#8-其他常用小类型速查)
+- [8. DynamicAtlas（纹理图集）](#8-dynamicatlas纹理图集)
+- [9. 其他常用小类型速查](#9-其他常用小类型速查)
 
 ---
 
@@ -390,7 +391,30 @@ r2d.render(&ClearConfig {
 
 ---
 
-## 8. 其他常用小类型速查
+## 8. DynamicAtlas（纹理图集）
+
+crate：`rjw_atlas`
+
+```rust
+pub struct AtlasConfig { pub max_pages: usize, pub padding: u32, pub lifetime: u32 }
+pub struct AtlasRegion { pub tl_px: (u32,u32), pub wh_px: (u32,u32), pub origin_px: (u32,u32), pub page_uid: u64 }
+pub struct DynamicAtlas<const PAGE_SIZE: u32 = 2048>
+pub struct StaticAtlas  // (serde feature only)
+```
+
+| 方法 | 说明 |
+|---|---|
+| `DynamicAtlas::new(device, queue, layout, config)` | 创建空图集 |
+| `insert(device, queue, layout, name, rgba, w, h, origin_px, clamp_margin)` | 插入/替换精灵；`clamp_margin: true` 自动扩展 1px 防越界 |
+| `insert_white(device, queue, layout)` | 插入 1×1 白像素 |
+| `get(name)` | 查找（重置寿命） |
+| `end_frame()` | 寿命-1，归零踢出 |
+| `compact()` | 重建 skyline |
+| `page_size()` / `page_count()` / `texture_uid_of(name)` | 查询 |
+| `StaticAtlas::from_toml(s)` | 从 TOML 反序列化 |
+| `StaticAtlas::get(name)` | 查找 |
+
+## 9. 其他常用小类型速查
 
 | 类型 / 函数 | 位置 | 用途 |
 |---|---|---|

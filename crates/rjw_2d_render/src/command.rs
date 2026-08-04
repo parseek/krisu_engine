@@ -15,12 +15,21 @@ pub(crate) enum DrawCommand {
         color: rjw_color::Color,
         transform: Transform2D,
     },
+    /// 高级 Sprite：跳过 Transform2D → Mat4 的自动推导，直接传入列主序模型矩阵。
+    /// `mat_idx` 指向 `DrawCommandQueue.matrices` 中的条目。
+    Sprite2DMatrix {
+        rect: SpriteRect,
+        color: rjw_color::Color,
+        mat_idx: usize,
+    },
     Mesh {
         /// 该命令的顶点在 `MeshStorage.vertices` 中的范围（录制时）
         vert: Range<usize>,
         /// 该命令的三角形索引在 `MeshStorage.tri_indices` 中的范围（全局索引）
         tri_index: Range<usize>,
     },
+    /// 外部绘制调用标记（不含数据，实际闭包由 `Render2D::buf_custom_draws` 管理）。
+    Custom,
 }
 
 /// 层级：数值越小越先绘制（越靠后）
@@ -55,6 +64,9 @@ pub(crate) struct DrawCommandQueue {
     states: Vec<States>,
     cmd_indicies: Vec<usize>,
 
+    /// 高级 Sprite2D 的模型矩阵池（`DrawCommand::Sprite2DMatrix.mat_idx` 指向此处）。
+    pub(crate) matrices: Vec<glam::Mat4>,
+
     dirty: bool,
 }
 
@@ -86,6 +98,7 @@ impl DrawCommandQueue {
         self.commands.clear();
         self.layers.clear();
         self.states.clear();
+        self.matrices.clear();
         self.dirty = false;
     }
 
