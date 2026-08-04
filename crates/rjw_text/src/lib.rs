@@ -71,7 +71,7 @@ impl Text {
     ) -> Buffer {
         let metrics = Metrics::new(size, line_height);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        let wrap_width = 1024.0f32.max(size * text.len() as f32 * 0.7);
+        let wrap_width = 1024.0f32.max(size * text.len() as f32);
         buffer.set_size(Some(wrap_width), Some(line_height));
         buffer.set_text(text, &attrs, Shaping::Advanced, Some(align));
         buffer.shape_until_scroll(&mut self.font_system, false);
@@ -101,7 +101,7 @@ impl Text {
                         line_y - loc.top as f32,
                     );
                     let sz = Vec2::new(loc.region.wh_px.0 as f32, loc.region.wh_px.1 as f32);
-                    callback(&loc.region, pos, sz);
+                    callback(&loc.region, pos.ceil(), sz);
                 }
             }
         }

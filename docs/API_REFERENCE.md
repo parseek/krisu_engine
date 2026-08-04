@@ -20,7 +20,8 @@
 - [6. RStates 渲染状态与 Builder 责任链](#6-rstates-渲染状态与-builder-责任链)
 - [7. ClearConfig（清屏配置）](#7-clearconfig清屏配置)
 - [8. DynamicAtlas（纹理图集）](#8-dynamicatlas纹理图集)
-- [9. 其他常用小类型速查](#9-其他常用小类型速查)
+- [9. Text（文本渲染）](#9-text文本渲染)
+- [10. 其他常用小类型速查](#10-其他常用小类型速查)
 
 ---
 
@@ -456,7 +457,39 @@ pub struct StaticAtlas  // (serde feature only)
 | `StaticAtlas::from_toml(s)` | 从 TOML 反序列化 |
 | `StaticAtlas::get(name)` | 查找 |
 
-## 9. 其他常用小类型速查
+## 9. Text（文本渲染）
+
+crate：`rjw_text`
+
+基于 `cosmic-text` 排版 + `swash` 字形光栅化 + `DynamicAtlas` 字形缓存。
+
+```rust
+pub struct Text { /* font_system: FontSystem, glyph_cache: DynamicAtlas<cosmic_text::CacheKey>, ... */ }
+```
+
+| 方法 | 说明 |
+|---|---|
+| `Text::new(device, queue, layout)` | 创建字体管理器（自动加载系统字体） |
+| `load_font_data(data: Vec<u8>)` | 加载额外的 ttf/otf 字体数据 |
+| `create_buffer(text, attrs, size, line_height, align)` | 创建已排版 cosmic-text Buffer |
+| `draw_label(r2d, text, color, size, line_height, pos, family, align, layer) -> Vec2` | ★ 一行渲染：pos=左上角，返回内容宽高 |
+| `draw_label_ex(r2d, text, color, size, line_height, pos, family, align, layer, origin) -> Vec2` | 扩展版：origin 归一化到 [0,1]，(0.5,0.5)=居中 |
+| `draw_text(buffer, callback)` | 遍历字形精灵，闭包自定义绘制 |
+| `draw_text_sprite(r2d, buffer, color, layer)` | 将字形渲染到 Render2D |
+
+```rust
+use rjw_text::{Text, Align};
+
+let mut font = Text::new(device, queue, layout);
+
+// 左上角单行文本
+font.draw_label(r2d, "Hello World", Color::WHITE, 14.0, 18.0, Vec2::new(10.0, 10.0), "SimHei", Align::Left, 0.0);
+
+// 屏幕居中 Game Over
+let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 28.0, cam.position, "SimHei", Align::Center, 1e7, Vec2::new(0.5, 0.5));
+```
+
+## 10. 其他常用小类型速查
 
 | 类型 / 函数 | 位置 | 用途 |
 |---|---|---|

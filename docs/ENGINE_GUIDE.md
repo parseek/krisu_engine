@@ -647,6 +647,34 @@ render2d.add_mesh(&verts, &tris, Color::WHITE, 96.0)
 
 ---
 
+## 8.5 文本渲染（`rjw_text`）
+
+`rjw_text` 基于 `cosmic-text` 排版 + `swash` 字形光栅化 + `DynamicAtlas` 字形缓存。
+
+### 核心 API
+
+| 方法 | 说明 |
+|---|---|
+| `Text::new(device, queue, layout)` | 创建字体系统（自动加载系统字体） |
+| `Text::draw_label(r2d, text, color, size, lh, pos, family, align, layer) -> Vec2` | ★ 左上角起始渲染，返回内容宽高 |
+| `Text::draw_label_ex(r2d, text, color, size, lh, pos, family, align, layer, origin) -> Vec2` | 扩展版：origin 归一化到 [0,1]，(0.5,0.5)=原点居中 |
+
+### 使用示例
+
+```rust
+use rjw_text::{Text, Align};
+
+let mut font = Text::new(r2d.device(), r2d.queue(), r2d.tex_bind_group_layout());
+
+// 左上角单行
+font.draw_label(r2d, "Hello", Color::WHITE, 14.0, 18.0, Vec2::new(10.0, 10.0), "SimHei", Align::Left, 0.0);
+
+// 屏幕居中（相机中心）
+let _ = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 28.0, cam.position, "SimHei", Align::Center, LAYER_UI, Vec2::new(0.5, 0.5));
+```
+
+---
+
 ## 9. 输入：键盘 / 鼠标
 
 ### 9.1 键盘——`KeyState`（重点：边沿）

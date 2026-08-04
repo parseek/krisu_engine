@@ -35,6 +35,8 @@
 | `rjw_main` | 入口 `run_app(App)`、事件循环、窗口、`MainContext`（键盘/鼠标/计时） |
 | `rjw_render` | 底层 `RenderContext`、纹理 `TextureWrapped`、wgpu 重导出 |
 | `rjw_2d_render` | ★ 2D 批渲染器 `Render2D`、`RStates`、Builder 责任链、`SpriteRect`、`Mesh`、分页实例缓冲、**统一管线缓存** |
+| `rjw_atlas` | ★ 运行时图集：DynamicAtlas（Skyline + 寿命 + clamp_margin）+ StaticAtlas（TOML） |
+| `rjw_text` | ★ 文本渲染（cosmic-text 排版 + swash 字形光栅化 + DynamicAtlas 缓存） |
 | `rjw_transform` | `Transform2D` + `Camera2D`（正交投影、坐标转换） |
 | `rjw_color` | `Color`(f32) / `ColorF64`(f64) + 常用常量 |
 | `rjw_keyboard` / `rjw_keystate` | 键盘输入与边沿状态机 |
