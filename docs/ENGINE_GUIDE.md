@@ -366,11 +366,25 @@ let mut atlas = DynamicAtlas::new(
 #### 插入精灵
 
 ```rust
-// insert(name, rgba_data, w, h, origin_px, clamp_margin) → Option<AtlasRegion>
-let grass = atlas.insert(device, queue, layout, "grass", &grass_rgba, 32, 32, (0, 0), true).unwrap();
+// ★ 最常用：insert_ex(name, rgba_bytes, w, h) → Option<AtlasRegion>
+let grass = atlas.insert_ex("grass", &grass_rgba, 32, 32).unwrap();
+
+// 完整参数版：insert(name, rgba, w, h, origin_px, clamp_margin)
+let custom = atlas.insert("custom", &rgba, 32, 32, (5, 5), false).unwrap();
 ```
 
-参数说明：
+> **简化说明**：`DynamicAtlas` 内部持有 `device`/`queue`/`layout`（`new` 时传入一次，后续方法无需再传）。
+
+便捷方法一览：
+
+| 方法 | 等价于 |
+|---|---|
+| `insert_ex(name, rgba, w, h)` | `insert(name, rgba, w, h, (0,0), true)` — 最常用 |
+| `insert_ex_origin(name, rgba, w, h, (ox,oy))` | `insert(name, rgba, w, h, origin_px, true)` |
+| `insert_no_clamp(name, rgba, w, h)` | `insert(name, rgba, w, h, (0,0), false)` |
+| `insert_white()` | 无参，直接返回 1×1 白像素 |
+
+参数说明（`insert` 完整签名）：
 
 | 参数 | 含义 |
 |---|---|
@@ -385,7 +399,7 @@ let grass = atlas.insert(device, queue, layout, "grass", &grass_rgba, 32, 32, (0
 #### 插入白色像素
 
 ```rust
-let white = atlas.insert_white(device, queue, layout);
+let white = atlas.insert_white();
 ```
 
 插入 1×1 纯白像素，用于纯色填充的 Sprite 合批到同一图集页内，避免纯色绘制使用独立纹理打断合批。
@@ -463,9 +477,9 @@ struct Tex {
 impl Tex {
     fn create(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) -> Self {
         let mut atlas = DynamicAtlas::new(device, queue, layout, AtlasConfig::default());
-        let white  = atlas.insert_white(device, queue, layout);
-        let grass  = atlas.insert(device, queue, layout, "grass", &make_grass(), 32, 32, (0,0), true).unwrap();
-        let player = atlas.insert(device, queue, layout, "player", &make_player(), 32, 32, (0,0), true).unwrap();
+        let white  = atlas.insert_white();
+        let grass  = atlas.insert_ex("grass", &make_grass(), 32, 32).unwrap();
+        let player = atlas.insert_ex("player", &make_player(), 32, 32).unwrap();
         Self { atlas, grass, player, white }
     }
 
@@ -714,6 +728,7 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 10. 改 `rstates.rs` 的 bitfield 布局时务必更新 `to_blend()` / `to_depth_stencil()` / `to_cull()` 等解包方法。
 11. 纹理数据长度必须 `w*h*4`。
 12. 改公共 crate 后，务必 `cargo check --workspace`。
+13. **建议**：进行**破坏性更改**、**特性添加**等操作时，请务必更新 [`API_REFERENCE.md`](API_REFERENCE.md) 和 [`ENGINE_GUIDE.md`](ENGINE_GUIDE.md)。
 
 ---
 
@@ -740,8 +755,8 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 | 延迟丢弃 builder（显式绑定变量） | `let _b = render2d.add_sprite2d(...).blend(...);` —— `_b` 在作用域结束时 Drop |
 | Atlas 一行绘制 | `tex.draw(r2d, &tex.grass, tl, wh, color, tf, layer)` |
 | 纯色用 white 合批 | `tex.draw(r2d, &tex.white, tl, wh, color, tf, layer)` |
-| Atlas 插入精灵（clamp_margin） | `atlas.insert(device, queue, layout, name, &rgba, w, h, (0,0), true)` |
-| Atlas 插入白色像素 | `atlas.insert_white(device, queue, layout)` |
+| Atlas 插入精灵 | `atlas.insert_ex(name, &rgba, w, h).unwrap()` |
+| Atlas 插入白色像素 | `atlas.insert_white()` |
 
 ---
 

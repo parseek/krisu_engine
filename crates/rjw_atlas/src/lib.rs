@@ -145,12 +145,18 @@ pub struct DynamicAtlas<const PAGE_SIZE: u32 = DEFAULT_PAGE_SIZE> {
     entries: HashMap<String, AtlasEntry>,
     config: AtlasConfig,
     dirty: bool,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    layout: wgpu::BindGroupLayout,
 }
 
 impl<const N: u32> DynamicAtlas<N> {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout, config: AtlasConfig) -> Self {
-        let page = AtlasPage::new(device, queue, layout, N);
-        Self { pages: vec![page], entries: HashMap::new(), config, dirty: false }
+        let device = device.clone();
+        let queue = queue.clone();
+        let layout = layout.clone();
+        let page = AtlasPage::new(&device, &queue, &layout, N);
+        Self { pages: vec![page], entries: HashMap::new(), config, dirty: false, device, queue, layout }
     }
 
     pub fn texture_uid_of(&self, name: &str) -> Option<u64> { self.entries.get(name).map(|e| e.region.page_uid) }
@@ -160,8 +166,7 @@ impl<const N: u32> DynamicAtlas<N> {
         else { None }
     }
 
-    pub fn insert(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout,
-        name: &str, rgba: &[u8], w: u32, h: u32, origin_px: (u32, u32), clamp_margin: bool,
+    pub fn insert(&mut self, name: &str, rgba: &[u8], w: u32, h: u32, origin_px: (u32, u32), clamp_margin: bool,
     ) -> Option<AtlasRegion> {
         if let Some(e) = self.entries.get_mut(name) { e.lifetime = self.config.lifetime; return Some(e.region); }
         let padding = self.config.padding;
@@ -174,13 +179,13 @@ impl<const N: u32> DynamicAtlas<N> {
             match self.try_alloc(alloc_w, alloc_h, padding) {
                 Some(res) => break res,
                 None if self.pages.len() < self.config.max_pages => {
-                    self.pages.push(AtlasPage::new(device, queue, layout, N));
+                    self.pages.push(AtlasPage::new(&self.device, &self.queue, &self.layout, N));
                 }
                 _ => return None,
             }
         };
         let page = &self.pages[page_idx];
-        queue.write_texture(
+        self.queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: page.texture.raw_texture(), mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
             &expanded_rgba, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(alloc_w * 4), rows_per_image: Some(alloc_h) },
             wgpu::Extent3d { width: alloc_w, height: alloc_h, depth_or_array_layers: 1 },
@@ -223,11 +228,24 @@ impl<const N: u32> DynamicAtlas<N> {
     pub fn page_size(&self) -> u32 { N }
 
     /// 插入 1×1 全白像素（与同页瓦片合批用）。
-    pub fn insert_white(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
-        layout: &wgpu::BindGroupLayout,
-    ) -> AtlasRegion {
-        self.insert(device, queue, layout, "white", &[255,255,255,255], 1, 1, (0,0), true)
+    pub fn insert_white(&mut self) -> AtlasRegion {
+        self.insert("white", &[255,255,255,255], 1, 1, (0,0), true)
             .expect("white pixel should always fit in atlas")
+    }
+
+    /// 插入精灵（默认 origin=(0,0)，clamp_margin=true）。最常用的便捷方法。
+    pub fn insert_ex(&mut self, name: &str, rgba: &[u8], w: u32, h: u32) -> Option<AtlasRegion> {
+        self.insert(name, rgba, w, h, (0, 0), true)
+    }
+
+    /// 插入精灵（指定原点，clamp_margin=true）。
+    pub fn insert_ex_origin(&mut self, name: &str, rgba: &[u8], w: u32, h: u32, origin_px: (u32, u32)) -> Option<AtlasRegion> {
+        self.insert(name, rgba, w, h, origin_px, true)
+    }
+
+    /// 插入精灵（默认 origin=(0,0)，clamp_margin=false）。用于不需要边界扩展的场景。
+    pub fn insert_no_clamp(&mut self, name: &str, rgba: &[u8], w: u32, h: u32) -> Option<AtlasRegion> {
+        self.insert(name, rgba, w, h, (0, 0), false)
     }
 }
 

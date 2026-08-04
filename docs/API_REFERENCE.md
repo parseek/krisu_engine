@@ -438,8 +438,11 @@ pub struct StaticAtlas  // (serde feature only)
 | 方法 | 说明 |
 |---|---|
 | `DynamicAtlas::new(device, queue, layout, config)` | 创建空图集 |
-| `insert(device, queue, layout, name, rgba, w, h, origin_px, clamp_margin)` | 插入/替换精灵；`clamp_margin: true` 自动扩展 1px 防越界 |
-| `insert_white(device, queue, layout)` | 插入 1×1 白像素 |
+| `insert(name, rgba, w, h, origin_px, clamp_margin)` | 插入/替换精灵（完整参数） |
+| `insert_ex(name, rgba, w, h)` | ★ 最常用：origin=(0,0), clamp_margin=true |
+| `insert_ex_origin(name, rgba, w, h, origin_px)` | 指定原点，clamp_margin=true |
+| `insert_no_clamp(name, rgba, w, h)` | origin=(0,0), clamp_margin=false |
+| `insert_white()` | 插入 1×1 白像素 |
 | `get(name)` | 查找（重置寿命） |
 | `end_frame()` | 寿命-1，归零踢出 |
 | `compact()` | 重建 skyline |

@@ -832,14 +832,14 @@ impl Tex {
                 ..Default::default()
             },
         );
-        let white = atlas.insert_white(device, queue, layout);
-        let grass = atlas.insert(device, queue, layout, "grass", &make_grass(), 32, 32, (0, 0), true).unwrap();
-        let field = atlas.insert(device, queue, layout, "field", &make_field(), 32, 32, (0, 0), true).unwrap();
-        let sand = atlas.insert(device, queue, layout, "sand", &make_sand(), 32, 32, (0, 0), true).unwrap();
-        let water = atlas.insert(device, queue, layout, "water", &make_water(), 32, 32, (0, 0), true).unwrap();
-        let tree = atlas.insert(device, queue, layout, "tree", &make_tree(), 64, 64, (0, 0), true).unwrap();
-        let player = atlas.insert(device, queue, layout, "player", &make_player(), 32, 32, (0, 0), true).unwrap();
-        let slime = atlas.insert(device, queue, layout, "slime", &make_slime(), 32, 32, (0, 0), true).unwrap();
+        let white = atlas.insert_white();
+        let grass = atlas.insert_ex("grass", &make_grass(), 32, 32).unwrap();
+        let field = atlas.insert_ex("field", &make_field(), 32, 32).unwrap();
+        let sand = atlas.insert_ex("sand", &make_sand(), 32, 32).unwrap();
+        let water = atlas.insert_ex("water", &make_water(), 32, 32).unwrap();
+        let tree = atlas.insert_ex("tree", &make_tree(), 64, 64).unwrap();
+        let player = atlas.insert_ex("player", &make_player(), 32, 32).unwrap();
+        let slime = atlas.insert_ex("slime", &make_slime(), 32, 32).unwrap();
         Self {
             atlas,
             grass,
