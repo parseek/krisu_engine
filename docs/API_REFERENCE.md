@@ -243,6 +243,8 @@ r2d.add_sprite2d(rect, Color::WHITE, tf, 0.0, &tex)
 | `add_mesh` | `r2d.add_mesh(&verts, &tri_indices, color, layer)` | 显式顶点+三角形索引（世界坐标） |
 | `add_polygon_fan` | `r2d.add_polygon_fan(&verts, color, layer)` | 顶点数组自动三角形扇 |
 | `add_polygon_strip` | `r2d.add_polygon_strip(&verts, color, layer)` | 三角形条带 |
+| `add_polygon_fan_uv` | `r2d.add_polygon_fan_uv(&verts, &uvs, color, layer)` | 三角形扇 + UV 坐标 |
+| `add_polygon_strip_uv` | `r2d.add_polygon_strip_uv(&verts, &uvs, color, layer)` | 三角形条带 + UV 坐标 |
 | `add_mesh_fn` | `r2d.add_mesh_fn(color, layer, \|sink\| { ... })` | 流程式安全建网格 |
 | `add_mesh_fn_prealloc` | `r2d.add_mesh_fn_prealloc(max_verts, max_tris, color, layer, \|v_slice, t_slice\| { ... })` | 已知顶点/三角形数，直接写预分配切片 |
 
@@ -297,7 +299,7 @@ crate：`rjw_2d_render`（`rstates` 模块）
 
 | 分类 | 方法 | 说明 |
 |---|---|---|
-| Blend | `blend(BlendMode)` / `blend_state(BlendDesc)` | Alpha/Additive/Multiply/Premultiplied |
+| Blend | `blend(BlendMode)` / `blend_state(BlendDesc)` | Alpha/Additive/Multiply/Premultiplied/Inverse/Subtract/Min/Max/Disabled |
 | Sampler | `samp_mag(f)` / `samp_min(f)` / `samp_mip(f)` | Linear / Nearest |
 | | `samp_addr_u(a)` / `samp_addr_v(a)` / `samp_addr_w(a)` | ClampToEdge / Repeat / MirrorRepeat |
 | | `samp_state(SamplerDesc)` | 批量设置采样器 |
@@ -326,7 +328,7 @@ crate：`rjw_2d_render`（`rstates` 模块）
 | 类型 | 值 |
 |---|---|
 | `RStates` | u64 bitfield，`RStates::default() / new()` = 全零（默认） |
-| `BlendMode` | `Alpha` / `Additive` / `Multiply` / `Premultiplied` |
+| `BlendMode` | `Alpha` / `Additive` / `Multiply` / `Premultiplied` / `Inverse` / `Subtract` / `Min` / `Max` / `Disabled` |
 | `FilterMode` | `Linear` / `Nearest` |
 | `AddressMode` | `ClampToEdge` / `Repeat` / `MirrorRepeat` |
 | `CullMode` | `None` / `Front` / `Back` |

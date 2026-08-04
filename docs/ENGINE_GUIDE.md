@@ -476,7 +476,7 @@ tex.draw(r2d, &tex.slime, tl, wh, Color::WHITE, tf, y_layer(foot))
 
 | 域 | 字段 | 示例 |
 |---|---|---|
-| Blend | `BlendMode` (Alpha/Additive/Multiply/Premultiplied) | `.blend(Additive)` |
+| Blend | `BlendMode` (Alpha/Additive/Multiply/Premultiplied/Inverse/Subtract/Min/Max/Disabled) | `.blend(Additive)` |
 | Sampler | mag/min/mip filter + addr_u/v/w | `.samp_addr_u(Repeat).samp_mag(Nearest)` |
 | Cull+Raster | cull + polygon + front_face + conservative | `.cull(Back).polygon(Line)` |
 | Depth | test + write + compare | `.depth_test(true).depth_write(true)` |
@@ -534,7 +534,7 @@ render2d.add_mesh(&verts, &tris, Color::WHITE, 96.0)
 | 类型 | 说明 |
 |---|---|
 | `RStates` | u64 bitfield，含全部 6 个控制域 |
-| `BlendMode` | Alpha / Additive / Multiply / Premultiplied |
+| `BlendMode` | Alpha / Additive / Multiply / Premultiplied / Inverse / Subtract / Min / Max / Disabled |
 | `FilterMode` | Linear / Nearest |
 | `AddressMode` | ClampToEdge / Repeat / MirrorRepeat |
 | `CullMode` | None / Front / Back |
