@@ -1,0 +1,15 @@
+[package]
+name = "rjw_text"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rjw_atlas = { path = "../rjw_atlas" }
+rjw_2d_render = { path = "../rjw_2d_render" }
+rjw_transform = { path = "../rjw_transform" }
+rjw_color = { path = "../rjw_color" }
+rjw_render = { path = "../rjw_render" }
+glam = "0.33.2"
+wgpu = "30.0.0"
+cosmic-text = "0.19.0"
+swash = "0.2.10"

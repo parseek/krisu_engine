@@ -831,6 +831,7 @@ impl Tex {
                 max_pages: 2,
                 ..Default::default()
             },
+            512, // 够了
         );
         let white = atlas.insert_white();
         let grass = atlas.insert_ex("grass", &make_grass(), 32, 32).unwrap();
