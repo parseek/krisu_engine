@@ -58,12 +58,12 @@ impl RStates {
             BlendMode::Alpha => Some(wgpu::BlendState::ALPHA_BLENDING),
             BlendMode::Additive => Some(wgpu::BlendState {
                 color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
                     dst_factor: wgpu::BlendFactor::One,
                     operation: wgpu::BlendOperation::Add,
                 },
                 alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
                     dst_factor: wgpu::BlendFactor::One,
                     operation: wgpu::BlendOperation::Add,
                 },
@@ -92,6 +92,55 @@ impl RStates {
                     operation: wgpu::BlendOperation::Add,
                 },
             }),
+            BlendMode::Inverse => Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::OneMinusDst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            }),
+            BlendMode::Subtract => Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::ReverseSubtract,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::ReverseSubtract,
+                },
+            }),
+            BlendMode::Min => Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Min,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Min,
+                },
+            }),
+            BlendMode::Max => Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Max,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Max,
+                },
+            }),
+            BlendMode::Disabled => None,
         }
     }
 
@@ -348,6 +397,11 @@ pub enum BlendMode {
     Additive,
     Multiply,
     Premultiplied,
+    Inverse,
+    Subtract,
+    Min,
+    Max,
+    Disabled,
 }
 
 impl BlendMode {
@@ -358,6 +412,11 @@ impl BlendMode {
             Self::Additive => 1,
             Self::Multiply => 2,
             Self::Premultiplied => 3,
+            Self::Inverse => 4,
+            Self::Subtract => 5,
+            Self::Min => 6,
+            Self::Max => 7,
+            Self::Disabled => 8,
         }
     }
 
@@ -367,6 +426,11 @@ impl BlendMode {
             1 => Self::Additive,
             2 => Self::Multiply,
             3 => Self::Premultiplied,
+            4 => Self::Inverse,
+            5 => Self::Subtract,
+            6 => Self::Min,
+            7 => Self::Max,
+            8 => Self::Disabled,
             _ => Self::Alpha,
         }
     }

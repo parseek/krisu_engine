@@ -180,7 +180,7 @@ pub struct Render2D {
     mvp: glam::Mat4,
     default_rstates: RStates,
 
-    buf_mesh_cmds: Vec<(Range<usize>, Range<usize>)>,
+    buf_mesh_cmds: Vec<(Range<usize>, Range<usize>, u64)>,
     buf_instances: Vec<InstanceData>,
     buf_ops: Vec<DrawOp>,
     buf_all_verts: Vec<VertexP3U2C4>,
@@ -315,6 +315,20 @@ impl Render2D {
         self.add_mesh_fn_prealloc(n, n-2, color, layer, |vs, ts| { for (d,s) in vs.iter_mut().zip(vertices) { d.pos = [s.x,s.y,0.0]; } for (i,t) in ts.iter_mut().enumerate() { *t = TriIndicies::new(0, (i+1) as u16, (i+2) as u16); } (n, n-2) })
     }
 
+    /// 带 UV 的多边形扇（fan triangulation：v0 作为中心，依次 v0, vi+1, vi+2）。
+    /// `vertices` 与 `uvs` 需等长，每个顶点对应一个归一化 UV 坐标。
+    pub fn add_polygon_fan_uv(&mut self, vertices: &[glam::Vec2], uvs: &[glam::Vec2], color: Color, layer: impl Into<Layer>) -> MeshBuilder<'_> {
+        debug_assert!(vertices.len() >= 3 && vertices.len() == uvs.len()); let n = vertices.len();
+        self.add_mesh_fn_prealloc(n, n-2, color, layer, |vs, ts| { for (d,(p,uv)) in vs.iter_mut().zip(vertices.iter().zip(uvs)) { d.pos = [p.x,p.y,0.0]; d.uv = [uv.x,uv.y]; } for (i,t) in ts.iter_mut().enumerate() { *t = TriIndicies::new(0, (i+1) as u16, (i+2) as u16); } (n, n-2) })
+    }
+
+    /// 带 UV 的多边形带（strip triangulation：v0 作为中心，依次 v0, vi+1, vi+2）。
+    /// `vertices` 与 `uvs` 需等长，每个顶点对应一个归一化 UV 坐标。
+    pub fn add_polygon_strip_uv(&mut self, vertices: &[glam::Vec2], uvs: &[glam::Vec2], color: Color, layer: impl Into<Layer>) -> MeshBuilder<'_> {
+        debug_assert!(vertices.len() >= 3 && vertices.len() == uvs.len()); let n = vertices.len();
+        self.add_mesh_fn_prealloc(n, n-2, color, layer, |vs, ts| { for (d,(p,uv)) in vs.iter_mut().zip(vertices.iter().zip(uvs)) { d.pos = [p.x,p.y,0.0]; d.uv = [uv.x,uv.y]; } for (i,t) in ts.iter_mut().enumerate() { *t = TriIndicies::new(0, (i+1) as u16, (i+2) as u16); } (n, n-2) })
+    }
+
     pub fn add_custom(&mut self, layer: impl Into<Layer>, cd: impl CustomDraw + 'static) -> CustomBuilder<'_> {
         self.buf_custom_draws.push(Arc::new(cd));
         CustomBuilder { queue: &mut self.command_queue, layer: layer.into(), rstates: RStates::default(), has_rstates: false }
@@ -371,7 +385,7 @@ impl Render2D {
                     if tu != ct || Some(rr) != cr || pf { close!(); ct = tu; cr = Some(rr); rs = self.buf_instances.len(); if pf { page+=1; ps = self.buf_instances.len(); } }
                     self.buf_instances.push(InstanceData::from_sprite_matrix(rect, *color, m));
                 }
-                DrawCommand::Mesh { vert, tri_index } => { close!(); ct = None; cr = None; rs = self.buf_instances.len(); self.buf_ops.push(DrawOp::MeshPlaceholder); self.buf_mesh_cmds.push((vert.clone(), tri_index.clone())); }
+                DrawCommand::Mesh { vert, tri_index } => { close!(); ct = None; cr = None; rs = self.buf_instances.len(); self.buf_ops.push(DrawOp::MeshPlaceholder); self.buf_mesh_cmds.push((vert.clone(), tri_index.clone(), rr)); }
                 DrawCommand::Custom => { close!(); ct = None; cr = None; rs = self.buf_instances.len(); self.buf_ops.push(DrawOp::CustomPlaceholder); }
             }
         }
@@ -380,17 +394,17 @@ impl Render2D {
         { let mut pi = 0; let mut s = 0; while s < self.buf_instances.len() { let e = (s+MAX_INSTANCES_PER_DRAW).min(self.buf_instances.len()); self.draw_page.update_instances_page(&self.queue, pi, &self.buf_instances[s..e]); pi+=1; s = e; } }
 
         if !self.buf_mesh_cmds.is_empty() {
-            let tv: usize = self.buf_mesh_cmds.iter().map(|(v,_)| v.end - v.start).sum();
-            let tt: usize = self.buf_mesh_cmds.iter().map(|(_,t)| t.end - t.start).sum();
+            let tv: usize = self.buf_mesh_cmds.iter().map(|(v,_,_)| v.end - v.start).sum();
+            let tt: usize = self.buf_mesh_cmds.iter().map(|(_,t,_)| t.end - t.start).sum();
             assert!(tv <= MAX_MESH_VERTS);
             self.draw_page.ensure_mesh_capacity(&self.device, tv, tt+1);
             let mut vc: usize = 0; let mut ic: usize = 0;
             let mut opp = self.buf_ops.iter_mut().filter_map(|o| match o { DrawOp::MeshPlaceholder => Some(o), _ => None });
-            for (v, t) in &self.buf_mesh_cmds {
+            for (v, t, rr) in &self.buf_mesh_cmds {
                 let vn = v.end - v.start; let tn = t.end - t.start;
                 if vn != 0 { self.buf_all_verts.extend_from_slice(&self.mesh_storage.vertices[v.clone()]); }
                 if vn != 0 && tn != 0 { let rb = (vc as i64) - (v.start as i64); for t in &self.mesh_storage.tri_indices[t.clone()] { self.buf_all_tris.push(TriIndicies(Index((t.0.0 as i64+rb) as u16), Index((t.1.0 as i64+rb) as u16), Index((t.2.0 as i64+rb) as u16))); } }
-                if let Some(o) = opp.next() { *o = DrawOp::Mesh { item: crate::draw_page::MeshDrawItem { first_vertex: vc as u32, vertex_count: vn as u16, tri_index_start: ic as u32, tri_index_count: tn as u16 }, rstates: 0 }; }
+                if let Some(o) = opp.next() { *o = DrawOp::Mesh { item: crate::draw_page::MeshDrawItem { first_vertex: vc as u32, vertex_count: vn as u16, tri_index_start: ic as u32, tri_index_count: tn as u16 }, rstates: *rr }; }
                 vc += vn; ic += tn;
             }
             if !self.buf_all_verts.is_empty() { self.queue.write_buffer(&self.draw_page.mesh_vb, 0, bytemuck::cast_slice(&self.buf_all_verts)); }
@@ -427,8 +441,8 @@ impl Render2D {
                     i += 1;
                 }
                 DrawOp::Mesh { item: _, rstates } => {
-                    let mut ss: Option<u32> = None; let mut sc: u32 = 0; let mut sr = *rstates;
-                    while i < self.buf_ops.len() { match &self.buf_ops[i] { DrawOp::Mesh { item, rstates: r } => { if item.tri_index_count != 0 { if ss.is_none() { ss = Some(item.tri_index_start * 3); sr = *r; } sc += item.tri_index_count as u32 * 3; } i += 1; } _ => break, } }
+                    let mut ss: Option<u32> = None; let mut sc: u32 = 0; let sr = *rstates;
+                    while i < self.buf_ops.len() { match &self.buf_ops[i] { DrawOp::Mesh { item, rstates: r } => { if *r != sr { break; } if item.tri_index_count != 0 { if ss.is_none() { ss = Some(item.tri_index_start * 3); } sc += item.tri_index_count as u32 * 3; } i += 1; } _ => break, } }
                     if let Some(start) = ss {
                         let pipeline = self.draw_page.get_or_create_pipeline(&self.device, sr);
                         pass.set_pipeline(pipeline);

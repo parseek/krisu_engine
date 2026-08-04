@@ -144,6 +144,24 @@ impl<'a> MeshSink<'a> {
         idx as u16
     }
 
+    /// push 一个顶点（位置 → 世界坐标；UV 手动指定；颜色取录制时传入的 `color`）。
+    ///
+    /// 返回该顶点的**局部索引**，可直接传给 `push_tri`。
+    #[inline]
+    pub fn push_vertex_uv(&mut self, pos: glam::Vec2, uv: glam::Vec2) -> u16 {
+        let idx = self.verts.len() as u32 - self.base;
+        debug_assert!(
+            idx <= u16::MAX as u32,
+            "too many vertices for u16 indices in one mesh"
+        );
+        self.verts.push(VertexP3U2C4 {
+            pos: [pos.x, pos.y, 0.0],
+            uv: [uv.x, uv.y],
+            color: self.color_arr,
+        });
+        idx as u16
+    }
+
     /// push 一个三角形（`a`/`b`/`c` 为**局部**索引，需已在前面 push 过对应顶点）。
     ///
     /// 内部自动把局部索引 + 本 mesh 的全局基址，重定位为全局索引写入 Storage。

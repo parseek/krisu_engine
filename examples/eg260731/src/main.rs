@@ -88,7 +88,7 @@ impl App for SpriteDemo {
         // 鼠标滚轮缩放、方向键平移（坐标系 X+ 右、Y+ 下：W ↔ 上/Y-，S ↔ 下/Y+）。
         let wheel = ctx.mouse.get_wheel_delta().to_pixel(None);
         if wheel.1 != 0.0 {
-            self.cam.zoom *= glam::Vec2::splat(1.1_f32.powf(wheel.1 as f32 * dt));
+            self.cam.zoom *= glam::Vec2::splat(1.1_f32.powf(wheel.1 as f32 * 0.01));
             self.cam.zoom = self.cam.zoom.clamp(glam::Vec2::splat(0.01), glam::Vec2::splat(100.0));
         }
         let move_speed = 400.0 * dt;

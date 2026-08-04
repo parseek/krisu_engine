@@ -35,6 +35,15 @@ impl Color {
     pub const fn rgb(r: f32, g: f32, b: f32) -> Self {
         Self::rgba(r, g, b, 1.0)
     }
+
+    #[inline]
+    pub const fn rgba_one(value: f32) -> Self {
+        Self { r: value, g: value, b: value, a: value }
+    }
+    #[inline]
+    pub const fn rgb_one(value: f32) -> Self {
+        Self::rgba(value, value, value, 1.0)
+    }
 }
 
 /// f64-precision color. Convenient for working with `wgpu::Color` and DVec3.
@@ -54,6 +63,15 @@ impl ColorF64 {
     #[inline]
     pub const fn rgb(r: f64, g: f64, b: f64) -> Self {
         Self::rgba(r, g, b, 1.0)
+    }
+
+    #[inline]
+    pub const fn rgba_one(value: f64) -> Self {
+        Self { r: value, g: value, b: value, a: value }
+    }
+    #[inline]
+    pub const fn rgb_one(value: f64) -> Self {
+        Self::rgba(value, value, value, 1.0)
     }
 }
 

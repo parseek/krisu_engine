@@ -11,7 +11,7 @@
 use std::f32::consts::{PI, TAU};
 
 use glam::Vec2;
-use rjw_2d_render::{ClearConfig, Layer, Render2D, SpriteRect};
+use rjw_2d_render::{BlendMode, ClearConfig, Layer, Render2D, SpriteRect};
 use rjw_atlas::{AtlasConfig, AtlasRegion, DynamicAtlas};
 use rjw_color::Color;
 use rjw_main::*;
@@ -470,7 +470,8 @@ fn draw_attack_slash(r2d: &mut Render2D, center: Vec2, angle: f32, opacity: f32)
         let a = angle - SLASH_HALF_ANGLE + 2.0 * SLASH_HALF_ANGLE * i as f32 / segs as f32;
         verts.push(center + Vec2::new(a.cos(), a.sin()) * SLASH_RANGE);
     }
-    r2d.add_polygon_fan(&verts, Color::rgba(1.0, 1.0, 0.9, 0.65 * opacity), y_layer(center.y + 14.0) + 0.3);
+    r2d.add_polygon_fan(&verts, Color::rgba_one(1.0 * opacity), LAYER_UI - 10.0)
+        .blend(BlendMode::Inverse);
 }
 
 fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, game: &Game) {
@@ -550,8 +551,7 @@ fn draw_entities(r2d: &mut Render2D, tex: &Tex, game: &Game) {
         let toward = (ppos - e.pos).y.atan2((ppos - e.pos).x);
         let squash = (e.anim * 3.0).sin();
         let tf = Transform2D::default().with_pos(e.pos).with_rot(toward).with_scale(Vec2::new(1.0 + 0.1 * squash, 1.0 - 0.08 * squash));
-        tex.draw(r2d, &tex.slime, Vec2::splat(-16.0), Vec2::splat(32.0), Color::WHITE, tf, y_layer(e_foot))
-            .blend(rjw_2d_render::BlendMode::Additive);
+        tex.draw(r2d, &tex.slime, Vec2::splat(-16.0), Vec2::splat(32.0), Color::WHITE, tf, y_layer(e_foot));
         let bar_w = 32.0;
         let bar_tl = e.pos + Vec2::new(-bar_w * 0.5, -27.0);
         let frac = e.hp as f32 / 3.0;
