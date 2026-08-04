@@ -16,6 +16,7 @@ use rjw_atlas::{AtlasConfig, AtlasRegion, DynamicAtlas};
 use rjw_color::Color;
 use rjw_main::*;
 use rjw_render::{wgpu, RenderConfig, RenderContext, TEXTURES};
+use rjw_text::Text;
 use rjw_transform::{Camera2D, Transform2D};
 
 // ── 常量 ─────────────────────────────────────────────────────────
@@ -583,7 +584,7 @@ fn draw_entities(r2d: &mut Render2D, tex: &Tex, game: &Game) {
     }
 }
 
-fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, game: &Game) {
+fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, font: &mut Text, game: &Game) {
     let hw = cam.viewport_size.x * 0.5 / cam.zoom.x;
     let hh = cam.viewport_size.y * 0.5 / cam.zoom.y;
     let tl = cam.position - Vec2::new(hw, hh);
@@ -640,6 +641,12 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, game: &Game) {
             LAYER_UI + 0.6,
         );
     }
+    // ── 文本渲染（使用 rjw_text draw_label） ──
+    let align = rjw_text::Align::Left;
+    font.draw_label(r2d, &format!("HP: {} / {}", game.player.hp, game.player.max_hp), Color::WHITE, 14.0, 18.0, bar_pos + Vec2::new(0.0, -18.0), "SimHei", align, LAYER_UI + 0.5);
+    font.draw_label(r2d, &format!("第 {} 波", game.wave), Color::rgba(1.0, 0.82, 0.2, 1.0), 14.0, 18.0, coin + Vec2::new(40.0, -6.0), "SimHei", align, LAYER_UI + 0.7);
+    font.draw_label(r2d, &format!("击杀 {}", game.kills), Color::rgba(0.95, 0.3, 0.3, 1.0), 14.0, 18.0, kill + Vec2::new(40.0, -6.0), "SimHei", align, LAYER_UI + 0.7);
+
     if game.state == GameState::GameOver {
         tex.draw(
             r2d,
@@ -650,6 +657,7 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, game: &Game) {
             Transform2D::default(),
             LAYER_GAMEOVER,
         );
+        font.draw_label(r2d, "GAME OVER — 按 R 重开", Color::rgba(1.0, 0.3, 0.3, 1.0), 22.0, 28.0, cam.position + Vec2::new(-100.0, -20.0), "SimHei", rjw_text::Align::Center, LAYER_GAMEOVER + 1.0);
     }
 }
 
@@ -884,6 +892,7 @@ struct RpgApp {
     render2d: Option<Render2D>,
     cam: Camera2D,
     tex: Option<Tex>,
+    font: Option<Text>,
     game: Game,
 }
 impl RpgApp {
@@ -896,6 +905,7 @@ impl RpgApp {
             render2d: None,
             cam,
             tex: None,
+            font: None,
             game,
         }
     }
@@ -910,6 +920,7 @@ impl App for RpgApp {
         let render = self.render.as_ref().unwrap();
         let render2d = Render2D::new(render);
         let tex = Tex::create(render2d.device(), render2d.queue(), render2d.tex_bind_group_layout());
+        let font = Text::new(render2d.device(), render2d.queue(), render2d.tex_bind_group_layout());
         let (w, h) = render.size();
         let mut cam = Camera2D::new(Vec2::new(w as f32, h as f32));
         cam.set_vp(Vec2::new(w as f32, h as f32), Vec2::ZERO);
@@ -917,6 +928,7 @@ impl App for RpgApp {
         self.render2d = Some(render2d);
         self.cam = cam;
         self.tex = Some(tex);
+        self.font = Some(font);
     }
     fn on_resized(&mut self, _ctx: &mut MainContext, width: u32, height: u32) {
         if let Some(r) = &mut self.render {
@@ -947,9 +959,10 @@ impl App for RpgApp {
             ));
         }
         render2d.set_mvp(self.cam.vp_matrix());
+        let font = self.font.as_mut().unwrap();
         draw_tiles(render2d, &self.cam, tex, &self.game);
         draw_entities(render2d, tex, &self.game);
-        draw_ui(render2d, &self.cam, tex, &self.game);
+        draw_ui(render2d, &self.cam, tex, font, &self.game);
         render2d.render(&ClearConfig {
             color: Some(wgpu::Color { r: 0.13, g: 0.24, b: 0.12, a: 1.0 }),
             depth: None,
