@@ -644,7 +644,7 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, font: &mut Text, game:
     // Debug 指示位置
 
     // HP Label 左上角
-    r2d.add_sprite2d_solid(SpriteRect::from_texture(cam.position, Vec2::splat(5.0)), Color::BLUEVIOLET, Transform2D::IDENTITY, LAYER_UI);
+    // r2d.add_sprite2d_solid(SpriteRect::from_texture(cam.position, Vec2::splat(5.0)), Color::BLUEVIOLET, Transform2D::IDENTITY, LAYER_UI);
     // ── 文本渲染（使用 rjw_text draw_label） ──
     let align = rjw_text::Align::Left;
     font.draw_label(r2d, &format!("❤HP: {} / {}", game.player.hp, game.player.max_hp), Color::WHITE, 14.0, 18.0, bar_pos + Vec2::new(0.0, -18.0), "SimHei", align, LAYER_UI + 0.5);
