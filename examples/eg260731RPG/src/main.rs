@@ -641,9 +641,13 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, font: &mut Text, game:
             LAYER_UI + 0.6,
         );
     }
+    // Debug 指示位置
+
+    // HP Label 左上角
+    r2d.add_sprite2d_solid(SpriteRect::from_texture(cam.position, Vec2::splat(5.0)), Color::BLUEVIOLET, Transform2D::IDENTITY, LAYER_UI);
     // ── 文本渲染（使用 rjw_text draw_label） ──
     let align = rjw_text::Align::Left;
-    font.draw_label(r2d, &format!("HP: {} / {}", game.player.hp, game.player.max_hp), Color::WHITE, 14.0, 18.0, bar_pos + Vec2::new(0.0, -18.0), "SimHei", align, LAYER_UI + 0.5);
+    font.draw_label(r2d, &format!("❤HP: {} / {}", game.player.hp, game.player.max_hp), Color::WHITE, 14.0, 18.0, bar_pos + Vec2::new(0.0, -18.0), "SimHei", align, LAYER_UI + 0.5);
     font.draw_label(r2d, &format!("第 {} 波", game.wave), Color::rgba(1.0, 0.82, 0.2, 1.0), 14.0, 18.0, coin + Vec2::new(40.0, -6.0), "SimHei", align, LAYER_UI + 0.7);
     font.draw_label(r2d, &format!("击杀 {}", game.kills), Color::rgba(0.95, 0.3, 0.3, 1.0), 14.0, 18.0, kill + Vec2::new(40.0, -6.0), "SimHei", align, LAYER_UI + 0.7);
 
@@ -657,7 +661,7 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, font: &mut Text, game:
             Transform2D::default(),
             LAYER_GAMEOVER,
         );
-        font.draw_label(r2d, "GAME OVER — 按 R 重开", Color::rgba(1.0, 0.3, 0.3, 1.0), 22.0, 28.0, cam.position + Vec2::new(-100.0, -20.0), "SimHei", rjw_text::Align::Center, LAYER_GAMEOVER + 1.0);
+        font.draw_label_ex(r2d, "❤GAME OVER — 按\n R 重开❤", Color::rgba(1.0, 0.3, 0.3, 1.0), 22.0, 28.0, cam.position, "SimHei", rjw_text::Align::Center, LAYER_GAMEOVER + 1.0, Vec2::new(0.5, 0.5));
     }
 }
 

@@ -180,7 +180,17 @@ impl Text {
     pub fn draw_label(
         &mut self, r2d: &mut Render2D, text: &str, color: Color,
         size: f32, line_height: f32, pos: Vec2, family: &str, align: Align, layer: impl Into<Layer> + Clone,
-    ) {
+    ) -> Vec2 {
+        self.draw_label_ex(r2d, text, color, size, line_height, pos, family, align, layer, Vec2::ZERO)
+    }
+
+    /// 扩展版：`origin` 以内容宽高为单位，归一化到 [0,1]。
+    /// `origin = (0,0)` 为左上角，`origin = (0.5,0.5)` 为中心点。
+    pub fn draw_label_ex(
+        &mut self, r2d: &mut Render2D, text: &str, color: Color,
+        size: f32, line_height: f32, pos: Vec2, family: &str, align: Align, layer: impl Into<Layer> + Clone,
+        origin: Vec2,
+    ) -> Vec2 {
         let attrs = if family.is_empty() {
             Attrs::new()
         } else {
@@ -196,10 +206,11 @@ impl Text {
                 }
             }
         }
-        let origin = self.buffer_origin(&buf);
+        let visual_origin = self.buffer_origin(&buf);
+        let content_size = self.buffer_content_size(&buf);
+        let offset = Vec2::new(content_size.x * origin.x, content_size.y * origin.y);
         let ps = self.glyph_cache.page_size() as f32;
         let inv = Vec2::new(1.0 / ps, 1.0 / ps);
-        // 第二次遍历绘制（此时 locations 已满）
         for run in buf.layout_runs() {
             let line_y = run.line_y;
             for glyph in run.glyphs.iter() {
@@ -210,7 +221,7 @@ impl Text {
                         physical.x as f32 + loc.left as f32,
                         line_y - loc.top as f32,
                     );
-                    let world_tl = pos + glyph_pos - origin;
+                    let world_tl = pos + glyph_pos - visual_origin - offset;
                     let glyph_size = Vec2::new(loc.region.wh_px.0 as f32, loc.region.wh_px.1 as f32);
                     let rect = SpriteRect::from_texture_px(
                         world_tl, glyph_size,
@@ -224,6 +235,17 @@ impl Text {
                 }
             }
         }
+        content_size
+    }
+
+    fn buffer_content_size(&self, buffer: &Buffer) -> Vec2 {
+        let mut w: f32 = 0.0;
+        let mut bottom: f32 = 0.0;
+        for run in buffer.layout_runs() {
+            w = w.max(run.line_w);
+            bottom = bottom.max(run.line_y + run.line_height);
+        }
+        Vec2::new(w.ceil(), bottom.ceil())
     }
 
     /// 计算文本的第一个视觉字形的左上角（bearing 恢复后），用于对齐。
