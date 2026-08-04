@@ -72,7 +72,9 @@ impl Text {
         let metrics = Metrics::new(size, line_height);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         let wrap_width = 1024.0f32.max(size * text.len() as f32);
-        buffer.set_size(Some(wrap_width), Some(line_height));
+        // 高度传 None：cosmic-text 会按 height_opt 裁剪超出范围的行，
+        // 若设成单行高度会导致多行文本只保留第一行。
+        buffer.set_size(Some(wrap_width), None);
         buffer.set_text(text, &attrs, Shaping::Advanced, Some(align));
         buffer.shape_until_scroll(&mut self.font_system, false);
         buffer
