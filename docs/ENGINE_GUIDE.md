@@ -436,7 +436,7 @@ atlas.page_size();    // 单页尺寸（= N，如 2048）
 - **寿命系统**：每个非永久精灵有 `config.lifetime` 帧的倒计时，每次 `get()` / `get_or_revive()` 命中时重置
 - **墓碑**：`end_frame()` 将到期且保存了源数据的精灵移入 `tombstones`（携带 RGBA + 宽高 + 原点）
 - **复活**：`get_or_revive(name)` 若在 entries 中找不到 → 从 tombstones 取出 RGBA → 重新 `insert_inner()` 写入图集 → 返回引用
-- **常驻精灵**：用 `insert_permanent()` 或 `insert_ex_permanent()` 插入的精灵 `source: None`，到期直接删除，不可复活
+- **常驻精灵**：用 `insert_permanent()` 或 `insert_ex_permanent()` 插入的精灵 `source: None`，永久存在
 
 ```rust
 // 普通精灵（可复活）

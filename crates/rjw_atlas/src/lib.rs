@@ -59,12 +59,22 @@ impl Skyline {
 
     fn allocate(&mut self, w: u32, h: u32, padding: u32) -> Option<(u32, u32)> {
         let needed = w + padding * 2;
-        let mut best_idx = 0;
+        let mut best_idx: Option<usize> = None;
         let mut best_y = u32::MAX;
+        let mut best_surplus = u32::MAX;
         for (i, seg) in self.segments.iter().enumerate() {
-            if seg.w >= needed && seg.y < best_y { best_y = seg.y; best_idx = i; }
+            // Best-Fit：最低 y 优先，同 y 时选「切剩最少」的段，减少右侧碎片
+            if seg.w >= needed {
+                let surplus = seg.w - needed;
+                if seg.y < best_y || (seg.y == best_y && surplus < best_surplus) {
+                    best_y = seg.y;
+                    best_surplus = surplus;
+                    best_idx = Some(i);
+                }
+            }
         }
-        if best_y == u32::MAX || best_y + h + padding * 2 > self.page_size { return None; }
+        let best_idx = best_idx?;
+        if best_y + h + padding * 2 > self.page_size { return None; }
 
         let seg = self.segments[best_idx];
         let x = seg.x + padding;
@@ -112,6 +122,22 @@ impl Skyline {
         let mut slf = Self { segments, page_size };
         slf.merge_adjacent();
         slf
+    }
+
+    /// 该页总空闲面积。
+    fn free_area(&self) -> u64 {
+        self.segments.iter().map(|seg| (seg.w as u64) * self.height_below(*seg)).sum()
+    }
+
+    /// 该页最大连续空闲矩形面积。
+    fn largest_free_area(&self) -> u64 {
+        self.segments.iter().map(|seg| (seg.w as u64) * self.height_below(*seg)).max().unwrap_or(0)
+    }
+
+    /// 段向下的自由高度：下方最近段的 y，或页底。
+    fn height_below(&self, seg: SkySegment) -> u64 {
+        let next_y = self.segments.iter().filter(|o| o.y > seg.y).map(|o| o.y).min().unwrap_or(self.page_size);
+        (next_y - seg.y) as u64
     }
 }
 
@@ -171,6 +197,10 @@ struct AtlasEntry {
     lifetime: u32,
     /// `None` = 常驻精灵，不受 lifetime 踢出影响。
     source: Option<SourceData>,
+    /// 真实分配块左上角（含 padding + clamp 边距），compact 重建用。
+    alloc_tl: (u32, u32),
+    /// 真实分配块尺寸（含 padding + clamp 边距）。
+    alloc_wh: (u32, u32),
 }
 
 pub struct DynamicAtlas<const PAGE_SIZE: u32 = DEFAULT_PAGE_SIZE> {
@@ -292,7 +322,16 @@ impl<const N: u32> DynamicAtlas<N> {
             tl_px: (x + margin_offs.0, y + margin_offs.1),
             wh_px: (w, h), origin_px, page_uid: page.texture.uid,
         };
-        self.entries.insert(name.to_string(), AtlasEntry { region, lifetime: self.config.lifetime, source: None });
+        // 真实分配块（含 padding + clamp 边距），compact_inner 用它重建
+        let alloc_tl = (x - padding, y - padding);
+        let alloc_wh = (alloc_w + padding * 2, alloc_h + padding * 2);
+        self.entries.insert(name.to_string(), AtlasEntry {
+            region,
+            lifetime: self.config.lifetime,
+            source: None,
+            alloc_tl,
+            alloc_wh,
+        });
         Some(region)
     }
 
@@ -367,8 +406,9 @@ impl<const N: u32> DynamicAtlas<N> {
     fn compact_inner(&mut self) {
         for page in &mut self.pages {
             let occupied: Vec<_> = self.entries.values().filter(|e| e.region.page_uid == page.texture.uid)
-                .map(|e| (e.region.tl_px.0, e.region.tl_px.1, e.region.wh_px.0, e.region.wh_px.1)).collect();
-            page.skyline = Skyline::from_occupied(N, &occupied, self.config.padding);
+                .map(|e| (e.alloc_tl.0, e.alloc_tl.1, e.alloc_wh.0, e.alloc_wh.1)).collect();
+            // occupied 已是含 padding + clamp 的原始块，不再叠加 padding（避免重复计入）
+            page.skyline = Skyline::from_occupied(N, &occupied, 0);
         }
         self.dirty = false;
     }
@@ -376,6 +416,27 @@ impl<const N: u32> DynamicAtlas<N> {
     pub fn page_count(&self) -> usize { self.pages.len() }
 
     pub fn page_size(&self) -> u32 { N }
+
+    // ── 碎片监控 ──
+
+    /// 总空闲面积（所有页，像素²）。
+    pub fn total_free(&self) -> u64 {
+        self.pages.iter().map(|p| p.skyline.free_area()).sum()
+    }
+
+    /// 最大连续空闲矩形面积（所有页，像素²）。
+    pub fn largest_free(&self) -> u64 {
+        self.pages.iter().map(|p| p.skyline.largest_free_area()).max().unwrap_or(0)
+    }
+
+    /// 碎片率：`1 - largest_free / total_free`。0 = 完美紧凑，1 = 完全碎片化。
+    pub fn fragmentation(&self) -> f32 {
+        let total = self.total_free();
+        if total == 0 { return 0.0; }
+        let largest = self.largest_free();
+        if largest == 0 { return 1.0; }
+        1.0 - (largest as f32) / (total as f32)
+    }
 
     // ── 便捷方法 ──
 
