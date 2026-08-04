@@ -116,7 +116,7 @@ impl Text {
             let line_y = run.line_y;
             for glyph in run.glyphs {
                 let font_id = self.family_id_for_glyph(glyph.glyph_id);
-                let key = GlyphKey { font_id, glyph_id: glyph.glyph_id, px_size: (glyph.font_size * 16.0) as u16 };
+                let key = GlyphKey { font_id, glyph_id: glyph.glyph_id, px_size: glyph.font_size as u16 };
                 let region = self.get_or_render_glyph(&key);
                 if let Some(region) = region {
                     let physical = glyph.physical((0.0, 0.0), 1.0);
@@ -149,13 +149,52 @@ impl Text {
         if self.glyph_cache.get(key).is_some() { return self.glyph_cache.get(key); }
         let font_data = self.fonts.get(&key.font_id)?;
         let font_ref = font_data.font_ref()?;
-        let metrics = font_ref.metrics(&[]);
-        let scale = key.px_size as f32 / metrics.units_per_em.max(1) as f32;
-        let w = (key.px_size as f32 * 0.8 * scale).ceil() as u32;
-        let h = (key.px_size as f32 * 1.2 * scale).ceil() as u32;
+        let px = key.px_size as f32;
+        // swash 0.2.9 正确渲染 API
+        use swash::scale::*;
+        use swash::zeno::{Format, Vector};
+        let glyph_id = swash::GlyphId::from(key.glyph_id);
+        let mut ctx = ScaleContext::new();
+        let mut scaler = ctx.builder(font_ref).size(px).hint(true).build();
+        let image = Render::new(&[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(StrikeWith::BestFit),
+            Source::Outline,
+        ])
+        .format(Format::Alpha)
+        .offset(Vector::new(0.0, 0.0))
+        .render(&mut scaler, glyph_id)?;
+        let w = image.placement.width as u32;
+        let h = image.placement.height as u32;
         if w == 0 || h == 0 { return None; }
         let mut rgba = vec![0u8; (w * h * 4) as usize];
-        for y in 0..h { for x in 0..w { let idx = ((y * w + x) * 4) as usize; rgba[idx..idx + 4].copy_from_slice(&[255,255,255,255]); } }
+        match image.content {
+            image::Content::Color => {
+                for row in 0..h as usize {
+                    for col in 0..w as usize {
+                        let src = (row * w as usize + col) * 4;
+                        let dst = src;
+                        rgba[dst..dst + 4].copy_from_slice(&image.data[src..src + 4]);
+                    }
+                }
+            }
+            image::Content::Mask => {
+                for row in 0..h as usize {
+                    for col in 0..w as usize {
+                        let src = row * w as usize + col;
+                        let dst = (row * w as usize + col) * 4;
+                        if src < image.data.len() {
+                            let a = image.data[src];
+                            rgba[dst] = 255;
+                            rgba[dst + 1] = 255;
+                            rgba[dst + 2] = 255;
+                            rgba[dst + 3] = a;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
         self.glyph_cache.insert(key.clone(), &rgba, w, h, (0, 0), false);
         self.glyph_cache.get(key)
     }
