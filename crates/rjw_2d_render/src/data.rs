@@ -21,8 +21,18 @@ pub struct SpriteRect {
 impl SpriteRect {
     /// 手动指定（UV 为 `[0,1]` 归一化坐标）
     #[inline]
-    pub const fn new(mesh_tl: glam::Vec2, mesh_wh: glam::Vec2, uv_tl: glam::Vec2, uv_wh: glam::Vec2) -> Self {
-        Self { mesh_tl, mesh_wh, uv_tl, uv_wh }
+    pub const fn new(
+        mesh_tl: glam::Vec2,
+        mesh_wh: glam::Vec2,
+        uv_tl: glam::Vec2,
+        uv_wh: glam::Vec2,
+    ) -> Self {
+        Self {
+            mesh_tl,
+            mesh_wh,
+            uv_tl,
+            uv_wh,
+        }
     }
 
     /// 整张纹理平铺
@@ -65,10 +75,26 @@ pub struct VertexP3U2C4 {
 
 /// 单位四边形顶点（x: 0→1, y: 0→1），用于实例化渲染
 pub const QUAD_VERTS: [VertexP3U2C4; QUAD_VERT_COUNT] = [
-    VertexP3U2C4 { pos: [0.0, 0.0, 0.0], uv: [0.0, 0.0], color: [1.0; 4] },
-    VertexP3U2C4 { pos: [1.0, 0.0, 0.0], uv: [1.0, 0.0], color: [1.0; 4] },
-    VertexP3U2C4 { pos: [0.0, 1.0, 0.0], uv: [0.0, 1.0], color: [1.0; 4] },
-    VertexP3U2C4 { pos: [1.0, 1.0, 0.0], uv: [1.0, 1.0], color: [1.0; 4] },
+    VertexP3U2C4 {
+        pos: [0.0, 0.0, 0.0],
+        uv: [0.0, 0.0],
+        color: [1.0; 4],
+    },
+    VertexP3U2C4 {
+        pos: [1.0, 0.0, 0.0],
+        uv: [1.0, 0.0],
+        color: [1.0; 4],
+    },
+    VertexP3U2C4 {
+        pos: [0.0, 1.0, 0.0],
+        uv: [0.0, 1.0],
+        color: [1.0; 4],
+    },
+    VertexP3U2C4 {
+        pos: [1.0, 1.0, 0.0],
+        uv: [1.0, 1.0],
+        color: [1.0; 4],
+    },
 ];
 
 pub type Vertex = VertexP3U2C4;

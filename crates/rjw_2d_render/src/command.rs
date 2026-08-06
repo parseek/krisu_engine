@@ -28,6 +28,19 @@ pub(crate) enum DrawCommand {
         /// 该命令的三角形索引在 `MeshStorage.tri_indices` 中的范围（全局索引）
         tri_index: Range<usize>,
     },
+    /// 静态网格（注册表）：`mesh_id` → `MESHES` 中的 `Arc<MeshData>`，实例化合并绘制。
+    /// 顶点自带 UV，通过 `States.texture_uid` 采样纹理。
+    StaticMesh {
+        mesh_id: u64,
+        color: rjw_color::Color,
+        transform: Transform2D,
+    },
+    /// 高级静态网格：直接传入列主序模型矩阵（`mat_idx` 指向 `DrawCommandQueue.matrices`）。
+    StaticMeshMatrix {
+        mesh_id: u64,
+        color: rjw_color::Color,
+        mat_idx: usize,
+    },
     /// 外部绘制调用标记（不含数据，实际闭包由 `Render2D::buf_custom_draws` 管理）。
     Custom,
 }
@@ -116,7 +129,9 @@ impl DrawCommandQueue {
             return;
         }
         self.cmd_indicies.sort_by(|&a, &b| {
-            self.layers[a].cmp(&self.layers[b]).then(self.states[a].cmp(&self.states[b]))
+            self.layers[a]
+                .cmp(&self.layers[b])
+                .then(self.states[a].cmp(&self.states[b]))
         });
         self.dirty = false;
     }

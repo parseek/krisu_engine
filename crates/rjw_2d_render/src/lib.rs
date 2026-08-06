@@ -30,14 +30,19 @@ pub mod rstates;
 pub use command::Layer;
 pub use data::{Index, MeshSink, SpriteRect, TriIndicies, Vertex, VertexP3U2C4};
 pub use draw_page::MAX_INSTANCES_PER_DRAW;
-pub use render2d::{ClearConfig, CustomBuilder, CustomDraw, MeshBuilder, Render2D, Sprite2DBuilder};
+pub use render2d::{
+    ClearConfig, CustomBuilder, CustomDraw, MeshBuilder, Render2D, Sprite2DBuilder,
+    StaticMeshBuilder,
+};
 pub use rstates::{
     AddressMode, BlendDesc, BlendMode, CompareFunc, CullMode, DepthState, FilterMode,
     FrontFaceWinding, PolygonMode, RStates, RasterState, SamplerDesc, StencilState,
 };
 
-// 纹理类型重导出（兼容旧路径 `rjw_2d_render::TextureWrapped` 等）。
-pub use rjw_render::{ArcTextureWrapped, TextureWrapped};
+// 纹理 / 网格 / 注册表类型重导出（兼容旧路径并暴露静态网格 API）。
+pub use rjw_render::{
+    ArcTextureWrapped, HasUid, MeshData, MESHES, TextureWrapped, TypedRegistry,
+};
 
 // ─── 单元测试 ─────────────────────────────────────────────────
 
@@ -65,7 +70,11 @@ mod mesh_sink_tests {
         let a = sink.push_vertex(glam::Vec2::new(0.0, 0.0));
         let b = sink.push_vertex(glam::Vec2::new(1.0, 0.0));
         let c = sink.push_vertex(glam::Vec2::new(0.0, 1.0));
-        assert_eq!([a, b, c], [0, 1, 2], "push_vertex should return local indices");
+        assert_eq!(
+            [a, b, c],
+            [0, 1, 2],
+            "push_vertex should return local indices"
+        );
 
         sink.push_tri(0, 1, 2);
         drop(sink);
@@ -73,9 +82,9 @@ mod mesh_sink_tests {
         // 全局索引应 +4。
         assert_eq!(storage.tri_indices.len(), 1);
         let tri = storage.tri_indices[0];
-        assert_eq!(tri.0 .0, 4);
-        assert_eq!(tri.1 .0, 5);
-        assert_eq!(tri.2 .0, 6);
+        assert_eq!(tri.0.0, 4);
+        assert_eq!(tri.1.0, 5);
+        assert_eq!(tri.2.0, 6);
 
         // 顶点颜色取录制颜色。
         assert_eq!(storage.vertices[4].color, [1.0, 0.0, 0.0, 1.0]);
@@ -87,7 +96,7 @@ mod mesh_sink_tests {
 mod matrix_tests {
     use super::*;
     use rjw_color::Color;
-    use rjw_transform::{Transform2D, Camera2D};
+    use rjw_transform::{Camera2D, Transform2D};
 
     const W: f32 = 1280.0;
     const H: f32 = 720.0;
@@ -111,7 +120,12 @@ mod matrix_tests {
     }
 
     /// 复刻 shader vs_main：mesh_pos = mesh_tl + pos.xy * mesh_wh；clip = vp * model * vec4(mesh_pos, 0, 1)。
-    fn mesh_ndc(vp: glam::Mat4, model: glam::Mat4, rect: &SpriteRect, local: glam::Vec2) -> glam::Vec2 {
+    fn mesh_ndc(
+        vp: glam::Mat4,
+        model: glam::Mat4,
+        rect: &SpriteRect,
+        local: glam::Vec2,
+    ) -> glam::Vec2 {
         let mesh_pos = rect.mesh_tl + local * rect.mesh_wh;
         let clip = vp * model * glam::Vec4::new(mesh_pos.x, mesh_pos.y, 0.0, 1.0);
         glam::Vec2::new(clip.x / clip.w, clip.y / clip.w)
@@ -124,7 +138,10 @@ mod matrix_tests {
         let model = model_matrix(&Transform2D::default());
         let rect = SpriteRect::from_texture(glam::Vec2::splat(-50.0), glam::Vec2::splat(100.0));
         let ndc = mesh_ndc(vp, model, &rect, glam::Vec2::new(0.5, 0.5));
-        assert!((ndc - glam::Vec2::ZERO).length() < EPS, "center mesh should map to NDC center, got {ndc:?}");
+        assert!(
+            (ndc - glam::Vec2::ZERO).length() < EPS,
+            "center mesh should map to NDC center, got {ndc:?}"
+        );
     }
 
     #[test]
@@ -133,8 +150,16 @@ mod matrix_tests {
         let vp = camera().vp_matrix();
         let clip_bottom = vp * glam::Vec4::new(0.0, H * 0.5, 0.0, 1.0);
         let clip_top = vp * glam::Vec4::new(0.0, -H * 0.5, 0.0, 1.0);
-        assert!(((clip_bottom.y / clip_bottom.w) + 1.0).abs() < EPS, "bottom(+y) should be NDC -1, got {}", clip_bottom.y / clip_bottom.w);
-        assert!(((clip_top.y / clip_top.w) - 1.0).abs() < EPS, "top(-y) should be NDC +1, got {}", clip_top.y / clip_top.w);
+        assert!(
+            ((clip_bottom.y / clip_bottom.w) + 1.0).abs() < EPS,
+            "bottom(+y) should be NDC -1, got {}",
+            clip_bottom.y / clip_bottom.w
+        );
+        assert!(
+            ((clip_top.y / clip_top.w) - 1.0).abs() < EPS,
+            "top(-y) should be NDC +1, got {}",
+            clip_top.y / clip_top.w
+        );
     }
 
     #[test]
@@ -144,8 +169,16 @@ mod matrix_tests {
         let model = model_matrix(&Transform2D::default().with_pos(glam::Vec2::new(100.0, 80.0)));
         let rect = SpriteRect::from_texture(glam::Vec2::splat(-10.0), glam::Vec2::splat(20.0));
         let ndc = mesh_ndc(vp, model, &rect, glam::Vec2::new(0.5, 0.5));
-        assert!(ndc.x > 0.0, "translated +x should be NDC x>0, got {}", ndc.x);
-        assert!(ndc.y < 0.0, "world +y (down) should be NDC y<0, got {}", ndc.y);
+        assert!(
+            ndc.x > 0.0,
+            "translated +x should be NDC x>0, got {}",
+            ndc.x
+        );
+        assert!(
+            ndc.y < 0.0,
+            "world +y (down) should be NDC y<0, got {}",
+            ndc.y
+        );
     }
 
     #[test]
@@ -155,7 +188,10 @@ mod matrix_tests {
         let model = model_matrix(&Transform2D::default().with_rot(std::f32::consts::PI / 2.0));
         let rect = SpriteRect::from_texture(glam::Vec2::splat(-50.0), glam::Vec2::splat(100.0));
         let ndc_center = mesh_ndc(vp, model, &rect, glam::Vec2::new(0.5, 0.5));
-        assert!((ndc_center - glam::Vec2::ZERO).length() < EPS, "center should stay at NDC center after rotation, got {ndc_center:?}");
+        assert!(
+            (ndc_center - glam::Vec2::ZERO).length() < EPS,
+            "center should stay at NDC center after rotation, got {ndc_center:?}"
+        );
     }
 
     #[test]
@@ -190,7 +226,11 @@ mod matrix_tests {
         assert!((clip0.y / clip0.w).abs() < EPS);
         // 世界 y=+200（下）→ NDC y<0
         let clip = vp * glam::Vec4::new(0.0, 200.0, 0.0, 1.0);
-        assert!((clip.y / clip.w) < 0.0, "world +y should map to NDC y<0 (down), got {}", clip.y / clip.w);
+        assert!(
+            (clip.y / clip.w) < 0.0,
+            "world +y should map to NDC y<0 (down), got {}",
+            clip.y / clip.w
+        );
     }
 
     #[test]
@@ -198,6 +238,9 @@ mod matrix_tests {
         // 与 Camera2D::screen_to_world 交叉验证：世界原点 → 屏幕中心
         let c = camera();
         let center_px = c.world_to_screen(glam::Vec2::ZERO);
-        assert!((center_px - glam::Vec2::new(W * 0.5, H * 0.5)).length() < EPS, "world origin should map to screen center, got {center_px:?}");
+        assert!(
+            (center_px - glam::Vec2::new(W * 0.5, H * 0.5)).length() < EPS,
+            "world origin should map to screen center, got {center_px:?}"
+        );
     }
 }

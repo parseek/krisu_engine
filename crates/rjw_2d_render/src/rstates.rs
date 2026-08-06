@@ -146,10 +146,12 @@ impl RStates {
 
     // ─── Sampler 域 (bits 8..24) ───
 
+    #[inline]
     fn samp_field(self, shift: u32, mask: u64) -> u32 {
         ((self.0 >> shift) & mask) as u32
     }
 
+    #[inline]
     fn set_samp_field(mut self, shift: u32, mask: u64, val: u32) -> Self {
         self.0 = (self.0 & !(mask << shift)) | (((val as u64) & mask) << shift);
         self
@@ -167,6 +169,22 @@ impl RStates {
     pub fn samp_mip(self, f: FilterMode) -> Self {
         self.set_samp_field(12, 0x3, f.to_u32())
     }
+
+    #[inline]
+    pub fn samp_filter(self, mag: FilterMode, min: FilterMode, mip: FilterMode) -> Self {
+        self.samp_mag(mag).samp_min(min).samp_mip(mip)
+    }
+
+    #[inline]
+    pub fn samp_filter_all(self, f: FilterMode) -> Self {
+        self.samp_mag(f).samp_min(f).samp_mip(f)
+    }
+
+    #[inline]
+    pub fn samp_min_mag(self, f: FilterMode) -> Self {
+        self.samp_mag(f).samp_min(f)
+    }
+
     #[inline]
     pub fn samp_addr_u(self, a: AddressMode) -> Self {
         self.set_samp_field(14, 0x3, a.to_u32())
@@ -179,13 +197,28 @@ impl RStates {
     pub fn samp_addr_w(self, a: AddressMode) -> Self {
         self.set_samp_field(18, 0x3, a.to_u32())
     }
+    
+    #[inline]
+    pub fn samp_addr_all(self, a: AddressMode) -> Self {
+        self.samp_addr_u(a).samp_addr_v(a).samp_addr_w(a)
+    }
 
+    #[inline]
+    pub fn samp_addr(self, u: AddressMode, v: AddressMode, w: AddressMode) -> Self {
+        self.samp_addr_u(u).samp_addr_v(v).samp_addr_w(w)
+    }
+
+    #[inline]
     pub fn samp_state(mut self, d: SamplerDesc) -> Self {
         self = self.samp_mag(d.mag).samp_min(d.min).samp_mip(d.mip);
-        self = self.samp_addr_u(d.addr_u).samp_addr_v(d.addr_v).samp_addr_w(d.addr_w);
+        self = self
+            .samp_addr_u(d.addr_u)
+            .samp_addr_v(d.addr_v)
+            .samp_addr_w(d.addr_w);
         self
     }
 
+    #[inline]
     pub fn to_sampler_desc(self) -> wgpu::SamplerDescriptor<'static> {
         let mag = FilterMode::from_u32(self.samp_field(8, 0x3));
         let min = FilterMode::from_u32(self.samp_field(10, 0x3));
@@ -235,6 +268,7 @@ impl RStates {
         self
     }
 
+    #[inline]
     pub fn raster_state(mut self, s: RasterState) -> Self {
         self = self
             .cull(s.cull)
@@ -244,6 +278,7 @@ impl RStates {
         self
     }
 
+    #[inline]
     pub fn to_cull(self) -> Option<wgpu::Face> {
         if self.0 & 2 != 0 {
             // Back
@@ -256,10 +291,12 @@ impl RStates {
         }
     }
 
+    #[inline]
     pub fn to_polygon(self) -> wgpu::PolygonMode {
         PolygonMode::from_u32(((self.0 >> 26) & 0x3) as u32).to_wgpu()
     }
 
+    #[inline]
     pub fn to_front_face(self) -> wgpu::FrontFace {
         if (self.0 >> 28) & 1 != 0 {
             wgpu::FrontFace::Cw
@@ -268,6 +305,7 @@ impl RStates {
         }
     }
 
+    #[inline]
     pub fn to_conservative(self) -> bool {
         (self.0 >> 29) & 1 != 0
     }

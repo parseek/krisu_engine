@@ -35,8 +35,8 @@
 ```
 crates/
 ├─ rjw_main        # 入口：run_app(App) + 事件循环 + 窗口 + MainContext(键盘/鼠标/计时)
-├─ rjw_render      # 底层渲染上下文：RenderContext / 纹理 TextureWrapped / wgpu 重导出
-├─ rjw_2d_render   # ★ 2D 批渲染器：Render2D / SpriteRect / Mesh / RStates / 分页实例缓冲 / 统一管线
+├─ rjw_render      # 底层渲染上下文：RenderContext / 纹理 TextureWrapped / 静态网格 MeshData / 泛型注册表 TypedRegistry / wgpu 重导出
+├─ rjw_2d_render   # ★ 2D 批渲染器：Render2D / SpriteRect / Mesh / StaticMesh / RStates / 分页实例缓冲 / 统一管线
 ├─ rjw_atlas       # ★ 运行时图集：DynamicAtlas（Skyline + 寿命 + clamp_margin）+ StaticAtlas（TOML）
 ├─ rjw_transform   # Transform2D + Camera2D（正交相机、VP 矩阵、坐标转换）
 ├─ rjw_color       # Color(f32) / ColorF64(f64) + 常用常量（RED/GREEN/...）
@@ -48,7 +48,7 @@ crates/
 examples/
 ├─ eg260729        # 最小清屏示例（手动 RenderPass）
 ├─ eg260731        # Render2D 精灵/多边形/mesh 能力演示
-└─ eg260731RPG     # ★ 综合 RPG：y-sort、波次系统、相机跟踪、程序化纹理
+└─ eg260731RPG     # ★ 综合 RPG：y-sort、波次系统、相机跟踪、程序化纹理、静态地形（石头/花经 StaticMesh 合批）
 ```
 
 **最核心概念一条线**：
@@ -197,21 +197,24 @@ self.cam.position += (player.pos - self.cam.position) * (1.0 - (-20.0 * dt).exp(
 
 ### 4.1 统一管线架构
 
-Sprite 与 Mesh **共用同一 `vs_main` 入口 + slot0(顶点)/slot1(实例) 布局**。
+Sprite、StaticMesh 与动态 Mesh **共用同一 `vs_main` 入口 + slot0(顶点)/slot1(实例) 布局**。
 
-- **Sprite**：slot1 绑定实例页缓冲 → `draw_indexed(quad_indices, 0, N_instances)`
-- **Mesh**：slot1 绑定"身份实例缓冲"（mesh_tl=0, mesh_wh=1, model=I）→ `draw_indexed(mesh_indices, 0, 1)` —— 等效于非实例化直通 VP
+- **Sprite**：顶点用注册的四边形网格（`quad_mesh_id`），slot1 绑实例页缓冲 → `draw_indexed(quad_indices, 0, N_instances)`
+- **StaticMesh**：顶点用 `MESHES` 注册表中用户网格，slot1 绑实例页缓冲 → `draw_indexed(mesh_indices, 0, N_instances)` —— 同 mesh_id 的实例自动合批
+- **动态 Mesh（add_mesh / add_polygon_*）**：顶点每帧上传 `draw_page.mesh_vb/mesh_ib`，slot1 绑 identity 实例（`mesh_tl=0, mesh_wh=1, mesh_pos = pos 直通`）→ `draw_indexed(段索引范围, 0, 1)`
 
-渲染状态（Blend / DepthStencil / Cull / Polygon / FrontFace / Conservative）全部**按 RStates 从管线缓存中自动获取或创建**，无需手动管理管线。
+渲染状态（Blend / DepthStencil / Cull / Polygon / FrontFace / Conservative / **Sampler**）全部**按 RStates 从管线缓存中自动获取或创建**，无需手动管理管线。
+**采样器由 RStates 位域（bits 8..24）驱动**：`.samp_mag(Nearest)` / `.samp_addr_u(Repeat)` 会真正创建对应 GPU 采样器（`Render2D` 内部缓存）；bind group 由 `Render2D` 按 `(tex_uid, samp_key)` 缓存。
 
-### 4.2 两种绘制类别
+### 4.2 绘制类别
 
 | 类别 | 方法 | Builder | 说明 |
 |---|---|---|---|
 | **Sprite（贴纹理）** | `add_sprite2d(rect,color,transform,layer,&tex)` | `Sprite2DBuilder` | 同纹理+同 RStates 合批 |
 | **Sprite（纯色）** | `add_sprite2d_solid(rect,color,transform,layer)` | `Sprite2DBuilder` | 内部用 1×1 白纹理 |
-| **Mesh** | `add_mesh(verts, tris, color, layer)` | `MeshBuilder` | 世界坐标顶点直通 VP |
+| **Mesh（动态）** | `add_mesh(verts, tris, color, layer)` | `MeshBuilder` | 世界坐标顶点直通 VP，每帧上传 |
 | **Mesh（便捷）** | `add_polygon_fan` / `add_polygon_strip` / `add_mesh_fn*` | `MeshBuilder` | 画圆、线、任意网格 |
+| **StaticMesh** | `add_static_mesh(mesh_id,color,transform,layer,&tex)` | `StaticMeshBuilder` | 注册表网格 + 实例化合批（GPU 顶点常驻） |
 
 ### 4.3 `SpriteRect`（位置/大小/UV）
 
@@ -284,6 +287,18 @@ r2d.add_custom(96.0, Wireframe { mdl });
 | 特殊混合/着色、调试线框、后处理 | `add_custom` 注入原生 wgpu |
 | 完全独立于 `Render2D` 的渲染 | 用 `begin_frame()` / `flush()` + 自建 pass，或直接在事件循环自建 encoder |
 
+### 4.6 静态网格 StaticMesh（GPU 顶点常驻 + 实例化合批）
+
+当一批元素**位置/纹理/层级固定、不参与实体 y-sort** 时（地图装饰如石头、花、栅栏…），应使用 `register_mesh` + `add_static_mesh*` 静态化：
+
+- **`MeshData`**（`rjw_render`）在 GPU 上持有顶点/索引缓冲，`register_mesh` 注册进全局 `MESHES`，返回 `mesh_id`。
+- **`add_static_mesh(mesh_id, color, transform, layer, &tex)`** 每帧只提交一个轻量实例（变换 + 颜色）；同 `mesh_id` + 同 RStates + 同纹理的实例自动合批为极少数 `draw_indexed`。
+- **共享网格模式**：为"圆形"等常见图形只建一个**单位网格**（半径为 1），实例变换用 `Translate(pos) * Scale(r)`——整张地图几百个圆共享同一顶点缓冲，DrawCall 从"每圆一次动态提交"降到每层 1 次。
+- **⚠️ 哪些元素不能静态化**：会**插入实体绘制顺序**的元素（如 RPG 中 `y_layer(foot_y)` 的树）必须保持动态路径（Sprite / `add_mesh*`），否则遮挡关系错误。固定 `LAYER_TERRAIN` 之类层级的元素才安全。
+- **地图重开重建**：静态地形列表随地图生成一次、缓存在 App 层；地图重开（如 R）时按版本号重建（参考 `eg260731RPG` 的 `map_rev` + `StaticTerrain` 模式）。
+
+示例见 [`API_REFERENCE.md`](API_REFERENCE.md#542-静态网格-staticmesh) §5.4.2。
+
 ---
 
 ## 5. Layer 语义与 y-sort 惯用法
@@ -317,9 +332,13 @@ render2d.add_sprite2d(rect, color, tf, y_layer(entity.foot_y), &tex);
 ## 6. 纹理与合批
 
 - 创建：`render2d.create_texture(label, &rgba8_data, w, h)`（RGBA8，`len == w*h*4` 否则 panic）。
-- 合批：**同一纹理 + 同一 RStates 的连续 Sprite 自动合批**。
-- 纹理池：`Render2D.textures` 持有 `Arc`，防止释放。
-- 1×1 白色纹理：纯色 Sprite 使用 `white_texture`。
+- 合批：**同一纹理 + 同一 RStates 的连续绘制自动合批**（含 Sprite 与 StaticMesh）。
+- 采样器**与纹理解耦**：`TextureWrapped` 只持有纹理本身（texture/view/uid），不再持有 sampler / bind group。
+  - 采样器完全由 `RStates` 位域（bits 8..24）驱动——`.samp_mag(Nearest)` / `.samp_addr_u(Repeat)` 等链式方法**真实生效**。
+  - `Render2D` 内部按需创建并缓存 `wgpu::Sampler`（默认线性 + ClampToEdge 走零开销快路径）。
+  - bind group 由 `Render2D` 按 `(tex_uid, samp_key)` 缓存，value 持有 `Arc<Texture>` 防悬挂；`prepare` 末尾自动剔除 `TEXTURES.remove` 掉的失效条目。
+- 全局注册表 `TEXTURES`（`TypedRegistry<TextureWrapped>`）：支持 `register`/`register_named`/`get`/`remove`/`remove_name_mapping`/`rename`/`contains_uid`/`contains_name`。
+- 1×1 白色纹理：纯色 Sprite/StaticMesh 使用 `white_texture`。
 
 ---
 
@@ -339,7 +358,7 @@ render2d.add_sprite2d(rect, color, tf, y_layer(entity.foot_y), &tex);
 
 | 类型 | 说明 |
 |---|---|
-| `DynamicAtlas<const N: u32>` | 主结构体，泛型 `N` 为单页像素尺寸，默认 2048 |
+| `DynamicAtlas<K = String>` | 主结构体，泛型 `K` 为精灵键类型（String 特化提供 TOML 导入导出） |
 | `AtlasConfig` | 配置：`max_pages`（最大页数）、`padding`（精灵间距）、`lifetime`（帧寿命） |
 | `AtlasRegion` | 图集区域描述：`tl_px`（像素左上角）、`wh_px`（尺寸）、`origin_px`（原点偏移）、`page_uid`（所在页纹理 uid） |
 
@@ -358,6 +377,7 @@ let mut atlas = DynamicAtlas::new(
         lifetime: 200,     // 200 帧未 get() 即视为不再需要
         ..Default::default()
     },
+    2048,                  // 单页像素尺寸
 );
 ```
 
@@ -772,9 +792,10 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 - `Render2D` 内部 `buf_*` 全部常驻复用（`clear()` 只清长度不释放）。
 - **实例缓冲是"页池"**：单帧总实例数可远超 8192，自动分页；**不要自己裁减数量去凑**。
 - **统一管线缓存**：`DrawPage` 按 `RStates::raw()` keys 缓存 `RenderPipeline`，首次遇新状态时创建、后续帧直接命中。HashMap 常驻，Query 事件循环保持不变。
-- **builder 不产生堆分配**：`Sprite2DBuilder` / `MeshBuilder` 均为栈上 struct，Drop 时直接转移到 `DrawCommandQueue` 的 Vec。
+- **builder 不产生堆分配**：`Sprite2DBuilder` / `MeshBuilder` / `StaticMeshBuilder` 均为栈上 struct，Drop 时直接转移到 `DrawCommandQueue` 的 Vec。
 - 页池按需一次性增长、永久复用。
 - Mesh 顶点走 u16 索引，单帧顶点数 ≤ 65535。
+- **静态网格合批**：固定层、不参与 y-sort 的地图元素用 `register_mesh` + `add_static_mesh*` 静态化；同 mesh_id 的实例自动合并为极少数 DrawCall。常见图形（如圆）用**一个单位网格 + 实例缩放**共享顶点，避免每实例一份缓冲。
 
 ---
 
@@ -789,12 +810,14 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 5. **Layer 数值小先画**；RPG 里实体/地形用 y-sort 动态 layer，UI 用 ≥1e7 固定层。
 6. **RStates resolve**：`prepare()` 中 `States.rstates: None` → `default_rstates`；`Some(r)` → 直接用 `r.raw()`。
 7. **Builder 是责任链，Drop 自动 push**：`add_*` 返回 builder，不链式调用也自动 push（`rstates: None`）。不要手动 push。
-8. **统一管线**：不再有 `sprite_pipeline` / `mesh_pipeline` 分支。所有绘制走 `get_or_create_pipeline(rst_raw)`，Mesh 绑定 identity instance buffer。
+8. **统一管线**：不再有 `sprite_pipeline` / `mesh_pipeline` 分支。所有绘制走 `get_or_create_pipeline(rst_raw)`，Sprite/StaticMesh 绑实例页、动态 Mesh 绑 identity instance buffer。
 9. **管线缓存 key = RStates::raw()**：u64 哈希，同一个 raw 值只创建一次管线。
-10. 改 `rstates.rs` 的 bitfield 布局时务必更新 `to_blend()` / `to_depth_stencil()` / `to_cull()` 等解包方法。
-11. 纹理数据长度必须 `w*h*4`。
-12. 改公共 crate 后，务必 `cargo check --workspace`。
-13. **建议**：进行**破坏性更改**、**特性添加**等操作时，请务必更新 [`API_REFERENCE.md`](API_REFERENCE.md) 和 [`ENGINE_GUIDE.md`](ENGINE_GUIDE.md)。
+10. **采样器由 RStates 位域驱动**：`.samp_*` 链式方法真实创建 GPU 采样器；`TextureWrapped` **不再持有** sampler / bind group（bind group 由 `Render2D` 缓存）。
+11. **静态网格**：`MeshData` 注册进 `MESHES` 后经 `add_static_mesh*` 实例化；固定层、不参与 y-sort 的元素才静态化，**会插入实体排序的（如 y_layer 树）保持动态**；地图重开时按版本号重建静态地形缓存。
+12. 改 `rstates.rs` 的 bitfield 布局时务必更新 `to_blend()` / `to_depth_stencil()` / `to_cull()` / `to_sampler_desc()` 等解包方法。
+13. 纹理数据长度必须 `w*h*4`。
+14. 改公共 crate 后，务必 `cargo check --workspace`。
+15. **建议**：进行**破坏性更改**、**特性添加**等操作时，请务必更新 [`API_REFERENCE.md`](API_REFERENCE.md) 和 [`ENGINE_GUIDE.md`](ENGINE_GUIDE.md)。
 
 ---
 
@@ -827,6 +850,10 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 | Atlas 自动复活查找 | `atlas.get_or_revive(name)` |
 | Atlas 从 TOML 批量导入 | `atlas.load_toml(toml_str, \|k\| data.get(k).cloned())` |
 | Atlas 导出 TOML | `atlas.export_toml()` |
+| 注册静态网格 | `let id = render2d.register_mesh(Arc::new(MeshData::from_pod(device, &verts, &idx, "m")));` |
+| 静态网格实例（Transform2D） | `render2d.add_static_mesh(id, color, tf, layer, &tex).done()` |
+| 静态网格实例（Mat4） | `render2d.add_static_mesh_matrix(id, color, model, layer, &tex).done()` |
+| 纯色圆共享单位网格 | 单位圆网格 + `with_pos(pos).with_scale(Vec2::splat(r))` 实例化 |
 
 ---
 

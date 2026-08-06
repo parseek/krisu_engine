@@ -17,6 +17,7 @@
 - [3. Camera2D（相机）](#3-camera2d相机)
 - [4. SpriteRect（精灵矩形）](#4-spriterect精灵矩形)
 - [5. Render2D（2D 批渲染器）](#5-render2d2d-批渲染器)
+  - [5.4.2 静态网格 StaticMesh](#542-静态网格-staticmesh)
 - [6. RStates 渲染状态与 Builder 责任链](#6-rstates-渲染状态与-builder-责任链)
 - [7. ClearConfig（清屏配置）](#7-clearconfig清屏配置)
 - [8. DynamicAtlas（纹理图集）](#8-dynamicatlas纹理图集)
@@ -189,6 +190,7 @@ crate：`rjw_2d_render`
 | `new` | `Render2D::new(&render_ctx)` | 基于 `RenderContext` 创建 |
 | `set_mvp` | `r2d.set_mvp(cam.vp_matrix())` | 设置 VP（每帧渲染前调用） |
 | `create_texture` | `r2d.create_texture("label", &rgba8, w, h)` | 建纹理（RGBA8，`len==w*h*4` 否则 panic），返回 `ArcTextureWrapped` |
+| `register_mesh` | `r2d.register_mesh(Arc<MeshData>) -> u64` | 注册静态网格到全局 `MESHES` 注册表，返回可复用 `mesh_id` |
 | `white_texture()` | `r2d.white_texture()` | 1×1 白色默认纹理引用 |
 | `device()` / `queue()` | `r2d.device()` / `r2d.queue()` | 暴露底层 wgpu 给高级用法 |
 
@@ -298,6 +300,47 @@ r2d.add_custom(1.0, MyFx);
 - **适用场景**：引擎封装之外的管线（自定义 shader、线框调试、后处理、自定义顶点格式等）。
 - 若不链式调用 RStates，则 `CustomBuilder` 仍按 `default_rstates` 参与排序（resolve 后为整数值相加大致落在默认位置）。
 
+### 5.4.2 静态网格 StaticMesh
+
+| 函数 | 用法 | 说明 |
+|---|---|---|
+| `add_static_mesh` | `r2d.add_static_mesh(mesh_id, color, transform, layer, &tex)` | 静态网格实例（Transform2D 变换），返回 `StaticMeshBuilder` |
+| `add_static_mesh_matrix` | `r2d.add_static_mesh_matrix(mesh_id, color, model_mat4, layer, &tex)` | 静态网格实例（直接列主序 Mat4，跳过 Transform2D 推导） |
+
+`MeshData`（`rjw_render`）包装 GPU 顶点/索引缓冲：
+
+| 函数 | 说明 |
+|---|---|
+| `MeshData::from_buffers(vb, ib, index_count)` | 直接包装已创建缓冲（自动分配 uid） |
+| `MeshData::from_pod(device, &verts, &indices, label)` | 从 CPU 数据创建缓冲（`T: bytemuck::Pod`，索引 u16） |
+| `mesh.uid` | 全局唯一 id（`HasUid` trait） |
+
+```rust
+use std::sync::Arc;
+use rjw_2d_render::MeshData;
+
+// ① 建单位圆网格（半径为 1，后续实例 transform = Translate(pos) * Scale(r) 复用）
+let circle = Arc::new(MeshData::from_pod(render2d.device(), &verts, &idx, "circle"));
+let circle_id = render2d.register_mesh(circle);
+
+// ② 提交多个静态实例（同 mesh_id + 同 RStates + 同纹理 → 自动合批为极少数 DrawCall）
+let white = render2d.white_texture().clone();
+for inst in &instances {
+    let tf = Transform2D::default().with_pos(inst.pos).with_scale(Vec2::splat(inst.r));
+    render2d.add_static_mesh(circle_id, inst.color, tf, inst.layer, &white).done();
+}
+
+// 矩阵版（高级）
+render2d.add_static_mesh_matrix(circle_id, Color::WHITE, model, 96.0, &tex).done();
+```
+
+要点：
+
+- **`StaticMeshBuilder`**：与 `Sprite2DBuilder` / `MeshBuilder` 相同的 RStates 责任链（`.blend(...)` / `.samp_mag(...)` / `.depth_test(...)` 等），**没有** `.set_texture()`——纹理由 `add_static_mesh*` 参数直接传入；`.done()` 立即消费提交，或依赖 Drop 自动 push。
+- **顶点坐标**：`MeshData` 顶点即世界坐标（静态网格走实例化直通 VP），变换由实例 `model` 提供；顶点自带 UV，配合采样器直通（同 `IDENTITY_INSTANCE` 语义）正确贴图。
+- **合批条件**：`(mesh_id, rstates, tex_uid)` 相同且绘制序列连续 → 合并为同一次 `draw_indexed`。相同内容的网格请**复用同一个 `Arc<MeshData>`** 注册，否则 id 不同无法合批。
+- **适用场景**：固定遮挡层、不参与 y-sort 的地图元素（石头、花、栅栏…）应静态化；**会插入实体绘制顺序的元素（如 RPG 中 `y_layer(foot_y)` 的树）保持动态**，切勿加入静态网格。
+
 ### 5.5 提交
 
 | 函数 | 用法 | 说明 |
@@ -318,6 +361,13 @@ r2d.render(&ClearConfig {
 
 - 实例缓冲是**页池**：单帧精灵数量可超 `MAX_INSTANCES_PER_DRAW`(8192)
 - `prepare()` 自动分页、每页只写一次、`draw()` 逐页绑定/绘制
+
+### 5.7 纹理与采样器
+
+- `TextureWrapped`（`rjw_render`）**只持有纹理本身**（`texture` / `view` / `width` / `height` / `uid`），**不再持有 sampler / bind group**——两者与纹理解耦。
+- **采样器完全由 `RStates` 位域（bits 8..24）驱动**：`.samp_mag(Nearest)` / `.samp_addr_u(Repeat)` 等链式方法**真正生效**，`Render2D` 按需创建并缓存 `wgpu::Sampler`（默认线性 + ClampToEdge 有零开销快路径）。
+- **bind group 由 `Render2D` 缓存**：key = `(tex_uid, samp_key)`，value 持有 `Arc<Texture>` 防悬挂；`prepare` 末尾自动剔除 `TEXTURES.remove` 掉的失效条目（资源正确释放）。
+- 全局注册表 `TEXTURES` 支持 `register` / `register_named` / `get` / `remove` / `remove_name_mapping` / `rename` / `contains_uid` / `contains_name`（`TypedRegistry<TextureWrapped>`）。
 
 ---
 
@@ -342,7 +392,7 @@ crate：`rjw_2d_render`（`rstates` 模块）
 | Stencil | `stencil_test(bool)` / `stencil_write(bool)` / `stencil_compare(CompareFunc)` | Always/Never/... |
 | | `stencil_state(StencilState)` | 批量设置模板 |
 
-### 6.2 Builder 链方法（`Sprite2DBuilder` / `MeshBuilder` 通用）
+### 6.2 Builder 链方法（`Sprite2DBuilder` / `MeshBuilder` / `StaticMeshBuilder` 通用）
 
 | 分类 | 方法 |
 |---|---|
@@ -352,6 +402,10 @@ crate：`rjw_2d_render`（`rstates` 模块）
 | Depth | `.depth_test(b)` / `.depth_write(b)` / `.depth_compare(f)` / `.depth_state(s)` |
 | Stencil | `.stencil_test(b)` / `.stencil_write(b)` / `.stencil_compare(f)` / `.stencil_state(s)` |
 | **MeshBuilder only** | `.set_texture(&tex)` |
+| **StaticMeshBuilder only** | `.done()`（立即消费提交；亦可靠 Drop 自动 push） |
+
+> 💡 `StaticMeshBuilder` 的纹理由 `add_static_mesh*` 参数传入，因此**没有** `.set_texture()`。
+> 采样器相关方法（`.samp_*`）会真正创建对应 GPU 采样器（见 §5.7）。
 
 不链式调用 = `rstates: None` → `draw()` 阶段 resolve 为 `Render2D.default_rstates`。
 
@@ -372,6 +426,11 @@ crate：`rjw_2d_render`（`rstates` 模块）
 | `RasterState` | `{ cull: CullMode, polygon: PolygonMode, front_face: FrontFaceWinding, conservative: bool }` |
 | `DepthState` | `{ test: bool, write: bool, compare: CompareFunc }` |
 | `StencilState` | `{ test: bool, write: bool, compare: CompareFunc }` |
+| `MeshData` | 静态网格：`{ vertex_buffer, index_buffer, index_count, uid }`（`rjw_render`） |
+| `StaticMeshBuilder<'a>` | `add_static_mesh*` 返回（立即可 `.done()` 提交） |
+| `HasUid` | trait：`fn uid(&self) -> u64`（`rjw_render`） |
+| `TypedRegistry<T: HasUid>` | 泛型注册表：`register` / `register_named` / `get` / `get_ref` / `remove` / `remove_name_mapping` / `rename` / `contains_uid` / `contains_name` |
+| `MESHES` | 全局静态网格注册表（`TypedRegistry<MeshData>`，`rjw_render`） |
 
 ### 6.4 使用示例
 
@@ -432,13 +491,13 @@ crate：`rjw_atlas`
 ```rust
 pub struct AtlasConfig { pub max_pages: usize, pub padding: u32, pub lifetime: u32 }
 pub struct AtlasRegion { pub tl_px: (u32,u32), pub wh_px: (u32,u32), pub origin_px: (u32,u32), pub page_uid: u64 }
-pub struct DynamicAtlas<const PAGE_SIZE: u32 = 2048>
-pub struct StaticAtlas  // (serde feature only)
+pub struct DynamicAtlas<K = String>  // K 为精灵键类型，String 特化提供 TOML 导入导出
+pub struct StaticAtlas            // (serde feature only)
 ```
 
 | 方法 | 说明 |
 |---|---|
-| `DynamicAtlas::new(device, queue, layout, config)` | 创建空图集 |
+| `DynamicAtlas::new(device, queue, layout, config, page_size)` | 创建空图集（`page_size` 为单页像素尺寸，如 2048） |
 | `insert(name, rgba, w, h, origin_px, clamp_margin)` | 插入/替换精灵（完整参数） |
 | `insert_ex(name, rgba, w, h)` | ★ 最常用：origin=(0,0), clamp_margin=true，自动保存源数据 |
 | `insert_ex_origin(name, rgba, w, h, origin_px)` | 指定原点，clamp_margin=true |
@@ -503,6 +562,10 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 | `ArcTextureWrapped.uid` | `rjw_render` | 纹理唯一 ID |
 | `Sprite2DBuilder<'a>` | `rjw_2d_render` | add_sprite2d* 返回 |
 | `MeshBuilder<'a>` | `rjw_2d_render` | add_mesh / add_polygon_* 返回 |
+| `StaticMeshBuilder<'a>` | `rjw_2d_render` | add_static_mesh* 返回，`.done()` 立即提交 |
+| `MeshData` | `rjw_render` | 静态网格（GPU 顶点/索引 + uid） |
+| `HasUid` | `rjw_render` | 全局唯一 id trait |
+| `TypedRegistry<T>` | `rjw_render` | 泛型线程安全注册表（纹理/网格共用） |
 | `CustomDraw` | `rjw_2d_render` | 外部绘制 trait（闭包 blanket impl） |
 | `CustomBuilder<'a>` | `rjw_2d_render` | add_custom 返回，可链式 RStates |
 

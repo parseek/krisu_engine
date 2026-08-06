@@ -146,10 +146,18 @@ struct AtlasPage {
 }
 
 impl AtlasPage {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout, page_size: u32) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, _layout: &wgpu::BindGroupLayout, page_size: u32) -> Self {
         let size = (page_size * page_size * 4) as usize;
         let clear = vec![0u8; size];
-        let tex = Arc::new(TextureWrapped::from_rgba8(device, queue, layout, "atlas_page", &clear, page_size, page_size));
+        let label = if cfg!(debug_assertions) { 
+            static PAGE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let f = format!("DynamicAtlas page ID: {:0>4} {}x{}", PAGE_COUNTER.load(std::sync::atomic::Ordering::Relaxed), page_size, page_size);
+            PAGE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            f
+        } else { 
+            format!("DynamicAtlas page {}x{}", page_size, page_size) 
+        };
+        let tex = Arc::new(TextureWrapped::from_rgba8(device, queue, &label, &clear, page_size, page_size));
         TEXTURES.register(tex.clone());
         Self { texture: tex, skyline: Skyline::new(page_size) }
     }

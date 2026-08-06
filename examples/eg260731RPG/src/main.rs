@@ -9,9 +9,10 @@
 //! 展示的引擎能力：DynamicAtlas 图集 / Skyline 打包 / clamp_margin / 合批优化 / RStates 责任链。
 
 use std::f32::consts::{PI, TAU};
+use std::sync::Arc;
 
 use glam::Vec2;
-use rjw_2d_render::{BlendMode, ClearConfig, Layer, Render2D, SpriteRect};
+use rjw_2d_render::{BlendMode, ClearConfig, Layer, MeshData, Render2D, SpriteRect, VertexP3U2C4};
 use rjw_atlas::{AtlasConfig, AtlasRegion, DynamicAtlas};
 use rjw_color::Color;
 use rjw_main::*;
@@ -261,8 +262,12 @@ enum GameState {
     GameOver,
 }
 
+/// 地图重开版本号（R 重开 → `Game::new()` → +1，StaticTerrain 据此重建）。
+static MAP_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct Game {
     map: Map,
+    map_rev: u64,
     player: Player,
     enemies: Vec<Enemy>,
     particles: Vec<Particle>,
@@ -280,6 +285,7 @@ impl Game {
         let mut rng = Rng::new(0x1234_567);
         let mut game = Self {
             map,
+            map_rev: MAP_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             player: Player::new(center_of_map()),
             enemies: Vec::new(),
             particles: Vec::new(),
@@ -475,6 +481,129 @@ fn draw_attack_slash(r2d: &mut Render2D, center: Vec2, angle: f32, opacity: f32)
         .blend(BlendMode::Inverse);
 }
 
+// ── 静态地形（石头 / 花：固定遮挡层、不插入实体排序，经 StaticMesh 合批） ──
+//
+// 设计说明（后续改动请保留注释）：
+// - `unit_circle_mesh` 是半径为 1 的单位圆扇面网格，注册到 MESHES 后**所有**圆图形用
+//   `add_static_mesh` 共享它，实例变换 = Translate(pos) * Scale(radius)。同 mesh_id + 同
+//   纹理（white） + 同 RStates → 整张地图的石头/花全部合批为极少数 DrawCall。
+// - 树**不能**放入静态地形：树的遮挡层是 `y_layer(foot_y)`，会插入玩家/史莱姆的实体
+//   Y 排序，必须保持动态绘制；石头/花使用固定 `LAYER_TERRAIN`，不参与实体排序，安全静态化。
+// - 静态地形在 `map_rev` 变化（R 重开 → `Game::new()`）时自动重建，复用 register_mesh。
+
+/// 单个静态圆实例：圆心 + 半径（单位圆网格 instance scale）+ 颜色 + 层级。
+struct StaticInst {
+    pos: Vec2,
+    r: f32,
+    color: Color,
+    layer: f32,
+}
+
+/// 静态地形缓存：单位圆网格 + 石头/花实例列表。
+struct StaticTerrain {
+    /// 构建时的 map_rev；不匹配则重建。
+    rev: u64,
+    circle_mesh_id: u64,
+    stone_insts: Vec<StaticInst>,
+    flower_insts: Vec<StaticInst>,
+}
+
+/// 构建单位圆扇面网格（中心 (0,0)、半径 1，世界坐标直通），供所有圆实例共享。
+fn unit_circle_mesh(device: &wgpu::Device) -> Arc<MeshData> {
+    const SEGS: usize = 22;
+    let mut verts = Vec::with_capacity(SEGS + 2);
+    verts.push(VertexP3U2C4 {
+        pos: [0.0, 0.0, 0.0],
+        uv: [0.0, 0.0],
+        color: [1.0; 4],
+    });
+    for i in 0..=SEGS {
+        let a = i as f32 / SEGS as f32 * TAU;
+        verts.push(VertexP3U2C4 {
+            pos: [a.cos(), a.sin(), 0.0],
+            uv: [0.0, 0.0],
+            color: [1.0; 4],
+        });
+    }
+    let mut idx = Vec::with_capacity(SEGS * 3);
+    for i in 0..SEGS {
+        idx.extend_from_slice(&[0, (i + 1) as u16, (i + 2) as u16]);
+    }
+    Arc::new(MeshData::from_pod(device, &verts, &idx, "RPG static circle"))
+}
+
+impl StaticTerrain {
+    fn build(render2d: &Render2D, map: &Map, rev: u64) -> Self {
+        let circle_mesh = unit_circle_mesh(render2d.device());
+        let circle_mesh_id = render2d.register_mesh(circle_mesh);
+        let mut stone_insts = Vec::new();
+        let mut flower_insts = Vec::new();
+        for y in 0..MAP_H {
+            for x in 0..MAP_W {
+                let o = Vec2::new(x as f32 * TILE, y as f32 * TILE);
+                match map.tiles[y * MAP_W + x] {
+                    Tile::Stone => {
+                        let c = o + Vec2::splat(TILE * 0.5);
+                        stone_insts.push(StaticInst {
+                            pos: c,
+                            r: 13.0,
+                            color: Color::rgba(0.52, 0.52, 0.58, 1.0),
+                            layer: LAYER_TERRAIN,
+                        });
+                        stone_insts.push(StaticInst {
+                            pos: c + Vec2::new(-3.5, -3.5),
+                            r: 8.0,
+                            color: Color::rgba(0.7, 0.7, 0.75, 1.0),
+                            layer: LAYER_TERRAIN + 0.1,
+                        });
+                    }
+                    Tile::Flower => {
+                        let c = o + Vec2::splat(TILE * 0.5);
+                        flower_insts.push(StaticInst {
+                            pos: c + Vec2::new(-6.0, -5.0),
+                            r: 3.0,
+                            color: Color::rgba(1.0, 0.5, 0.7, 1.0),
+                            layer: LAYER_TERRAIN,
+                        });
+                        flower_insts.push(StaticInst {
+                            pos: c + Vec2::new(5.0, -6.0),
+                            r: 3.0,
+                            color: Color::rgba(1.0, 0.9, 0.4, 1.0),
+                            layer: LAYER_TERRAIN,
+                        });
+                        flower_insts.push(StaticInst {
+                            pos: c + Vec2::new(-1.0, 5.0),
+                            r: 3.0,
+                            color: Color::rgba(0.9, 0.6, 1.0, 1.0),
+                            layer: LAYER_TERRAIN,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self {
+            rev,
+            circle_mesh_id,
+            stone_insts,
+            flower_insts,
+        }
+    }
+
+    /// 提交所有静态圆实例（使用白纹理 → 纯色，全部可合批）。
+    fn draw(&self, r2d: &mut Render2D) {
+        let white = r2d.white_texture().clone();
+        let submit = |r2d: &mut Render2D, insts: &[StaticInst]| {
+            for inst in insts {
+                let tf = Transform2D::default().with_pos(inst.pos).with_scale(Vec2::splat(inst.r));
+                r2d.add_static_mesh(self.circle_mesh_id, inst.color, tf, inst.layer, &white);
+            }
+        };
+        submit(r2d, &self.stone_insts);
+        submit(r2d, &self.flower_insts);
+    }
+}
+
 fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, game: &Game) {
     let hw = cam.viewport_size.x * 0.5 / cam.zoom.x;
     let hh = cam.viewport_size.y * 0.5 / cam.zoom.y;
@@ -502,17 +631,14 @@ fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, game: &Game) {
                     tex.draw(r2d, &tex.sand, o, Vec2::splat(TILE), Color::WHITE, Transform2D::default(), LAYER_GROUND);
                 }
                 Tile::Flower => {
+                    // 花朵圆面片已由 StaticTerrain 静态实例化提交（固定 LAYER_TERRAIN 层），
+                    // 这里只画 grass 底。
                     tex.draw(r2d, &tex.grass, o, Vec2::splat(TILE), Color::WHITE, Transform2D::default(), LAYER_GROUND);
-                    let c = o + Vec2::splat(TILE * 0.5);
-                    draw_circle(r2d, c + Vec2::new(-6.0, -5.0), 3.0, Color::rgba(1.0, 0.5, 0.7, 1.0), LAYER_TERRAIN);
-                    draw_circle(r2d, c + Vec2::new(5.0, -6.0), 3.0, Color::rgba(1.0, 0.9, 0.4, 1.0), LAYER_TERRAIN);
-                    draw_circle(r2d, c + Vec2::new(-1.0, 5.0), 3.0, Color::rgba(0.9, 0.6, 1.0, 1.0), LAYER_TERRAIN);
                 }
                 Tile::Stone => {
+                    // 石头圆面片已由 StaticTerrain 静态实例化提交（固定 LAYER_TERRAIN 层），
+                    // 这里只画 grass 底。
                     tex.draw(r2d, &tex.grass, o, Vec2::splat(TILE), Color::WHITE, Transform2D::default(), LAYER_GROUND);
-                    let c = o + Vec2::splat(TILE * 0.5);
-                    draw_circle(r2d, c, 13.0, Color::rgba(0.52, 0.52, 0.58, 1.0), LAYER_TERRAIN);
-                    draw_circle(r2d, c + Vec2::new(-3.5, -3.5), 8.0, Color::rgba(0.7, 0.7, 0.75, 1.0), LAYER_TERRAIN + 0.1);
                 }
                 Tile::Tree => {
                     tex.draw(r2d, &tex.grass, o, Vec2::splat(TILE), Color::WHITE, Transform2D::default(), LAYER_GROUND);
@@ -898,6 +1024,8 @@ struct RpgApp {
     tex: Option<Tex>,
     font: Option<Text>,
     game: Game,
+    /// 石头/花静态地形缓存（按 `map_rev` 重建，R 重开后自动更新）。
+    static_terrain: Option<StaticTerrain>,
 }
 impl RpgApp {
     fn new() -> Self {
@@ -911,6 +1039,7 @@ impl RpgApp {
             tex: None,
             font: None,
             game,
+            static_terrain: None,
         }
     }
 }
@@ -962,7 +1091,16 @@ impl App for RpgApp {
                 self.game.kills
             ));
         }
-        render2d.set_mvp(self.cam.vp_matrix());
+        render2d
+            .set_mvp(self.cam.vp_matrix())
+//          .default_samp_min_mag(rjw_2d_render::FilterMode::Nearest)
+        ;
+        // 石头 / 花静态地形：地图版本变化时重建一次（单位圆网格 + 实例列表常驻），
+        // 每帧只提交实例数据，全部合批。树保持动态（Y 排序插入实体，绝不入此地）。
+        if self.static_terrain.as_ref().map(|t| t.rev) != Some(self.game.map_rev) {
+            self.static_terrain = Some(StaticTerrain::build(render2d, &self.game.map, self.game.map_rev));
+        }
+        self.static_terrain.as_ref().unwrap().draw(render2d);
         let font = self.font.as_mut().unwrap();
         draw_tiles(render2d, &self.cam, tex, &self.game);
         draw_entities(render2d, tex, &self.game);

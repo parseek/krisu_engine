@@ -1,4 +1,8 @@
+pub mod mesh;
+pub mod registry;
 pub mod texture;
+pub use mesh::{MeshData, MESHES};
+pub use registry::{HasUid, TypedRegistry};
 pub use texture::{ArcTextureWrapped, TextureRegistry, TextureWrapped, TEXTURES};
 
 use winit::window::Window;
