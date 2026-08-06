@@ -541,21 +541,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eg260731CustomDraw"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "env_logger",
- "glam",
- "log",
- "rjw_2d_render",
- "rjw_color",
- "rjw_main",
- "rjw_render",
- "rjw_transform",
-]
-
-[[package]]
 name = "eg260731RPG"
 version = "0.1.0"
 dependencies = [
@@ -568,6 +553,21 @@ dependencies = [
  "rjw_main",
  "rjw_render",
  "rjw_text",
+ "rjw_transform",
+]
+
+[[package]]
+name = "eg260806CustomDraw"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "env_logger",
+ "glam",
+ "log",
+ "rjw_2d_render",
+ "rjw_color",
+ "rjw_main",
+ "rjw_render",
  "rjw_transform",
 ]
 
