@@ -275,6 +275,8 @@ r2d.add_polygon_fan(&verts, Color::CYAN, 96.0)
 |---|---|---|
 | `add_custom` | `r2d.add_custom(layer, \|pass\| { ... })` | 注入一段原生 wgpu 绘制调用，参与 (layer, states) 排序 |
 
+**👉 完整可运行示例见 `examples/eg260731CustomDraw/`**（`cargo run -p eg260731CustomDraw`）：演示结构体形式 + 闭包形式 + 与引擎 Sprite 混排。
+
 ```rust
 // 闭包直接传（blanket impl）—— pass 是 &mut wgpu::RenderPass
 r2d.add_custom(1.0, |pass| {
@@ -291,6 +293,32 @@ impl rjw_2d_render::CustomDraw for MyFx {
 }
 r2d.add_custom(1.0, MyFx);
 ```
+
+> 💡 **最小完整模式**（自建管线 + 顶点缓冲，参考 `eg260731CustomDraw` 的 `Tri` 结构体）：
+>
+> ```rust
+> // ① 建管线：模块 + 空 pipeline layout + 自定义 VertexBufferLayout
+> let shader = device.create_shader_module(...);               // 自定义 WGSL
+> let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+>     bind_group_layouts: &[],                 // 不需要 bind group 时传空
+>     immediate_size: 0,
+> });
+> let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+>     layout: Some(&layout),                   // 其余字段按需（见 example）
+>     ...
+> });
+>
+> // ② 建顶点缓冲（bytemuck::cast_slice 传入 f32 数组）
+> let vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+>     contents: bytemuck::cast_slice(&verts),
+>     usage: wgpu::BufferUsages::VERTEX,
+> });
+>
+> // ③ 在 CustomDraw::draw / 闭包中执行（pass 已由引擎打开）
+> pass.set_pipeline(&pipeline);
+> pass.set_vertex_buffer(0, vbo.slice(..));
+> pass.draw(0..n_verts, 0..1);
+> ```
 
 要点：
 

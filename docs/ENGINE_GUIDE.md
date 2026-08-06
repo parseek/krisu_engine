@@ -46,9 +46,10 @@ crates/
 └─ rjw_time        # DeltaTimer（帧间隔 dt 与 FPS）
 
 examples/
-├─ eg260729        # 最小清屏示例（手动 RenderPass）
-├─ eg260731        # Render2D 精灵/多边形/mesh 能力演示
-└─ eg260731RPG     # ★ 综合 RPG：y-sort、波次系统、相机跟踪、程序化纹理、静态地形（石头/花经 StaticMesh 合批）
+├─ eg260729           # 最小清屏示例（手动 RenderPass）
+├─ eg260731           # Render2D 精灵/多边形/mesh 能力演示
+├─ eg260731CustomDraw # add_custom / CustomDraw 逃逸舱口（自建管线三角形）
+└─ eg260731RPG        # ★ 综合 RPG：y-sort、波次系统、相机跟踪、程序化纹理、静态地形（石头/花经 StaticMesh 合批）
 ```
 
 **最核心概念一条线**：
@@ -252,6 +253,8 @@ ClearConfig { color: Option<wgpu::Color>, depth: Option<f32>, stencil: Option<u3
 
 #### 用法
 
+**👉 完整可运行示例见 `examples/eg260731CustomDraw/`**（`cargo run -p eg260731CustomDraw`）：演示结构体形式（`Tri` 自建管线）+ 闭包形式 + 与引擎 Sprite 混排 3 层。
+
 ```rust
 // ① 闭包形式（最常用）
 r2d.add_custom(1.0, |pass| {
@@ -270,6 +273,32 @@ impl rjw_2d_render::CustomDraw for Wireframe {
 }
 r2d.add_custom(96.0, Wireframe { mdl });
 ```
+
+> 💡 **最小完整使用模式**（建管线 → 建顶点 → draw，详见 `eg260731CustomDraw`）：
+>
+> ```rust
+> // ① 自建管线（layout 可无 bind group）
+> let shader = device.create_shader_module(...);
+> let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+>     bind_group_layouts: &[],           // 不需要 bind group 时传空
+>     immediate_size: 0,
+> });
+> let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+>     layout: Some(&layout),
+>     // ...目标格式 = render.format()（surface_format），其余按需
+> });
+>
+> // ② 顶点缓冲（设备缓冲 + bytemuck 上传）
+> let vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+>     contents: bytemuck::cast_slice(&verts),
+>     usage: wgpu::BufferUsages::VERTEX,
+> });
+>
+> // ③ 在 CustomDraw::draw / 闭包中执行（pass 已由引擎打开）
+> pass.set_pipeline(&pipeline);
+> pass.set_vertex_buffer(0, vbo.slice(..));
+> pass.draw(0..n_verts, 0..1);
+> ```
 
 > ⚠️ **pass 生命周期**：`add_custom` 的闭包在 `render()` / `flush()` 内部的 `draw()` 阶段调用。此时 RenderPass 已 `begin`，请在闭包内**使用**，而不要再 `begin_render_pass`。
 
