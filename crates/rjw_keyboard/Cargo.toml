@@ -2,6 +2,13 @@
 name = "rjw_keyboard"
 version = "0.1.0"
 edition = "2024"
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "Winit-based keyboard input manager with per-frame edge and true-edge handling."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+readme = "README.md"
+keywords = ["keyboard", "input", "winit", "state"]
+categories = ["game-engines", "game-development", "hardware-support"]
 
 [dependencies]
 winit = "0.30.13"

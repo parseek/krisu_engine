@@ -1,0 +1,70 @@
+# rjw_keyboard
+
+中文：  
+`rjw_keyboard` 基于 `winit` 和 `rjw_keystate`，为键盘输入提供按帧管理的状态查询，支持边沿（Edge）和真边沿（True Edge）检测。
+
+English：  
+`rjw_keyboard` builds on `winit` and `rjw_keystate` to provide per‑frame keyboard state queries with edge and true‑edge detection.
+
+---
+
+## 功能特性 / Features
+
+中文：
+- 使用 `PhysicalKey::Code` 作为按键标识，避免布局差异。
+- 每个按键维护 `KeyState`，包含按下、边沿、真边沿及突然释放标记。
+- 提供 `get()` 获取单个按键状态，`get_keys_iter()` 遍历所有按键。
+- 必须在每帧调用 `end_frame()` 清除边沿标记并处理 `SuddenUp`。
+- 通过 `window_event()` 处理 `WindowEvent::KeyboardInput`。
+
+English：
+- Uses `PhysicalKey::Code` as key identifier to avoid layout differences.
+- Each key maintains a `KeyState` with pressed, edge, true‑edge, and sudden‑up flags.
+- Provides `get()` for single key state and `get_keys_iter()` to iterate over all keys.
+- Must call `end_frame()` every frame to clear edge flags and handle `SuddenUp`.
+- Processes `WindowEvent::KeyboardInput` via `window_event()`.
+
+---
+
+## 示例代码 / Example
+
+```rust
+use winit::event::WindowEvent;
+use rjw_keyboard::KeyboardInput;
+use rjw_keystate::*;
+
+let mut keyboard = KeyboardInput::default();
+
+// 在事件循环中注入事件
+// Inject events in your event loop
+keyboard.window_event(&event);
+
+// 每帧结束时更新状态
+// End of each frame
+keyboard.end_frame();
+
+// 查询按键状态（例如 Space 键）
+// Query key state (e.g., Space)
+let space_state = keyboard.get(winit::keyboard::KeyCode::Space);
+if space_state.down_true_edge() {
+    println!("Space was just truly pressed (not a repeat)");
+}
+```
+
+---
+
+## 关于 `SuddenUp` 的说明 / About `SuddenUp`
+
+中文：  
+当操作系统在同一个输入帧内报告了按键按下和释放时（例如极短的点击），`KeyboardInput` 会利用 `rjw_keystate` 的 `sudden_up` 标记，在 `end_frame()` 中将该按键正确转换为释放状态。  
+这确保了即使在同一帧内发生按下‑释放，下一帧查询时按键已表现为释放，避免“卡键”。
+
+English：  
+When the OS reports both a press and a release for the same key within one frame (e.g., a very short tap), `KeyboardInput` uses the `sudden_up` flag from `rjw_keystate` to correctly transition the key to released state during `end_frame()`.  
+This ensures that even if press‑release happens in the same frame, the key will appear as released in the next frame, preventing stuck keys.
+
+---
+
+## 许可 / License
+
+MIT © 2026 KrisuRJW

@@ -9,4 +9,4 @@ license = "MIT"
 repository = "https://github.com/parseek/krisu_engine"
 readme = "README.md"
 keywords = ["keyboard", "mouse", "input", "state"]
-categories = ["game-engines", "hardware-support"]
+categories = ["game-engines", "game-development", "hardware-support"]

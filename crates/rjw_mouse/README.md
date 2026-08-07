@@ -1,0 +1,80 @@
+# rjw_mouse
+
+中文：  
+`rjw_mouse` 基于 `winit` 和 `rjw_keystate`，提供鼠标位置、移动增量、滚轮增量以及按键状态的逐帧管理，支持边沿和真边沿检测。
+
+English：  
+`rjw_mouse` builds on `winit` and `rjw_keystate` to provide per‑frame mouse position, movement delta, wheel delta, and button states with edge and true‑edge detection.
+
+---
+
+## 功能特性 / Features
+
+中文：
+- 鼠标位置（光标坐标）和移动增量（累计每帧的位移）。
+- 滚轮增量同时支持 `LineDelta` 和 `PixelDelta`，并提供互相转换方法。
+- 五个标准按键（左、右、中、后退、前进）+ 其他按键，均以 `KeyState` 存储。
+- 提供 `in_window()` 判断光标是否在窗口内。
+- 每帧调用 `end_frame()` 清空增量和边沿标记。
+- 支持 `WindowEvent`（光标移动、滚轮、按键、进出窗口）和 `DeviceEvent`（鼠标移动）两种事件源。
+
+English：
+- Mouse position (cursor coordinates) and movement delta (accumulated per frame).
+- Wheel delta supports both `LineDelta` and `PixelDelta` with conversion methods.
+- Five standard buttons (Left, Right, Middle, Back, Forward) + others, each stored as `KeyState`.
+- Provides `in_window()` to check if cursor is inside the window.
+- Call `end_frame()` every frame to clear deltas and edge flags.
+- Supports both `WindowEvent` (cursor move, wheel, buttons, enter/leave) and `DeviceEvent` (mouse motion).
+
+---
+
+## 示例代码 / Example
+
+```rust
+use winit::event::{WindowEvent, DeviceEvent};
+use rjw_mouse::MouseInput;
+use rjw_keystate::*;
+
+let mut mouse = MouseInput::default();
+
+// 在事件循环中注入事件
+// Inject events in your event loop
+mouse.window_event(&window_event);
+mouse.device_event(&device_event);
+
+// 每帧结束清理
+// End of frame
+mouse.end_frame();
+
+// 获取鼠标位置和增量
+// Get position and delta
+let pos = mouse.get_mouse_position();
+let delta = mouse.get_mouse_delta();
+
+// 检查左键是否刚刚按下（真边沿）
+// Check if left button was just truly pressed
+if mouse.get_mouse_button_state(winit::event::MouseButton::Left).down_true_edge() {
+    println!("Left button truly pressed");
+}
+
+// 获取滚轮增量（自动识别类型）
+// Get wheel delta (auto-detects type)
+let wheel = mouse.get_wheel_delta();
+let (x, y) = wheel.to_pixel(None); // 转为像素值
+```
+
+---
+
+## 关于 `SuddenUp` 的说明 / About `SuddenUp`
+
+中文：  
+鼠标按键同样可能在同一帧内收到按下和释放事件（例如快速双击中的第一次点击）。`MouseInput` 利用 `rjw_keystate` 的 `sudden_up` 标记，在 `end_frame()` 中将这些按键正确转为释放状态，避免状态不一致。
+
+English：  
+Mouse buttons can also receive press and release events within the same frame (e.g., the first click of a double‑tap). `MouseInput` uses the `sudden_up` flag from `rjw_keystate` to correctly transition such buttons to released state during `end_frame()`, maintaining consistency.
+
+---
+
+## 许可 / License
+
+MIT © 2026 KrisuRJW

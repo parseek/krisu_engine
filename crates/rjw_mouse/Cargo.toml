@@ -2,6 +2,13 @@
 name = "rjw_mouse"
 version = "0.1.0"
 edition = "2024"
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "Winit-based mouse input manager with position, delta, wheel, and button state (with edge/true-edge)."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+readme = "README.md"
+keywords = ["mouse", "input", "winit", "state", "edge", "wheel"]
+categories = ["game-engines", "hardware-support"]
 
 [dependencies]
 winit = "0.30.13"
