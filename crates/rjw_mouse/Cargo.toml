@@ -7,7 +7,7 @@ description = "Winit-based mouse input manager with position, delta, wheel, and 
 license = "MIT"
 repository = "https://github.com/parseek/krisu_engine"
 readme = "README.md"
-keywords = ["mouse", "input", "winit", "state", "edge", "wheel"]
+keywords = ["mouse", "input", "winit", "state", "wheel"]
 categories = ["game-engines", "hardware-support"]
 
 [dependencies]
