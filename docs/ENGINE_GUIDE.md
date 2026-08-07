@@ -253,7 +253,7 @@ ClearConfig { color: Option<wgpu::Color>, depth: Option<f32>, stencil: Option<u3
 
 #### 用法
 
-**👉 完整可运行示例见 `examples/eg260731CustomDraw/`**（`cargo run -p eg260731CustomDraw`）：演示结构体形式（`Tri` 自建管线）+ 闭包形式 + 与引擎 Sprite 混排 3 层。
+**👉 完整可运行示例见 [`examples/eg260806CustomDraw/`](../examples/eg260806CustomDraw/src/main.rs)**（`cargo run -p eg260806CustomDraw`）：演示结构体形式（`Tri` 自建管线）+ 闭包形式 + 与引擎 Sprite 混排 3 层。
 
 ```rust
 // ① 闭包形式（最常用）

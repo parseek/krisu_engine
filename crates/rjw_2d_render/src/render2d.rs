@@ -494,6 +494,7 @@ impl<F: Fn(&mut wgpu::RenderPass<'_>) + Send + Sync> CustomDraw for F {
 /// 链式设置 RStates；Drop 时 push `DrawCommand::Custom`。
 pub struct CustomBuilder<'a> {
     queue: &'a mut DrawCommandQueue,
+    cmd: Option<DrawCommand>,
     layer: Layer,
     rstates: RStates,
     has_rstates: bool,
@@ -619,14 +620,16 @@ impl Drop for CustomBuilder<'_> {
         } else {
             None
         };
-        self.queue.push(
-            DrawCommand::Custom,
-            self.layer,
-            States {
-                rstates,
-                texture_uid: None,
-            },
-        );
+        if let Some(cmd) = self.cmd.take() {
+            self.queue.push(
+                cmd,
+                self.layer,
+                States {
+                    rstates,
+                    texture_uid: None,
+                },
+            );
+        }
     }
 }
 
@@ -1291,9 +1294,11 @@ impl Render2D {
         layer: impl Into<Layer>,
         cd: impl CustomDraw + 'static,
     ) -> CustomBuilder<'_> {
+        let idx = self.buf_custom_draws.len();
         self.buf_custom_draws.push(Arc::new(cd));
         CustomBuilder {
             queue: &mut self.command_queue,
+            cmd: Some(DrawCommand::Custom { idx }),
             layer: layer.into(),
             rstates: RStates::default(),
             has_rstates: false,
@@ -1506,7 +1511,6 @@ impl Render2D {
             }};
         }
 
-        let mut custom_idx = 0usize;
         for (cmd, layer, states) in self.command_queue.iter() {
             let tu = states.texture_uid;
             let rr = states.rstates.unwrap_or(self.default_rstates).raw();
@@ -1609,13 +1613,14 @@ impl Render2D {
                     dyn_accum_verts += vn;
                     dyn_accum_tris += tn;
                 }
-                DrawCommand::Custom => {
+                DrawCommand::Custom { idx } => {
                     // Custom 是合批屏障：关闭动态段、冲刷已收集 items。
                     flush_dyn!();
                     build_ops!();
                     self.buf_items.clear();
-                    self.buf_ops.push(DrawOp::Custom { idx: custom_idx });
-                    custom_idx += 1;
+                    // `idx` 由 `add_custom` 分配、随命令参与排序，
+                    // 保证排序后仍指向 `buf_custom_draws` 中正确的闭包。
+                    self.buf_ops.push(DrawOp::Custom { idx: *idx });
                 }
             }
         }

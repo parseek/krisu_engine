@@ -42,7 +42,9 @@ pub(crate) enum DrawCommand {
         mat_idx: usize,
     },
     /// 外部绘制调用标记（不含数据，实际闭包由 `Render2D::buf_custom_draws` 管理）。
-    Custom,
+    /// `idx` 指向 `Render2D::buf_custom_draws` 中的条目（与 `Sprite2DMatrix.mat_idx` 同理，
+    /// 随命令参与排序，保证排序后仍能正确关联到对应闭包）。
+    Custom { idx: usize },
 }
 
 /// 层级：数值越小越先绘制（越靠后）

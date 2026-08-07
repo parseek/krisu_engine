@@ -1,4 +1,4 @@
-//! eg260731CustomDraw —— 演示引擎的「逃逸舱口」`add_custom` / `CustomDraw`
+//! eg260806CustomDraw —— 演示引擎的「逃逸舱口」`add_custom` / `CustomDraw`
 //!
 //! 展示能力：
 //! - **结构体形式**：实现 `CustomDraw` trait，持有自建管线 + 顶点缓冲，
@@ -51,13 +51,14 @@ impl Tri {
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         pts: [(f32, f32); 3],
-        color: [f32; 4],
+        color: [rjw_color::Color; 3],
     ) -> Self {
         // 交错：pos(2×f32) + color(4×f32) = 24 字节 / 顶点
         let mut verts = Vec::with_capacity(3 * 6);
-        for &(x, y) in &pts {
+        for (&(x, y), &color) in pts.iter().zip(color.iter()) {
             verts.extend_from_slice(&[x, y]);
-            verts.extend_from_slice(&color);
+            let v: [f32; 4] = color.into();
+            verts.extend_from_slice(&v);
         }
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -183,19 +184,29 @@ impl App for CustomDrawApp {
             render2d.device(),
             surface_format,
             [(-0.9, -0.7), (-0.55, 0.7), (-0.2, -0.4)],
-            [1.0, 0.2, 0.2, 1.0],
+            [[1.0, 0.2, 0.2, 1.0].into(); 3],
         ));
         self.tris.push(Tri::new(
             render2d.device(),
             surface_format,
             [(0.1, 0.7), (0.6, 0.2), (0.1, -0.6)],
-            [0.2, 0.9, 0.3, 1.0],
+            [[0.2, 0.9, 0.3, 1.0].into(); 3],
         ));
         self.tris.push(Tri::new(
             render2d.device(),
             surface_format,
             [(0.55, -0.75), (0.95, 0.0), (0.5, 0.6)],
-            [0.25, 0.45, 1.0, 1.0],
+            [[0.25, 0.45, 1.0, 1.0].into(); 3],
+        ));
+        self.tris.push(Tri::new(
+            render2d.device(),
+            surface_format,
+            [(-0.20, -0.20), (-0.50, -0.40), (-0.05, -0.90)],
+            [
+                [1.0, 0.2, 0.2, 1.0].into(),
+                [0.2, 0.9, 0.3, 1.0].into(),
+                Color::AQUA,
+                ],
         ));
 
         let (w, h) = render.size();
@@ -233,14 +244,14 @@ impl App for CustomDrawApp {
         );
 
         // ── 结构体形式：三个自绘三角形（layer 1，夹在 Sprite 之间）──
-        for tri in &self.tris {
+        for tri in &self.tris[1..] {
             render2d.add_custom(LAYER_MID, tri.clone()); // CustomDraw: Send + Sync，Arc 句柄可 clone
         }
 
         // ── 闭包形式：等价写法（blanket impl：Fn(&mut RenderPass) + Send + Sync）──
         // 这里让第一个三角形再画一次，验证同一资源可多路复用。
         let tri0 = self.tris[0].clone();
-        render2d.add_custom(LAYER_MID + 0.1, move |pass: &mut wgpu::RenderPass<'_>| {
+        render2d.add_custom(LAYER_MID - 0.1, move |pass: &mut wgpu::RenderPass<'_>| {
             tri0.draw_to(pass);
         });
 
@@ -256,7 +267,7 @@ impl App for CustomDrawApp {
 
         if let Some(w) = ctx.primary_window() {
             w.set_title(&format!(
-                "eg260731CustomDraw  FPS {:.0}  |  红色三角形由结构体形式绘制；闭包形式重复绘制一次；蓝色/绿色为自创管线",
+                "eg260731CustomDraw  FPS {:.0}  |  红色三角形由结构体形式绘制；闭包形式重复绘制一次；蓝色/绿色/彩色为自创管线",
                 ctx.timer.get_fps()
             ));
         }
