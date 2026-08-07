@@ -44,6 +44,9 @@ pub use rjw_render::{
     ArcTextureWrapped, HasUid, MeshData, MESHES, TextureWrapped, TypedRegistry,
 };
 
+pub use rjw_color as color;
+pub use rjw_color::{Color, ColorF64};
+
 // ─── 单元测试 ─────────────────────────────────────────────────
 
 /// `MeshSink` 重定位逻辑单元测试（无 GPU 依赖）：
