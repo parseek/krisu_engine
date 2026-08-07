@@ -2,3 +2,11 @@
 name = "rjw_keystate"
 version = "0.1.0"
 edition = "2024"
+
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "A lightweight key state representation with pressed, edge, and true-edge flags for keyboard/mouse input."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+readme = "README.md"
+keywords = ["keyboard", "mouse", "input", "state"]
+categories = ["game-engines", "hardware-support"]
