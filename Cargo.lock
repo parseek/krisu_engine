@@ -1881,16 +1881,8 @@ name = "rjw_main"
 version = "0.1.0"
 dependencies = [
  "rjw_keyboard 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "rjw_mouse 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rjw_mouse 0.1.0",
  "rjw_time",
- "winit",
-]
-
-[[package]]
-name = "rjw_mouse"
-version = "0.1.0"
-dependencies = [
- "rjw_keystate 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "winit",
 ]
 
@@ -1899,6 +1891,14 @@ name = "rjw_mouse"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0a2a665a2763fdbc7dcf9a2e6ea18b2634f3b8d31e9dfaa1123356b4db5a6778"
+dependencies = [
+ "rjw_keystate 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "winit",
+]
+
+[[package]]
+name = "rjw_mouse"
+version = "0.1.1"
 dependencies = [
  "rjw_keystate 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "winit",

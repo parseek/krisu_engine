@@ -6,6 +6,7 @@ pub use rjw_mouse::MouseInput;
 
 pub use winit;
 pub use winit::keyboard::KeyCode;
+pub use winit::event::MouseButton;
 pub use winit::event_loop::EventLoop;
 pub use winit::event_loop::ActiveEventLoop;
 pub use winit::error::EventLoopError;

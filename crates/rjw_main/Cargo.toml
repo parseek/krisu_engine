@@ -7,4 +7,4 @@ edition = "2024"
 winit = "0.30.13"
 rjw_time = { path = "../rjw_time" }
 rjw_keyboard = "0.1.0"
-rjw_mouse = "0.1.0"
+rjw_mouse = "0.1.1"

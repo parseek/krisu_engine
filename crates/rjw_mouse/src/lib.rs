@@ -1,7 +1,7 @@
 use rjw_keystate::*;
 use winit::dpi::PhysicalPosition;
 use winit::event::WindowEvent;
-use winit::event::MouseButton;
+pub use winit::event::MouseButton;
 
 fn mb_to_idx(button: MouseButton) -> usize {
     match button {
@@ -97,7 +97,12 @@ impl MouseInput {
     }
     #[inline]
     #[allow(unused)]
-    pub fn get_mouse_button_state(&self, button: winit::event::MouseButton) -> KeyState {
+    pub fn get_mouse_button_state(&self, button: MouseButton) -> KeyState {
+        self.mouse_buttons[mb_to_idx(button)]
+    }
+    #[inline]
+    #[allow(unused)]
+    pub fn get(&self, button: MouseButton) -> KeyState {
         self.mouse_buttons[mb_to_idx(button)]
     }
     #[inline]
