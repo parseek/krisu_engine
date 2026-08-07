@@ -6,3 +6,11 @@ pub use transform2d::Transform2D;
 #[allow(unused)]
 pub mod camera2d;
 pub use camera2d::Camera2D;
+
+pub use glam;
+pub use glam::{
+    Vec2,
+    Vec3,
+    Vec4,
+    Mat4
+};

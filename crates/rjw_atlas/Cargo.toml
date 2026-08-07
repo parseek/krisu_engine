@@ -8,7 +8,6 @@ rjw_render = { path = "../rjw_render" }
 glam = "0.33.2"
 wgpu = "30.0.0"
 log = "0.4.33"
-dashmap = "6.1"
 serde = { version = "1", features = ["derive"], optional = true }
 toml = { version = "0.8", optional = true }
 
