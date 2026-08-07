@@ -7,7 +7,7 @@ edition = "2024"
 rjw_render = { path = "../rjw_render" }
 rjw_atlas = { path = "../rjw_atlas", optional = true }
 rjw_transform = { path = "../rjw_transform" }
-rjw_color = "0.1.0"
+rjw_color = { version = "0.1.0", features = ["wgpu"] }
 wgpu = "30.0.0"
 glam = "0.33.2"
 ordered-float = "4.2"
