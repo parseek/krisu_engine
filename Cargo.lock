@@ -520,7 +520,7 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "log",
- "rjw_color",
+ "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rjw_main",
  "rjw_render",
  "wgpu",
@@ -534,7 +534,7 @@ dependencies = [
  "glam",
  "log",
  "rjw_2d_render",
- "rjw_color",
+ "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rjw_main",
  "rjw_render",
  "rjw_transform",
@@ -549,7 +549,7 @@ dependencies = [
  "log",
  "rjw_2d_render",
  "rjw_atlas",
- "rjw_color",
+ "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rjw_main",
  "rjw_render",
  "rjw_text",
@@ -565,7 +565,7 @@ dependencies = [
  "glam",
  "log",
  "rjw_2d_render",
- "rjw_color",
+ "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rjw_main",
  "rjw_render",
  "rjw_transform",
@@ -1812,7 +1812,7 @@ dependencies = [
  "log",
  "ordered-float 4.6.0",
  "rjw_atlas",
- "rjw_color",
+ "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rjw_render",
  "rjw_transform",
  "wgpu",
@@ -1837,6 +1837,15 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "serde",
+ "wgpu",
+]
+
+[[package]]
+name = "rjw_color"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c26b8d9ceb0a9eafc997d312e7032ba6300a5d2ade539e728de0a2a68906f7d"
+dependencies = [
  "wgpu",
 ]
 
@@ -1896,7 +1905,7 @@ dependencies = [
  "glam",
  "rjw_2d_render",
  "rjw_atlas",
- "rjw_color",
+ "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rjw_render",
  "rjw_transform",
  "swash",

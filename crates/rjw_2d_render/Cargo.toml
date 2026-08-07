@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 rjw_render = { path = "../rjw_render" }
 rjw_atlas = { path = "../rjw_atlas", optional = true }
-rjw_color = { path = "../rjw_color" }
 rjw_transform = { path = "../rjw_transform" }
+rjw_color = "0.1.0"
 wgpu = "30.0.0"
 glam = "0.33.2"
 ordered-float = "4.2"

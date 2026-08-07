@@ -9,6 +9,6 @@ rjw_main = { path = "../../crates/rjw_main" }
 rjw_render = { path = "../../crates/rjw_render" }
 rjw_2d_render = { path = "../../crates/rjw_2d_render" }
 rjw_transform = { path = "../../crates/rjw_transform" }
-rjw_color = { path = "../../crates/rjw_color", features = ["wgpu"] }
+rjw_color = { version = "0.1.0", features = ["wgpu"] }
 env_logger = "0.11.11"
 log = "0.4.33"

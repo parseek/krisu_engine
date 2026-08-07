@@ -7,8 +7,8 @@ edition = "2024"
 rjw_atlas = { path = "../rjw_atlas" }
 rjw_2d_render = { path = "../rjw_2d_render" }
 rjw_transform = { path = "../rjw_transform" }
-rjw_color = { path = "../rjw_color" }
 rjw_render = { path = "../rjw_render" }
+rjw_color = "0.1.0"
 glam = "0.33.2"
 wgpu = "30.0.0"
 cosmic-text = "0.19.0"
