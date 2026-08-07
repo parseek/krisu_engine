@@ -12,4 +12,4 @@ categories = ["game-engines", "hardware-support"]
 
 [dependencies]
 winit = "0.30.13"
-rjw_keystate = { path = "../rjw_keystate" }
+rjw_keystate = "0.1.0"
