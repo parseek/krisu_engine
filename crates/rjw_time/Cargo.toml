@@ -2,3 +2,10 @@
 name = "rjw_time"
 version = "0.1.0"
 edition = "2024"
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "Frame delta time (DeltaTime) and smoothed FPS timer (DeltaTimer) for game loops."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+readme = "README.md"
+keywords = ["time", "fps", "delta", "game-loop"]
+categories = ["game-development"]

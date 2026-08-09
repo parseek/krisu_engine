@@ -2,12 +2,19 @@
 name = "rjw_text"
 version = "0.1.0"
 edition = "2024"
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "Text rendering via cosmic-text layout, swash glyph rasterization and a DynamicAtlas glyph cache."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+readme = "README.md"
+keywords = ["text", "font", "glyph", "cosmic-text"]
+categories = ["game-development", "graphics"]
 
 [dependencies]
-rjw_atlas = { path = "../rjw_atlas" }
-rjw_2d_render = { path = "../rjw_2d_render" }
-rjw_transform = { path = "../rjw_transform" }
-rjw_render = { path = "../rjw_render" }
+rjw_atlas = { path = "../rjw_atlas", version = "0.1.0" }
+rjw_2d_render = { path = "../rjw_2d_render", version = "0.1.0" }
+rjw_transform = { path = "../rjw_transform", version = "0.1.0" }
+rjw_render = { path = "../rjw_render", version = "0.1.0" }
 rjw_color = "0.1.0"
 glam = "0.33.2"
 wgpu = "30.0.0"

@@ -2,9 +2,16 @@
 name = "rjw_main"
 version = "0.1.0"
 edition = "2024"
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "App entry point: winit event loop, MainContext with timer/keyboard/mouse, and the App trait."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+readme = "README.md"
+keywords = ["app", "winit", "game", "entry-point"]
+categories = ["game-engines"]
 
 [dependencies]
 winit = "0.30.13"
-rjw_time = { path = "../rjw_time" }
+rjw_time = { path = "../rjw_time", version = "0.1.0" }
 rjw_keyboard = "0.1.0"
 rjw_mouse = "0.1.1"

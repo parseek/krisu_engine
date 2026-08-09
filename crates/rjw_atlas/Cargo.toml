@@ -2,9 +2,16 @@
 name = "rjw_atlas"
 version = "0.1.0"
 edition = "2024"
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "Runtime dynamic (Skyline) and static texture atlases with lifetime management and TOML import/export."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+readme = "README.md"
+keywords = ["atlas", "sprite", "texture", "skyline"]
+categories = ["game-development", "multimedia::images"]
 
 [dependencies]
-rjw_render = { path = "../rjw_render" }
+rjw_render = { path = "../rjw_render", version = "0.1.0" }
 glam = "0.33.2"
 wgpu = "30.0.0"
 log = "0.4.33"

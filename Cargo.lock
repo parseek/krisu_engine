@@ -520,7 +520,7 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "log",
- "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rjw_color 0.1.0",
  "rjw_main",
  "rjw_render",
  "wgpu",
@@ -534,7 +534,7 @@ dependencies = [
  "glam",
  "log",
  "rjw_2d_render",
- "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rjw_color 0.1.0",
  "rjw_main",
  "rjw_render",
  "rjw_transform",
@@ -549,7 +549,7 @@ dependencies = [
  "log",
  "rjw_2d_render",
  "rjw_atlas",
- "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rjw_color 0.1.0",
  "rjw_main",
  "rjw_render",
  "rjw_text",
@@ -565,7 +565,7 @@ dependencies = [
  "glam",
  "log",
  "rjw_2d_render",
- "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rjw_color 0.1.0",
  "rjw_main",
  "rjw_render",
  "rjw_transform",
@@ -1812,7 +1812,7 @@ dependencies = [
  "log",
  "ordered-float 4.6.0",
  "rjw_atlas",
- "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rjw_color 0.1.0",
  "rjw_render",
  "rjw_transform",
  "wgpu",
@@ -1833,15 +1833,6 @@ dependencies = [
 [[package]]
 name = "rjw_color"
 version = "0.1.0"
-dependencies = [
- "glam",
- "serde",
- "wgpu",
-]
-
-[[package]]
-name = "rjw_color"
-version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c26b8d9ceb0a9eafc997d312e7032ba6300a5d2ade539e728de0a2a68906f7d"
 dependencies = [
@@ -1849,11 +1840,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "rjw_keyboard"
-version = "0.1.0"
+name = "rjw_color"
+version = "0.1.1"
 dependencies = [
- "rjw_keystate 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "winit",
+ "glam",
+ "serde",
+ "wgpu",
 ]
 
 [[package]]
@@ -1862,13 +1854,17 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7a92b163db8aefc3c1ab9ba631ba0b66543d503d910339452d8d4514858c770"
 dependencies = [
- "rjw_keystate 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rjw_keystate 0.1.0",
  "winit",
 ]
 
 [[package]]
-name = "rjw_keystate"
-version = "0.1.0"
+name = "rjw_keyboard"
+version = "0.1.1"
+dependencies = [
+ "rjw_keystate 0.1.0",
+ "winit",
+]
 
 [[package]]
 name = "rjw_keystate"
@@ -1877,30 +1873,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fb8ca9710d489319ff721f9c05f740c333cc472780e0ad79d0fa0fc7618310"
 
 [[package]]
+name = "rjw_keystate"
+version = "0.1.1"
+
+[[package]]
 name = "rjw_main"
 version = "0.1.0"
 dependencies = [
- "rjw_keyboard 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "rjw_mouse 0.1.0",
+ "rjw_keyboard 0.1.0",
+ "rjw_mouse 0.1.1",
  "rjw_time",
  "winit",
 ]
 
 [[package]]
 name = "rjw_mouse"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a2a665a2763fdbc7dcf9a2e6ea18b2634f3b8d31e9dfaa1123356b4db5a6778"
+checksum = "4c348c1f9168e2949c0a050c97f60d512bac15636f8485eabebe7528e498857b"
 dependencies = [
- "rjw_keystate 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rjw_keystate 0.1.0",
  "winit",
 ]
 
 [[package]]
 name = "rjw_mouse"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
- "rjw_keystate 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rjw_keystate 0.1.0",
  "winit",
 ]
 
@@ -1924,7 +1924,7 @@ dependencies = [
  "glam",
  "rjw_2d_render",
  "rjw_atlas",
- "rjw_color 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rjw_color 0.1.0",
  "rjw_render",
  "rjw_transform",
  "swash",

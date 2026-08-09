@@ -2,6 +2,13 @@
 name = "rjw_transform"
 version = "0.1.0"
 edition = "2024"
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "2D transforms (Transform2D) and orthographic camera (Camera2D) with VP matrices and screen/world conversion."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+readme = "README.md"
+keywords = ["transform", "camera", "2d", "glam"]
+categories = ["game-development", "mathematics"]
 
 [dependencies]
 glam = { version = "0.33.2", features = ["serde"] }

@@ -2,6 +2,13 @@
 name = "rjw_render"
 version = "0.1.0"
 edition = "2024"
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "Low-level wgpu render context: surface/device/queue management, textures, static meshes and global registries."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+readme = "README.md"
+keywords = ["wgpu", "render", "graphics", "texture"]
+categories = ["game-engines", "graphics"]
 
 [dependencies]
 wgpu = "30.0.0"
