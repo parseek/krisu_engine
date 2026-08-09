@@ -2,12 +2,19 @@
 //!
 //! - `DynamicAtlas<K=String>`：Skyline 打包器，运行时插入/踢出/compact/自动新建页 + TOML 批量导入 + 自动复活。
 //!   `K` 泛型键（默认 `String`），`String` 特化支持 TOML 导入/导出 + 便捷方法。
-//! - `StaticAtlas`：从 TOML 反序列化预排布图集（`spr.toml`）。
+//! - `StaticAtlas<K=String>`：从 TOML 反序列化预排布图集（`spr.toml`），泛型与 `DynamicAtlas` 一致。
+//! - `DynamicAtlas` / `StaticAtlas` 均实现 `Index` / `IndexMut`：`atlas[&key]` 直接读写区域。
 //! - `AtlasRegion`：图集内精灵坐标（像素左上角 + 尺寸 + 原点偏移 + 页 uid）。
 //!
 //! 依赖全局纹理注册表 `rjw_render::TEXTURES`（DashMap），完全解耦 `rjw_2d_render`。
 
-use std::{collections::HashMap, hash::Hash, sync::Arc};
+use std::{
+    borrow::Borrow,
+    collections::HashMap,
+    hash::Hash,
+    ops::{Index, IndexMut},
+    sync::Arc,
+};
 
 use rjw_render::{ArcTextureWrapped, TextureWrapped, TEXTURES};
 #[cfg(feature = "serde")]
@@ -423,6 +430,29 @@ impl DynamicAtlas<String> {
     }
 }
 
+// ─── Index / IndexMut ─────────────────────────────────────────
+
+impl<K, Q> Index<&Q> for DynamicAtlas<K>
+where
+    K: Hash + Eq + Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+{
+    type Output = AtlasRegion;
+    fn index(&self, key: &Q) -> &AtlasRegion {
+        &self.entries.get(key).expect("DynamicAtlas: region not found for key").region
+    }
+}
+
+impl<K, Q> IndexMut<&Q> for DynamicAtlas<K>
+where
+    K: Hash + Eq + Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+{
+    fn index_mut(&mut self, key: &Q) -> &mut AtlasRegion {
+        &mut self.entries.get_mut(key).expect("DynamicAtlas: region not found for key").region
+    }
+}
+
 // ─── TOML 辅助 ────────────────────────────────────────────────
 
 fn crop_rgba(full: &[u8], tex_w: usize, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
@@ -467,9 +497,54 @@ pub fn parse_toml_entries(toml_str: &str) -> Result<HashMap<String, TOMLEntry>, 
 
 // ─── StaticAtlas ──────────────────────────────────────────────
 
-pub struct StaticAtlas { regions: HashMap<String, AtlasRegion> }
+/// 静态预排布图集（如 `spr.toml` 精灵表）：`K` 泛型键（默认 `String`），与 `DynamicAtlas` 泛型一致。
+///
+/// 实现 `Index<&Q>` / `IndexMut<&Q>`（`K: Borrow<Q>`）：`atlas["sprite"]` 直接读写区域。
+#[derive(Debug, Clone)]
+pub struct StaticAtlas<K = String> {
+    regions: HashMap<K, AtlasRegion>,
+}
 
-impl StaticAtlas {
+impl<K> Default for StaticAtlas<K> {
+    fn default() -> Self {
+        Self { regions: HashMap::new() }
+    }
+}
+
+impl<K: Hash + Eq> From<HashMap<K, AtlasRegion>> for StaticAtlas<K> {
+    fn from(value: HashMap<K, AtlasRegion>) -> Self {
+        Self { regions: value }
+    }
+}
+
+impl<K: Hash + Eq> StaticAtlas<K> {
+    /// 查找区域（接受可借用键：`&str` / `&String` / 其它 `K: Borrow<Q>`）。
+    pub fn get<Q>(&self, key: &Q) -> Option<&AtlasRegion>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.regions.get(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.regions.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.regions.contains_key(key)
+    }
+}
+
+// String 特化：TOML 导入/导出（serde feature），向后兼容。
+impl StaticAtlas<String> {
+    #[cfg(feature = "serde")]
     pub fn from_toml(toml_str: &str) -> Result<Self, StaticAtlasError> {
         let data: SpriteAtlasToml = toml::from_str(toml_str)?;
         let mut regions = HashMap::new();
@@ -487,7 +562,27 @@ impl StaticAtlas {
         }
         toml::to_string(&data)
     }
-    pub fn get(&self, name: &str) -> Option<&AtlasRegion> { self.regions.get(name) }
+}
+
+impl<K, Q> Index<&Q> for StaticAtlas<K>
+where
+    K: Hash + Eq + Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+{
+    type Output = AtlasRegion;
+    fn index(&self, key: &Q) -> &AtlasRegion {
+        self.regions.get(key).expect("StaticAtlas: region not found for key")
+    }
+}
+
+impl<K, Q> IndexMut<&Q> for StaticAtlas<K>
+where
+    K: Hash + Eq + Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+{
+    fn index_mut(&mut self, key: &Q) -> &mut AtlasRegion {
+        self.regions.get_mut(key).expect("StaticAtlas: region not found for key")
+    }
 }
 
 #[derive(Debug)]
@@ -520,4 +615,63 @@ fn expand_clamp_margin(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     { let s = (((h - 1) * w) * 4) as usize; let d = ((nh - 1) * nw) * 4; let d = d as usize; out[d..d + 4].copy_from_slice(&rgba[s..s + 4]); }
     { let s = (((h - 1) * w + w - 1) * 4) as usize; let d = ((nh - 1) * nw + nw - 1) * 4; let d = d as usize; out[d..d + 4].copy_from_slice(&rgba[s..s + 4]); }
     out
+}
+
+#[cfg(test)]
+mod static_atlas_tests {
+    use super::*;
+
+    fn sample() -> StaticAtlas<String> {
+        let mut m = HashMap::new();
+        m.insert(
+            "a".to_string(),
+            AtlasRegion { tl_px: (1, 2), wh_px: (8, 8), origin_px: (0, 0), page_uid: 42 },
+        );
+        m.insert(
+            "b".to_string(),
+            AtlasRegion { tl_px: (10, 20), wh_px: (4, 4), origin_px: (0, 0), page_uid: 42 },
+        );
+        StaticAtlas::from(m)
+    }
+
+    #[test]
+    fn index_and_index_mut() {
+        let mut atlas = sample();
+        // Index<&str>（String: Borrow<str>）
+        assert_eq!(atlas["a"].tl_px, (1, 2));
+        // Index<&String>
+        let key = "b".to_string();
+        assert_eq!(atlas[&key].wh_px, (4, 4));
+        // IndexMut：直接改写区域
+        atlas["b"].origin_px = (5, 6);
+        assert_eq!(atlas[&key].origin_px, (5, 6));
+    }
+
+    #[test]
+    fn get_accepts_borrowed_keys() {
+        let atlas = sample();
+        assert_eq!(atlas.get("a").unwrap().page_uid, 42);
+        let key = "b".to_string();
+        assert!(atlas.get(&key).is_some());
+        assert!(atlas.get("missing").is_none());
+        assert!(atlas.contains_key("a"));
+        assert_eq!(atlas.len(), 2);
+        assert!(!atlas.is_empty());
+    }
+
+    #[test]
+    fn generic_key_type() {
+        // K = u32（与 DynamicAtlas 一致的泛型能力）
+        let mut m = HashMap::new();
+        m.insert(
+            7u32,
+            AtlasRegion { tl_px: (0, 0), wh_px: (2, 2), origin_px: (0, 0), page_uid: 1 },
+        );
+        let atlas = StaticAtlas::<u32>::from(m);
+        assert_eq!(atlas[&7].wh_px, (2, 2));
+        assert!(atlas.get(&7).is_some());
+        // 泛型 Default
+        let empty: StaticAtlas<u32> = StaticAtlas::default();
+        assert!(empty.is_empty());
+    }
 }

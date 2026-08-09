@@ -175,6 +175,53 @@ let b = SpriteRect::from_texture_px(
 );
 ```
 
+### 4.1 SpriteRectPx（像素 UV 精灵矩形）
+
+crate：`rjw_2d_render`（`data` 模块）
+
+与 `SpriteRect` 字段一一对应，但 `uv_tl` / `uv_wh` 以**像素**为单位（而非归一化坐标），
+并额外持有纹理像素尺寸 `tex_wh`，便于实现裁剪类特效（shrink / expand / exceed 等）。
+引擎主要使用 `ArcTextureWrapped`（内置 `width` / `height`），可直接用 `from_tex` / `from_tex_px` 构造。
+
+```rust
+pub struct SpriteRectPx {
+    pub mesh_tl: Vec2, // 世界坐标左上角
+    pub mesh_wh: Vec2, // 世界尺寸
+    pub uv_tl:   Vec2, // 纹理子区左上角（像素）
+    pub uv_wh:   Vec2, // 纹理子区尺寸（像素）
+    pub tex_wh:  Vec2, // 纹理尺寸（像素）
+}
+```
+
+| 函数 | 用法 | 说明 |
+|---|---|---|
+| `new` | `SpriteRectPx::new(tl, wh, uv_tl_px, uv_wh_px, tex_wh_px)` | 全手动（UV 像素） |
+| `from_texture` | `SpriteRectPx::from_texture(tl, wh, tex_wh_px)` | 整张贴图 |
+| `from_tex` | `SpriteRectPx::from_tex(tl, wh, &tex)` | 整张贴图（尺寸取 `tex.width`/`tex.height`） |
+| `from_tex_px` | `SpriteRectPx::from_tex_px(tl, wh, uv_tl_px, uv_wh_px, &tex)` | 像素子区（尺寸取 `tex.width`/`tex.height`） |
+| `to_sprite_rect` | `px.to_sprite_rect() -> SpriteRect` | 转为归一化 `SpriteRect`（`Into` 同样可用：`let s: SpriteRect = px.into();`） |
+| `shrink_mesh_x/y/(x,y)` | `px.shrink_mesh_x(8.0)` | 世界坐标网格收缩（同 `SpriteRect`） |
+| `shrink_uv_x/y/(x,y)` | `px.shrink_uv_x(8.0)` | UV 双侧各收窄 px（居中，clamp 到 0 不翻转） |
+| `shrink_left/right/up/down` | `px.shrink_left(8.0)` | UV 单侧收窄 px（clamp 到 0） |
+| `expand_left/right/up/down` | `px.expand_down(8.0)` | UV 单侧展开 px（**Clamp** 到纹理边界） |
+| `expand` | `px.expand(8.0)` | UV 四周各展开 px（Clamp） |
+| `exceed_left/right/up/down` | `px.exceed_left(8.0)` | UV 单侧展开 px（**不 Clamp**，允许越界采样） |
+
+```rust
+use rjw_2d_render::{SpriteRectPx, TextureWrapped};
+use glam::Vec2;
+
+// 整张贴图（尺寸自动取自纹理）
+let base = SpriteRectPx::from_tex(Vec2::ZERO, Vec2::splat(64.0), &tex);
+// 向下展开 16px（Clamp 到纹理下边界）
+let r = base.expand_down(16.0).to_sprite_rect();
+r2d.add_sprite2d(r, Color::WHITE, Transform2D::default(), 0.0, &tex);
+// 或直接传 SpriteRectPx（add_sprite2d* 接受 impl Into<SpriteRect>）
+r2d.add_sprite2d(base.shrink_uv_x(8.0), Color::WHITE, Transform2D::default(), 0.0, &tex);
+// 向左越界展开 4px（不 Clamp）
+r2d.add_sprite2d(base.exceed_left(4.0), Color::WHITE, Transform2D::default(), 0.0, &tex);
+```
+
 ---
 
 ## 5. Render2D（2D 批渲染器）
@@ -374,7 +421,8 @@ render2d.add_static_mesh_matrix(circle_id, Color::WHITE, model, 96.0, &tex).done
 | 函数 | 用法 | 说明 |
 |---|---|---|
 | `render` | `r2d.render(&ClearConfig { ... })` | **全流程**：begin_frame → 创建 pass → 绘制 → 提交呈现 |
-| `flush` | `r2d.flush(&mut pass)` | 只录制绘制到用户自己建的 pass |
+| `flush` | `r2d.flush(&mut pass)` | 只录制绘制到用户自己建的 pass（仅传入 Pass） |
+| `render_command_buffer` | `r2d.render_command_buffer(&ClearConfig, &target_view, depth)` | 仅编码为 `CommandBuffer`（不提交/不 present，适合离屏渲染/合并提交） |
 | `begin_frame` | `r2d.begin_frame() -> Option<(SurfaceTexture, TextureView)>` | 手动获取表面 |
 
 ```rust
@@ -520,8 +568,11 @@ crate：`rjw_atlas`
 pub struct AtlasConfig { pub max_pages: usize, pub padding: u32, pub lifetime: u32 }
 pub struct AtlasRegion { pub tl_px: (u32,u32), pub wh_px: (u32,u32), pub origin_px: (u32,u32), pub page_uid: u64 }
 pub struct DynamicAtlas<K = String>  // K 为精灵键类型，String 特化提供 TOML 导入导出
-pub struct StaticAtlas            // (serde feature only)
+pub struct StaticAtlas<K = String>   // 泛型与 DynamicAtlas 一致；from_toml/to_toml (serde feature only)
 ```
+
+> 💡 `DynamicAtlas` / `StaticAtlas` 均实现 `Index<&Q>` / `IndexMut<&Q>`（`K: Borrow<Q>`）：
+> `atlas[&key]` / `atlas["name"]` 直接读写区域，`get()` 语义见下表（DynamicAtlas 的 `get` 会刷新寿命）。
 
 | 方法 | 说明 |
 |---|---|
@@ -541,8 +592,8 @@ pub struct StaticAtlas            // (serde feature only)
 | `compact()` | 重建 skyline |
 | `page_size()` / `page_count()` / `texture_uid_of(name)` | 查询 |
 | `parse_toml_entries(toml_str)` | 辅助：解析 TOML 返回原始条目表 |
-| `StaticAtlas::from_toml(s)` | 从 TOML 反序列化 |
-| `StaticAtlas::get(name)` | 查找 |
+| `StaticAtlas::from_toml(s)` | 从 TOML 反序列化（`K=String` 特化） |
+| `StaticAtlas::get(name)` | 查找（接受 `&str` 等可借用键） |
 
 ## 9. Text（文本渲染）
 

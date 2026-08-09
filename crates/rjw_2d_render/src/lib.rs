@@ -9,7 +9,7 @@
 //!
 //! # 模块划分
 //!
-//! - [`data`]：几何/数据类型（`SpriteRect`/`VertexP3U2C4`/`Index`/`TriIndicies`/`MeshStorage`/`MeshSink`）
+//! - [`data`]：几何/数据类型（`SpriteRect`/`SpriteRectPx`/`VertexP3U2C4`/`Index`/`TriIndicies`/`MeshStorage`/`MeshSink`）
 //! - [`command`]：绘制命令枚举、层级 `Layer`、状态与命令队列
 //! - [`draw_page`]：GPU 实例数据/缓冲页（`InstanceData`/`VPBuffer`/`MeshDrawItem`/`DrawOp`/`DrawPage`）
 //! - [`render2d`]：`Render2D` 渲染器主体 + `ClearConfig`
@@ -28,7 +28,7 @@ pub mod rstates;
 // ─── 对外重导出（保持既有 API 不变） ──────────────────────────
 
 pub use command::Layer;
-pub use data::{Index, MeshSink, SpriteRect, TriIndicies, Vertex, VertexP3U2C4};
+pub use data::{Index, MeshSink, SpriteRect, SpriteRectPx, TriIndicies, Vertex, VertexP3U2C4};
 pub use draw_page::MAX_INSTANCES_PER_DRAW;
 pub use render2d::{
     ClearConfig, CustomBuilder, CustomDraw, MeshBuilder, Render2D, Sprite2DBuilder,
@@ -245,5 +245,123 @@ mod matrix_tests {
             (center_px - glam::Vec2::new(W * 0.5, H * 0.5)).length() < EPS,
             "world origin should map to screen center, got {center_px:?}"
         );
+    }
+}
+
+/// `SpriteRectPx` 单元测试：像素 UV → 归一化换算、收缩 / 展开（Clamp）/ 越界（不 Clamp）行为。
+#[cfg(test)]
+mod sprite_rect_px_tests {
+    use super::*;
+
+    const EPS: f32 = 1e-4;
+
+    /// 64×64 纹理的整张贴图精灵
+    fn px64() -> SpriteRectPx {
+        SpriteRectPx::from_texture(
+            glam::Vec2::ZERO,
+            glam::Vec2::splat(32.0),
+            glam::Vec2::splat(64.0),
+        )
+    }
+
+    #[test]
+    fn from_texture_maps_full_region() {
+        let r = px64();
+        assert_eq!(r.uv_tl, glam::Vec2::ZERO);
+        assert_eq!(r.uv_wh, glam::Vec2::splat(64.0));
+        let s: SpriteRect = r.into();
+        assert_eq!(s.uv_tl, glam::Vec2::ZERO);
+        assert!((s.uv_wh - glam::Vec2::ONE).length() < EPS);
+        // mesh 透传
+        assert_eq!(s.mesh_tl, r.mesh_tl);
+        assert_eq!(s.mesh_wh, r.mesh_wh);
+    }
+
+    #[test]
+    fn pixel_subregion_normalizes_correctly() {
+        let r = SpriteRectPx::new(
+            glam::Vec2::new(-16.0, -8.0),
+            glam::Vec2::new(32.0, 16.0),
+            glam::Vec2::new(16.0, 32.0),
+            glam::Vec2::new(64.0, 32.0),
+            glam::Vec2::new(256.0, 128.0),
+        );
+        let s = r.to_sprite_rect();
+        assert!((s.uv_tl - glam::Vec2::new(16.0 / 256.0, 32.0 / 128.0)).length() < EPS);
+        assert!((s.uv_wh - glam::Vec2::new(64.0 / 256.0, 32.0 / 128.0)).length() < EPS);
+    }
+
+    #[test]
+    fn shrink_uv_is_centered_and_clamped() {
+        let r = px64();
+        let s = r.shrink_uv_x(8.0);
+        assert!((s.uv_tl.x - 8.0).abs() < EPS, "tl.x = {}", s.uv_tl.x);
+        assert!((s.uv_wh.x - 48.0).abs() < EPS, "wh.x = {}", s.uv_wh.x);
+        // 过窄：clamp 到 0，uv_tl 居中（不翻转）
+        let c = r.shrink_uv_x(64.0);
+        assert_eq!(c.uv_wh.x, 0.0);
+        assert!((c.uv_tl.x - 32.0).abs() < EPS);
+    }
+
+    #[test]
+    fn expand_clamps_at_texture_bounds() {
+        // 子区 (0,16)-(48,32)，纹理 64×64
+        let r = SpriteRectPx::new(
+            glam::Vec2::ZERO,
+            glam::Vec2::splat(32.0),
+            glam::Vec2::new(0.0, 16.0),
+            glam::Vec2::new(48.0, 32.0),
+            glam::Vec2::splat(64.0),
+        );
+        // 左：tl.x 已贴 0，无可展开
+        let e = r.expand_left(1000.0);
+        assert_eq!(e.uv_tl.x, 0.0);
+        assert!((e.uv_wh.x - 48.0).abs() < EPS);
+        // 右：0+48=48，剩 16px
+        let e = r.expand_right(1000.0);
+        assert!((e.uv_wh.x - 64.0).abs() < EPS, "wh.x = {}", e.uv_wh.x);
+        // 下：16+32=48，剩 16px
+        let e = r.expand_down(1000.0);
+        assert!((e.uv_wh.y - 48.0).abs() < EPS, "wh.y = {}", e.uv_wh.y);
+        assert_eq!(e.uv_tl.y, 16.0);
+        // 上：tl.y=16，可展开 16px
+        let e = r.expand_up(1000.0);
+        assert_eq!(e.uv_tl.y, 0.0);
+        assert!((e.uv_wh.y - 48.0).abs() < EPS);
+    }
+
+    #[test]
+    fn exceed_does_not_clamp() {
+        let r = px64();
+        let e = r.exceed_left(16.0).exceed_down(16.0);
+        assert_eq!(e.uv_tl, glam::Vec2::new(-16.0, 0.0));
+        assert_eq!(e.uv_wh, glam::Vec2::new(80.0, 80.0));
+        let e = r.exceed_up(8.0).exceed_right(8.0);
+        assert_eq!(e.uv_tl, glam::Vec2::new(0.0, -8.0));
+        assert_eq!(e.uv_wh, glam::Vec2::new(72.0, 72.0));
+    }
+
+    #[test]
+    fn shrink_single_side_clamps_to_zero() {
+        let r = px64();
+        let s = r.shrink_left(100.0);
+        assert_eq!(s.uv_wh.x, 0.0);
+        assert!((s.uv_tl.x - 64.0).abs() < EPS);
+        let s = r.shrink_right(100.0);
+        assert_eq!(s.uv_wh.x, 0.0);
+        assert_eq!(s.uv_tl.x, 0.0);
+        let s = r.shrink_down(100.0);
+        assert_eq!(s.uv_wh.y, 0.0);
+        assert_eq!(s.uv_tl.y, 0.0);
+    }
+
+    #[test]
+    fn shrink_mesh_mirrors_sprite_rect() {
+        let r = px64();
+        let s = r.shrink_mesh_x(4.0).shrink_mesh_y(2.0);
+        assert!((s.mesh_wh - glam::Vec2::new(24.0, 28.0)).length() < EPS);
+        assert!((s.mesh_tl - glam::Vec2::new(4.0, 2.0)).length() < EPS);
+        // UV 不受影响
+        assert_eq!(s.uv_wh, glam::Vec2::splat(64.0));
     }
 }

@@ -1025,12 +1025,13 @@ impl Render2D {
 
     pub fn add_sprite2d(
         &mut self,
-        rect: SpriteRect,
+        rect: impl Into<SpriteRect>,
         color: Color,
         transform: Transform2D,
         layer: impl Into<Layer>,
         texture: &ArcTextureWrapped,
     ) -> Sprite2DBuilder<'_> {
+        let rect = rect.into();
         Sprite2DBuilder {
             queue: &mut self.command_queue,
             cmd: Some(DrawCommand::Sprite2D {
@@ -1047,7 +1048,7 @@ impl Render2D {
 
     pub fn add_sprite2d_solid(
         &mut self,
-        rect: SpriteRect,
+        rect: impl Into<SpriteRect>,
         color: Color,
         transform: Transform2D,
         layer: impl Into<Layer>,
@@ -1058,12 +1059,13 @@ impl Render2D {
 
     pub fn add_sprite2d_matrix(
         &mut self,
-        rect: SpriteRect,
+        rect: impl Into<SpriteRect>,
         color: Color,
         model: glam::Mat4,
         layer: impl Into<Layer>,
         texture: &ArcTextureWrapped,
     ) -> Sprite2DBuilder<'_> {
+        let rect = rect.into();
         let mat_idx = self.command_queue.matrices.len();
         self.command_queue.matrices.push(model);
         Sprite2DBuilder {
@@ -1376,12 +1378,97 @@ impl Render2D {
         self
     }
 
+    /// 将当前队列中的命令**只录制到用户自建的 `wgpu::RenderPass`**（仅传入 Pass，不编码/提交）。
+    ///
+    /// 适合离屏渲染 / 自定义 pass 组合；命令队列在录制完成后清空（与 [`Render2D::render`] 一致）。
     pub fn flush(&mut self, pass: &mut wgpu::RenderPass<'_>) {
         self.prepare();
         self.draw(pass);
         self.command_queue.clear();
         self.mesh_storage.clear();
         self.buf_custom_draws.clear();
+    }
+
+    /// 将当前队列中的命令**仅编码为 `wgpu::CommandBuffer`**（不提交、不 present）。
+    ///
+    /// 适合离屏渲染 / 多渲染器合并提交 / 自定义 submit 时机；用法：
+    ///
+    /// ```no_run
+    /// # let mut render2d: rjw_2d_render::Render2D = unimplemented!();
+    /// # let target: wgpu::TextureView = unimplemented!();
+    /// let cb = render2d.render_command_buffer(
+    ///     &rjw_2d_render::ClearConfig::default(),
+    ///     &target,
+    ///     None,
+    /// );
+    /// render2d.queue().submit(std::iter::once(cb));
+    /// ```
+    ///
+    /// - `target`：渲染目标纹理视图（离屏纹理 / surface view 均可）。
+    /// - `depth`：可选外部深度/模板视图；传 `None` 且 `clear` 需要深度时，自动按
+    ///   `target` 尺寸创建 / 复用内部深度纹理。
+    ///
+    /// 编码完成后清空命令队列（与 [`Render2D::render`] / [`Render2D::flush`] 一致）。
+    pub fn render_command_buffer(
+        &mut self,
+        clear: &ClearConfig,
+        target: &wgpu::TextureView,
+        depth: Option<&wgpu::TextureView>,
+    ) -> wgpu::CommandBuffer {
+        self.prepare();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render2D: command buffer encoder"),
+            });
+        let nd = clear.depth.is_some() || clear.stencil.is_some();
+        if nd && depth.is_none() {
+            let size = target.texture().size();
+            self.ensure_depth(size.width, size.height);
+        }
+        let dv = if nd { depth.or(self.depth_view.as_ref()) } else { None };
+        {
+            let co = match clear.color {
+                Some(c) => wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(c),
+                    store: wgpu::StoreOp::Store,
+                },
+                None => wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            };
+            let dsa = dv.map(|dv| wgpu::RenderPassDepthStencilAttachment {
+                view: dv,
+                depth_ops: clear.depth.map(|d| wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(d),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: clear.stencil.map(|s| wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(s),
+                    store: wgpu::StoreOp::Store,
+                }),
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render2D: command buffer pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: co,
+                })],
+                depth_stencil_attachment: dsa,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            self.draw(&mut pass);
+        }
+        let cb = encoder.finish();
+        self.command_queue.clear();
+        self.mesh_storage.clear();
+        self.buf_custom_draws.clear();
+        cb
     }
 
     pub fn begin_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
