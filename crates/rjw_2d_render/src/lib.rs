@@ -92,6 +92,29 @@ mod mesh_sink_tests {
         // 顶点颜色取录制颜色。
         assert_eq!(storage.vertices[4].color, [1.0, 0.0, 0.0, 1.0]);
     }
+
+    /// 验证 `push_vertex_uv_color` 写入逐顶点颜色（不取录制颜色）。
+    #[test]
+    fn push_vertex_uv_color_sets_vertex_color() {
+        let mut storage = data::MeshStorage::default();
+        let mut sink = data::MeshSink {
+            base: 0,
+            verts: &mut storage.vertices,
+            tris: &mut storage.tri_indices,
+            color_arr: [0.0, 1.0, 0.0, 1.0],
+        };
+        let idx = sink.push_vertex_uv_color(
+            glam::Vec2::new(10.0, 20.0),
+            glam::Vec2::new(0.25, 0.75),
+            [1.0, 0.0, 0.0, 0.5],
+        );
+        assert_eq!(idx, 0);
+        drop(sink);
+        let v = storage.vertices[0];
+        assert_eq!(v.pos, [10.0, 20.0, 0.0]);
+        assert_eq!(v.uv, [0.25, 0.75]);
+        assert_eq!(v.color, [1.0, 0.0, 0.0, 0.5]);
+    }
 }
 
 /// 矩阵数学单元测试（无 GPU 依赖）。

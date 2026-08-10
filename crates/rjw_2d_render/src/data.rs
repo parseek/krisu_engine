@@ -534,6 +534,24 @@ impl<'a> MeshSink<'a> {
         idx as u16
     }
 
+    /// push 一个顶点（位置 + UV + **自定义逐顶点颜色**；不取录制时的 `color`）。
+    ///
+    /// 用于逐顶点渐变等场景（如文本渐变）。返回该顶点的**局部索引**。
+    #[inline]
+    pub fn push_vertex_uv_color(&mut self, pos: glam::Vec2, uv: glam::Vec2, color: [f32; 4]) -> u16 {
+        let idx = self.verts.len() as u32 - self.base;
+        debug_assert!(
+            idx <= u16::MAX as u32,
+            "too many vertices for u16 indices in one mesh"
+        );
+        self.verts.push(VertexP3U2C4 {
+            pos: [pos.x, pos.y, 0.0],
+            uv: [uv.x, uv.y],
+            color,
+        });
+        idx as u16
+    }
+
     /// push 一个三角形（`a`/`b`/`c` 为**局部**索引，需已在前面 push 过对应顶点）。
     ///
     /// 内部自动把局部索引 + 本 mesh 的全局基址，重定位为全局索引写入 Storage。

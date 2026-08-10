@@ -1,6 +1,6 @@
 [package]
 name = "rjw_2d_render"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["KrisuRJW <Cmd1loica99@163.com>"]
 description = "Batched 2D renderer: unified Sprite/Mesh pipeline, RStates bitfield, builder chain and paged instance buffers."
@@ -12,8 +12,8 @@ categories = ["game-engines", "graphics"]
 
 [dependencies]
 rjw_render = { path = "../rjw_render", version = "0.1.0" }
-rjw_atlas = { path = "../rjw_atlas", version = "0.1.0", optional = true }
-rjw_transform = { path = "../rjw_transform", version = "0.1.0" }
+rjw_atlas = { path = "../rjw_atlas", version = "0.1.1", optional = true }
+rjw_transform = { path = "../rjw_transform", version = "0.1.1" }
 rjw_color = { version = "0.1.0", features = ["wgpu"] }
 wgpu = "30.0.0"
 glam = "0.33.2"

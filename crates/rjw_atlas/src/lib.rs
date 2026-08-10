@@ -1,6 +1,7 @@
 //! 运行时动态 / 静态纹理图集。
 //!
-//! - `DynamicAtlas<K=String>`：Skyline 打包器，运行时插入/踢出/compact/自动新建页 + TOML 批量导入 + 自动复活。
+//! - `DynamicAtlas<K=String>`：Guillotine 空闲矩形打包器，运行时插入/踢出/compact 去碎片重排/自动新建页
+//!   + TOML 批量导入 + 自动复活；`compact()` 重排后 `generation()` 递增，缓存区域者据此刷新。
 //!   `K` 泛型键（默认 `String`），`String` 特化支持 TOML 导入/导出 + 便捷方法。
 //! - `StaticAtlas<K=String>`：从 TOML 反序列化预排布图集（`spr.toml`），泛型与 `DynamicAtlas` 一致。
 //! - `DynamicAtlas` / `StaticAtlas` 均实现 `Index` / `IndexMut`：`atlas[&key]` 直接读写区域。
@@ -50,98 +51,137 @@ pub struct AtlasRegion {
     pub page_uid: u64,
 }
 
-// ─── Skyline ──────────────────────────────────────────────────
+// ─── 空闲矩形打包器（Guillotine）──────────────────────────────
 
-#[derive(Clone, Copy, Debug)]
-struct SkySegment { x: u32, y: u32, w: u32 }
+/// 空闲矩形：页内一块未被占用的区域 `[x, x+w) × [y, y+h)`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreeRect { x: u32, y: u32, w: u32, h: u32 }
 
-struct Skyline {
-    segments: Vec<SkySegment>,
-    page_size: u32,
+/// 空闲矩形列表打包器（替换旧“天空线”：天空线无法表达“行下方整宽自由区”，
+/// 混合高度时会把页碎片化成窄列，导致“页未满却开新页”）。
+///
+/// 算法：best-fit（最低 y → 最小面积）选择一个能容纳的空闲矩形，放置后沿剩余较长方向
+/// **古莱丁切分**（竖直切分保留整高右侧列 / 水平切分保留整宽下方行），并合并相邻空闲矩形。
+/// 这样按行堆放字形时，每一行下方始终存在**整宽**的自由矩形，宽字形总能放下。
+#[derive(Clone)]
+struct Guillotine {
+    segments: Vec<FreeRect>,
 }
 
-impl Skyline {
+impl Guillotine {
     fn new(page_size: u32) -> Self {
-        Self { segments: vec![SkySegment { x: 0, y: 0, w: page_size }], page_size }
+        Self { segments: vec![FreeRect { x: 0, y: 0, w: page_size, h: page_size }] }
     }
 
     fn allocate(&mut self, w: u32, h: u32, padding: u32) -> Option<(u32, u32)> {
-        let needed = w + padding * 2;
-        let mut best_idx: Option<usize> = None;
-        let mut best_y = u32::MAX;
-        let mut best_surplus = u32::MAX;
-        for (i, seg) in self.segments.iter().enumerate() {
-            if seg.w >= needed {
-                let surplus = seg.w - needed;
-                if seg.y < best_y || (seg.y == best_y && surplus < best_surplus) {
-                    best_y = seg.y;
-                    best_surplus = surplus;
-                    best_idx = Some(i);
-                }
+        let nw = w + padding * 2;
+        let nh = h + padding * 2;
+        // best-fit：最低 y（优先填当前行），其次最小面积（减少浪费）。
+        let mut best: Option<(usize, u32, u32)> = None;
+        for (i, r) in self.segments.iter().enumerate() {
+            if r.w >= nw && r.h >= nh {
+                let area = r.w * r.h;
+                let better = match best {
+                    None => true,
+                    Some((_, by, ba)) => r.y < by || (r.y == by && area < ba),
+                };
+                if better { best = Some((i, area, r.w)); }
             }
         }
-        let best_idx = best_idx?;
-        if best_y + h + padding * 2 > self.page_size { return None; }
-
-        let seg = self.segments[best_idx];
-        let x = seg.x + padding;
-        let y = seg.y + padding;
-        self.segments.remove(best_idx);
-
-        let right_w = seg.w - needed;
-        if right_w > 0 {
-            self.segments.push(SkySegment { x: x + w + padding, y: seg.y, w: right_w });
+        let (idx, _, _) = best?;
+        let rect = self.segments.remove(idx);
+        let x = rect.x + padding;
+        let y = rect.y + padding;
+        let rw = rect.w - nw; // 右侧剩余宽
+        let rh = rect.h - nh; // 下方剩余高
+        // 沿剩余较长方向切分：
+        // - 水平切分（rh ≥ rw）：下方为**整宽**矩形，适合按行堆放；
+        // - 竖直切分（rw > rh）：右侧为整高矩形。
+        if rh >= rw {
+            if rh > 0 { self.segments.push(FreeRect { x: rect.x, y: rect.y + nh, w: rect.w, h: rh }); }
+            if rw > 0 { self.segments.push(FreeRect { x: rect.x + nw, y: rect.y, w: rw, h: nh }); }
+        } else {
+            if rw > 0 { self.segments.push(FreeRect { x: rect.x + nw, y: rect.y, w: rw, h: rect.h }); }
+            if rh > 0 { self.segments.push(FreeRect { x: rect.x, y: rect.y + nh, w: nw, h: rh }); }
         }
-        self.segments.push(SkySegment { x: seg.x, y: y + h + padding, w: needed });
-        self.segments.sort_by_key(|s| s.x);
-        self.merge_adjacent();
+        self.merge();
         Some((x, y))
     }
 
-    fn merge_adjacent(&mut self) {
+    /// 合并相邻空闲矩形：同 y 同高 x 相邻 → 横向合并；同 x 同宽 y 相邻 → 纵向合并。
+    fn merge(&mut self) {
+        if self.segments.len() < 2 { return; }
+        self.segments.sort_by_key(|r| (r.y, r.x));
         let mut i = 0;
         while i + 1 < self.segments.len() {
             let a = self.segments[i]; let b = self.segments[i + 1];
-            if a.y == b.y && a.x + a.w == b.x { self.segments[i].w = a.w + b.w; self.segments.remove(i + 1); }
-            else { i += 1; }
+            if a.y == b.y && a.h == b.h && a.x + a.w == b.x {
+                self.segments[i].w += b.w;
+                self.segments.remove(i + 1);
+            } else { i += 1; }
+        }
+        self.segments.sort_by_key(|r| (r.x, r.y));
+        let mut i = 0;
+        while i + 1 < self.segments.len() {
+            let a = self.segments[i]; let b = self.segments[i + 1];
+            if a.x == b.x && a.w == b.w && a.y + a.h == b.y {
+                self.segments[i].h += b.h;
+                self.segments.remove(i + 1);
+            } else { i += 1; }
         }
     }
 
+    /// 从已占用的矩形重建空闲矩形列表：x 扫描线，每个跨度取覆盖它的占用矩形的 y 区间之并，
+    /// 求 `[0, page_size)` 的补集得到自由区间，最后合并相邻跨度。
+    ///
+    /// 与增量 [`Self::allocate`] 维护的空闲矩形**等价**（自由区完全一致），供 `compact` 重建使用。
     fn from_occupied(page_size: u32, occupied: &[(u32, u32, u32, u32)], padding: u32) -> Self {
-        let mut segments = vec![SkySegment { x: 0, y: 0, w: page_size }];
-        let mut sorted: Vec<_> = occupied.iter().collect();
-        sorted.sort_by_key(|&&(ox, oy, _, _)| (oy, ox));
-        for &&(ox, oy, ow, oh) in &sorted {
-            let px = ox.saturating_sub(padding); let py = oy.saturating_sub(padding);
-            let pw = ow + padding * 2; let ph = oh + padding * 2;
-            let mut i = 0;
-            while i < segments.len() {
-                let s = segments[i];
-                let right = px + pw; let s_right = s.x + s.w;
-                if s.x < right && px < s_right && s.y < py + ph && py < s.y.saturating_add(1).min(page_size) {
-                    segments.remove(i);
-                    if s.x < px { segments.insert(i, SkySegment { x: s.x, y: s.y, w: px - s.x }); i += 1; }
-                    if s_right > right { segments.insert(i, SkySegment { x: right, y: s.y, w: s_right - right }); i += 1; }
-                    if py + ph > s.y + 1 && py + ph < page_size { segments.insert(i, SkySegment { x: s.x, y: py + ph, w: pw }); i += 1; }
-                } else { i += 1; }
+        let mut xs: Vec<u32> = vec![0, page_size];
+        let mut rects: Vec<(u32, u32, u32, u32)> = Vec::new(); // (x0, y0, x1, y1) 含 padding 扩展
+        for &(ox, oy, ow, oh) in occupied {
+            let x0 = ox.saturating_sub(padding);
+            let y0 = oy.saturating_sub(padding);
+            let x1 = x0.saturating_add(ow + padding * 2).min(page_size);
+            let y1 = y0.saturating_add(oh + padding * 2).min(page_size);
+            if x1 > x0 && y1 > y0 {
+                rects.push((x0, y0, x1, y1));
+                xs.push(x0);
+                xs.push(x1);
             }
         }
-        let mut slf = Self { segments, page_size };
-        slf.merge_adjacent();
+        xs.sort_unstable();
+        xs.dedup();
+
+        let mut segments: Vec<FreeRect> = Vec::new();
+        for span in xs.windows(2) {
+            let (xa, xb) = (span[0], span[1]);
+            if xa >= xb { continue; }
+            // 覆盖整个跨度 [xa, xb) 的占用矩形（事件点来自矩形边界，跨度为最大子区间）。
+            let mut ivs: Vec<(u32, u32)> = rects.iter()
+                .filter(|r| r.0 <= xa && r.2 >= xb)
+                .map(|r| (r.1, r.3))
+                .collect();
+            ivs.sort_unstable();
+            // 占用区间之并 → [0, page_size) 的补集 = 自由区间。
+            let mut cur = 0u32;
+            for &(y0, y1) in &ivs {
+                if y0 > cur { segments.push(FreeRect { x: xa, y: cur, w: xb - xa, h: y0.min(page_size) - cur }); }
+                cur = cur.max(y1);
+                if cur >= page_size { break; }
+            }
+            if cur < page_size { segments.push(FreeRect { x: xa, y: cur, w: xb - xa, h: page_size - cur }); }
+        }
+        let mut slf = Self { segments };
+        slf.merge();
         slf
     }
 
     fn free_area(&self) -> u64 {
-        self.segments.iter().map(|seg| (seg.w as u64) * self.height_below(*seg)).sum()
+        self.segments.iter().map(|r| (r.w as u64) * (r.h as u64)).sum()
     }
 
     fn largest_free_area(&self) -> u64 {
-        self.segments.iter().map(|seg| (seg.w as u64) * self.height_below(*seg)).max().unwrap_or(0)
-    }
-
-    fn height_below(&self, seg: SkySegment) -> u64 {
-        let next_y = self.segments.iter().filter(|o| o.y > seg.y).map(|o| o.y).min().unwrap_or(self.page_size);
-        (next_y - seg.y) as u64
+        self.segments.iter().map(|r| (r.w as u64) * (r.h as u64)).max().unwrap_or(0)
     }
 }
 
@@ -149,7 +189,7 @@ impl Skyline {
 
 struct AtlasPage {
     texture: ArcTextureWrapped,
-    skyline: Skyline,
+    allocator: Guillotine,
 }
 
 impl AtlasPage {
@@ -166,7 +206,7 @@ impl AtlasPage {
         };
         let tex = Arc::new(TextureWrapped::from_rgba8(device, queue, &label, &clear, page_size, page_size));
         TEXTURES.register(tex.clone());
-        Self { texture: tex, skyline: Skyline::new(page_size) }
+        Self { texture: tex, allocator: Guillotine::new(page_size) }
     }
 }
 
@@ -211,6 +251,7 @@ struct AtlasEntry {
     source: Option<SourceData>,
     alloc_tl: (u32, u32),
     alloc_wh: (u32, u32),
+    clamp_margin: bool,
 }
 
 pub struct DynamicAtlas<K = String> {
@@ -220,6 +261,8 @@ pub struct DynamicAtlas<K = String> {
     config: AtlasConfig,
     page_size: u32,
     dirty: bool,
+    /// 去碎片重排世代号：每次 `compact` 真正搬动条目时 +1，持有缓存区域者据此刷新。
+    generation: u64,
     device: wgpu::Device,
     queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
@@ -235,8 +278,11 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         let queue = queue.clone();
         let layout = layout.clone();
         let page = AtlasPage::new(&device, &queue, &layout, page_size);
-        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, device, queue, layout }
+        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout }
     }
+
+    /// 去碎片重排世代号（每次搬动条目 +1；未搬动则不变）。
+    pub fn generation(&self) -> u64 { self.generation }
 
     pub fn texture_uid_of(&self, key: &K) -> Option<u64> { self.entries.get(key).map(|e| e.region.page_uid) }
 
@@ -319,14 +365,15 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         let region = AtlasRegion { tl_px: (x + margin_offs.0, y + margin_offs.1), wh_px: (w, h), origin_px, page_uid: page.texture.uid };
         let alloc_tl = (x - padding, y - padding);
         let alloc_wh = (alloc_w + padding * 2, alloc_h + padding * 2);
-        self.entries.insert(key, AtlasEntry { region, lifetime: self.config.lifetime, source: None, alloc_tl, alloc_wh });
+        self.entries.insert(key, AtlasEntry { region, lifetime: self.config.lifetime, source: None, alloc_tl, alloc_wh, clamp_margin });
         Some(region)
     }
 
     fn try_alloc(&mut self, w: u32, h: u32, padding: u32) -> Option<(usize, u32, u32)> {
-        for (i, page) in self.pages.iter_mut().enumerate() { if let Some((x, y)) = page.skyline.allocate(w, h, padding) { return Some((i, x, y)); } }
-        if self.dirty { self.compact_inner(); }
-        for (i, page) in self.pages.iter_mut().enumerate() { if let Some((x, y)) = page.skyline.allocate(w, h, padding) { return Some((i, x, y)); } }
+        for (i, page) in self.pages.iter_mut().enumerate() { if let Some((x, y)) = page.allocator.allocate(w, h, padding) { return Some((i, x, y)); } }
+        // 第一遍失败：无条件整理（重建空闲矩形、合并碎片），避免“页未满却开新页”。
+        self.compact_inner();
+        for (i, page) in self.pages.iter_mut().enumerate() { if let Some((x, y)) = page.allocator.allocate(w, h, padding) { return Some((i, x, y)); } }
         None
     }
 
@@ -336,7 +383,7 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         for (k, e) in &self.entries {
             if e.lifetime == 0 {
                 if let Some(src) = &e.source {
-                    to_tomb.push((k.clone(), Tombstone { source: src.clone_inline(), origin_px: e.region.origin_px, clamp_margin: true }));
+                    to_tomb.push((k.clone(), Tombstone { source: src.clone_inline(), origin_px: e.region.origin_px, clamp_margin: e.clamp_margin }));
                     remove_keys.push(k.clone());
                 }
             }
@@ -349,21 +396,106 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
 
     pub fn compact(&mut self) { self.compact_inner(); }
 
+    /// 去碎片整理：优先尝试**全量重排**（所有带源条目按面积降序重排到最少页，真正消除碎片）；
+    /// 若存在无法搬动的无源条目（永久精灵）则退回按页重建空闲矩形（配合 [`Guillotine::from_occupied`]）。
     fn compact_inner(&mut self) {
+        if self.repack_all() {
+            self.dirty = false;
+            return;
+        }
         let ps = self.page_size;
         for page in &mut self.pages {
             let occupied: Vec<_> = self.entries.values().filter(|e| e.region.page_uid == page.texture.uid)
                 .map(|e| (e.alloc_tl.0, e.alloc_tl.1, e.alloc_wh.0, e.alloc_wh.1)).collect();
-            page.skyline = Skyline::from_occupied(ps, &occupied, 0);
+            page.allocator = Guillotine::from_occupied(ps, &occupied, 0);
         }
         self.dirty = false;
+    }
+
+    /// 把全部带源条目按面积降序重排进最少页（复用现有页纹理），重传纹理并更新条目区域。
+    ///
+    /// - 任何条目无源（永久精灵，无法重新上传）→ 放弃重排，返回 `false`。
+    /// - 重排成功 → `generation` 递增（外部持有区域缓存者据此刷新），返回 `true`。
+    /// - 重排后仍超出 `max_pages` → 放弃，返回 `false`。
+    fn repack_all(&mut self) -> bool {
+        if self.entries.is_empty() { return true; }
+        if self.entries.values().any(|e| e.source.is_none()) { return false; }
+
+        struct Item<K> {
+            key: K,
+            rgba: Vec<u8>,
+            alloc_w: u32,
+            alloc_h: u32,
+            margin_offs: (u32, u32),
+            wh_px: (u32, u32),
+            origin_px: (u32, u32),
+            lifetime: u32,
+        }
+        let mut items: Vec<Item<K>> = Vec::with_capacity(self.entries.len());
+        for (key, e) in &self.entries {
+            let (rgba, w, h) = e.source.as_ref().expect("source checked above").extract();
+            let (expanded, alloc_w, alloc_h, margin_offs) = if e.clamp_margin {
+                (expand_clamp_margin(&rgba, w, h), w + 2, h + 2, (1u32, 1u32))
+            } else {
+                (rgba, w, h, (0u32, 0u32))
+            };
+            items.push(Item { key: key.clone(), rgba: expanded, alloc_w, alloc_h, margin_offs, wh_px: (w, h), origin_px: e.region.origin_px, lifetime: e.lifetime });
+        }
+        // 大块优先 → 密度更高，减少碎片。
+        items.sort_by(|a, b| (b.alloc_h * b.alloc_w).cmp(&(a.alloc_h * a.alloc_w)));
+
+        let padding = self.config.padding;
+        let mut allocators: Vec<Guillotine> = vec![Guillotine::new(self.page_size)];
+        let mut slots: Vec<(usize, u32, u32)> = Vec::with_capacity(items.len());
+        'outer: for it in &items {
+            for (si, sky) in allocators.iter_mut().enumerate() {
+                if let Some((x, y)) = sky.allocate(it.alloc_w, it.alloc_h, padding) {
+                    slots.push((si, x, y));
+                    continue 'outer;
+                }
+            }
+            if allocators.len() >= self.config.max_pages { return false; }
+            let mut sky = Guillotine::new(self.page_size);
+            let (x, y) = sky.allocate(it.alloc_w, it.alloc_h, padding).expect("fresh page always fits");
+            allocators.push(sky);
+            slots.push((allocators.len() - 1, x, y));
+        }
+
+        while self.pages.len() < allocators.len() {
+            self.pages.push(AtlasPage::new(&self.device, &self.queue, &self.layout, self.page_size));
+        }
+        for (it, (pi, x, y)) in items.into_iter().zip(slots.into_iter()) {
+            let page = &self.pages[pi];
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: page.texture.raw_texture(), mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                &it.rgba,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(it.alloc_w * 4), rows_per_image: Some(it.alloc_h) },
+                wgpu::Extent3d { width: it.alloc_w, height: it.alloc_h, depth_or_array_layers: 1 },
+            );
+            let e = self.entries.get_mut(&it.key).expect("entry must exist");
+            e.region = AtlasRegion {
+                tl_px: (x + it.margin_offs.0, y + it.margin_offs.1),
+                wh_px: it.wh_px,
+                origin_px: it.origin_px,
+                page_uid: page.texture.uid,
+            };
+            e.alloc_tl = (x - padding, y - padding);
+            e.alloc_wh = (it.alloc_w + padding * 2, it.alloc_h + padding * 2);
+            e.lifetime = it.lifetime;
+        }
+        self.pages.truncate(allocators.len());
+        for (page, sky) in self.pages.iter_mut().zip(allocators.into_iter()) {
+            page.allocator = sky;
+        }
+        self.generation += 1;
+        true
     }
 
     pub fn page_count(&self) -> usize { self.pages.len() }
     pub fn page_size(&self) -> u32 { self.page_size }
 
-    pub fn total_free(&self) -> u64 { self.pages.iter().map(|p| p.skyline.free_area()).sum() }
-    pub fn largest_free(&self) -> u64 { self.pages.iter().map(|p| p.skyline.largest_free_area()).max().unwrap_or(0) }
+    pub fn total_free(&self) -> u64 { self.pages.iter().map(|p| p.allocator.free_area()).sum() }
+    pub fn largest_free(&self) -> u64 { self.pages.iter().map(|p| p.allocator.largest_free_area()).max().unwrap_or(0) }
 
     pub fn fragmentation(&self) -> f32 {
         let total = self.total_free();
@@ -673,5 +805,186 @@ mod static_atlas_tests {
         // 泛型 Default
         let empty: StaticAtlas<u32> = StaticAtlas::default();
         assert!(empty.is_empty());
+    }
+}
+#[cfg(test)]
+mod guillotine_tests {
+    use super::*;
+
+    /// 按顺序分配一组矩形（padding 可设），返回分配器与放置结果 `(x, y, w, h)`。
+    fn allocate_all(page: u32, padding: u32, items: &[(u32, u32)]) -> (Guillotine, Vec<(u32, u32, u32, u32)>) {
+        let mut sky = Guillotine::new(page);
+        let mut placed = Vec::new();
+        for &(w, h) in items {
+            if let Some((x, y)) = sky.allocate(w, h, padding) {
+                placed.push((x, y, w, h));
+            }
+        }
+        (sky, placed)
+    }
+
+    /// 检查两个分配器的自由区总面积一致（重建应与增量分配等价）。
+    fn assert_same_free_space(a: &Guillotine, b: &Guillotine) {
+        assert_eq!(a.free_area(), b.free_area(), "重建后自由面积应与增量分配一致");
+    }
+
+    #[test]
+    fn compact_roundtrip_preserves_free_space() {
+        // 混合尺寸（含高低差形成阶梯）下，compact 重建的空闲矩形应与增量分配的自由区等价。
+        let items: Vec<(u32, u32)> = vec![
+            (10, 10), (10, 10), (10, 10), (20, 8), (8, 20),
+            (30, 16), (16, 30), (4, 4), (4, 4), (4, 4),
+            (64, 64), (10, 10), (8, 8), (22, 22), (5, 40),
+        ];
+        let (sky, placed) = allocate_all(1024, 0, &items);
+        let rebuilt = Guillotine::from_occupied(1024, &placed, 0);
+        assert_same_free_space(&sky, &rebuilt);
+        // 重建后还能放下与增量分配相同的探测矩形。
+        for &(w, h) in &[(12, 4), (40, 20), (5, 5)] {
+            let mut s = sky.clone();
+            let mut r = rebuilt.clone();
+            assert_eq!(s.allocate(w, h, 0).is_some(), r.allocate(w, h, 0).is_some(),
+                "探测矩形 ({w}, {h}) 的可用性应一致");
+        }
+    }
+
+    #[test]
+    fn padded_roundtrip_matches_compact_inner() {
+        // 模拟文本字形：padding=1 放置，compact_inner 传 alloc 矩形（tl=(x-1,y-1), wh=(w+2,h+2)）。
+        let page = 512;
+        let items: [(u32, u32); 7] = [(10, 10), (12, 8), (30, 30), (8, 20), (16, 16), (4, 4), (20, 12)];
+        let mut sky = Guillotine::new(page);
+        let mut placed = Vec::new();
+        for &(w, h) in &items {
+            let (x, y) = sky.allocate(w, h, 1).expect("应能放入");
+            placed.push((x - 1, y - 1, w + 2, h + 2));
+        }
+        let rebuilt = Guillotine::from_occupied(page, &placed, 0);
+        assert_same_free_space(&sky, &rebuilt);
+    }
+
+    #[test]
+    fn same_row_free_band_is_full_width() {
+        // 同一行三个 4px 字形：增量分配后行下方应保留**整宽**空闲矩形（0,4,64,60）——
+        // 旧Guillotine 空闲矩形会碎片化成窄列导致开新页；空闲矩形模型不会。
+        let (sky, placed) = allocate_all(64, 0, &[(4, 4), (4, 4), (4, 4)]);
+        assert!(sky.segments.iter().any(|s| s.x == 0 && s.y == 4 && s.w == 64 && s.h == 60),
+            "增量分配后行下方应为整宽自由区: {:?}", sky.segments);
+        // 重建是“极大化”表示：字形下方 [0,12)×[4,64) 一条带 + [12,64) 从顶部即自由。
+        let rebuilt = Guillotine::from_occupied(64, &placed, 0);
+        assert!(rebuilt.segments.iter().any(|s| s.x == 0 && s.y == 4 && s.w == 12 && s.h == 60),
+            "重建后字形行下方 [0,12) 应从 y=4 自由: {:?}", rebuilt.segments);
+        assert!(rebuilt.segments.iter().any(|s| s.x == 12 && s.y == 0 && s.w == 52 && s.h == 64),
+            "重建后 [12,64) 应从 y=0 自由: {:?}", rebuilt.segments);
+        // 12px 宽的字形必须能放进下一行。
+        let mut r = rebuilt;
+        assert!(r.allocate(12, 4, 0).is_some());
+    }
+
+    #[test]
+    fn offset_and_stacked_bands_are_preserved() {
+        // R1=[0,10)×[0,10)，R2=[5,10)×[10,15)：自由区必须保留 x∈[5,10) 从 y=15 起的带，
+        // 且空闲矩形之间不允许重叠。
+        let placed = vec![(0u32, 0u32, 10u32, 10u32), (5, 10, 5, 5)];
+        let rebuilt = Guillotine::from_occupied(20, &placed, 0);
+        assert!(rebuilt.segments.iter().any(|s| s.x == 0 && s.y == 10 && s.w == 5 && s.h == 10),
+            "x∈[0,5) 从 y=10 起应自由: {:?}", rebuilt.segments);
+        assert!(rebuilt.segments.iter().any(|s| s.x == 5 && s.y == 15 && s.w == 5 && s.h == 5),
+            "x∈[5,10) 从 y=15 起应自由: {:?}", rebuilt.segments);
+        assert!(rebuilt.segments.iter().any(|s| s.x == 10 && s.y == 0 && s.w == 10 && s.h == 20),
+            "x∈[10,20) 整列应自由: {:?}", rebuilt.segments);
+        for i in 0..rebuilt.segments.len() {
+            for j in (i + 1)..rebuilt.segments.len() {
+                let a = rebuilt.segments[i];
+                let b = rebuilt.segments[j];
+                let ox = a.x < b.x + b.w && b.x < a.x + a.w;
+                let oy = a.y < b.y + b.h && b.y < a.y + a.h;
+                assert!(!(ox && oy), "空闲矩形重叠: {:?} vs {:?}", a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn padded_pack_and_rebuild_keep_usage_correct() {
+        // 伪随机混合尺寸 + padding=1：放置不重叠、重建后 free_area + 占用面积 ≤ 页面积，
+        // 且“大块优先重排”（即 repack 策略）也必须能容纳全部矩形。
+        let page = 512;
+        let mut sky = Guillotine::new(page);
+        let mut placed = Vec::new();
+        let mut seed = 0x9E37_79B9u32;
+        let mut glyph_sizes: Vec<(u32, u32)> = Vec::new();
+        for _ in 0..400 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let w = 4 + seed % 48;
+            let h = 4 + (seed >> 8) % 48;
+            if let Some((x, y)) = sky.allocate(w, h, 1) {
+                glyph_sizes.push((w, h));
+                // 与 `compact_inner` 一致：记录 alloc 矩形（tl=(x-1,y-1), wh=(w+2,h+2)）。
+                placed.push((x - 1, y - 1, w + 2, h + 2));
+            }
+        }
+        for i in 0..placed.len() {
+            for j in (i + 1)..placed.len() {
+                let a = placed[i]; let b = placed[j];
+                let ox = a.0 < b.0 + b.2 && b.0 < a.0 + a.2;
+                let oy = a.1 < b.1 + b.3 && b.1 < a.1 + a.3;
+                assert!(!(ox && oy), "alloc 矩形重叠: {:?} vs {:?}", a, b);
+            }
+        }
+        let rebuilt = Guillotine::from_occupied(page, &placed, 0);
+        assert_same_free_space(&sky, &rebuilt);
+        // 占用面积按 alloc 矩形（含 padding）计，自由区与占用区互补不超页面积。
+        let occupied_area: u64 = placed.iter().map(|&(_, _, w, h)| w as u64 * h as u64).sum();
+        assert!(rebuilt.free_area() + occupied_area <= (page as u64) * (page as u64),
+            "free_area + 占用面积不应超过页面积");
+        // 反向：大块优先 + 全新分配（repack 策略）也必须全部容纳。
+        let mut sorted = glyph_sizes;
+        sorted.sort_by(|a, b| (b.1 * b.0).cmp(&(a.1 * a.0)));
+        let mut repacked = Guillotine::new(page);
+        for &(w, h) in &sorted {
+            assert!(repacked.allocate(w, h, 1).is_some(), "大块优先重排应能放下 (w={w}, h={h})");
+        }
+    }
+
+    #[test]
+    fn text_like_glyph_mix_fits_single_page() {
+        // 模拟 eg260810TextChain 示例：字形按文本块到达（26px 大块 → 20px → 30px+emoji → 16px → 24px）。
+        // 空闲矩形分配器按行堆放，**到达顺序即可全部放入单张 1024² 页**，无需重排——
+        // 这是“页未满却开新页”的回归测试。
+        let page = 1024u32;
+        let mut sky = Guillotine::new(page);
+        let mut placed = Vec::new();
+        let mut seed = 0x5DE_ECE_66u32;
+        let mut failed = 0usize;
+
+        fn next(seed: &mut u32) -> u32 {
+            *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *seed
+        }
+        for &(sz, count) in &[(26.0f32, 120usize), (20.0, 35), (30.0, 40), (16.0, 40), (24.0, 16)] {
+            for _ in 0..count {
+                let r = next(&mut seed);
+                let w = (sz * (0.4 + (r % 120) as f32 / 100.0)).round() as u32;
+                let h = (sz * (1.0 + ((r >> 8) % 25) as f32 / 100.0)).round() as u32;
+                match sky.allocate(w, h, 1) {
+                    Some((x, y)) => placed.push((x, y, w, h)),
+                    None => failed += 1,
+                }
+            }
+        }
+        for _ in 0..2 {
+            let r = next(&mut seed);
+            let w = 60 + r % 10;
+            let h = 60 + (r >> 8) % 10;
+            match sky.allocate(w, h, 1) {
+                Some((x, y)) => placed.push((x, y, w, h)),
+                None => failed += 1,
+            }
+        }
+
+        assert_eq!(failed, 0, "到达顺序应全部放入单页，失败 {failed} 个");
+        assert!(placed.len() >= 250, "应放入全部字形，实际 {}", placed.len());
+        let max_bottom = placed.iter().map(|&(_, y, _, h)| y + h).max().unwrap();
+        assert!(max_bottom <= page, "全部字形应保持在单页内，最低底边 {max_bottom} > {page}");
     }
 }

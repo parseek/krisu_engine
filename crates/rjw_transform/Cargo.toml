@@ -1,6 +1,6 @@
 [package]
 name = "rjw_transform"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["KrisuRJW <Cmd1loica99@163.com>"]
 description = "2D transforms (Transform2D) and orthographic camera (Camera2D) with VP matrices and screen/world conversion."

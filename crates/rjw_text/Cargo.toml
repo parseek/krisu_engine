@@ -1,6 +1,6 @@
 [package]
 name = "rjw_text"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["KrisuRJW <Cmd1loica99@163.com>"]
 description = "Text rendering via cosmic-text layout, swash glyph rasterization and a DynamicAtlas glyph cache."
@@ -10,12 +10,23 @@ readme = "README.md"
 keywords = ["text", "font", "glyph", "cosmic-text"]
 categories = ["game-development", "graphics"]
 
+[features]
+default = ["rjw_2d_render"]
+# `draw_label` / `draw_label_ex`（绑定 Render2D 的便捷方法）依赖此 feature（默认开启）。
+# 关闭后保留核心排版/测量/回调 API：create_buffer / measure / measure_buffer / draw_text / draw_label_with。
+rjw_2d_render = [
+    "dep:rjw_2d_render",
+    "dep:rjw_render",
+    "dep:rjw_color",
+]
+
 [dependencies]
-rjw_atlas = { path = "../rjw_atlas", version = "0.1.0" }
-rjw_2d_render = { path = "../rjw_2d_render", version = "0.1.0" }
-rjw_transform = { path = "../rjw_transform", version = "0.1.0" }
-rjw_render = { path = "../rjw_render", version = "0.1.0" }
-rjw_color = "0.1.0"
+rjw_atlas = { path = "../rjw_atlas", version = "0.1.1" }
+rjw_2d_render = { path = "../rjw_2d_render", version = "0.1.1", optional = true }
+rjw_transform = { path = "../rjw_transform", version = "0.1.1" }
+rjw_render = { path = "../rjw_render", version = "0.1.0", optional = true }
+rjw_color = { version = "0.1.0", optional = true }
+arrayvec = "0.7"
 glam = "0.33.2"
 wgpu = "30.0.0"
 cosmic-text = "0.19.0"

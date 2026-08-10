@@ -12,5 +12,10 @@ pub use glam::{
     Vec2,
     Vec3,
     Vec4,
-    Mat4
+    Mat4,
+    vec2,
+    vec3,
+    vec3a,
+    vec4,
+    mat4,
 };

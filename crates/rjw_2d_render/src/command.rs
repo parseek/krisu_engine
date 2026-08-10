@@ -63,6 +63,14 @@ impl From<f32> for Layer {
     }
 }
 
+impl Layer {
+    /// 获取层级数值（f64）。
+    #[inline]
+    pub fn as_f64(&self) -> f64 {
+        self.0.into_inner()
+    }
+}
+
 /// 渲染状态（Pipeline + 绑定组），不拥有所有权。
 /// 实现排序 trait，相邻相同状态可合批。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

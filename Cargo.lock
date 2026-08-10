@@ -572,6 +572,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eg260810TextChain"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "glam",
+ "log",
+ "rjw_2d_render",
+ "rjw_color 0.1.0",
+ "rjw_main",
+ "rjw_render",
+ "rjw_text",
+ "rjw_transform",
+]
+
+[[package]]
 name = "env_filter"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1805,7 +1820,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rjw_2d_render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "glam",
@@ -1820,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "rjw_atlas"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "log",
@@ -1918,8 +1933,9 @@ dependencies = [
 
 [[package]]
 name = "rjw_text"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "arrayvec",
  "cosmic-text",
  "glam",
  "rjw_2d_render",
@@ -1937,7 +1953,7 @@ version = "0.1.0"
 
 [[package]]
 name = "rjw_transform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "serde",

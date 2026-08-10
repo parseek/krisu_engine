@@ -589,7 +589,8 @@ pub struct StaticAtlas<K = String>   // 泛型与 DynamicAtlas 一致；from_tom
 | `load_toml(toml_str, rgba_provider)` | 从 TOML 批量导入（闭包提供源纹理 RGBA） |
 | `export_toml()` | 导出当前 entries 为 TOML 文本 |
 | `end_frame()` | 寿命-1，有源数据→墓碑；常驻直接删除 |
-| `compact()` | 重建 skyline |
+| `compact()` | 去碎片：带源条目全量重排到最少页（重传纹理，`generation`+1）；含永久条目时退回按页重建空闲矩形 |
+| `generation()` | 去碎片重排世代号（搬动条目时 +1；缓存区域者据此刷新） |
 | `page_size()` / `page_count()` / `texture_uid_of(name)` | 查询 |
 | `parse_toml_entries(toml_str)` | 辅助：解析 TOML 返回原始条目表 |
 | `StaticAtlas::from_toml(s)` | 从 TOML 反序列化（`K=String` 特化） |
@@ -610,10 +611,34 @@ pub struct Text { /* font_system: FontSystem, glyph_cache: DynamicAtlas<cosmic_t
 | `Text::new(device, queue, layout)` | 创建字体管理器（自动加载系统字体） |
 | `load_font_data(data: Vec<u8>)` | 加载额外的 ttf/otf 字体数据 |
 | `create_buffer(text, attrs, size, line_height, align)` | 创建已排版 cosmic-text Buffer |
-| `draw_label(r2d, text, color, size, line_height, pos, family, align, layer) -> Vec2` | ★ 一行渲染：pos=左上角，返回内容宽高 |
-| `draw_label_ex(r2d, text, color, size, line_height, pos, family, align, layer, origin) -> Vec2` | 扩展版：origin 归一化到 [0,1]，(0.5,0.5)=居中 |
-| `draw_text(buffer, callback)` | 遍历字形精灵，闭包自定义绘制 |
-| `draw_text_sprite(r2d, buffer, color, layer)` | 将字形渲染到 Render2D |
+| `measure(text, attrs, size, line_height, align) -> Vec2` | 排版 + 测量内容宽高（GUI 布局用） |
+| `measure_buffer(buffer) -> Vec2` | 已排版 Buffer 的内容宽高（行盒；空文本返回 (0,0)） |
+| `draw_label(r2d, text, color, size, line_height, pos, family, align, layer) -> Vec2` | ★ 一行渲染：pos=左上角，返回内容宽高（feature = `rjw_2d_render`） |
+| `draw_label_ex(r2d, text, color, size, line_height, pos, family, align, layer, origin) -> Vec2` | 扩展版：origin 归一化到 [0,1]，(0.5,0.5)=居中（feature = `rjw_2d_render`） |
+| `draw_label_with(text, size, line_height, pos, family, align, origin, callback) -> Vec2` | 回调版标签渲染：不绑定 Render2D，GUI 自定义字形绘制 |
+| `draw_text(buffer, callback)` | 遍历字形精灵，闭包 `(region, world_pos, world_size)` 自定义绘制 |
+| `Text::text(..) -> TextLayout` | 责任链入口（阶段一：排版配置；常量字符串 `TextStorage` 内联） |
+| `TextLayout::size/line_height/line_space/align/attrs/font_family` | 排版链设置 |
+| `TextLayout::measure() -> Vec2` | 排版 + 测量内容宽高（不消费链） |
+| `TextLayout::into_buffer() -> Buffer` | 排版并交出 cosmic-text Buffer（消费链） |
+| `TextLayout::into_render() -> TextRender` | 转阶段二（用 `Text` 内部缓冲，单标签快速路径，跨帧复用容量） |
+| `TextLayout::into_render_with(&mut TextBuffer) -> TextRender` | 转阶段二（用户持缓冲，多标签并存） |
+| `TextLayout::precache() -> Self` | 预缓存：字形入图集（预热），返回自身可稍后渲染 |
+| `TextLayout::into_render() -> TextRender` | 转阶段二：**直接堆存储** |
+| `TextRender::from_layout(layout)` | 从 `TextLayout` 转换（TextRender 的函数） |
+| `TextRender::new(text, string, size, lh, align)` | 直接构造（跳过 builder） |
+| `TextRender::origin/origin_px/offset/color/map` | 渲染设置：归一化/像素原点、偏移、全局色、逐字形修改 |
+| `TextRender::transform(Option<Transform2D>)` | 渲染级变换：作用整个文本块，`draw_with` / `draw_sprite2d` / `draw_2d_gradient` 均应用 |
+| `TextRender::draw_with(callback)` | 回调 `(measure, line, region, topleft)` 绘制（核心，无 feature 依赖） |
+| `TextRender::draw_sprite2d(r2d, layer)` | 直接渲染到 Render2D（feature = `rjw_2d_render`） |
+| `TextRender::draw_2d_gradient(r2d, layer, mode, axis, stops)` | 渐变渲染：Glyph/Line/Frame × 横/竖向，动态 mesh 逐顶点色（feature = `rjw_2d_render`） |
+| `TextStorage` / `LineSpace` / `GradientMode` / `GradientAxis` | 文本内联存储 / 行距(像素·倍率) / 渐变区间 / 渐变方向 |
+| `GlyphType` | 字形类型：`Normal`（单色可染色）/ `Color`（Emoji 等）；`GlyphData::glyph_str()` 取对应字符 &str |
+| `Text::build_style() -> TextStyle` | 构建可复用样式（临时持有 `&mut Text`；可复用多次 `text(..)`） |
+| `Style` / `TextStyle` | 解耦样式（family=`AttrsOwned` 无借用，克隆继承 `base.clone().size(..)`）/ 临时样式句柄 |
+| `RenderDefaults` / `OwnedAttrs` | 渲染默认（color/origin/offset/transform）/ 无借用完整文本属性（cosmic-text `AttrsOwned`） |
+
+> **性能**：`Text` 内置**排版缓存（LRU）**——按（文本/字号/行高/对齐/attrs）缓存 cosmic-text 排版，相同输入直接克隆 `Buffer` 跳过重复整形（上限 [`MAX_LAYOUT_CACHE`]=128，满时淘汰最久未用）；空格等**无图字形**只判定一次（`no_image`）；字形图集去碎片重排后自动同步区域。
 
 ```rust
 use rjw_text::{Text, Align};
@@ -626,6 +651,10 @@ font.draw_label(r2d, "Hello World", Color::WHITE, 14.0, 18.0, Vec2::new(10.0, 10
 // 屏幕居中 Game Over
 let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 28.0, cam.position, "SimHei", Align::Center, 1e7, Vec2::new(0.5, 0.5));
 ```
+
+> 注：`draw_label` / `draw_label_ex` 依赖默认 feature `rjw_2d_render`；纯测量/回调 API
+> （`measure` / `measure_buffer` / `draw_text` / `draw_label_with`）不依赖渲染器，
+> 可通过 `default-features = false` 关闭该 feature。
 
 ## 10. 其他常用小类型速查
 

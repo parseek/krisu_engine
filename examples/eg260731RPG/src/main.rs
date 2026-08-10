@@ -6,18 +6,18 @@
 //! - 史莱姆会追踪并撞击玩家造成伤害
 //! - HP 归零 → 游戏结束，按 R 重新开始，Esc 退出
 //!
-//! 展示的引擎能力：DynamicAtlas 图集 / Skyline 打包 / clamp_margin / 合批优化 / RStates 责任链。
+//! 展示的引擎能力：DynamicAtlas 图集 / Guillotine 空闲矩形打包 / clamp_margin / 合批优化 / RStates 责任链。
 
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
-use glam::Vec2;
+use glam::{Vec2, vec2};
 use rjw_2d_render::{BlendMode, ClearConfig, Layer, MeshData, Render2D, SpriteRect, VertexP3U2C4};
 use rjw_atlas::{AtlasConfig, AtlasRegion, DynamicAtlas};
 use rjw_color::Color;
 use rjw_main::*;
 use rjw_render::{wgpu, RenderConfig, RenderContext, TEXTURES};
-use rjw_text::Text;
+use rjw_text::{Align, LineSpace, Text};
 use rjw_transform::{Camera2D, Transform2D};
 
 // ── 常量 ─────────────────────────────────────────────────────────
@@ -770,12 +770,25 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, font: &mut Text, game:
     // Debug 指示位置
 
     // HP Label 左上角
-    // r2d.add_sprite2d_solid(SpriteRect::from_texture(cam.position, Vec2::splat(5.0)), Color::BLUEVIOLET, Transform2D::IDENTITY, LAYER_UI);
-    // ── 文本渲染（使用 rjw_text draw_label） ──
-    let align = rjw_text::Align::Left;
-    font.draw_label(r2d, &format!("❤HP: {} / {}", game.player.hp, game.player.max_hp), Color::WHITE, 14.0, 18.0, bar_pos + Vec2::new(0.0, -18.0), "SimHei", align, LAYER_UI + 0.5);
-    font.draw_label(r2d, &format!("第 {} 波", game.wave), Color::rgba(1.0, 0.82, 0.2, 1.0), 14.0, 18.0, coin + Vec2::new(40.0, -6.0), "SimHei", align, LAYER_UI + 0.7);
-    font.draw_label(r2d, &format!("击杀 {}", game.kills), Color::rgba(0.95, 0.3, 0.3, 1.0), 14.0, 18.0, kill + Vec2::new(40.0, -6.0), "SimHei", align, LAYER_UI + 0.7);
+    // ── 文本渲染（TextStyle：公共字体/字号/行距一次定义，逐处只写差异） ──
+    let mut ui = font.build_style()
+        .font_family("SimHei")
+        .size(14.0)
+        .line_space(LineSpace::Multiple(1.5))
+        .align(Align::Left);
+    ui.text(format!("❤HP: {} / {}", game.player.hp, game.player.max_hp))
+        .color(Color::WHITE)
+        .offset(bar_pos + vec2(0.0, -18.0))
+        .draw_sprite2d(r2d, LAYER_UI + 0.5);
+    ui.text(format!("第 {} 波", game.wave))
+        .color(Color::rgba(1.0, 0.82, 0.2, 1.0))
+        .offset(coin + vec2(120.0, -6.0))
+        .draw_sprite2d(r2d, LAYER_UI + 0.7);
+    ui.text(format!("击杀 {}", game.kills))
+        .color(Color::rgba(0.95, 0.3, 0.3, 1.0))
+        .offset(kill + vec2(120.0, -6.0))
+        .draw_sprite2d(r2d, LAYER_UI + 0.7);
+
 
     if game.state == GameState::GameOver {
         tex.draw(
