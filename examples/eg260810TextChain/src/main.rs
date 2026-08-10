@@ -24,11 +24,11 @@ struct ChainDemo {
     cam: Camera2D,
     t: f32,
     /// 帧计数（FPS 统计）
-    frame: u64,
+    // frame: u64,
     /// FPS 统计窗口累计时间
-    fps_time: f32,
+    // fps_time: f32,
     /// FPS 统计窗口帧数
-    fps_frames: u32,
+    // fps_frames: u32,
     /// 上次观测到的字形图集页数（变化时打印，用于验证“页未满却开新页”修复）
     last_page_count: usize,
 }
@@ -41,9 +41,9 @@ impl ChainDemo {
             font: None,
             cam: Camera2D::new(Vec2::ZERO),
             t: 0.0,
-            frame: 0,
-            fps_time: 0.0,
-            fps_frames: 0,
+            // frame: 0,
+            // fps_time: 0.0,
+            // fps_frames: 0,
             last_page_count: 0,
         }
     }
@@ -92,14 +92,14 @@ impl App for ChainDemo {
         let dt = ctx.timer.dt().get_f32();
         self.t += dt;
         let t = self.t;
-        self.frame += 1;
-        self.fps_time += dt;
-        self.fps_frames += 1;
-        if self.fps_time >= 1.0 {
-            eprintln!("FPS: {:.0} (frame {})", self.fps_frames as f32 / self.fps_time, self.frame);
-            self.fps_time = 0.0;
-            self.fps_frames = 0;
-        }
+        // self.frame += 1;
+        // self.fps_time += dt;
+        // self.fps_frames += 1;
+        // if self.fps_time >= 1.0 {
+        //     eprintln!("FPS: {:.0} (frame {})", self.fps_frames as f32 / self.fps_time, self.frame);
+        //     self.fps_time = 0.0;
+        //     self.fps_frames = 0;
+        // }
 
         let Some(r2d) = &mut self.render2d else { return };
         let Some(font) = &mut self.font else { return };
