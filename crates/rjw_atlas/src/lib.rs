@@ -60,17 +60,20 @@ struct FreeRect { x: u32, y: u32, w: u32, h: u32 }
 /// 空闲矩形列表打包器（替换旧“天空线”：天空线无法表达“行下方整宽自由区”，
 /// 混合高度时会把页碎片化成窄列，导致“页未满却开新页”）。
 ///
-/// 算法：best-fit（最低 y → 最小面积）选择一个能容纳的空闲矩形，放置后沿剩余较长方向
-/// **古莱丁切分**（竖直切分保留整高右侧列 / 水平切分保留整宽下方行），并合并相邻空闲矩形。
-/// 这样按行堆放字形时，每一行下方始终存在**整宽**的自由矩形，宽字形总能放下。
+/// 算法：best-fit（最低 y → 最小面积）选择一个能容纳的空闲矩形，放置后切分：
+/// - **整宽矩形**（`w == page_size`，即某行/新页的行矩形）→ **水平切分**：下方保留整宽行，
+///   保证下一行始终可放宽字形（即使行内字形高度交错）；
+/// - 其余矩形 → 沿剩余较长方向（`rh >= rw` 水平 / `rw > rh` 竖直）切分，保持随机负载密度。
+/// 并合并相邻空闲矩形。
 #[derive(Clone)]
 struct Guillotine {
     segments: Vec<FreeRect>,
+    page_size: u32,
 }
 
 impl Guillotine {
     fn new(page_size: u32) -> Self {
-        Self { segments: vec![FreeRect { x: 0, y: 0, w: page_size, h: page_size }] }
+        Self { segments: vec![FreeRect { x: 0, y: 0, w: page_size, h: page_size }], page_size }
     }
 
     fn allocate(&mut self, w: u32, h: u32, padding: u32) -> Option<(u32, u32)> {
@@ -94,13 +97,17 @@ impl Guillotine {
         let y = rect.y + padding;
         let rw = rect.w - nw; // 右侧剩余宽
         let rh = rect.h - nh; // 下方剩余高
-        // 沿剩余较长方向切分：
-        // - 水平切分（rh ≥ rw）：下方为**整宽**矩形，适合按行堆放；
-        // - 竖直切分（rw > rh）：右侧为整高矩形。
-        if rh >= rw {
+        // 整宽矩形 → 水平切分（下方保留整宽行，下一行始终可放宽字形）。
+        let full_width_row = rect.w >= self.page_size;
+        if rh == 0 {
+            // 字形恰好填满该矩形高度 → 右侧整高列。
+            if rw > 0 { self.segments.push(FreeRect { x: rect.x + nw, y: rect.y, w: rw, h: rect.h }); }
+        } else if full_width_row || rh >= rw {
+            // 水平切分：下方整宽行 + 右侧 `nh` 高条带。
             if rh > 0 { self.segments.push(FreeRect { x: rect.x, y: rect.y + nh, w: rect.w, h: rh }); }
             if rw > 0 { self.segments.push(FreeRect { x: rect.x + nw, y: rect.y, w: rw, h: nh }); }
         } else {
+            // 竖直切分：右侧整高列 + 下方 `nw` 宽条带。
             if rw > 0 { self.segments.push(FreeRect { x: rect.x + nw, y: rect.y, w: rw, h: rect.h }); }
             if rh > 0 { self.segments.push(FreeRect { x: rect.x, y: rect.y + nh, w: nw, h: rh }); }
         }
@@ -171,7 +178,7 @@ impl Guillotine {
             }
             if cur < page_size { segments.push(FreeRect { x: xa, y: cur, w: xb - xa, h: page_size - cur }); }
         }
-        let mut slf = Self { segments };
+        let mut slf = Self { segments, page_size };
         slf.merge();
         slf
     }
@@ -441,8 +448,8 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
             };
             items.push(Item { key: key.clone(), rgba: expanded, alloc_w, alloc_h, margin_offs, wh_px: (w, h), origin_px: e.region.origin_px, lifetime: e.lifetime });
         }
-        // 大块优先 → 密度更高，减少碎片。
-        items.sort_by(|a, b| (b.alloc_h * b.alloc_w).cmp(&(a.alloc_h * a.alloc_w)));
+        // 高优先 → 同高字形聚成整行，契合行式（整宽行）分配器，密度更高。
+        items.sort_by(|a, b| b.alloc_h.cmp(&a.alloc_h).then((b.alloc_h * b.alloc_w).cmp(&(a.alloc_h * a.alloc_w))));
 
         let padding = self.config.padding;
         let mut allocators: Vec<Guillotine> = vec![Guillotine::new(self.page_size)];
@@ -937,13 +944,31 @@ mod guillotine_tests {
         let occupied_area: u64 = placed.iter().map(|&(_, _, w, h)| w as u64 * h as u64).sum();
         assert!(rebuilt.free_area() + occupied_area <= (page as u64) * (page as u64),
             "free_area + 占用面积不应超过页面积");
-        // 反向：大块优先 + 全新分配（repack 策略）也必须全部容纳。
+        // 反向：高优先 + 全新分配（与 `repack_all` 相同的策略）也必须全部容纳。
         let mut sorted = glyph_sizes;
-        sorted.sort_by(|a, b| (b.1 * b.0).cmp(&(a.1 * a.0)));
+        sorted.sort_by(|a, b| (b.1).cmp(&(a.1)).then((b.1 * b.0).cmp(&(a.1 * a.0))));
         let mut repacked = Guillotine::new(page);
         for &(w, h) in &sorted {
-            assert!(repacked.allocate(w, h, 1).is_some(), "大块优先重排应能放下 (w={w}, h={h})");
+            assert!(repacked.allocate(w, h, 1).is_some(), "高优先重排应能放下 (w={w}, h={h})");
         }
+    }
+
+    #[test]
+    fn next_row_keeps_full_width_band() {
+        // 回归：行内字形**高度交错**（20/24/22/26）时，旧“沿剩余较长方向”切分会把下一行
+        // 碎成互不合并的窄条，宽字形放不下 → “页未满却开新页”。
+        // 新策略（水平切分优先，整宽行始终保留）下，宽字形应总能放入下一行。
+        let page = 128u32;
+        let mut sky = Guillotine::new(page);
+        // 填满前几行：14 个 8px 宽、高度交错的窄字形（20/22/24/26 循环）。
+        // 高度交错会让旧“沿较长方向”切分产生互不合并的窄条；新策略保持整宽下一行。
+        for i in 0..14u32 {
+            let h = 20 + (i % 4) * 2; // 20/22/24/26 循环
+            sky.allocate(8, h, 0).expect("窄字形应能放入");
+        }
+        // 宽字形 (100×20)：旧策略下最大空闲矩形仅 80 宽会失败；新策略必落入某行的整宽矩形。
+        assert!(sky.allocate(100, 20, 0).is_some(),
+            "高度交错填满后，宽字形必须能放入下一行的整宽自由区");
     }
 
     #[test]
