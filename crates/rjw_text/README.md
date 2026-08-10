@@ -17,7 +17,7 @@ English：
 - `draw_label_with`：回调版标签渲染，不绑定渲染器（GUI 自定义绘制用）。
 - `draw_label` / `draw_label_ex`：一行文本直接渲染到 `Render2D`，支持 family / align / origin（feature = `rjw_2d_render`，默认开启）。
 - 责任链：`text(..)..into_render()/into_render_with(&mut TextBuffer)..origin(..)..draw_with(..)`（`TextLayout` / `TextRender`；`draw_sprite2d` / `draw_2d_gradient` 需默认 feature，渐变支持横向/竖向）。
-- `create_buffer`：cosmic-text 排版（Metrics / Attrs / Shaping / Align），内部按输入做 **LRU 排版缓存**（上限 [`MAX_LAYOUT_CACHE`]=128），相同输入直接克隆跳过重复整形。
+- `create_buffer`：cosmic-text 排版（Metrics / Attrs / Shaping / Align），内部按输入做 **LRU 排版缓存**（上限 [`MAX_LAYOUT_CACHE`]=128），相同输入经 O(1) 签名命中后返回共享 `Arc<Buffer>`（不深拷贝），跳过重复整形。
 - 空格 / 零尺寸 / 渲染失败字形记入 `no_image` 只判定一次，避免每帧重复光栅化。
 - `load_font_data`：加载自定义 ttf / otf 字体。
 - `DEFAULT_GLYPH_ATLAS_SIZE`：字形图集默认尺寸（1024）。
@@ -29,7 +29,7 @@ English：
 - `draw_label_with`: callback-based label rendering, not bound to any renderer (for GUI custom drawing).
 - `draw_label` / `draw_label_ex`: render a single line directly to `Render2D` with family / align / origin (feature = `rjw_2d_render`, enabled by default).
 - Chain API: `text(..)..into_render()/into_render_with(&mut TextBuffer)..origin(..)..draw_with(..)` (`TextLayout` / `TextRender`; `draw_sprite2d` / `draw_2d_gradient` need the default feature).
-- `create_buffer`: cosmic-text layout (Metrics / Attrs / Shaping / Align), with an internal **LRU layout cache** (cap [`MAX_LAYOUT_CACHE`]=128) so repeated inputs clone the shaped `Buffer` instead of re-shaping.
+- `create_buffer`: cosmic-text layout (Metrics / Attrs / Shaping / Align), with an internal **LRU layout cache** (cap [`MAX_LAYOUT_CACHE`]=128); repeated inputs hit via an O(1) signature and return a shared `Arc<Buffer>` (no deep copy).
 - Zero-size / missing-font / failed glyphs are recorded in `no_image` and judged once, avoiding per-frame re-rasterization.
 - `load_font_data`: load custom ttf / otf fonts.
 - `DEFAULT_GLYPH_ATLAS_SIZE`: default glyph atlas size (1024).

@@ -13,11 +13,12 @@
 //! 无栈内大数组。常量字符串经 [`TextStorage`] 内联存储。
 //!
 //! 性能：`Text` 内部对 cosmic-text 排版做 **LRU 缓存**（[`MAX_LAYOUT_CACHE`]）——相同
-//! （文本/字号/行高/对齐/attrs）输入直接克隆已排版 `Buffer`，跳过每帧重复整形；
-//! 空格等无图字形只判定一次；字形图集去碎片重排后自动同步各字形区域。
+//! （文本/字号/行高/对齐/attrs）输入经 O(1) 签名命中后返回共享 `Arc<Buffer>`（不深拷贝），
+//! 跳过每帧重复整形；空格等无图字形只判定一次；字形图集去碎片重排后自动同步各字形区域。
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 use glam::Vec2;
@@ -628,9 +629,9 @@ impl<'a> TextLayout<'a> {
         Text::measure_buffer(&buffer)
     }
 
-    /// 排版并交出 `Buffer`（cosmic-text），消费链。
+    /// 排版并交出共享 `Arc<Buffer>`（cosmic-text；缓存命中间接共享，不深拷贝），消费链。
     #[inline]
-    pub fn into_buffer(self) -> Buffer {
+    pub fn into_buffer(self) -> Arc<Buffer> {
         let TextLayout { text, string, family, attrs, size, line_height, line_space, align, .. } = self;
         let attrs: Attrs<'_> = match attrs {
             Some(a) => a,
@@ -725,7 +726,7 @@ impl<'a> TextLayout<'a> {
 
 // ─── 排版 + 收集（阶段一 → 阶段二） ─────────────────────────────
 
-/// 排版 + 光栅化（字形入图集），返回 `Buffer` 供收集。
+/// 排版 + 光栅化（字形入图集），返回共享 `Arc<Buffer>` 供收集。
 fn shape_and_rasterize(
     text: &mut Text,
     string: &str,
@@ -733,7 +734,7 @@ fn shape_and_rasterize(
     size: f32,
     line_height: f32,
     align: Align,
-) -> Buffer {
+) -> Arc<Buffer> {
     let buffer = text.create_buffer(string, attrs, size, line_height, align);
     // 确保所有字形已渲染入图集（buffer_origin 依赖 bearing 数据）；无图像字形只判定一次。
     for run in buffer.layout_runs() {

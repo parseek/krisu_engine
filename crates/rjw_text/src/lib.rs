@@ -1,8 +1,8 @@
 //! 文本渲染：基于 `cosmic-text` 排版 + `swash` 字形光栅化 + `DynamicAtlas` 字形缓存。
 //!
 //! - `Text`：持有字体系统（cosmic-text `FontSystem`）、字形缓存图集（key=`cosmic_text::CacheKey`）。
-//! - 性能：**LRU 排版缓存**（[`MAX_LAYOUT_CACHE`]）跨帧复用同一输入的 cosmic-text 排版；空格等无图字形
-//!   （`no_image`）只判定一次；字形图集去碎片重排后自动同步区域。
+//! - 性能：**LRU 排版缓存**（[`MAX_LAYOUT_CACHE`]）按 O(1) 签名预过滤命中同一输入，返回共享
+//!   `Arc<Buffer>`（不深拷贝）；空格等无图字形（`no_image`）只判定一次；字形图集去碎片重排后自动同步区域。
 //! - `measure` / `measure_buffer`：排版内容宽高（GUI 布局用）。
 //! - `draw_text(buffer, callback)` / `draw_label_with(..., callback)`：字形回调遍历，不绑定渲染器。
 //! - `draw_label` / `draw_label_ex`：一行文本直接渲染到 `Render2D`（feature = `rjw_2d_render`，默认开启）。
@@ -11,7 +11,10 @@
 mod chain;
 pub use chain::*;
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 pub use cosmic_text::{Align, Attrs, AttrsOwned, Buffer, Family, FontSystem, Metrics, Shaping};
 use glam::Vec2;
@@ -62,37 +65,85 @@ fn align_disc(align: Align) -> u8 {
     }
 }
 
+/// cosmic-text `Attrs` 的轻量摘要（只用于缓存签名预过滤，不保证唯一；桶内仍做完整比较）。
+#[inline]
+fn attrs_hash(attrs: &Attrs<'_>) -> u64 {
+    let mut h = DefaultHasher::new();
+    attrs.weight.0.hash(&mut h);
+    (match attrs.style {
+        cosmic_text::Style::Normal => 0u8,
+        cosmic_text::Style::Italic => 1,
+        cosmic_text::Style::Oblique => 2,
+    })
+    .hash(&mut h);
+    (match attrs.stretch {
+        cosmic_text::Stretch::UltraCondensed => 0u8,
+        cosmic_text::Stretch::ExtraCondensed => 1,
+        cosmic_text::Stretch::Condensed => 2,
+        cosmic_text::Stretch::SemiCondensed => 3,
+        cosmic_text::Stretch::Normal => 4,
+        cosmic_text::Stretch::SemiExpanded => 5,
+        cosmic_text::Stretch::Expanded => 6,
+        cosmic_text::Stretch::ExtraExpanded => 7,
+        cosmic_text::Stretch::UltraExpanded => 8,
+    })
+    .hash(&mut h);
+    attrs.metadata.hash(&mut h);
+    h.finish()
+}
+
 /// 排版缓存键：影响 cosmic-text 排版的全部输入（文本 / 字号 / 行高 / 对齐 / 完整 attrs）。
 ///
-/// 命中缓存时直接克隆已排版的 [`Buffer`]，跳过昂贵的 `Shaping::Advanced` 整形——
-/// 这是 Debug 构建下静态文本每帧重新排版（约 10–20ms）的主要瓶颈。
+/// `sig` 是 **O(1) 签名**（长度 + 首尾字节 + 各数值字段 + attrs 摘要，不哈希全文、不分配），
+/// 用于缓存桶预过滤；命中路径无需 `to_owned` 拷贝全文。
 ///
+/// 命中缓存时返回共享的 [`Arc<Buffer>`]，跳过昂贵的 `Shaping::Advanced` 整形。
 /// 注意：缓存仅按上述输入区分；若之后调用 [`Text::load_font_data`] 追加字体，
 /// 已缓存排版不会自动使用新字体（新文本自然不受影响）。
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LayoutCacheKey {
     text: String,
     size_bits: u32,
     line_height_bits: u32,
     align: u8,
     attrs: AttrsOwned,
+    sig: u64,
 }
 
 impl LayoutCacheKey {
     fn new(text: &str, attrs: &Attrs<'_>, size: f32, line_height: f32, align: Align) -> Self {
-        Self {
-            text: text.to_owned(),
-            size_bits: size.to_bits(),
-            line_height_bits: line_height.to_bits(),
-            align: align_disc(align),
-            attrs: AttrsOwned::new(attrs),
-        }
+        let size_bits = size.to_bits();
+        let line_height_bits = line_height.to_bits();
+        let align = align_disc(align);
+        let sig = Self::sig_of(text, attrs, size_bits, line_height_bits, align);
+        Self { text: text.to_owned(), size_bits, line_height_bits, align, attrs: AttrsOwned::new(attrs), sig }
+    }
+
+    /// O(1) 签名：长度 + 首尾字节 + 数值字段 + attrs 摘要。
+    fn sig_of(text: &str, attrs: &Attrs<'_>, size_bits: u32, line_height_bits: u32, align: u8) -> u64 {
+        let mut h = DefaultHasher::new();
+        text.len().hash(&mut h);
+        if let Some(&b) = text.as_bytes().first() { b.hash(&mut h); }
+        if let Some(&b) = text.as_bytes().last() { b.hash(&mut h); }
+        size_bits.hash(&mut h);
+        line_height_bits.hash(&mut h);
+        align.hash(&mut h);
+        attrs_hash(attrs).hash(&mut h);
+        h.finish()
     }
 }
 
-/// 排版缓存容器：**LRU 回收**。值带单调“最近使用序号”，达到 `cap` 时淘汰序号最小（最久未用）的条目。
+/// 缓存条目。
+struct LayoutCacheEntry {
+    key: LayoutCacheKey,
+    buffer: Arc<Buffer>,
+    last: u64,
+}
+
+/// 排版缓存容器：**LRU 回收**。按 O(1) 签名分桶（`sig -> entries`，桶内条目极少），
+/// 命中路径不构造完整键（无全文拷贝/哈希），桶内才做完整字段比较。
 struct LayoutCache {
-    map: HashMap<LayoutCacheKey, (Buffer, u64)>,
+    buckets: HashMap<u64, Vec<LayoutCacheEntry>>,
     seq: u64,
     cap: usize,
 }
@@ -103,34 +154,51 @@ impl LayoutCache {
     }
 
     fn with_cap(cap: usize) -> Self {
-        Self { map: HashMap::new(), seq: 0, cap }
+        Self { buckets: HashMap::new(), seq: 0, cap }
     }
 
-    /// 命中则刷新该条目的最近使用序号，返回缓存 Buffer。
-    fn get(&mut self, key: &LayoutCacheKey) -> Option<&Buffer> {
-        let entry = self.map.get_mut(key)?;
+    fn len(&self) -> usize {
+        self.buckets.values().map(|b| b.len()).sum()
+    }
+
+    /// 命中则刷新该条目的最近使用序号，返回共享 `Arc<Buffer>`（O(1)）。
+    fn find(&mut self, sig: u64, matches: impl Fn(&LayoutCacheKey) -> bool) -> Option<Arc<Buffer>> {
+        let bucket = self.buckets.get_mut(&sig)?;
+        let pos = bucket.iter().position(|e| matches(&e.key))?;
+        let entry = &mut bucket[pos];
         self.seq = self.seq.wrapping_add(1);
-        entry.1 = self.seq;
-        Some(&entry.0)
+        entry.last = self.seq;
+        Some(entry.buffer.clone())
     }
 
-    /// 插入；已满时先淘汰最久未使用的条目。
-    fn insert(&mut self, key: LayoutCacheKey, buf: Buffer) {
-        if self.map.len() >= self.cap {
-            if let Some(evict) = self.map
-                .iter()
-                .min_by_key(|&(_, &(_, last))| last)
-                .map(|(k, _)| k.clone())
-            {
-                self.map.remove(&evict);
+    /// 插入；已满时淘汰全局最久未使用的条目。
+    fn insert(&mut self, key: LayoutCacheKey, buf: Arc<Buffer>) {
+        if self.len() >= self.cap {
+            let mut evict: Option<(u64, usize)> = None;
+            let mut min_last = u64::MAX;
+            for (sig, bucket) in &self.buckets {
+                for (i, e) in bucket.iter().enumerate() {
+                    if e.last < min_last {
+                        min_last = e.last;
+                        evict = Some((*sig, i));
+                    }
+                }
+            }
+            if let Some((sig, i)) = evict {
+                let bucket = self.buckets.get_mut(&sig).expect("bucket must exist");
+                bucket.remove(i);
+                if bucket.is_empty() {
+                    self.buckets.remove(&sig);
+                }
             }
         }
         self.seq = self.seq.wrapping_add(1);
-        self.map.insert(key, (buf, self.seq));
+        let sig = key.sig;
+        self.buckets.entry(sig).or_default().push(LayoutCacheEntry { key, buffer: buf, last: self.seq });
     }
 
     fn clear(&mut self) {
-        self.map.clear();
+        self.buckets.clear();
     }
 }
 
@@ -199,17 +267,30 @@ impl Text {
         self.no_image.clear();
     }
 
-    /// 排版文本为 cosmic-text `Buffer`（内容随后经 [`Self::draw_text`] 等遍历）。
+    /// 排版文本为共享 `Arc<Buffer>`（cosmic-text），内容随后经 [`Self::draw_text`] 等遍历。
     ///
-    /// 相同输入（文本 / 字号 / 行高 / 对齐 / attrs）会命中内部排版缓存，直接克隆已排版结果，
-    /// 显著降低 Debug 构建下静态文本每帧排版的成本。缓存达到 [`MAX_LAYOUT_CACHE`] 时按 LRU
-    /// 淘汰最久未使用的条目，避免缓存无限增长。
+    /// 相同输入（文本 / 字号 / 行高 / 对齐 / attrs）会命中内部排版缓存：**O(1) 签名预过滤**
+    /// 后返回共享的 [`Arc<Buffer>`]（不深拷贝排版结果），显著降低 Debug / 大文本下静态文本
+    /// 每帧排版的成本。缓存达到 [`MAX_LAYOUT_CACHE`] 时按 LRU 淘汰最久未用条目。
+    ///
+    /// 返回值为共享只读布局；需要修改的调用方用 [`Arc::make_mut`]（仅当缓存仍持有时才深拷贝）。
     pub fn create_buffer(
         &mut self, text: &str, attrs: Attrs<'_>, size: f32, line_height: f32, align: Align,
-    ) -> Buffer {
-        let key = LayoutCacheKey::new(text, &attrs, size, line_height, align);
-        if let Some(buf) = self.layout_cache.get(&key) {
-            return buf.clone();
+    ) -> Arc<Buffer> {
+        let size_bits = size.to_bits();
+        let line_height_bits = line_height.to_bits();
+        let align_u8 = align_disc(align);
+        let sig = LayoutCacheKey::sig_of(text, &attrs, size_bits, line_height_bits, align_u8);
+        let matches = |k: &LayoutCacheKey| {
+            k.sig == sig
+                && k.size_bits == size_bits
+                && k.line_height_bits == line_height_bits
+                && k.align == align_u8
+                && k.text == text
+                && k.attrs.as_attrs() == attrs
+        };
+        if let Some(cached) = self.layout_cache.find(sig, matches) {
+            return cached;
         }
         let metrics = Metrics::new(size, line_height);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -219,8 +300,10 @@ impl Text {
         buffer.set_size(Some(wrap_width), None);
         buffer.set_text(text, &attrs, Shaping::Advanced, Some(align));
         buffer.shape_until_scroll(&mut self.font_system, false);
-        self.layout_cache.insert(key, buffer.clone());
-        buffer
+        let arc = Arc::new(buffer);
+        let key = LayoutCacheKey::new(text, &attrs, size, line_height, align);
+        self.layout_cache.insert(key, arc.clone());
+        arc
     }
 
     /// 统一字形遍历内核：先确保全部字形已渲染入图集，再逐个回调。
@@ -515,22 +598,29 @@ mod tests {
         let k5 = LayoutCacheKey::new("World", &Attrs::new(), 14.0, 20.0, Align::Left);
         let k6 = LayoutCacheKey::new("Hello", &Attrs::new().family(Family::Monospace), 14.0, 20.0, Align::Left);
         assert_eq!(k1, k2, "相同输入应命中同一缓存键");
+        assert_eq!(k1.sig, k2.sig, "相同输入签名应一致");
         assert_ne!(k1, k3, "字号不同应区分");
         assert_ne!(k1, k4, "对齐不同应区分");
         assert_ne!(k1, k5, "文本不同应区分");
         assert_ne!(k1, k6, "font family 不同应区分");
+        // O(1) 签名应区分大部分不同输入（预过滤失效也不会错，桶内会完整比较）。
+        assert_ne!(k1.sig, k3.sig, "字号不同签名应区分");
+        assert_ne!(k1.sig, k4.sig, "对齐不同签名应区分");
     }
 
     #[test]
     fn layout_cache_lru_evicts_least_recent() {
-        fn make(fs: &mut FontSystem, text: &str) -> (LayoutCacheKey, Buffer) {
+        fn make(fs: &mut FontSystem, text: &str) -> (LayoutCacheKey, Arc<Buffer>) {
             let attrs = Attrs::new();
             let metrics = Metrics::new(14.0, 20.0);
             let mut buf = Buffer::new(fs, metrics);
             buf.set_size(Some(1024.0), None);
             buf.set_text(text, &attrs, Shaping::Advanced, Some(Align::Left));
             buf.shape_until_scroll(fs, false);
-            (LayoutCacheKey::new(text, &attrs, 14.0, 20.0, Align::Left), buf)
+            (LayoutCacheKey::new(text, &attrs, 14.0, 20.0, Align::Left), Arc::new(buf))
+        }
+        fn hit(cache: &mut LayoutCache, key: &LayoutCacheKey) -> Option<Arc<Buffer>> {
+            cache.find(key.sig, |k| k == key)
         }
         let mut fs = FontSystem::new();
         fs.db_mut().load_system_fonts();
@@ -542,17 +632,19 @@ mod tests {
         cache.insert(k1.clone(), b1);
         cache.insert(k2.clone(), b2);
         cache.insert(k3.clone(), b3);
-        assert_eq!(cache.map.len(), 3);
-        // 命中 k1 → k1 变为最新。
-        assert!(cache.get(&k1).is_some());
+        assert_eq!(cache.len(), 3);
+        // 命中 k1 → k1 变为最新，且返回同一共享 Arc（不深拷贝）。
+        let hit1 = hit(&mut cache, &k1).expect("k1 应命中");
+        let hit2 = hit(&mut cache, &k1).expect("k1 再次应命中");
+        assert!(Arc::ptr_eq(&hit1, &hit2), "缓存命中应返回同一 Arc<Buffer>");
         // 插入 k4 → 已满，应淘汰最久未使用的 k2。
         cache.insert(k4.clone(), b4);
-        assert_eq!(cache.map.len(), 3, "满容量后插入应淘汰一个条目");
-        assert!(cache.get(&k1).is_some(), "k1 应保留（最近命中过）");
-        assert!(cache.get(&k3).is_some(), "k3 应保留");
-        assert!(cache.get(&k4).is_some(), "k4 应保留（新插入）");
-        assert!(cache.get(&k2).is_none(), "LRU 应淘汰最久未使用的 k2");
+        assert_eq!(cache.len(), 3, "满容量后插入应淘汰一个条目");
+        assert!(hit(&mut cache, &k1).is_some(), "k1 应保留（最近命中过）");
+        assert!(hit(&mut cache, &k3).is_some(), "k3 应保留");
+        assert!(hit(&mut cache, &k4).is_some(), "k4 应保留（新插入）");
+        assert!(hit(&mut cache, &k2).is_none(), "LRU 应淘汰最久未使用的 k2");
         cache.clear();
-        assert_eq!(cache.map.len(), 0);
+        assert_eq!(cache.len(), 0);
     }
 }
