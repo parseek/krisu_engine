@@ -340,6 +340,41 @@ impl Text {
     pub fn build_style(&mut self) -> TextStyle<'_> {
         TextStyle { text: self, style: Style::default() }
     }
+
+    /// 从用户保存的（共享）`Buffer` 直接进入阶段二 [`TextRender`]（责任链渲染）。
+    ///
+    /// 适用于**静态大文本**：[`Text::create_buffer`] / [`TextLayout::into_buffer`] 返回的
+    /// `Arc<Buffer>` 由用户保存一次，每帧调用本方法渲染——跳过重复整形
+    /// （Release 下大文本不缓存，此举即官方“手动缓存”路径）。
+    ///
+    /// 首次调用会确保该 Buffer 的字形已入图集（后续调用 O(字形数) 收集+绘制，不再整形）；
+    /// 返回的 [`TextRender`] 可继续 `.origin/.offset/.color/.transform/.map/`
+    /// `.draw_sprite2d/.draw_2d_gradient/.draw_with`。
+    #[inline]
+    pub fn render_from<'a>(&'a mut self, buffer: &Buffer) -> TextRender<'a> {
+        // 确保全部字形已渲染入图集（buffer_origin 依赖 bearing 数据）；无图像字形只判定一次。
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                let cache_key = glyph.physical((0.0, 0.0), 1.0).cache_key;
+                if !self.locations.contains_key(&cache_key) && !self.no_image.contains(&cache_key) {
+                    self.rasterize_and_pack(cache_key);
+                }
+            }
+        }
+        self.sync_atlas_regions();
+        let visual_origin = self.buffer_origin(buffer);
+        let page_size = self.glyph_cache.page_size() as f32;
+        let (content_size, measure) = collect_glyphs(
+            &self.locations, buffer, visual_origin,
+            &mut self.buf.glyphs, &mut self.buf.lines,
+        );
+        let glyphs = &mut self.buf.glyphs;
+        let lines = &mut self.buf.lines;
+        TextRender {
+            glyphs, lines, content_size, measure,
+            origin: Vec2::ZERO, offset: Vec2::ZERO, color: [1.0; 4], transform: None, page_size,
+        }
+    }
 }
 
 impl<'a> TextStyle<'a> {

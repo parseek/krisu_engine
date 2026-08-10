@@ -621,6 +621,7 @@ pub struct Text { /* font_system: FontSystem, glyph_cache: DynamicAtlas<cosmic_t
 | `TextLayout::size/line_height/line_space/align/attrs/font_family` | 排版链设置 |
 | `TextLayout::measure() -> Vec2` | 排版 + 测量内容宽高（不消费链） |
 | `TextLayout::into_buffer() -> Arc<Buffer>` | 排版并交出共享 cosmic-text Buffer（消费链） |
+| `Text::render_from(&mut self, buffer: &Buffer) -> TextRender` | ★ 从用户保存的 `Arc<Buffer>` 直接进入阶段二（责任链渲染，跳过整形；静态大文本手动缓存路径） |
 | `TextLayout::into_render() -> TextRender` | 转阶段二（用 `Text` 内部缓冲，单标签快速路径，跨帧复用容量） |
 | `TextLayout::into_render_with(&mut TextBuffer) -> TextRender` | 转阶段二（用户持缓冲，多标签并存） |
 | `TextLayout::precache() -> Self` | 预缓存：字形入图集（预热），返回自身可稍后渲染 |
@@ -638,7 +639,7 @@ pub struct Text { /* font_system: FontSystem, glyph_cache: DynamicAtlas<cosmic_t
 | `Style` / `TextStyle` | 解耦样式（family=`AttrsOwned` 无借用，克隆继承 `base.clone().size(..)`）/ 临时样式句柄 |
 | `RenderDefaults` / `OwnedAttrs` | 渲染默认（color/origin/offset/transform）/ 无借用完整文本属性（cosmic-text `AttrsOwned`） |
 
-> **性能**：`Text` 内置**排版缓存（LRU）**——按（文本/字号/行高/对齐/attrs）缓存 cosmic-text 排版，相同输入经 **O(1) 签名**预过滤后返回共享 `Arc<Buffer>`（不深拷贝，跳过重复整形；上限 [`MAX_LAYOUT_CACHE`]=128，满时淘汰最久未用）；空格等**无图字形**只判定一次（`no_image`）；字形图集去碎片重排后自动同步区域。
+> **性能**：`Text` 内置**排版缓存（LRU）**——按（文本/字号/行高/对齐/attrs）缓存 cosmic-text 排版，相同输入经 **O(1) 签名**预过滤后返回共享 `Arc<Buffer>`（不深拷贝，跳过重复整形；上限 [`MAX_LAYOUT_CACHE`]=128，满时淘汰最久未用）。缓存启用规则：**Debug 恒缓存**；**Release 仅缓存 ≤ [`LARGE_TEXT_CACHE_LIMIT`]=512 字节的小文本**（大文本多为动态/低频，不入缓存、每帧直接整形）；静态大文本请保存 `Arc<Buffer>` 经 `render_from` 手动复用。空格等**无图字形**只判定一次（`no_image`）；字形图集去碎片重排后自动同步区域。
 
 ```rust
 use rjw_text::{Text, Align};

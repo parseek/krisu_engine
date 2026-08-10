@@ -53,6 +53,26 @@ struct GlyphLocation {
 /// 排版缓存条目数上限：达到后按 **LRU** 淘汰最久未使用的条目（静态标签通常远小于此值）。
 pub const MAX_LAYOUT_CACHE: usize = 128;
 
+/// **Release 构建下**的排版缓存文本长度上限（字节）：超过此值的文本不入缓存、每帧直接整形。
+///
+/// Debug 构建（`cfg!(debug_assertions)`）恒缓存——Debug 整形慢 10-100 倍，缓存是刚需；
+/// Release 下大文本多为动态/低频（日志、聊天、终端），缓存必然 miss 且挤占 LRU/内存，
+/// 而 Release 整形又足够快，故跳过。静态大文本请由用户保存 `Arc<Buffer>` 后经
+/// [`Text::render_from`] 走责任链渲染（存一次、每帧复用）。
+pub const LARGE_TEXT_CACHE_LIMIT: usize = 512;
+
+/// Release 下 `len` 字节的文本是否值得缓存。
+#[inline]
+fn release_caches_len(len: usize) -> bool {
+    len <= LARGE_TEXT_CACHE_LIMIT
+}
+
+/// 是否对该文本启用排版缓存：Debug 恒真；Release 仅小文本。
+#[inline]
+fn should_use_layout_cache(len: usize) -> bool {
+    cfg!(debug_assertions) || release_caches_len(len)
+}
+
 /// cosmic-text `Align` 的 u8 判别（`Align` 未实现 `Hash`，缓存键需可哈希表示）。
 #[inline]
 fn align_disc(align: Align) -> u8 {
@@ -270,27 +290,34 @@ impl Text {
     /// 排版文本为共享 `Arc<Buffer>`（cosmic-text），内容随后经 [`Self::draw_text`] 等遍历。
     ///
     /// 相同输入（文本 / 字号 / 行高 / 对齐 / attrs）会命中内部排版缓存：**O(1) 签名预过滤**
-    /// 后返回共享的 [`Arc<Buffer>`]（不深拷贝排版结果），显著降低 Debug / 大文本下静态文本
-    /// 每帧排版的成本。缓存达到 [`MAX_LAYOUT_CACHE`] 时按 LRU 淘汰最久未用条目。
+    /// 后返回共享的 [`Arc<Buffer>`]（不深拷贝排版结果）。缓存达到 [`MAX_LAYOUT_CACHE`] 时按 LRU
+    /// 淘汰最久未用条目。
+    ///
+    /// 缓存启用规则（见 [`LARGE_TEXT_CACHE_LIMIT`]）：**Debug 恒缓存**；**Release 仅缓存
+    /// ≤ 512 字节的小文本**——大文本（多为动态/低频）不入缓存、每帧直接整形。静态大文本请
+    /// 保存本方法返回的 `Arc<Buffer>`，每帧经 [`Text::render_from`] 走责任链渲染（存一次、复用）。
     ///
     /// 返回值为共享只读布局；需要修改的调用方用 [`Arc::make_mut`]（仅当缓存仍持有时才深拷贝）。
     pub fn create_buffer(
         &mut self, text: &str, attrs: Attrs<'_>, size: f32, line_height: f32, align: Align,
     ) -> Arc<Buffer> {
-        let size_bits = size.to_bits();
-        let line_height_bits = line_height.to_bits();
-        let align_u8 = align_disc(align);
-        let sig = LayoutCacheKey::sig_of(text, &attrs, size_bits, line_height_bits, align_u8);
-        let matches = |k: &LayoutCacheKey| {
-            k.sig == sig
-                && k.size_bits == size_bits
-                && k.line_height_bits == line_height_bits
-                && k.align == align_u8
-                && k.text == text
-                && k.attrs.as_attrs() == attrs
-        };
-        if let Some(cached) = self.layout_cache.find(sig, matches) {
-            return cached;
+        let use_cache = should_use_layout_cache(text.len());
+        if use_cache {
+            let size_bits = size.to_bits();
+            let line_height_bits = line_height.to_bits();
+            let align_u8 = align_disc(align);
+            let sig = LayoutCacheKey::sig_of(text, &attrs, size_bits, line_height_bits, align_u8);
+            let matches = |k: &LayoutCacheKey| {
+                k.sig == sig
+                    && k.size_bits == size_bits
+                    && k.line_height_bits == line_height_bits
+                    && k.align == align_u8
+                    && k.text == text
+                    && k.attrs.as_attrs() == attrs
+            };
+            if let Some(cached) = self.layout_cache.find(sig, matches) {
+                return cached;
+            }
         }
         let metrics = Metrics::new(size, line_height);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -301,8 +328,10 @@ impl Text {
         buffer.set_text(text, &attrs, Shaping::Advanced, Some(align));
         buffer.shape_until_scroll(&mut self.font_system, false);
         let arc = Arc::new(buffer);
-        let key = LayoutCacheKey::new(text, &attrs, size, line_height, align);
-        self.layout_cache.insert(key, arc.clone());
+        if use_cache {
+            let key = LayoutCacheKey::new(text, &attrs, size, line_height, align);
+            self.layout_cache.insert(key, arc.clone());
+        }
         arc
     }
 
@@ -606,6 +635,18 @@ mod tests {
         // O(1) 签名应区分大部分不同输入（预过滤失效也不会错，桶内会完整比较）。
         assert_ne!(k1.sig, k3.sig, "字号不同签名应区分");
         assert_ne!(k1.sig, k4.sig, "对齐不同签名应区分");
+    }
+
+    #[test]
+    fn layout_cache_release_large_text_rule() {
+        // Release 构建下：≤ LARGE_TEXT_CACHE_LIMIT 的文本才缓存，更大文本不缓存。
+        // （`cfg!(debug_assertions)` 是编译期常量，测试构建恒真；此测试直接验证纯规则函数。）
+        assert!(release_caches_len(0), "空/短文本应缓存");
+        assert!(release_caches_len(LARGE_TEXT_CACHE_LIMIT), "恰好等于上限应缓存");
+        assert!(!release_caches_len(LARGE_TEXT_CACHE_LIMIT + 1), "超过上限不应缓存（Release）");
+        assert!(!release_caches_len(4096), "大文本不应缓存（Release）");
+        // Debug 构建应恒缓存（`should_use_layout_cache` 由编译期开关决定，这里只验证结构性正确）。
+        assert!(cfg!(debug_assertions) || !release_caches_len(1024));
     }
 
     #[test]
