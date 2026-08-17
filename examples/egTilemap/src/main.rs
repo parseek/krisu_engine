@@ -73,7 +73,7 @@ impl TilemapDemo {
         let water = insert(atlas, "water", [70, 120, 200], [30, 70, 140]);
         let accent = insert(atlas, "accent", [232, 150, 60], [160, 90, 20]);
 
-        let mut map = TileMap::new(512.0);
+        let mut map = TileMap::new(1024.0);
         let push = |map: &mut TileMap, atlas: &DynamicAtlas, src: &RegionRef, gx: i32, gy: i32, solid: bool, flip_x: bool| {
             let region = src.resolve(atlas).expect("resolve src region");
             let mut t = Tile::whole_region(
@@ -225,8 +225,13 @@ impl App for TilemapDemo {
             50.0,
         );
 
-        // HUD（UI 文本：屏幕固定——screen_fixed 锚定屏幕像素、反旋转、抵消缩放；
-        // 字号与位置按 scale_factor 换算为物理像素，旋转/缩放相机下 HUD 不倾斜、不缩放）
+        // HUD（UI 文本，屏幕固定——内联实现，不依赖 rjw_text 扩展）：
+        // - 位置：anchor = cam.screen_to_world(屏幕像素)，随相机旋转/缩放仍是屏幕左上角；
+        // - 缩放：transform scale = 1/zoom → 屏幕字形大小 = size × zoom × (1/zoom) = size；
+        // - 旋转：transform rotation = -cam.rotation → 文字方向抵消相机旋转（屏幕对齐）。
+        //   注意：若希望 HUD 跟随世界旋转（倾斜），去掉 with_rot(-…) 即可（该旋转非多余——
+        //   屏幕方向 = R(cam.rot)·世界方向，必须逆旋转才保持屏幕水平）。
+        // - 字号/锚点按 scale_factor 换算为物理像素。
         let sf = self.scale_factor;
         let hud = format!(
             "C: cull {} · Q/E cam rot {:.0}° · R/F zoom {:.2} · M: map rot {:.0}° | visible {}/{} chunks {} | WASD move · Arrows cam",
@@ -238,11 +243,17 @@ impl App for TilemapDemo {
             self.map.tile_count(),
             self.map.chunk_count(),
         );
+        let anchor = self.cam.screen_to_world(Vec2::new(14.0 * sf, 14.0 * sf));
         font.text(hud.as_str())
             .size(16.0 * sf)
             .align(Align::Left)
             .into_render()
-            .screen_fixed(&self.cam, Vec2::new(14.0 * sf, 14.0 * sf))
+            .transform(
+                Transform2D::IDENTITY
+                    .with_pos(anchor)
+                    .with_rot(-self.cam.rotation)
+                    .with_scale(Vec2::new(1.0 / self.cam.zoom.x, 1.0 / self.cam.zoom.y)),
+            )
             .color(Color::YELLOW)
             .draw_sprite2d(r2d, 100.0);
 
@@ -262,7 +273,7 @@ fn main() -> Result<(), EventLoopError> {
         render2d: None,
         font: None,
         cam: Camera2D::new(Vec2::new(1280.0, 720.0)),
-        map: TileMap::new(512.0),
+        map: TileMap::new(1024.0),
         player_pos: Vec2::new(TILE * 4.0, TILE * 4.0),
         player_size: Vec2::new(48.0, 48.0),
         culling: false,

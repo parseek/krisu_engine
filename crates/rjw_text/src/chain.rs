@@ -31,7 +31,7 @@ use rjw_color::Color;
 #[cfg(feature = "rjw_2d_render")]
 use rjw_render::TEXTURES;
 use swash::scale::image::Content as SwashContent;
-pub use rjw_transform::{Camera2D, Rect, Transform2D};
+pub use rjw_transform::{Rect, Transform2D};
 
 use cosmic_text::{AttrsOwned, FamilyOwned, Stretch, Weight};
 use crate::{Align, Attrs, Buffer, Family, GlyphLocation, Text};
@@ -998,25 +998,6 @@ impl TextRender<'_> {
     #[inline]
     pub fn transform(&mut self, transform: impl Into<Option<Transform2D>>) -> &mut Self {
         self.transform = transform.into();
-        self
-    }
-
-    /// **屏幕固定（UI 文本）**：把文本块锚定到相机屏幕像素 `screen_px`，
-    /// 文本**不随相机旋转/缩放**——字形屏幕大小 = 文本局部 `size`（调用方按
-    /// `logical_px * scale_factor` 设置），位置 = `screen_px`（逻辑像素 × scale_factor）。
-    ///
-    /// 实现：设置整块变换 = `{ pos: cam.screen_to_world(screen_px), rotation: -cam.rotation,
-    /// scale: 1/cam.zoom }`，使文本局部坐标 1:1 映射到屏幕像素且与相机逆旋转对齐。
-    /// **每帧调用**（transform 每帧重建）。
-    #[inline]
-    pub fn screen_fixed(&mut self, cam: &Camera2D, screen_px: Vec2) -> &mut Self {
-        let anchor = cam.screen_to_world(screen_px);
-        self.transform = Some(
-            Transform2D::IDENTITY
-                .with_pos(anchor)
-                .with_rot(-cam.rotation)
-                .with_scale(Vec2::new(1.0 / cam.zoom.x, 1.0 / cam.zoom.y)),
-        );
         self
     }
 

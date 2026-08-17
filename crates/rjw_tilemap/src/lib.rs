@@ -22,7 +22,11 @@ use rjw_transform::{Camera2D, Rect, Transform2D};
 use rjw_2d_render::{Layer, Render2D, VertexP3U2C4};
 
 /// 默认 chunk 尺寸（世界像素）。
-pub const DEFAULT_CHUNK_SIZE: f32 = 512.0;
+///
+/// 权衡：chunk 越大 → 粗剔粒度越粗（draw call 数 ≈ 可见 chunk 数更少），但单 chunk
+/// 顶点缓冲/重建成本更高；高分辨率（大视口）下取 1024 比 512 更合适（视口 1920×1080
+/// 时 512 → 约 4×3 个 chunk，1024 → 2×2 个）。
+pub const DEFAULT_CHUNK_SIZE: f32 = 1024.0;
 
 /// 一张贴片：源图集子矩形 → 目标网格矩形（轴对齐，负尺寸 = 翻转）。
 #[derive(Debug, Clone)]
