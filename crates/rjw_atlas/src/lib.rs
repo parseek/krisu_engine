@@ -41,7 +41,7 @@ impl Default for AtlasConfig {
     }
 }
 
-// ─── AtlasRegion ──────────────────────────────────────────────
+// ─── AtlasRegion / RegionRef ──────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
 pub struct AtlasRegion {
@@ -49,6 +49,44 @@ pub struct AtlasRegion {
     pub wh_px: (u32, u32),
     pub origin_px: (u32, u32),
     pub page_uid: u64,
+}
+
+/// 图集条目的稳定句柄（**独立于** [`AtlasRegion`] 的值拷贝）。
+///
+/// - `region_id`：条目唯一且**跨去碎片重排稳定**（重排只改 `tl_px`，id 不变）；
+/// - **RAII 引用计数**：`RegionRef` 持有条目 keepalive 的 `Arc` 克隆，drop 自动释放；
+///   被引用的条目不参与 LRU 逐出（`end_frame` 时保活）——外部持有句柄期间条目保证可用；
+/// - 重排后经 [`RegionRef::resolve`] 取最新 UV（无需外部自行同步 generation）。
+#[derive(Clone, Debug)]
+pub struct RegionRef {
+    region_id: u64,
+    page_uid: u64,
+    /// RAII 保活：仅持有（drop 自动释放），不直接读取。
+    #[allow(dead_code)]
+    keepalive: Arc<()>,
+}
+
+impl RegionRef {
+    #[inline]
+    pub fn region_id(&self) -> u64 {
+        self.region_id
+    }
+    #[inline]
+    pub fn page_uid(&self) -> u64 {
+        self.page_uid
+    }
+    /// 离线/测试句柄：不保活任何条目，`resolve` 仅按 id 查 atlas。
+    #[inline]
+    pub fn from_parts(region_id: u64, page_uid: u64) -> Self {
+        Self { region_id, page_uid, keepalive: Arc::new(()) }
+    }
+    /// 在 `atlas` 中解析该条目**当前**（含重排后）的区域。
+    ///
+    /// 被引用的条目保证存在（保活不逐出），因此通常恒为 `Some`。
+    #[inline]
+    pub fn resolve<K: Hash + Eq + Clone>(&self, atlas: &DynamicAtlas<K>) -> Option<AtlasRegion> {
+        atlas.resolve_by_id(self.region_id)
+    }
 }
 
 // ─── 空闲矩形打包器（Guillotine）──────────────────────────────
@@ -259,6 +297,10 @@ struct AtlasEntry {
     alloc_tl: (u32, u32),
     alloc_wh: (u32, u32),
     clamp_margin: bool,
+    /// 稳定条目 id（跨重排不变）。
+    region_id: u64,
+    /// keepalive：条目自身持 1 个强引用；外部 `RegionRef` 持有克隆 → `strong_count() > 1` 表示被引用。
+    keepalive: Arc<()>,
 }
 
 pub struct DynamicAtlas<K = String> {
@@ -273,6 +315,10 @@ pub struct DynamicAtlas<K = String> {
     device: wgpu::Device,
     queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
+    /// region_id 分配器。
+    next_region_id: u64,
+    /// region_id → 键（`resolve_by_id` / `acquire_by_id` 用）。
+    by_id: HashMap<u64, K>,
 }
 
 /// 通用泛型方法（所有 K）。
@@ -285,7 +331,24 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         let queue = queue.clone();
         let layout = layout.clone();
         let page = AtlasPage::new(&device, &queue, &layout, page_size);
-        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout }
+        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout, next_region_id: 1, by_id: HashMap::new() }
+    }
+
+    /// 按稳定 `region_id` 解析当前区域（重排后仍可用；条目被逐出则返回 `None`）。
+    pub fn resolve_by_id(&self, region_id: u64) -> Option<AtlasRegion> {
+        let key = self.by_id.get(&region_id)?;
+        self.entries.get(key).map(|e| e.region)
+    }
+
+    /// 获取条目的稳定句柄（RAII 引用计数：drop 自动释放；被引用条目不逐出）。
+    pub fn acquire(&mut self, key: &K) -> Option<RegionRef> {
+        let e = self.entries.get_mut(key)?;
+        e.lifetime = self.config.lifetime;
+        Some(RegionRef {
+            region_id: e.region_id,
+            page_uid: e.region.page_uid,
+            keepalive: e.keepalive.clone(),
+        })
     }
 
     /// 去碎片重排世代号（每次搬动条目 +1；未搬动则不变）。
@@ -372,7 +435,14 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         let region = AtlasRegion { tl_px: (x + margin_offs.0, y + margin_offs.1), wh_px: (w, h), origin_px, page_uid: page.texture.uid };
         let alloc_tl = (x - padding, y - padding);
         let alloc_wh = (alloc_w + padding * 2, alloc_h + padding * 2);
-        self.entries.insert(key, AtlasEntry { region, lifetime: self.config.lifetime, source: None, alloc_tl, alloc_wh, clamp_margin });
+        let region_id = self.next_region_id;
+        self.next_region_id += 1;
+        let keepalive = Arc::new(());
+        self.entries.insert(key.clone(), AtlasEntry {
+            region, lifetime: self.config.lifetime, source: None, alloc_tl, alloc_wh, clamp_margin,
+            region_id, keepalive,
+        });
+        self.by_id.insert(region_id, key);
         Some(region)
     }
 
@@ -388,14 +458,19 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         let mut to_tomb: Vec<(K, Tombstone)> = Vec::new();
         let mut remove_keys: Vec<K> = Vec::new();
         for (k, e) in &self.entries {
-            if e.lifetime == 0 {
+            // 被外部 RegionRef 引用的条目保活（keepalive strong_count > 1），不逐出。
+            if e.lifetime == 0 && Arc::strong_count(&e.keepalive) == 1 {
                 if let Some(src) = &e.source {
                     to_tomb.push((k.clone(), Tombstone { source: src.clone_inline(), origin_px: e.region.origin_px, clamp_margin: e.clamp_margin }));
                     remove_keys.push(k.clone());
                 }
             }
         }
-        for k in &remove_keys { self.entries.remove(k); }
+        for k in &remove_keys {
+            if let Some(e) = self.entries.remove(k) {
+                self.by_id.remove(&e.region_id);
+            }
+        }
         for (k, t) in to_tomb { self.tombstones.insert(k, t); }
         for e in self.entries.values_mut() { if e.source.is_some() { e.lifetime = e.lifetime.saturating_sub(1); } }
         if !self.entries.is_empty() || self.dirty { self.dirty = true; }

@@ -112,6 +112,39 @@ impl Camera2D {
     /// --- Viewport state application ---
     // todo
 
+    /// 可见半宽高（世界单位）：`viewport_size * 0.5 / zoom`（非均匀缩放逐分量）。
+    #[inline]
+    pub fn view_half_size(&self) -> Vec2 {
+        Vec2::new(
+            self.viewport_size.x * 0.5 / self.zoom.x,
+            self.viewport_size.y * 0.5 / self.zoom.y,
+        )
+    }
+
+    /// 未旋转相机时的世界视口矩形：`position ± view_half_size()`。
+    #[inline]
+    pub fn world_view_rect(&self) -> crate::Rect {
+        let half = self.view_half_size();
+        crate::Rect::new(self.position.x - half.x, self.position.y - half.y, half.x * 2.0, half.y * 2.0)
+    }
+
+    /// 世界视口**保守 AABB**（含旋转）：把相机局部视口矩形四角经
+    /// [`Self::world_transform`]（pos + 旋转 + 1/zoom 缩放）变换后取包围盒。
+    ///
+    /// 旋转相机时视口是旋转矩形，此 AABB 是其超集——剔除**不误杀**（保守，多绘一点）。
+    #[inline]
+    pub fn view_aabb(&self) -> crate::Rect {
+        let half = self.viewport_size * 0.5;
+        let t = self.world_transform();
+        let pts = [
+            Vec2::new(-half.x, -half.y),
+            Vec2::new(half.x, -half.y),
+            Vec2::new(-half.x, half.y),
+            half,
+        ];
+        crate::Rect::from_point_slice(&t.transform_points(&pts))
+    }
+
     /// --- Camera as a world transform ---
 
     /// View the camera as a parent world transform.
@@ -263,5 +296,40 @@ mod tests {
             (via_tf - via_mat).length() < EPS,
             "world_transform vs view⁻¹ mismatch: tf={via_tf:?} mat={via_mat:?}"
         );
+    }
+
+    #[test]
+    fn world_view_rect_follows_position_and_zoom() {
+        let mut c = cam();
+        c.position = Vec2::new(100.0, -50.0);
+        c.zoom = Vec2::splat(2.0);
+        let r = c.world_view_rect();
+        assert!((r.x - (100.0 - W * 0.25)).abs() < EPS, "left = pos.x - half/zoom");
+        assert!((r.y - (-50.0 - H * 0.25)).abs() < EPS, "top = pos.y - half/zoom");
+        assert!((r.w - W * 0.5).abs() < EPS, "width = viewport/zoom");
+        assert!((r.h - H * 0.5).abs() < EPS, "height = viewport/zoom");
+    }
+
+    #[test]
+    fn view_aabb_is_conservative_when_rotated() {
+        let mut c = cam();
+        c.position = Vec2::ZERO;
+        c.rotation = 0.785398; // 45°
+        let a = c.view_aabb();
+        let half = Vec2::new(W, H) * 0.5;
+        let t = c.world_transform();
+        for p in [
+            Vec2::new(-half.x, -half.y),
+            Vec2::new(half.x, -half.y),
+            Vec2::new(-half.x, half.y),
+            half,
+        ] {
+            assert!(a.contains_point(t.transform_point(p)), "旋转后视口角点 {p:?} 应在保守 AABB 内");
+        }
+        // 未旋转：view_aabb == world_view_rect
+        c.rotation = 0.0;
+        let a0 = c.view_aabb();
+        let r0 = c.world_view_rect();
+        assert!((a0.x - r0.x).abs() < EPS && (a0.w - r0.w).abs() < EPS, "未旋转时二者应一致");
     }
 }
