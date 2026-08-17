@@ -228,9 +228,9 @@ impl App for TilemapDemo {
         // HUD（UI 文本，屏幕固定——内联实现，不依赖 rjw_text 扩展）：
         // - 位置：anchor = cam.screen_to_world(屏幕像素)，随相机旋转/缩放仍是屏幕左上角；
         // - 缩放：transform scale = 1/zoom → 屏幕字形大小 = size × zoom × (1/zoom) = size；
-        // - 旋转：transform rotation = -cam.rotation → 文字方向抵消相机旋转（屏幕对齐）。
-        //   注意：若希望 HUD 跟随世界旋转（倾斜），去掉 with_rot(-…) 即可（该旋转非多余——
-        //   屏幕方向 = R(cam.rot)·世界方向，必须逆旋转才保持屏幕水平）。
+        // - 旋转：屏幕→世界逆变换带 R(+rotation)（世界→屏幕是 zoom·R(-rotation)·(w-pos)），
+        //   transform rotation = +cam.rotation → 文字方向抵消相机旋转（屏幕对齐）。
+        //   注意：若希望 HUD 跟随世界旋转（倾斜），去掉 with_rot(…) 即可。
         // - 字号/锚点按 scale_factor 换算为物理像素。
         let sf = self.scale_factor;
         let hud = format!(
@@ -251,7 +251,7 @@ impl App for TilemapDemo {
             .transform(
                 Transform2D::IDENTITY
                     .with_pos(anchor)
-                    .with_rot(-self.cam.rotation)
+                    .with_rot(self.cam.rotation)
                     .with_scale(Vec2::new(1.0 / self.cam.zoom.x, 1.0 / self.cam.zoom.y)),
             )
             .color(Color::YELLOW)

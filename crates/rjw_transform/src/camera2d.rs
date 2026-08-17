@@ -332,4 +332,38 @@ mod tests {
         let r0 = c.world_view_rect();
         assert!((a0.x - r0.x).abs() < EPS && (a0.w - r0.w).abs() < EPS, "未旋转时二者应一致");
     }
+
+    /// 屏幕固定文本（UI）的变换数学：局部点 local 经
+    /// `{ pos: screen_to_world(anchor), rotation: +cam.rotation, scale: 1/zoom }`
+    /// 到世界、再 world_to_screen，应等于 `anchor + local`（1:1、不旋转、不缩放）。
+    ///
+    /// 曾犯错误：用 `-cam.rotation` 会双重旋转（文字转 -2×rot）。
+    #[test]
+    fn screen_fixed_transform_maps_local_to_screen_1to1() {
+        let mut c = cam();
+        c.position = Vec2::new(100.0, -50.0);
+        c.rotation = 0.7;
+        c.zoom = Vec2::new(1.5, 0.75);
+        let anchor_px = Vec2::new(40.0, 30.0);
+        let anchor_world = c.screen_to_world(anchor_px);
+        let t = crate::Transform2D::IDENTITY
+            .with_pos(anchor_world)
+            .with_rot(c.rotation)
+            .with_scale(Vec2::new(1.0 / c.zoom.x, 1.0 / c.zoom.y));
+        for local in [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(50.0, 12.0),
+            Vec2::new(-20.0, 100.0),
+            Vec2::new(300.0, -40.0),
+        ] {
+            let world = t.transform_point(local);
+            let screen = c.world_to_screen(world);
+            let expect = anchor_px + local;
+            assert!(
+                (screen - expect).length() < 0.05,
+                "local {local:?} → screen {screen:?} 应等于 {expect:?}（相机 rot={} zoom={:?}）",
+                c.rotation, c.zoom
+            );
+        }
+    }
 }
