@@ -165,6 +165,23 @@ impl Camera2D {
         }
     }
 
+    /// 世界 → 相机局部（view 变换，= [`Self::world_transform`] 的**逆**）。
+    ///
+    /// 输出 = `R(-rotation)·((w - position)·zoom)`（相机局部坐标，Y+ 向下）。
+    ///
+    /// **精度说明**：`Transform2D { pos, scale, rotation }` 的参数化固定"先缩放后旋转"，
+    /// 其逆也只能是"先缩放后旋转"结构；而 `view_matrix`（先旋转后缩放）在**非均匀缩放 +
+    /// 旋转**下与前者不可交换——此时 `view_transform` 是近似（往返有偏差）。
+    /// **均匀缩放**（`zoom.x == zoom.y`）下完全精确，且满足
+    /// `world_to_screen(w) - viewport_pos - vp/2 == view_transform(w)`。
+    /// 需要旋转 + 非均匀缩放的精确坐标反算时，请用矩阵路径（`view_matrix` / `vp_matrix`）。
+    ///
+    /// 供坐标反算：把世界点/矩形变换到相机空间（屏幕固定文本、命中测试、精确剔除等）。
+    #[inline]
+    pub fn view_transform(&self) -> crate::Transform2D {
+        self.world_transform().inverse()
+    }
+
     /// --- Coordinate conversion ---
 
     /// Convert a window pixel coordinate to world space.
@@ -363,6 +380,43 @@ mod tests {
                 (screen - expect).length() < 0.05,
                 "local {local:?} → screen {screen:?} 应等于 {expect:?}（相机 rot={} zoom={:?}）",
                 c.rotation, c.zoom
+            );
+        }
+    }
+
+    #[test]
+    fn view_transform_roundtrip_uniform_zoom() {
+        // 均匀缩放下 view_transform ↔ world_transform 互为精确逆
+        let mut c = cam();
+        c.position = Vec2::new(30.0, -20.0);
+        c.rotation = 0.4;
+        c.zoom = Vec2::splat(1.5);
+        for w in [Vec2::ZERO, Vec2::new(123.0, -456.0), Vec2::new(-640.0, 360.0)] {
+            let local = c.view_transform().transform_point(w);
+            let back = c.world_transform().transform_point(local);
+            assert!((back - w).length() < 0.05, "view→world 往返应还原 {w:?} → {back:?}");
+        }
+        // 非均匀缩放 + 旋转：Transform2D 参数化固有局限（先缩后旋 vs 先旋后缩），
+        // view_transform 为近似——仅验证不 panic，不做精确断言。
+        c.zoom = Vec2::new(1.5, 0.75);
+        let _ = c.view_transform().transform_point(Vec2::new(123.0, -456.0));
+    }
+
+    #[test]
+    fn view_transform_matches_screen_offset_uniform_zoom() {
+        // 均匀缩放下：view_transform(w) == world_to_screen(w) - viewport_pos - vp/2
+        let mut c = cam();
+        c.position = Vec2::new(30.0, -20.0);
+        c.rotation = 0.4;
+        c.zoom = Vec2::splat(1.5);
+        let vp = c.viewport_size;
+        for w in [Vec2::ZERO, Vec2::new(123.0, -456.0), Vec2::new(-640.0, 360.0)] {
+            let via_tf = c.view_transform().transform_point(w);
+            let screen = c.world_to_screen(w);
+            let expect = screen - c.viewport_pos - vp * 0.5;
+            assert!(
+                (via_tf - expect).length() < 0.05,
+                "均匀缩放 view_transform({w:?})={via_tf:?} 应等于屏幕偏移 {expect:?}"
             );
         }
     }

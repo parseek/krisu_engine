@@ -7,8 +7,9 @@
 //! - **Chunk 预生成顶点数据**：每个 chunk 按（页, 层）预生成 GPU 静态 mesh（`MeshData`），
 //!   结构/变换变更或图集重排（`generation` 变化）时按脏标记重建；每帧绘制 = 可见 chunk 的
 //!   `add_static_mesh`（draw call ≈ 可见 chunk 数），**每帧零收集 / 零分组 / 零 resolve / 零堆分配**；
-//! - **剔除直接收相机**：[`TileMap::draw`] 接收 `&Camera2D`（`None` = 不剔除），内部用
-//!   [`Camera2D::view_aabb`]（含旋转/缩放保守世界 AABB）逆变换到地图局部，按 chunk AABB 粗剔。
+//! - **剔除抽象为 [`ViewCull`]**：[`TileMap::draw`] 接收 `Option<&impl ViewCull>`
+//!   （2D 传 `&Camera2D`，`None` = 不剔除；3D 相机实现 trait 即可），内部用
+//!   [`ViewCull::world_view_aabb`]（含旋转/缩放保守世界 AABB）逆变换到地图局部，按 chunk AABB 粗剔。
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -18,7 +19,7 @@ use glam::Vec2;
 use rjw_atlas::{AtlasRegion, DynamicAtlas, RegionRef};
 use rjw_color::Color;
 use rjw_render::{MeshData, MESHES, TEXTURES};
-use rjw_transform::{Camera2D, Rect, Transform2D};
+use rjw_transform::{Rect, Transform2D, ViewCull};
 use rjw_2d_render::{Layer, Render2D, VertexP3U2C4};
 
 /// 默认 chunk 尺寸（世界像素）。
@@ -223,10 +224,13 @@ impl TileMap {
         &self.solid_cache
     }
 
-    /// 相机下可见贴片数（`None` = 全部）：chunk 粗剔后按组计数（与 mesh 提交粒度一致）。
+    /// 视图下可见贴片数（`None` = 全部）：chunk 粗剔后按组计数（与 mesh 提交粒度一致）。
+    ///
+    /// `view` 抽象为 [`ViewCull`]（2D = `&Camera2D`，3D = 视锥体实现）；剔除在
+    /// **地图局部空间**做（视图 `world_view_aabb` 逆变换到局部后与 chunk AABB 相交）。
     #[inline]
-    pub fn visible_count(&self, cam: Option<&Camera2D>) -> usize {
-        let Some(local_view) = self.local_view(cam) else {
+    pub fn visible_count(&self, view: Option<&impl ViewCull>) -> usize {
+        let Some(local_view) = self.local_view(view) else {
             return self.tiles.len();
         };
         self.chunks
@@ -236,18 +240,19 @@ impl TileMap {
             .count()
     }
 
-    /// 相机世界视口 AABB → 地图局部空间（保守逆变换；`None` = 不剔除）。
-    fn local_view(&self, cam: Option<&Camera2D>) -> Option<Rect> {
-        let world_view = cam?.view_aabb();
+    /// 视图可见区（世界保守 AABB）→ 地图局部空间（保守逆变换；`None` = 不剔除）。
+    fn local_view(&self, view: Option<&impl ViewCull>) -> Option<Rect> {
+        let world_view = view?.world_view_aabb();
         match self.transform {
             Some(t) => Some(world_view.transform(&t.inverse())),
             None => Some(world_view),
         }
     }
 
-    /// 渲染。`atlas` 提供 region 解析；`cam` 为 `Some` 时按 [`Camera2D::view_aabb`]
-    /// 世界 AABB 剔除（**chunk 粒度**粗剔）。
+    /// 渲染。`atlas` 提供 region 解析；`view` 为 `Some` 时按 [`ViewCull::world_view_aabb`]
+    /// 世界 AABB 剔除（**chunk 粒度**粗剔，地图局部空间判定）。
     ///
+    /// `view` 抽象为 [`ViewCull`]：2D 传 `&Camera2D`；3D 相机（视锥体）实现 trait 后可直接传入。
     /// 顶点数据在**首次绘制 / 结构或变换变更 / 图集重排**时按脏标记预生成（静态 mesh），
     /// 每帧仅做：chunk AABB 剔除 + `add_static_mesh` 提交（draw call ≈ 可见 chunk 数）。
     pub fn draw<K: Hash + Eq + Clone>(
@@ -255,7 +260,7 @@ impl TileMap {
         r2d: &mut Render2D,
         atlas: &DynamicAtlas<K>,
         base_layer: impl Into<Layer>,
-        cam: Option<&Camera2D>,
+        view: Option<&impl ViewCull>,
     ) {
         if self.tiles.is_empty() {
             return;
@@ -265,7 +270,7 @@ impl TileMap {
             self.rebuild_meshes(r2d, atlas);
         }
         let base: f64 = base_layer.into().as_f64();
-        let local_view = self.local_view(cam);
+        let local_view = self.local_view(view);
         let map_t = self.transform.unwrap_or_default();
 
         for chunk in self.chunks.values() {
@@ -405,6 +410,6 @@ mod tests {
         let mut m = TileMap::new(512.0);
         m.push(tile(1, 1, 0.0, 0.0, 64.0, 64.0));
         m.push(tile(1, 1, 1000.0, 1000.0, 64.0, 64.0));
-        assert_eq!(m.visible_count(None), 2);
+        assert_eq!(m.visible_count(None::<&rjw_transform::Camera2D>), 2);
     }
 }

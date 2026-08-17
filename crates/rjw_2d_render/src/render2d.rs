@@ -4,7 +4,7 @@ use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use rjw_color::Color;
 use rjw_render::{ArcTextureWrapped, MeshData, MESHES, TEXTURES, TextureWrapped};
-use rjw_transform::{Camera2D, Rect, Transform2D};
+use rjw_transform::{Camera2D, Rect, Transform2D, ViewCull};
 
 use crate::command::{DrawCommand, DrawCommandQueue, Layer, States};
 use crate::data::{
@@ -671,9 +671,9 @@ pub struct Render2D {
     mvp: glam::Mat4,
     /// 视口剔除开关（默认 **false**；[`Self::set_culling`]）。
     culling: bool,
-    /// 剔除相机（[`Self::set_cull_camera`] 设置）：`Some` 时用其
-    /// [`Camera2D::view_aabb`]（世界保守 AABB，含旋转/缩放）做剔除，而非反推 MVP。
-    cull_cam: Option<Camera2D>,
+    /// 剔除视图（[`Self::set_cull_view`] / [`Self::set_cull_camera`] 设置）：
+    /// 抽象为 [`ViewCull`]（2D = `Camera2D` 保守 AABB；3D = 视锥体，后续）。
+    cull_view: Option<Box<dyn ViewCull + Send + Sync>>,
     default_rstates: RStates,
 
     /// 四边形网格（Sprite 合批用）的全局注册表 uid。
@@ -783,7 +783,7 @@ impl Render2D {
             depth_size: (0, 0),
             mvp: glam::Mat4::IDENTITY,
             culling: false,
-            cull_cam: None,
+            cull_view: None,
             default_rstates: RStates::default(),
             quad_mesh_id,
             sampler_cache: HashMap::new(),
@@ -810,28 +810,38 @@ impl Render2D {
     /// 开启后，`add_sprite2d` / `add_sprite2d_matrix`（及经 `add_mesh` 提交的动态 mesh **除外**）
     /// 在写入实例缓冲前，按精灵世界 AABB 与视口世界矩形相交测试，剔除完全不可见的精灵。
     ///
-    /// 视口来源：优先用 [`Self::set_cull_camera`] 传入的相机（`view_aabb`，含旋转/缩放）；
-    /// 未设置相机时回退为 [`Self::set_mvp`] 反推（正交相机下正确）。
+    /// 视口来源：优先用 [`Self::set_cull_view`] / [`Self::set_cull_camera`] 传入的视图
+    /// （`ViewCull::world_view_aabb`，含旋转/缩放）；未设置时回退为 [`Self::set_mvp`] 反推。
     #[inline]
     pub fn set_culling(&mut self, culling: bool) -> &mut Self {
         self.culling = culling;
         self
     }
 
-    /// 直接以相机驱动剔除：`Some(cam)` 开启（用 [`Camera2D::view_aabb`] 世界保守 AABB，
-    /// **含旋转/缩放**，不再需要从 MVP 反推视口）；`None` 关闭。
+    /// 以**抽象视图**驱动剔除：`Some(view)` 开启（用 [`ViewCull::world_view_aabb`]
+    /// 保守 AABB，含旋转/缩放，不再反推 MVP）；`None` 关闭。
+    ///
+    /// 抽象化便于 3D 扩展：3D 相机实现 [`ViewCull`]（视锥体测试）后可直接传入。
     #[inline]
-    pub fn set_cull_camera(&mut self, cam: Option<&Camera2D>) -> &mut Self {
-        self.cull_cam = cam.copied();
-        self.culling = cam.is_some();
+    pub fn set_cull_view(&mut self, view: Option<Box<dyn ViewCull + Send + Sync>>) -> &mut Self {
+        self.cull_view = view;
+        self.culling = self.cull_view.is_some();
         self
     }
 
-    /// 当前剔除视口矩形：优先相机 `view_aabb`，否则 MVP 反推。
+    /// 以 2D 相机驱动剔除（[`Camera2D`] 实现 [`ViewCull`] 的便捷入口）。
+    #[inline]
+    pub fn set_cull_camera(&mut self, cam: Option<&Camera2D>) -> &mut Self {
+        self.cull_view = cam.map(|c| Box::new(*c) as Box<dyn ViewCull + Send + Sync>);
+        self.culling = self.cull_view.is_some();
+        self
+    }
+
+    /// 当前剔除视口矩形：优先抽象视图 `world_view_aabb`，否则 MVP 反推。
     #[inline]
     fn cull_view_rect(&self) -> Rect {
-        match self.cull_cam {
-            Some(cam) => cam.view_aabb(),
+        match &self.cull_view {
+            Some(v) => v.world_view_aabb(),
             None => self.viewport_world_rect(),
         }
     }

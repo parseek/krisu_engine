@@ -11,6 +11,10 @@ pub use camera2d::Camera2D;
 pub mod rect;
 pub use rect::Rect;
 
+#[allow(unused)]
+pub mod view_cull;
+pub use view_cull::ViewCull;
+
 pub use glam;
 pub use glam::{
     Vec2,

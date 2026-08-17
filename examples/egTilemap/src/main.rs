@@ -187,14 +187,14 @@ impl App for TilemapDemo {
                 .with_move_by(-center));
         }
 
-        // 方向键：移动相机
+        // 方向键：沿**相机朝向**移动（walk_xy 把位移旋转到相机系；相机旋转后方向键仍符合直觉）
         let cam_speed = 700.0;
-        let mut cam_move = Vec2::ZERO;
-        if kb.get(KeyCode::ArrowLeft).pressed() { cam_move.x -= cam_speed * dt; }
-        if kb.get(KeyCode::ArrowRight).pressed() { cam_move.x += cam_speed * dt; }
-        if kb.get(KeyCode::ArrowUp).pressed() { cam_move.y -= cam_speed * dt; }
-        if kb.get(KeyCode::ArrowDown).pressed() { cam_move.y += cam_speed * dt; }
-        self.cam.move_by(cam_move);
+        let mut cam_walk = Vec2::ZERO;
+        if kb.get(KeyCode::ArrowLeft).pressed() { cam_walk.x -= cam_speed * dt; }  // 相机左
+        if kb.get(KeyCode::ArrowRight).pressed() { cam_walk.x += cam_speed * dt; } // 相机右
+        if kb.get(KeyCode::ArrowUp).pressed() { cam_walk.y -= cam_speed * dt; }    // 相机前
+        if kb.get(KeyCode::ArrowDown).pressed() { cam_walk.y += cam_speed * dt; }  // 相机后
+        self.cam.walk_xy(cam_walk);
 
         // WASD：玩家移动（对 solid 贴片做滑动碰撞；solid_rects 为脏标记缓存，静态地图零开销）
         let speed = 340.0;
