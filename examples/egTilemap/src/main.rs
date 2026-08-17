@@ -159,13 +159,14 @@ impl App for TilemapDemo {
         let dt = ctx.timer.dt().get_f32();
         let kb = &ctx.keyboard;
 
-        // C：切换剔除（TileMap::draw 直接收 &Camera2D）
+        // C：切换剔除（判定闭包形式：世界 AABB 与相机 view_aabb 相交）
         if kb.get(KeyCode::KeyC).down_edge() {
             self.culling = !self.culling;
+            let cull_fn = |aabb: &rjw_text::Rect| aabb.intersects(&self.cam.view_aabb());
             eprintln!(
                 "culling: {}  visible {}/{}  chunks {}",
                 self.culling,
-                self.map.visible_count(self.culling.then_some(&self.cam)),
+                self.map.visible_count(self.culling.then_some(&cull_fn as &dyn Fn(&rjw_text::Rect) -> bool)),
                 self.map.tile_count(),
                 self.map.chunk_count(),
             );
@@ -211,11 +212,15 @@ impl App for TilemapDemo {
         let Some(font) = &mut self.font else { return };
         let atlas = self._atlas.as_ref().expect("atlas initialized");
         r2d.set_mvp(self.cam.vp_matrix());
-        // Render2D 级剔除：直接以相机驱动（对 sprite 生效；tilemap 自身按 chunk 剔除）
+        // Render2D 级剔除：闭包形式（对 sprite 生效；tilemap 自身按 chunk 剔除）
         r2d.set_cull_camera(self.culling.then_some(&self.cam));
 
-        let cam_ref = if self.culling { Some(&self.cam) } else { None };
-        self.map.draw(r2d, atlas, 0.0, cam_ref);
+        // TileMap 剔除：判定闭包（世界 AABB 与相机 view_aabb 相交），None = 不剔除
+        let view_aabb = self.cam.view_aabb();
+        let cull_fn = |aabb: &rjw_text::Rect| aabb.intersects(&view_aabb);
+        let cull: Option<&dyn Fn(&rjw_text::Rect) -> bool> =
+            if self.culling { Some(&cull_fn) } else { None };
+        self.map.draw(r2d, atlas, 0.0, cull);
 
         // 玩家方块（地图旋转时玩家仍在世界坐标移动）
         r2d.add_sprite2d_solid(
@@ -239,7 +244,7 @@ impl App for TilemapDemo {
             self.cam.rotation.to_degrees(),
             self.cam.zoom.x,
             self.map.transform().map(|t| t.rotation.to_degrees()).unwrap_or(0.0),
-            self.map.visible_count(cam_ref),
+            self.map.visible_count(cull),
             self.map.tile_count(),
             self.map.chunk_count(),
         );

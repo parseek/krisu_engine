@@ -4,7 +4,7 @@ use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use rjw_color::Color;
 use rjw_render::{ArcTextureWrapped, MeshData, MESHES, TEXTURES, TextureWrapped};
-use rjw_transform::{Camera2D, Rect, Transform2D, ViewCull};
+use rjw_transform::{Camera2D, Rect, Transform2D};
 
 use crate::command::{DrawCommand, DrawCommandQueue, Layer, States};
 use crate::data::{
@@ -671,9 +671,9 @@ pub struct Render2D {
     mvp: glam::Mat4,
     /// 视口剔除开关（默认 **false**；[`Self::set_culling`]）。
     culling: bool,
-    /// 剔除视图（[`Self::set_cull_view`] / [`Self::set_cull_camera`] 设置）：
-    /// 抽象为 [`ViewCull`]（2D = `Camera2D` 保守 AABB；3D = 视锥体，后续）。
-    cull_view: Option<Box<dyn ViewCull + Send + Sync>>,
+    /// 剔除判定闭包（[`Self::set_cull_with`] / [`Self::set_cull_camera`]）：`Fn(世界 AABB) -> bool`。
+    /// 未设置时回退为 [`Self::set_mvp`] 反推的视口矩形相交。
+    cull_pred: Option<Box<dyn Fn(&Rect) -> bool + Send + Sync>>,
     default_rstates: RStates,
 
     /// 四边形网格（Sprite 合批用）的全局注册表 uid。
@@ -783,7 +783,7 @@ impl Render2D {
             depth_size: (0, 0),
             mvp: glam::Mat4::IDENTITY,
             culling: false,
-            cull_view: None,
+            cull_pred: None,
             default_rstates: RStates::default(),
             quad_mesh_id,
             sampler_cache: HashMap::new(),
@@ -810,40 +810,35 @@ impl Render2D {
     /// 开启后，`add_sprite2d` / `add_sprite2d_matrix`（及经 `add_mesh` 提交的动态 mesh **除外**）
     /// 在写入实例缓冲前，按精灵世界 AABB 与视口世界矩形相交测试，剔除完全不可见的精灵。
     ///
-    /// 视口来源：优先用 [`Self::set_cull_view`] / [`Self::set_cull_camera`] 传入的视图
-    /// （`ViewCull::world_view_aabb`，含旋转/缩放）；未设置时回退为 [`Self::set_mvp`] 反推。
+    /// 视口来源：优先用 [`Self::set_cull_with`] / [`Self::set_cull_camera`] 设置的**判定闭包**；
+    /// 未设置时回退为 [`Self::set_mvp`] 反推（正交相机下正确）。
     #[inline]
     pub fn set_culling(&mut self, culling: bool) -> &mut Self {
         self.culling = culling;
         self
     }
 
-    /// 以**抽象视图**驱动剔除：`Some(view)` 开启（用 [`ViewCull::world_view_aabb`]
-    /// 保守 AABB，含旋转/缩放，不再反推 MVP）；`None` 关闭。
+    /// 以**判定闭包**驱动剔除：`Some(f)` 开启（`f(世界 AABB) -> bool`，可见返回 true）；
+    /// `None` 关闭。
     ///
-    /// 抽象化便于 3D 扩展：3D 相机实现 [`ViewCull`]（视锥体测试）后可直接传入。
+    /// 闭包形式最灵活：可直接捕获相机做视锥体/矩形判定（3D 亦同），无需实现 trait。
     #[inline]
-    pub fn set_cull_view(&mut self, view: Option<Box<dyn ViewCull + Send + Sync>>) -> &mut Self {
-        self.cull_view = view;
-        self.culling = self.cull_view.is_some();
+    pub fn set_cull_with(
+        &mut self,
+        f: Option<Box<dyn Fn(&Rect) -> bool + Send + Sync>>,
+    ) -> &mut Self {
+        self.cull_pred = f;
+        self.culling = self.cull_pred.is_some();
         self
     }
 
-    /// 以 2D 相机驱动剔除（[`Camera2D`] 实现 [`ViewCull`] 的便捷入口）。
+    /// 以 2D 相机驱动剔除（内部包装为 [`Self::set_cull_with`] 闭包：与 `view_aabb` 相交）。
     #[inline]
     pub fn set_cull_camera(&mut self, cam: Option<&Camera2D>) -> &mut Self {
-        self.cull_view = cam.map(|c| Box::new(*c) as Box<dyn ViewCull + Send + Sync>);
-        self.culling = self.cull_view.is_some();
-        self
-    }
-
-    /// 当前剔除视口矩形：优先抽象视图 `world_view_aabb`，否则 MVP 反推。
-    #[inline]
-    fn cull_view_rect(&self) -> Rect {
-        match &self.cull_view {
-            Some(v) => v.world_view_aabb(),
-            None => self.viewport_world_rect(),
-        }
+        self.set_cull_with(cam.map(|c| {
+            let view = c.view_aabb();
+            Box::new(move |aabb: &Rect| aabb.intersects(&view)) as Box<dyn Fn(&Rect) -> bool + Send + Sync>
+        }))
     }
 
     /// 视口世界矩形：由当前 MVP 逆变换 clip 空间四角得到（正交相机下 z 取 0 即可）。
@@ -874,6 +869,25 @@ impl Render2D {
             pts[i] = glam::Vec2::new(v.x / v.w, v.y / v.w);
         }
         Rect::from_point_slice(&pts).intersects(vp)
+    }
+
+    /// 精灵四角经 `model` 变换后的世界 AABB 是否通过**判定闭包**（可见返回 true）。
+    fn sprite_in_viewport_pred(rect: &SpriteRect, model: glam::Mat4, pred: &dyn Fn(&Rect) -> bool) -> bool {
+        let tl = rect.mesh_tl;
+        let wh = rect.mesh_wh;
+        let corners = [
+            tl,
+            glam::Vec2::new(tl.x + wh.x, tl.y),
+            glam::Vec2::new(tl.x, tl.y + wh.y),
+            tl + wh,
+        ];
+        let mut pts = [glam::Vec2::ZERO; 4];
+        for (i, c) in corners.iter().enumerate() {
+            let v = model * glam::Vec4::new(c.x, c.y, 0.0, 1.0);
+            pts[i] = glam::Vec2::new(v.x / v.w, v.y / v.w);
+        }
+        let aabb = Rect::from_point_slice(&pts);
+        pred(&aabb)
     }
 
     /// `Transform2D` → 列主序 2D model 矩阵（与 [`InstanceData::from_sprite`] 一致）。
@@ -1687,7 +1701,12 @@ impl Render2D {
             }};
         }
 
-        let vp_cull = if self.culling { Some(self.cull_view_rect()) } else { None };
+        // 剔除：优先判定闭包；未设置时回退 MVP 反推的视口矩形。
+        let vp_cull = if self.culling && self.cull_pred.is_none() {
+            Some(self.viewport_world_rect())
+        } else {
+            None
+        };
         for (cmd, layer, states) in self.command_queue.iter() {
             let tu = states.texture_uid;
             let rr = states.rstates.unwrap_or(self.default_rstates).raw();
@@ -1698,11 +1717,18 @@ impl Render2D {
                     transform,
                 } => {
                     flush_dyn!();
-                    // 视口剔除：世界 AABB 与视口无交集 → 跳过（不产生实例）。
-                    if let Some(vp) = vp_cull {
-                        let model = Self::transform2d_model(transform);
-                        if !Self::sprite_in_viewport(rect, model, &vp) {
-                            continue;
+                    // 视口剔除：世界 AABB 判定（闭包或 MVP 矩形）不通过 → 跳过（不产生实例）。
+                    if self.culling {
+                        if let Some(p) = &self.cull_pred {
+                            let model = Self::transform2d_model(transform);
+                            if !Self::sprite_in_viewport_pred(rect, model, p.as_ref()) {
+                                continue;
+                            }
+                        } else if let Some(vp) = vp_cull {
+                            let model = Self::transform2d_model(transform);
+                            if !Self::sprite_in_viewport(rect, model, &vp) {
+                                continue;
+                            }
                         }
                     }
                     self.buf_items.push(BatchItem {
@@ -1722,9 +1748,15 @@ impl Render2D {
                 } => {
                     flush_dyn!();
                     let m = self.command_queue.matrices[*mat_idx];
-                    if let Some(vp) = vp_cull {
-                        if !Self::sprite_in_viewport(rect, m, &vp) {
-                            continue;
+                    if self.culling {
+                        if let Some(p) = &self.cull_pred {
+                            if !Self::sprite_in_viewport_pred(rect, m, p.as_ref()) {
+                                continue;
+                            }
+                        } else if let Some(vp) = vp_cull {
+                            if !Self::sprite_in_viewport(rect, m, &vp) {
+                                continue;
+                            }
                         }
                     }
                     self.buf_items.push(BatchItem {
