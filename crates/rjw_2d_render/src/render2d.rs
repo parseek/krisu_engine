@@ -4,7 +4,7 @@ use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use rjw_color::Color;
 use rjw_render::{ArcTextureWrapped, MeshData, MESHES, TEXTURES, TextureWrapped};
-use rjw_transform::{Rect, Transform2D};
+use rjw_transform::{Camera2D, Rect, Transform2D};
 
 use crate::command::{DrawCommand, DrawCommandQueue, Layer, States};
 use crate::data::{
@@ -669,8 +669,11 @@ pub struct Render2D {
     depth_view: Option<wgpu::TextureView>,
     depth_size: (u32, u32),
     mvp: glam::Mat4,
-    /// 视口剔除开关（默认 **false**；开启后 Sprite 系列在提交前按世界 AABB 与视口矩形做剔除）。
+    /// 视口剔除开关（默认 **false**；[`Self::set_culling`]）。
     culling: bool,
+    /// 剔除相机（[`Self::set_cull_camera`] 设置）：`Some` 时用其
+    /// [`Camera2D::view_aabb`]（世界保守 AABB，含旋转/缩放）做剔除，而非反推 MVP。
+    cull_cam: Option<Camera2D>,
     default_rstates: RStates,
 
     /// 四边形网格（Sprite 合批用）的全局注册表 uid。
@@ -780,6 +783,7 @@ impl Render2D {
             depth_size: (0, 0),
             mvp: glam::Mat4::IDENTITY,
             culling: false,
+            cull_cam: None,
             default_rstates: RStates::default(),
             quad_mesh_id,
             sampler_cache: HashMap::new(),
@@ -804,12 +808,32 @@ impl Render2D {
     /// 视口剔除开关（默认 **false**）。
     ///
     /// 开启后，`add_sprite2d` / `add_sprite2d_matrix`（及经 `add_mesh` 提交的动态 mesh **除外**）
-    /// 在写入实例缓冲前，按精灵世界 AABB 与视口世界矩形（由 [`Self::set_mvp`] 反推）相交测试，
-    /// 剔除完全不可见的精灵——减少实例数与上传量，绘制结果不变（视口外的本来也看不见）。
+    /// 在写入实例缓冲前，按精灵世界 AABB 与视口世界矩形相交测试，剔除完全不可见的精灵。
+    ///
+    /// 视口来源：优先用 [`Self::set_cull_camera`] 传入的相机（`view_aabb`，含旋转/缩放）；
+    /// 未设置相机时回退为 [`Self::set_mvp`] 反推（正交相机下正确）。
     #[inline]
     pub fn set_culling(&mut self, culling: bool) -> &mut Self {
         self.culling = culling;
         self
+    }
+
+    /// 直接以相机驱动剔除：`Some(cam)` 开启（用 [`Camera2D::view_aabb`] 世界保守 AABB，
+    /// **含旋转/缩放**，不再需要从 MVP 反推视口）；`None` 关闭。
+    #[inline]
+    pub fn set_cull_camera(&mut self, cam: Option<&Camera2D>) -> &mut Self {
+        self.cull_cam = cam.copied();
+        self.culling = cam.is_some();
+        self
+    }
+
+    /// 当前剔除视口矩形：优先相机 `view_aabb`，否则 MVP 反推。
+    #[inline]
+    fn cull_view_rect(&self) -> Rect {
+        match self.cull_cam {
+            Some(cam) => cam.view_aabb(),
+            None => self.viewport_world_rect(),
+        }
     }
 
     /// 视口世界矩形：由当前 MVP 逆变换 clip 空间四角得到（正交相机下 z 取 0 即可）。
@@ -1653,7 +1677,7 @@ impl Render2D {
             }};
         }
 
-        let vp_cull = if self.culling { Some(self.viewport_world_rect()) } else { None };
+        let vp_cull = if self.culling { Some(self.cull_view_rect()) } else { None };
         for (cmd, layer, states) in self.command_queue.iter() {
             let tu = states.texture_uid;
             let rr = states.rstates.unwrap_or(self.default_rstates).raw();

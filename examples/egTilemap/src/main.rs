@@ -1,11 +1,11 @@
-//! egTilemap —— `rjw_tilemap` v2 演示：任意图集区域贴片 + 物件化 + Chunk+AABB 剔除。
+//! egTilemap —— `rjw_tilemap` v3 演示：源裁剪贴片 + Chunk 预生成顶点 + 相机剔除。
 //!
-//! - 运行时向 `DynamicAtlas` 插入程序生成纹理 → `RegionRef` 句柄（重排后仍可用、保活）→ 任意尺寸贴片；
-//! - tile 仅位移+缩放：**负 size 翻转**（负宽 = 水平镜像）；
-//! - **M 键**旋转整个地图（TileMap 整体变换，物件化）；
-//! - **C 键**切换相机剔除（`TileMap::draw` 直接收 `&Camera2D`，内部用 `view_aabb` 世界保守 AABB
-//!   → 局部空间 chunk 粗剔 + tile 精剔；HUD 显示 visible / total）；
-//! - **Q/E** 旋转相机、**R/F** 缩放相机（演示旋转/缩放下剔除仍保守正确）；
+//! - 运行时向 `DynamicAtlas` 插入程序生成纹理 → `RegionRef` 句柄（重排后仍可用、保活）→
+//!   `Tile { src, src_tl/src_wh（源内裁剪）, mesh_tl/mesh_wh（目标，负 = 翻转）}`；
+//! - **M 键**旋转整个地图（TileMap 整体变换，物件化；chunk 顶点按脏标记重建）；
+//! - **C 键**切换剔除：`TileMap::draw` 直接收 `&Camera2D`（`view_aabb` 世界保守 AABB →
+//!   局部空间 chunk AABB 粗剔）；同时开启 `Render2D::set_cull_camera`（对 sprite 生效）；
+//! - **Q/E** 旋转相机、**R/F** 缩放相机（旋转/缩放下剔除仍保守正确）；
 //! - WASD 移动玩家（`rjw_collision::move_and_collide` 对 solid 贴片滑动碰撞）；方向键移动相机。
 
 use glam::Vec2;
@@ -72,9 +72,11 @@ impl TilemapDemo {
         let accent = insert(atlas, "accent", [232, 150, 60], [160, 90, 20]);
 
         let mut map = TileMap::new(512.0);
-        let push = |map: &mut TileMap, region: &RegionRef, gx: i32, gy: i32, solid: bool, flip_x: bool| {
-            let mut t = Tile::new(
-                region.clone(),
+        let push = |map: &mut TileMap, atlas: &DynamicAtlas, src: &RegionRef, gx: i32, gy: i32, solid: bool, flip_x: bool| {
+            let region = src.resolve(atlas).expect("resolve src region");
+            let mut t = Tile::whole_region(
+                region,
+                src.clone(),
                 Vec2::new(gx as f32 * TILE, gy as f32 * TILE),
                 Vec2::new(if flip_x { -TILE } else { TILE }, TILE), // 负宽 = 水平镜像
             );
@@ -95,7 +97,7 @@ impl TilemapDemo {
                 } else {
                     (&grass, false)
                 };
-                push(&mut map, region, gx, gy, solid, (gx + gy) % 9 == 0);
+                push(&mut map, atlas, region, gx, gy, solid, (gx + gy) % 9 == 0);
             }
         }
         map
@@ -205,6 +207,8 @@ impl App for TilemapDemo {
         let Some(font) = &mut self.font else { return };
         let atlas = self._atlas.as_ref().expect("atlas initialized");
         r2d.set_mvp(self.cam.vp_matrix());
+        // Render2D 级剔除：直接以相机驱动（对 sprite 生效；tilemap 自身按 chunk 剔除）
+        r2d.set_cull_camera(self.culling.then_some(&self.cam));
 
         let cam_ref = if self.culling { Some(&self.cam) } else { None };
         self.map.draw(r2d, atlas, 0.0, cam_ref);

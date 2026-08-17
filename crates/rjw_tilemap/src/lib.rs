@@ -1,53 +1,60 @@
-//! 任意图集区域贴片（`rjw_tilemap`）v2 —— 物件化 + Chunk+AABB。
+//! 任意图集区域贴片（`rjw_tilemap`）v3 —— 物件化 + Chunk 预生成顶点 + 相机剔除。
 //!
-//! - **任意区域贴片**：每个 tile 引用一个 [`RegionRef`]（`rjw_atlas` 稳定句柄，
-//!   动态图集**去碎片重排后仍可用**、被引用条目不逐出），任意位置/尺寸粘贴。
-//! - **矩形仅位移+缩放**：tile 是轴对齐矩形，`size` 为负 = 翻转（负宽水平镜像、负高垂直镜像）；
-//!   任意变换（旋转/缩放）由 **TileMap 整体 `transform`**（物件化）承担。
-//! - **Chunk + AABB**：`chunk_size` 可配置（默认 512 世界像素）；tile 按**左上角**归属 chunk，
-//!   chunk 的 AABB = 块内所有 tile 的**并集**（含跨界部分）——剔除按 AABB 相交判定，
-//!   不依赖"选择框"索引，跨界 tile 不会漏绘/错绘。
+//! - **Tile = 源裁剪 + 目标网格**：`{ src: RegionRef, src_tl/src_wh: 源内裁剪（像素，相对 AtlasRegion 左上角）,
+//!   mesh_tl/mesh_wh: 目标位置/尺寸（局部坐标，负 = 翻转）}`——可从同一张图集精灵裁出任意子矩形贴片；
+//! - **RegionRef**（`rjw_atlas`）：稳定 id + RAII 保活，动态图集**重排后仍可用**；
+//! - **物件化**：`TileMap` 整体 `transform`（位移/旋转/缩放整个地图）；tile 矩形保持轴对齐（仅位移缩放）；
+//! - **Chunk 预生成顶点数据**：每个 chunk 按（页, 层）预生成 GPU 静态 mesh（`MeshData`），
+//!   结构/变换变更或图集重排（`generation` 变化）时按脏标记重建；每帧绘制 = 可见 chunk 的
+//!   `add_static_mesh`（draw call ≈ 可见 chunk 数），**每帧零收集 / 零分组 / 零 resolve / 零堆分配**；
 //! - **剔除直接收相机**：[`TileMap::draw`] 接收 `&Camera2D`（`None` = 不剔除），内部用
-//!   [`Camera2D::view_aabb`]（含旋转/缩放的保守世界 AABB）逆变换到地图局部做两级剔除。
-//! - 渲染复用 `rjw_2d_render::Render2D` 实例化 sprite 路径，按 `page_uid` 分组。
+//!   [`Camera2D::view_aabb`]（含旋转/缩放保守世界 AABB）逆变换到地图局部，按 chunk AABB 粗剔。
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::Arc;
 
 use glam::Vec2;
 use rjw_atlas::{AtlasRegion, DynamicAtlas, RegionRef};
 use rjw_color::Color;
-use rjw_render::TEXTURES;
+use rjw_render::{MeshData, MESHES, TEXTURES};
 use rjw_transform::{Camera2D, Rect, Transform2D};
-use rjw_2d_render::{Layer, Render2D, SpriteRect};
+use rjw_2d_render::{Layer, Render2D, VertexP3U2C4};
 
 /// 默认 chunk 尺寸（世界像素）。
 pub const DEFAULT_CHUNK_SIZE: f32 = 512.0;
 
-/// 一张贴片：图集区域句柄 + 局部位置/尺寸（轴对齐；`size` 负 = 翻转）。
+/// 一张贴片：源图集子矩形 → 目标网格矩形（轴对齐，负尺寸 = 翻转）。
 #[derive(Debug, Clone)]
 pub struct Tile {
-    /// 图集区域句柄（RAII 保活；重排后经 `resolve` 取最新 UV）。
-    pub region: RegionRef,
-    /// 地图局部坐标左上角（整体变换由 [`TileMap::transform`] 承担）。
-    pub pos: Vec2,
-    /// 局部尺寸（负 = 翻转；AABB/剔除按归一化）。
-    pub size: Vec2,
-    /// 着色（彩色内容建议 `Color::WHITE`）。
+    /// 源图集条目（RAII 保活；重排后经 `resolve` 取最新 AtlasRegion）。
+    pub src: RegionRef,
+    /// 源内裁剪起点（**像素**，相对 `AtlasRegion.tl_px`；`(0,0)` = 整张精灵）。
+    pub src_tl: Vec2,
+    /// 源内裁剪尺寸（**像素**，可负 = 翻转；`(0,0)` 表示整张精灵）。
+    pub src_wh: Vec2,
+    /// 目标位置（地图局部坐标左上角）。
+    pub mesh_tl: Vec2,
+    /// 目标尺寸（可负 = 翻转；AABB/剔除按归一化）。
+    pub mesh_wh: Vec2,
+    /// 着色（烘焙进顶点颜色）。
     pub color: Color,
-    /// 相对基础层的层级偏移。
+    /// 相对基础层的层级偏移（按 (页, 层) 分 mesh）。
     pub layer: f32,
     /// 是否参与碰撞（`solid_rects` 收集）。
     pub solid: bool,
 }
 
 impl Tile {
+    /// 从整张 `region` 贴片：`src_tl = (0,0)`、`src_wh = region.wh_px`。
     #[inline]
-    pub fn new(region: RegionRef, pos: Vec2, size: Vec2) -> Self {
+    pub fn whole_region(region: AtlasRegion, src: RegionRef, mesh_tl: Vec2, mesh_wh: Vec2) -> Self {
         Self {
-            region,
-            pos,
-            size,
+            src,
+            src_tl: Vec2::ZERO,
+            src_wh: Vec2::new(region.wh_px.0 as f32, region.wh_px.1 as f32),
+            mesh_tl,
+            mesh_wh,
             color: Color::WHITE,
             layer: 0.0,
             solid: false,
@@ -57,22 +64,29 @@ impl Tile {
     /// 局部 AABB（负尺寸归一化）。
     #[inline]
     pub fn aabb_local(&self) -> Rect {
-        Rect::new(self.pos.x, self.pos.y, self.size.x, self.size.y).normalized()
+        Rect::new(self.mesh_tl.x, self.mesh_tl.y, self.mesh_wh.x, self.mesh_wh.y).normalized()
     }
 }
 
-/// chunk：块内按 `region_id` **预分组**的 tile 索引 + 局部并集 AABB（含跨界部分）。
-///
-/// 预分组让渲染时**每组只 resolve 一次**图集区域（region_id 稳定，重排/换页不影响分组），
-/// 组内 tile 共享同一 UV / page_uid——避免每 tile 重复 HashMap 查找。
+/// 预生成顶点网格（静态 mesh，GPU 已上传）。
+#[derive(Debug)]
+struct ChunkMesh {
+    page_uid: u64,
+    mesh_id: u64,
+    layer: f32,
+}
+
+/// chunk：块内按 `region_id` 预分组 + 局部并集 AABB + 预生成网格。
 #[derive(Debug, Default)]
 struct Chunk {
     aabb: Option<Rect>,
-    /// region_id → 该 chunk 内使用此图集条目的 tile 索引。
+    /// region_id → 该 chunk 内使用此图集条目的 tile 索引（visible_count / 重建用）。
     groups: HashMap<u64, Vec<usize>>,
+    /// 预生成顶点网格（每 (页, 层) 一个）。
+    meshes: Vec<ChunkMesh>,
 }
 
-/// 贴片集合：Chunk 组织 + 可选整体变换（物件化）+ 脏标记缓存。
+/// 贴片集合：Chunk 组织 + 预生成顶点 + 可选整体变换（物件化）+ 脏标记缓存。
 #[derive(Debug)]
 pub struct TileMap {
     tiles: Vec<Tile>,
@@ -80,12 +94,12 @@ pub struct TileMap {
     chunk_size: f32,
     /// 整体世界变换（`None` = 单位；旋转/缩放整个地图）。
     transform: Option<Transform2D>,
-    /// 结构/变换脏标记：置位后 `solid_rects` 缓存重建。
+    /// 结构/变换脏标记：置位后 solid 缓存与 chunk mesh 重建。
     dirty: bool,
     /// solid 世界 AABB 缓存（静态地图时每帧零计算）。
     solid_cache: Vec<Rect>,
-    /// draw 内部 scratch（复用容量，避免每帧堆分配）。
-    scratch_pages: Vec<(u64, Vec<(usize, AtlasRegion)>)>,
+    /// 上次 chunk mesh 重建时的图集 generation（重排后自动重建）。
+    atlas_gen: Option<u64>,
 }
 
 impl Default for TileMap {
@@ -104,7 +118,7 @@ impl TileMap {
             transform: None,
             dirty: false,
             solid_cache: Vec::new(),
-            scratch_pages: Vec::new(),
+            atlas_gen: None,
         }
     }
 
@@ -127,7 +141,7 @@ impl TileMap {
         self
     }
 
-    /// 手动置脏（若你通过 [`Self::tiles`] 直接修改了 tile 字段，需调用本方法刷新缓存）。
+    /// 手动置脏（若你通过 [`Self::tiles`] 直接修改了 tile 字段，需调用本方法刷新缓存与网格）。
     #[inline]
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
@@ -135,6 +149,11 @@ impl TileMap {
 
     #[inline]
     pub fn clear(&mut self) {
+        for chunk in self.chunks.values_mut() {
+            for m in std::mem::take(&mut chunk.meshes) {
+                MESHES.remove(m.mesh_id);
+            }
+        }
         self.tiles.clear();
         self.chunks.clear();
         self.dirty = true;
@@ -144,9 +163,9 @@ impl TileMap {
     #[inline]
     pub fn push(&mut self, tile: Tile) {
         let idx = self.tiles.len();
-        let chunk_pos = self.chunk_of(tile.pos);
+        let chunk_pos = self.chunk_of(tile.mesh_tl);
         let aabb = tile.aabb_local();
-        let region_id = tile.region.region_id();
+        let region_id = tile.src.region_id();
         self.tiles.push(tile);
         let chunk = self.chunks.entry(chunk_pos).or_default();
         chunk.aabb = Some(match chunk.aabb {
@@ -200,7 +219,7 @@ impl TileMap {
         &self.solid_cache
     }
 
-    /// 相机下可见贴片数（`None` = 全部）：chunk 粗剔 + tile 精剔，与 [`Self::draw`] 同逻辑。
+    /// 相机下可见贴片数（`None` = 全部）：chunk 粗剔后按组计数（与 mesh 提交粒度一致）。
     #[inline]
     pub fn visible_count(&self, cam: Option<&Camera2D>) -> usize {
         let Some(local_view) = self.local_view(cam) else {
@@ -210,7 +229,6 @@ impl TileMap {
             .values()
             .filter(|c| c.aabb.map_or(false, |a| a.intersects(&local_view)))
             .flat_map(|c| c.groups.values().flatten())
-            .filter(|&&i| self.tiles[i].aabb_local().intersects(&local_view))
             .count()
     }
 
@@ -223,13 +241,11 @@ impl TileMap {
         }
     }
 
-    /// 渲染。`atlas` 提供 region 解析（动态图集重排后取最新 UV）；
-    /// `cam` 为 `Some` 时按 [`Camera2D::view_aabb`] 世界 AABB 剔除（chunk 粗剔 + tile 精剔）。
+    /// 渲染。`atlas` 提供 region 解析；`cam` 为 `Some` 时按 [`Camera2D::view_aabb`]
+    /// 世界 AABB 剔除（**chunk 粒度**粗剔）。
     ///
-    /// 内部优化：
-    /// - chunk 内按 `region_id` **预分组** → 每组只 resolve 一次图集区域，组内 tile 共享 UV/page；
-    /// - 复用内部 scratch 缓冲（`&mut self`），**每帧零堆分配**；
-    /// - 按 `page_uid` 分组提交（一个 mesh 只绑一张纹理页）；整体变换作用于每个 tile quad。
+    /// 顶点数据在**首次绘制 / 结构或变换变更 / 图集重排**时按脏标记预生成（静态 mesh），
+    /// 每帧仅做：chunk AABB 剔除 + `add_static_mesh` 提交（draw call ≈ 可见 chunk 数）。
     pub fn draw<K: Hash + Eq + Clone>(
         &mut self,
         r2d: &mut Render2D,
@@ -240,12 +256,14 @@ impl TileMap {
         if self.tiles.is_empty() {
             return;
         }
+        // 重建预生成网格（结构/变换变更，或图集重排导致 UV 过期）。
+        if self.dirty || self.atlas_gen != Some(atlas.generation()) {
+            self.rebuild_meshes(r2d, atlas);
+        }
         let base: f64 = base_layer.into().as_f64();
         let local_view = self.local_view(cam);
         let map_t = self.transform.unwrap_or_default();
 
-        // 收集可见 tile（chunk 粗剔 + group 内精剔），每组 resolve 一次 region。
-        self.scratch_pages.clear();
         for chunk in self.chunks.values() {
             let Some(ca) = chunk.aabb else { continue };
             if let Some(lv) = local_view {
@@ -253,45 +271,74 @@ impl TileMap {
                     continue;
                 }
             }
-            for (&region_id, idxs) in &chunk.groups {
-                let Some(region) = atlas.resolve_by_id(region_id) else { continue };
-                let uid = region.page_uid;
-                for &i in idxs {
-                    let tile = &self.tiles[i];
-                    if let Some(lv) = local_view {
-                        if !tile.aabb_local().intersects(&lv) {
-                            continue;
-                        }
-                    }
-                    match self.scratch_pages.iter_mut().find(|(u, _)| *u == uid) {
-                        Some((_, v)) => v.push((i, region)),
-                        None => self.scratch_pages.push((uid, vec![(i, region)])),
-                    }
-                }
-            }
-        }
-
-        for (uid, idxs) in &self.scratch_pages {
-            let Some(tex) = TEXTURES.get(*uid) else { continue };
-            let inv = Vec2::new(1.0 / tex.width as f32, 1.0 / tex.height as f32);
-            for &(i, region) in idxs {
-                let tile = &self.tiles[i];
-                let rect = SpriteRect::from_texture_px(
-                    tile.pos,
-                    tile.size,
-                    Vec2::new(region.tl_px.0 as f32, region.tl_px.1 as f32),
-                    Vec2::new(region.wh_px.0 as f32, region.wh_px.1 as f32),
-                    inv,
-                );
-                r2d.add_sprite2d(
-                    rect,
-                    tile.color,
+            for m in &chunk.meshes {
+                let Some(tex) = TEXTURES.get(m.page_uid) else { continue };
+                r2d.add_static_mesh(
+                    m.mesh_id,
+                    Color::WHITE,
                     map_t,
-                    Layer::from(base + tile.layer as f64),
+                    Layer::from(base + m.layer as f64),
                     &tex,
                 );
             }
         }
+    }
+
+    /// 重建全部 chunk 的预生成顶点网格（注销旧 mesh → 按 (页, 层) 生成顶点 → 注册新 mesh）。
+    fn rebuild_meshes<K: Hash + Eq + Clone>(&mut self, r2d: &mut Render2D, atlas: &DynamicAtlas<K>) {
+        for chunk in self.chunks.values_mut() {
+            for m in std::mem::take(&mut chunk.meshes) {
+                MESHES.remove(m.mesh_id);
+            }
+        }
+        for (chunk_pos, chunk) in self.chunks.iter_mut() {
+            let Some(_) = chunk.aabb else { continue };
+            // 收集本 chunk 全部 tile 索引（region_id 分组展开）
+            let all_idx: Vec<usize> = chunk.groups.values().flatten().copied().collect();
+            if all_idx.is_empty() {
+                continue;
+            }
+            // 按 (页, 层) 分组：组内共享纹理与绘制层级
+            let mut buckets: HashMap<(u64, u32), Vec<usize>> = HashMap::new();
+            for &i in &all_idx {
+                let tile = &self.tiles[i];
+                let Some(region) = tile.src.resolve(atlas) else { continue };
+                buckets.entry((region.page_uid, tile.layer.to_bits())).or_default().push(i);
+            }
+            for ((page_uid, layer_bits), idxs) in buckets {
+                let Some(tex) = TEXTURES.get(page_uid) else { continue };
+                let pw = tex.width as f32;
+                let ph = tex.height as f32;
+                let mut verts: Vec<VertexP3U2C4> = Vec::with_capacity(idxs.len() * 4);
+                let mut indices: Vec<u16> = Vec::with_capacity(idxs.len() * 6);
+                for &i in &idxs {
+                    let tile = &self.tiles[i];
+                    let Some(region) = tile.src.resolve(atlas) else { continue };
+                    let u0 = (region.tl_px.0 as f32 + tile.src_tl.x) / pw;
+                    let v0 = (region.tl_px.1 as f32 + tile.src_tl.y) / ph;
+                    let uw = tile.src_wh.x / pw;
+                    let vh = tile.src_wh.y / ph;
+                    let tl = tile.mesh_tl;
+                    let wh = tile.mesh_wh;
+                    let c: [f32; 4] = tile.color.into();
+                    let base = verts.len() as u16;
+                    verts.push(VertexP3U2C4 { pos: [tl.x, tl.y, 0.0], uv: [u0, v0], color: c });
+                    verts.push(VertexP3U2C4 { pos: [tl.x + wh.x, tl.y, 0.0], uv: [u0 + uw, v0], color: c });
+                    verts.push(VertexP3U2C4 { pos: [tl.x, tl.y + wh.y, 0.0], uv: [u0, v0 + vh], color: c });
+                    verts.push(VertexP3U2C4 { pos: [tl.x + wh.x, tl.y + wh.y, 0.0], uv: [u0 + uw, v0 + vh], color: c });
+                    indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+                }
+                if verts.is_empty() {
+                    continue;
+                }
+                let label = format!("tilemap chunk {chunk_pos:?} page {page_uid}");
+                let mesh = MeshData::from_pod(r2d.device(), &verts, &indices, &label);
+                let mesh_id = MESHES.register(Arc::new(mesh));
+                chunk.meshes.push(ChunkMesh { page_uid, mesh_id, layer: f32::from_bits(layer_bits) });
+            }
+        }
+        self.dirty = false;
+        self.atlas_gen = Some(atlas.generation());
     }
 }
 
@@ -300,7 +347,16 @@ mod tests {
     use super::*;
 
     fn tile(region_id: u64, page_uid: u64, x: f32, y: f32, w: f32, h: f32) -> Tile {
-        Tile::new(RegionRef::from_parts(region_id, page_uid), Vec2::new(x, y), Vec2::new(w, h))
+        Tile {
+            src: RegionRef::from_parts(region_id, page_uid),
+            src_tl: Vec2::ZERO,
+            src_wh: Vec2::new(64.0, 64.0),
+            mesh_tl: Vec2::new(x, y),
+            mesh_wh: Vec2::new(w, h),
+            color: Color::WHITE,
+            layer: 0.0,
+            solid: false,
+        }
     }
 
     #[test]
@@ -317,7 +373,6 @@ mod tests {
         assert_eq!(m.chunk_count(), 1, "跨界 tile 仍归属左上角所在 chunk");
         let c = m.chunks.get(&(0, 0)).unwrap();
         assert_eq!(c.aabb.unwrap(), Rect::new(500.0, 10.0, 40.0, 40.0), "跨界部分计入 chunk AABB");
-        // 不同 chunk 的 tile 分开
         m.push(tile(1, 1, 600.0, 10.0, 40.0, 40.0));
         assert_eq!(m.chunk_count(), 2, "600 归属 chunk (1,0)");
         assert_eq!(m.tile_count(), 2);
@@ -329,13 +384,10 @@ mod tests {
         let mut t = tile(1, 1, 0.0, 0.0, 10.0, 10.0);
         t.solid = true;
         m.push(t);
-        // 整体平移（缓存按脏标记重建）
         m.set_transform(Transform2D::IDENTITY.with_pos(Vec2::new(100.0, 50.0)));
         let first = m.solid_rects()[0];
         assert_eq!(first, Rect::new(100.0, 50.0, 10.0, 10.0), "平移后世界 AABB");
-        // 结构未变 → 缓存复用（结果一致且不重建：两次调用值相同）
         assert_eq!(m.solid_rects()[0], first, "未置脏应复用缓存");
-        // 整体旋转 45° → 保守 AABB 包含变换后的角点
         m.set_transform(Transform2D::IDENTITY.with_pos(Vec2::ZERO).with_rot(0.785398));
         let r0 = m.solid_rects()[0];
         let t = m.transform().unwrap();
