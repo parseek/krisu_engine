@@ -163,14 +163,14 @@ fn draw_text_demos(r2d: &mut Render2D, font: &mut Text, t: f32, half_w: f32, hal
     {
         let mut title = TextStyle::with_style(font, &warn);
         title.text("Style 责任链 → with_style(&warn)：weight+color 继承")
-            .offset(Vec2::new(-half_w + 14.0, -half_h + 70.0))
+            .offset(Vec2::new(-half_w + 14.0, -half_h + 70.0).round())
             .draw_sprite2d(r2d, 100.0);
     }
     {
         let mut sub = TextStyle::with_style(font, &base);
         sub.set_style(&fancy);
         sub.text("set_style(&fancy)：italic + letter_spacing")
-            .offset(Vec2::new(-half_w + 14.0, -half_h + 95.0))
+            .offset(Vec2::new(-half_w + 14.0, -half_h + 95.0).round())
             .draw_sprite2d(r2d, 100.0);
     }
 
@@ -180,7 +180,7 @@ fn draw_text_demos(r2d: &mut Render2D, font: &mut Text, t: f32, half_w: f32, hal
         .align(Align::Center)
         .into_render()
         .origin(Vec2::new(0.5, 0.0))
-        .offset(Vec2::new(0.0, -half_h + 100.0))
+        .offset(Vec2::new(0.0, -half_h + 100.0).round())
         .color(Color::CYAN)
         .draw_sprite2d(r2d, 99.0);
 
@@ -189,7 +189,7 @@ fn draw_text_demos(r2d: &mut Render2D, font: &mut Text, t: f32, half_w: f32, hal
         .size(30.0)
         .align(Align::Center)
         .into_render()
-        .transform(Transform2D::default().with_pos(Vec2::new(0.0, 60.0)).with_rot(0.05))
+        .transform(Transform2D::default().with_pos(Vec2::new(0.0, 60.0).round()).with_rot(0.05))
         .origin(Vec2::new(0.5, 0.0))
         .draw_2d_gradient(
             r2d, 98.0,
@@ -199,11 +199,12 @@ fn draw_text_demos(r2d: &mut Render2D, font: &mut Text, t: f32, half_w: f32, hal
 
     // ── 4. 多行 + 竖向渐变（Frame 模式） ──
     font.text("C) 竖向渐变\nFrame 模式")
+        .font_family("站酷快乐体2016修订版")
         .size(26.0)
         .align(Align::Center)
         .into_render()
         .origin(Vec2::new(0.5, 0.5))
-        .offset(Vec2::new(0.0, -half_h + 190.0))
+        .offset(Vec2::new(0.0, -half_h + 190.0).round())
         .draw_2d_gradient(
             r2d, 97.0,
             GradientMode::Frame, GradientAxis::Vertical,
@@ -212,11 +213,12 @@ fn draw_text_demos(r2d: &mut Render2D, font: &mut Text, t: f32, half_w: f32, hal
 
     // ── 4. 多行 + 竖向渐变（Line 模式） ──
     font.text("C2) 竖向渐变\nLine 模式")
+        .font_family("站酷快乐体2016修订版")
         .size(26.0)
         .align(Align::Center)
         .into_render()
         .origin(Vec2::new(0.5, 0.5))
-        .offset(Vec2::new(0.0, -half_h + 280.0))
+        .offset(Vec2::new(0.0, -half_h + 280.0).round())
         .draw_2d_gradient(
             r2d, 97.0,
             GradientMode::Line, GradientAxis::Vertical,
@@ -229,7 +231,7 @@ fn draw_text_demos(r2d: &mut Render2D, font: &mut Text, t: f32, half_w: f32, hal
         .align(Align::Center)
         .into_render()
         .origin(Vec2::new(0.5, 0.5))
-        .offset(Vec2::new(0.0, 0.0))
+        .offset(Vec2::new(0.0, 0.0).round())
         .draw_with(|_m, _ln, region, tr| {
             // tr.pos = 字形世界锚点；在字形下方画一条黄色下划线
             if let Some(tex) = TEXTURES.get(region.page_uid) {
@@ -247,7 +249,8 @@ fn draw_text_demos(r2d: &mut Render2D, font: &mut Text, t: f32, half_w: f32, hal
         });
 
     // ── 6. map：逐字形动画 + glyph_str / glyph_type ──
-    font.text("E) map 逐字形 ✨😀")
+    font.text("E) map 逐字形 ✨😀🔵❤️💖😍👌🤞👻☠️🤖👾🙉")
+        .font_family("站酷快乐体2016修订版")
         .size(30.0)
         .align(Align::Center)
         .into_render()

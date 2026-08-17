@@ -250,7 +250,7 @@ impl Style {
         self
     }
 
-    /// 斜体。
+    /// 斜体；字体无斜体字面时，cosmic-text 打 `FAKE_ITALIC` 标记、光栅化做 14° 斜切合成伪斜体。
     #[inline]
     pub fn italic(mut self, italic: bool) -> Self {
         self.attrs.style = if italic { cosmic_text::Style::Italic } else { cosmic_text::Style::Normal };
@@ -431,7 +431,7 @@ impl<'a> TextStyle<'a> {
         self.style = self.style.weight(weight);
         self
     }
-    /// 斜体。
+    /// 斜体（无斜体字面时由光栅化合成伪斜体，见 [`Style::italic`]）。
     #[inline]
     pub fn italic(mut self, italic: bool) -> Self {
         self.style = self.style.italic(italic);

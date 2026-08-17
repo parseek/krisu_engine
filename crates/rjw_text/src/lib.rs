@@ -31,7 +31,7 @@ use swash::scale::{
     Render, ScaleContext, Source,
     image::Content as SwashContent,
 };
-use swash::zeno::{Format, Vector};
+use swash::zeno::{Angle, Format, Transform, Vector};
 
 pub const DEFAULT_GLYPH_ATLAS_SIZE: u32 = 1024;
 
@@ -224,6 +224,40 @@ impl LayoutCache {
 
 // ─── Text ──────────────────────────────────────────────────────
 
+// ─── 字形光栅化（swash） ────────────────────────────────────────
+
+/// 光栅化单个字形（swash）。与 cosmic-text 自带光栅化保持一致：
+/// `FAKE_ITALIC` 标记（cosmic-text 在字体无斜体字面时为 italic 排版打上）→ 对字形做
+/// **14° 斜切**合成伪斜体；字体自带斜体字面时则由排版层直接选中斜体字形，本函数无需变换。
+///
+/// 返回 `None` 表示该字形无法产生像素（缺字体 / swash 渲染失败 / 零尺寸）。
+fn swash_render_image(
+    font_system: &mut FontSystem,
+    context: &mut ScaleContext,
+    cache_key: cosmic_text::CacheKey,
+) -> Option<swash::scale::image::Image> {
+    let font = font_system.get_font(cache_key.font_id, cache_key.font_weight)?;
+    let mut scaler = context
+        .builder(font.as_swash())
+        .size(f32::from_bits(cache_key.font_size_bits))
+        .hint(!cache_key.flags.contains(cosmic_text::CacheKeyFlags::DISABLE_HINTING))
+        .build();
+    let offset = Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float());
+    Render::new(&[
+        Source::ColorOutline(0),
+        Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
+        Source::Outline,
+    ])
+    .format(Format::Alpha)
+    .offset(offset)
+    .transform(if cache_key.flags.contains(cosmic_text::CacheKeyFlags::FAKE_ITALIC) {
+        Some(Transform::skew(Angle::from_degrees(14.0), Angle::from_degrees(0.0)))
+    } else {
+        None
+    })
+    .render(&mut scaler, cache_key.glyph_id)
+}
+
 pub struct Text {
     font_system: FontSystem,
     scale_context: ScaleContext,
@@ -386,26 +420,9 @@ impl Text {
     ///
     /// 无法产生像素的字形（空格/零尺寸、缺字体、swash 渲染失败）会记入 [`Self::no_image`]，
     /// 避免每帧重复光栅化（Debug 下 swash 渲染是主要开销）。
+    /// 渲染细节见 [`swash_render_image`]（含 `FAKE_ITALIC` 伪斜体 14° 斜切）。
     fn rasterize_and_pack(&mut self, cache_key: cosmic_text::CacheKey) {
-        let Some(font) = self.font_system.get_font(cache_key.font_id, cache_key.font_weight) else {
-            self.no_image.insert(cache_key);
-            return;
-        };
-        let mut scaler = self.scale_context
-            .builder(font.as_swash())
-            .size(f32::from_bits(cache_key.font_size_bits))
-            .hint(!cache_key.flags.contains(cosmic_text::CacheKeyFlags::DISABLE_HINTING))
-            .build();
-        let offset = Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float());
-        let image = Render::new(&[
-            Source::ColorOutline(0),
-            Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
-            Source::Outline,
-        ])
-        .format(Format::Alpha)
-        .offset(offset)
-        .render(&mut scaler, cache_key.glyph_id);
-        let Some(image) = image else {
+        let Some(image) = swash_render_image(&mut self.font_system, &mut self.scale_context, cache_key) else {
             self.no_image.insert(cache_key);
             return;
         };
@@ -687,5 +704,87 @@ mod tests {
         assert!(hit(&mut cache, &k2).is_none(), "LRU 应淘汰最久未使用的 k2");
         cache.clear();
         assert_eq!(cache.len(), 0);
+    }
+
+    /// italic 在 cosmic-text 排版层的真实行为（视觉呈现由光栅化端决定）：
+    /// - 字体带斜体字面（如 Times New Roman）→ 选中真正的斜体字形（font_id/glyph_id 变化）；
+    /// - 字体无斜体字面（如 SimHei）→ 字形不变，但 cache key 打上 `FAKE_ITALIC` 标记，
+    ///   本 crate 的光栅化据此做 14° 斜切合成伪斜体（见 [`swash_render_image`] 与下个测试）。
+    #[test]
+    fn italic_selection_depends_on_face() {
+        fn shape(fs: &mut FontSystem, family: &str, italic: bool) -> (Vec<(u64, u32)>, bool) {
+            let metrics = Metrics::new(14.0, 20.0);
+            let mut buf = Buffer::new(fs, metrics);
+            buf.set_size(Some(1024.0), None);
+            let style = if italic {
+                cosmic_text::Style::Italic
+            } else {
+                cosmic_text::Style::Normal
+            };
+            let attrs = Attrs::new().family(Family::Name(family)).style(style);
+            buf.set_text("Hello", &attrs, Shaping::Advanced, Some(Align::Left));
+            buf.shape_until_scroll(fs, false);
+            let mut ids = Vec::new();
+            let mut fake = false;
+            for run in buf.layout_runs() {
+                for g in run.glyphs.iter() {
+                    let k = g.physical((0.0, 0.0), 1.0).cache_key;
+                    // fontdb::ID 是不透明 key，哈希后比较（同一 FontSystem 内确定性一致）
+                    let mut h = DefaultHasher::new();
+                    k.font_id.hash(&mut h);
+                    ids.push((h.finish(), k.glyph_id as u32));
+                    fake |= k.flags.contains(cosmic_text::CacheKeyFlags::FAKE_ITALIC);
+                }
+            }
+            (ids, fake)
+        }
+        let mut fs = FontSystem::new();
+        fs.db_mut().load_system_fonts();
+        // 有斜体字面 → 真正切换字形，且不需要伪斜体标记
+        let (kn, faken) = shape(&mut fs, "Times New Roman", false);
+        let (ki, fakei) = shape(&mut fs, "Times New Roman", true);
+        assert!(!kn.is_empty(), "Times New Roman 应命中字形");
+        assert_ne!(kn, ki, "Times New Roman：italic 应切换到真正的斜体字形");
+        assert!(!faken && !fakei, "Times New Roman：正常/斜体均不应打 FAKE_ITALIC");
+        // 无斜体字面 → 字形不变，仅打 FAKE_ITALIC 标记（光栅化端据其做 14° 斜切，见下个测试）
+        let (sn, faken2) = shape(&mut fs, "SimHei", false);
+        let (si, fakei2) = shape(&mut fs, "SimHei", true);
+        assert!(!sn.is_empty(), "SimHei 应命中字形");
+        assert_eq!(sn, si, "SimHei 无斜体字面：字形身份应相同（复用 regular 字形）");
+        assert!(!faken2, "SimHei normal 不应打 FAKE_ITALIC");
+        assert!(fakei2, "SimHei italic 应打 FAKE_ITALIC（由光栅化端决定是否合成斜切）");
+    }
+
+    /// 像素级验证：无斜体字面的 SimHei 走 `FAKE_ITALIC` 时，[`swash_render_image`]
+    /// 应输出**不同的像素**（14° 斜切伪斜体），证明 italic 在光栅化端真正生效。
+    #[test]
+    fn fake_italic_skews_simhei_glyphs() {
+        let mut fs = FontSystem::new();
+        fs.db_mut().load_system_fonts();
+        let metrics = Metrics::new(32.0, 40.0);
+        let mut buf = Buffer::new(&mut fs, metrics);
+        buf.set_size(Some(1024.0), None);
+        let attrs = Attrs::new()
+            .family(Family::Name("SimHei"))
+            .style(cosmic_text::Style::Italic);
+        buf.set_text("A", &attrs, Shaping::Advanced, Some(Align::Left));
+        buf.shape_until_scroll(&mut fs, false);
+        let mut key = None;
+        for run in buf.layout_runs() {
+            for g in run.glyphs.iter() {
+                key = Some(g.physical((0.0, 0.0), 1.0).cache_key);
+            }
+        }
+        let key = key.expect("SimHei 'A' 应命中字形");
+        assert!(key.flags.contains(cosmic_text::CacheKeyFlags::FAKE_ITALIC), "italic 应带 FAKE_ITALIC 标记");
+        let mut ctx = ScaleContext::new();
+        // 同一个字形，仅去掉 FAKE_ITALIC 标记 → 应渲染出不同的像素
+        let normal = swash_render_image(&mut fs, &mut ctx, cosmic_text::CacheKey {
+            flags: cosmic_text::CacheKeyFlags::empty(),
+            ..key
+        }).expect("normal 渲染应成功");
+        let italic = swash_render_image(&mut fs, &mut ctx, key).expect("fake italic 渲染应成功");
+        assert!(!normal.data.is_empty() && !italic.data.is_empty(), "两种渲染都应有像素");
+        assert_ne!(normal.data, italic.data, "FAKE_ITALIC 斜切应改变 SimHei 光栅化像素");
     }
 }
