@@ -7,6 +7,10 @@ pub use transform2d::Transform2D;
 pub mod camera2d;
 pub use camera2d::Camera2D;
 
+#[allow(unused)]
+pub mod rect;
+pub use rect::Rect;
+
 pub use glam;
 pub use glam::{
     Vec2,

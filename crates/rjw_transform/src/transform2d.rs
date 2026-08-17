@@ -126,6 +126,24 @@ impl Transform2D {
             )
     }
 
+    /// Transform an array of points from local space to parent space.
+    /// 将一组点从局部空间变换到父级空间（逐个 [`Self::transform_point`]）。
+    #[inline]
+    pub fn transform_points<const N: usize>(&self, local: &[Vec2; N]) -> [Vec2; N] {
+        let mut out = [Vec2::ZERO; N];
+        for (i, p) in local.iter().enumerate() {
+            out[i] = self.transform_point(*p);
+        }
+        out
+    }
+
+    /// Transform an array of points and return their bounding box.
+    /// 变换一组点并返回其轴对齐包围盒（AABB，保守）。
+    #[inline]
+    pub fn transform_points_aabb<const N: usize>(&self, local: &[Vec2; N]) -> crate::Rect {
+        crate::Rect::from_point_slice(&self.transform_points(local))
+    }
+
     /// Inverse: transform a point from parent space back to local space.
     /// 反向变换：将点从父级空间变换回局部空间。
     ///
