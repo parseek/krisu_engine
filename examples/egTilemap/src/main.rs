@@ -268,11 +268,24 @@ impl App for TilemapDemo {
 
 fn main() -> Result<(), EventLoopError> {
     env_logger::init();
+    // 可选启动参数：--cam-rot <弧度> 设置初始相机旋转（RenderDoc 验证屏幕固定文本用）。
+    let mut cam = Camera2D::new(Vec2::new(1280.0, 720.0));
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if a == "--cam-rot" {
+            if let Some(v) = args.next() {
+                cam.rotation = v.parse().unwrap_or(0.0);
+            }
+        }
+    }
+    if cam.rotation != 0.0 {
+        eprintln!("initial cam rotation = {:.3} rad", cam.rotation);
+    }
     rjw_main::run_app(TilemapDemo {
         render: None,
         render2d: None,
         font: None,
-        cam: Camera2D::new(Vec2::new(1280.0, 720.0)),
+        cam,
         map: TileMap::new(1024.0),
         player_pos: Vec2::new(TILE * 4.0, TILE * 4.0),
         player_size: Vec2::new(48.0, 48.0),
