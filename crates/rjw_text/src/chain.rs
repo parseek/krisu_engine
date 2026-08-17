@@ -31,7 +31,7 @@ use rjw_color::Color;
 #[cfg(feature = "rjw_2d_render")]
 use rjw_render::TEXTURES;
 use swash::scale::image::Content as SwashContent;
-pub use rjw_transform::Transform2D;
+pub use rjw_transform::{Rect, Transform2D};
 
 use cosmic_text::{AttrsOwned, FamilyOwned, Stretch, Weight};
 use crate::{Align, Attrs, Buffer, Family, GlyphLocation, Text};
@@ -366,13 +366,14 @@ impl Text {
         let page_size = self.glyph_cache.page_size() as f32;
         let (content_size, measure) = collect_glyphs(
             &self.locations, buffer, visual_origin,
-            &mut self.buf.glyphs, &mut self.buf.lines,
+            &mut self.buf.glyphs, &mut self.buf.lines, None,
         );
         let glyphs = &mut self.buf.glyphs;
         let lines = &mut self.buf.lines;
         TextRender {
             glyphs, lines, content_size, measure,
             origin: Vec2::ZERO, offset: Vec2::ZERO, color: [1.0; 4], transform: None, page_size,
+            clip: None, clip_world: None, cull: false,
         }
     }
 }
@@ -410,6 +411,9 @@ impl<'a> TextStyle<'a> {
             line_space: style.line_space,
             align: style.align,
             render: style.render,
+            clip: None,
+            cull: false,
+            cache: CachePolicy::Auto,
         }
     }
 
@@ -497,7 +501,28 @@ impl<'a> TextStyle<'a> {
         self.style = self.style.transform(transform);
         self
     }
-}// ─── TextBuffer / TextLayout（阶段一：排版配置） ─────────────────
+}
+
+// ─── 缓存策略 / 剔除开关 ────────────────────────────────────────
+
+/// 排版缓存策略（**每个文本操作**可指定；默认 [`CachePolicy::Auto`] 保持现状）。
+///
+/// 作用于内部 LRU 排版缓存（见 [`crate::MAX_LAYOUT_CACHE`]）：
+/// - [`CachePolicy::Auto`]：Debug 恒缓存；Release 仅缓存 ≤ [`crate::LARGE_TEXT_CACHE_LIMIT`] 字节的小文本；
+/// - [`CachePolicy::Always`]：强制进 LRU（含大文本；注意会挤压 LRU 容量）；
+/// - [`CachePolicy::Never`]：不缓存、不写 LRU（每帧整形；适合一次性/超低频文本）；
+/// - [`CachePolicy::User`]：不使用内部 LRU（配合 [`Text::render_from`] / [`TextLayout::into_render_with`]
+///   由用户持有 `Arc<Buffer>` / `TextBuffer` 管理缓存）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CachePolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
+    User,
+}
+
+// ─── TextBuffer / TextLayout（阶段一：排版配置） ─────────────────
 
 /// 用户可持有的可复用字形/行缓冲（`into_render_with` 使用；跨帧 clear+填充，容量保留）。
 #[derive(Clone, Debug, Default)]
@@ -519,6 +544,12 @@ pub struct TextLayout<'a> {
     line_space: Option<LineSpace>,
     align: Align,
     render: RenderDefaults,
+    /// 文本局部裁剪区域（相对字形 `top_left` 坐标；`cull(true)` 时启用收集期剔除）。
+    clip: Option<Rect>,
+    /// 剔除开关（默认 false；配合 `clip` 与 [`TextRender::clip_world`]）。
+    cull: bool,
+    /// 排版缓存策略（默认 Auto）。
+    cache: CachePolicy,
 }
 
 impl Text {
@@ -535,6 +566,9 @@ impl Text {
             line_space: None,
             align: Align::Left,
             render: RenderDefaults::default(),
+            clip: None,
+            cull: false,
+            cache: CachePolicy::Auto,
         }
     }
 }
@@ -617,6 +651,34 @@ impl<'a> TextLayout<'a> {
         self
     }
 
+    /// 文本局部裁剪区域（相对字形 `top_left` 坐标，**不含** origin/offset）。
+    ///
+    /// 配合 [`Self::cull`]：`cull(true)` 时在**收集期**剔除裁剪区外的行/字形
+    /// （轨道 A：GUI 无变换文本；对测量与坐标零副作用）。默认 `None`。
+    #[inline]
+    pub fn clip(mut self, clip: impl Into<Option<Rect>>) -> Self {
+        self.clip = clip.into();
+        self
+    }
+
+    /// 是否启用剔除（默认 **false**；与 [`Self::clip`] / [`TextRender::clip_world`] 配合）。
+    ///
+    /// 默认关闭保证现有行为完全不变；开启后：
+    /// - 收集期按 `clip`（文本局部）剔除不可见行/字形；
+    /// - 渲染期按 [`TextRender::clip_world`]（世界坐标）做整块 + 逐字形保守剔除。
+    #[inline]
+    pub fn cull(mut self, cull: bool) -> Self {
+        self.cull = cull;
+        self
+    }
+
+    /// 排版缓存策略（默认 [`CachePolicy::Auto`] 保持现状）。
+    #[inline]
+    pub fn cache(mut self, policy: CachePolicy) -> Self {
+        self.cache = policy;
+        self
+    }
+
     /// 便捷绘制：内部 `into_render()` 后逐字形回调 `(measure, line, region, transform)`。
     #[inline]
     pub fn draw_with<F>(self, callback: F)
@@ -659,15 +721,16 @@ impl<'a> TextLayout<'a> {
         let string = self.string.as_str();
         let size = self.size;
         let align = self.align;
+        let cache = self.cache;
         let text = &mut *self.text;
-        let buffer = text.create_buffer(string, attrs, size, lh, align);
+        let buffer = text.create_buffer_policy(string, attrs, size, lh, align, cache);
         Text::measure_buffer(&buffer)
     }
 
     /// 排版并交出共享 `Arc<Buffer>`（cosmic-text；缓存命中间接共享，不深拷贝），消费链。
     #[inline]
     pub fn into_buffer(self) -> Arc<Buffer> {
-        let TextLayout { text, string, family, attrs, size, line_height, line_space, align, .. } = self;
+        let TextLayout { text, string, family, attrs, size, line_height, line_space, align, cache, .. } = self;
         let attrs: Attrs<'_> = match attrs {
             Some(a) => a,
             None => match family.as_deref() {
@@ -676,7 +739,7 @@ impl<'a> TextLayout<'a> {
             },
         };
         let lh = effective_line_height(size, line_height, line_space);
-        text.create_buffer(string.as_str(), attrs, size, lh, align)
+        text.create_buffer_policy(string.as_str(), attrs, size, lh, align, cache)
     }
 
     /// 预缓存：排版 + 光栅化（字形入图集），**不收集数据**。返回自身，可稍后 `into_render` / `into_render_with`。
@@ -690,14 +753,16 @@ impl<'a> TextLayout<'a> {
             },
         };
         let lh = effective_line_height(self.size, self.line_height, self.line_space);
-        let _ = shape_and_rasterize(&mut *self.text, self.string.as_str(), attrs, self.size, lh, self.align);
+        let _ = shape_and_rasterize(
+            &mut *self.text, self.string.as_str(), attrs, self.size, lh, self.align, self.cache,
+        );
         self
     }
 
     /// 转为阶段二 [`TextRender`]，消费链。**用 `Text` 内部默认缓冲**（单标签快速路径，跨帧复用容量）。
     #[inline]
     pub fn into_render(self) -> TextRender<'a> {
-        let TextLayout { text, string, family, attrs, size, line_height, line_space, align, render } = self;
+        let TextLayout { text, string, family, attrs, size, line_height, line_space, align, render, clip, cull, cache } = self;
         let attrs: Attrs<'_> = match attrs {
             Some(a) => a,
             None => match family.as_deref() {
@@ -706,18 +771,20 @@ impl<'a> TextLayout<'a> {
             },
         };
         let lh = effective_line_height(size, line_height, line_space);
-        let buffer = shape_and_rasterize(&mut *text, string.as_str(), attrs, size, lh, align);
+        let buffer = shape_and_rasterize(&mut *text, string.as_str(), attrs, size, lh, align, cache);
         let visual_origin = text.buffer_origin(&buffer);
         let page_size = text.glyph_cache.page_size() as f32;
         let (content_size, measure) = collect_glyphs(
             &text.locations, &buffer, visual_origin,
             &mut text.buf.glyphs, &mut text.buf.lines,
+            if cull { clip } else { None },
         );
         let glyphs = &mut text.buf.glyphs;
         let lines = &mut text.buf.lines;
         let mut tr = TextRender {
             glyphs, lines, content_size, measure,
             origin: Vec2::ZERO, offset: Vec2::ZERO, color: [1.0; 4], transform: None, page_size,
+            clip: if cull { clip } else { None }, clip_world: None, cull,
         };
         tr.color = render.color.unwrap_or([1.0; 4]);
         tr.origin = render.origin.unwrap_or(Vec2::ZERO);
@@ -729,7 +796,7 @@ impl<'a> TextLayout<'a> {
     /// 转为阶段二 [`TextRender`]，消费链。**用用户提供的缓冲**（多标签并存互不冲突；跨帧复用容量）。
     #[inline]
     pub fn into_render_with<'b>(self, buf: &'b mut TextBuffer) -> TextRender<'b> {
-        let TextLayout { text, string, family, attrs, size, line_height, line_space, align, render } = self;
+        let TextLayout { text, string, family, attrs, size, line_height, line_space, align, render, clip, cull, cache } = self;
         let attrs: Attrs<'_> = match attrs {
             Some(a) => a,
             None => match family.as_deref() {
@@ -738,18 +805,20 @@ impl<'a> TextLayout<'a> {
             },
         };
         let lh = effective_line_height(size, line_height, line_space);
-        let buffer = shape_and_rasterize(&mut *text, string.as_str(), attrs, size, lh, align);
+        let buffer = shape_and_rasterize(&mut *text, string.as_str(), attrs, size, lh, align, cache);
         let visual_origin = text.buffer_origin(&buffer);
         let page_size = text.glyph_cache.page_size() as f32;
         let (content_size, measure) = collect_glyphs(
             &text.locations, &buffer, visual_origin,
             &mut buf.glyphs, &mut buf.lines,
+            if cull { clip } else { None },
         );
         let glyphs = &mut buf.glyphs;
         let lines = &mut buf.lines;
         let mut tr = TextRender {
             glyphs, lines, content_size, measure,
             origin: Vec2::ZERO, offset: Vec2::ZERO, color: [1.0; 4], transform: None, page_size,
+            clip: if cull { clip } else { None }, clip_world: None, cull,
         };
         tr.color = render.color.unwrap_or([1.0; 4]);
         tr.origin = render.origin.unwrap_or(Vec2::ZERO);
@@ -769,8 +838,9 @@ fn shape_and_rasterize(
     size: f32,
     line_height: f32,
     align: Align,
+    cache: CachePolicy,
 ) -> Arc<Buffer> {
-    let buffer = text.create_buffer(string, attrs, size, line_height, align);
+    let buffer = text.create_buffer_policy(string, attrs, size, line_height, align, cache);
     // 确保所有字形已渲染入图集（buffer_origin 依赖 bearing 数据）；无图像字形只判定一次。
     for run in buffer.layout_runs() {
         for glyph in run.glyphs.iter() {
@@ -786,12 +856,16 @@ fn shape_and_rasterize(
 }
 
 /// 把排版结果收集进 `glyphs` / `lines`（先 clear，复用容量），返回内容宽高与测量。
+///
+/// `clip`（文本局部坐标，相对字形 `top_left`）：`Some` 时启用**收集期剔除**（轨道 A）——
+/// 行/字形与裁剪区无交集的跳过收集；坐标与测量不受影响（剔除只是"不收集"）。
 fn collect_glyphs(
     locations: &HashMap<cosmic_text::CacheKey, GlyphLocation>,
     buffer: &Buffer,
     visual_origin: Vec2,
     glyphs: &mut Vec<GlyphData>,
     lines: &mut Vec<LineMeasureInfo>,
+    clip: Option<Rect>,
 ) -> (Vec2, MeasureInfo) {
     glyphs.clear();
     lines.clear();
@@ -799,6 +873,22 @@ fn collect_glyphs(
     for run in buffer.layout_runs() {
         let line_idx = lines.len();
         let glyph_start = glyphs.len();
+        // 行级（垂直）预剔除：行盒与 clip 无交集 → 整行跳过（仍保留空行信息）。
+        if let Some(c) = clip {
+            let top = run.line_top - visual_origin.y;
+            let bottom = top + run.line_height;
+            if top >= c.y + c.h || bottom <= c.y {
+                lines.push(LineMeasureInfo {
+                    line_i: run.line_i,
+                    top_left: Vec2::new(0.0, top),
+                    width: run.line_w,
+                    line_height: run.line_height,
+                    baseline: run.line_y - run.line_top,
+                    glyph_range: glyph_start..glyph_start,
+                });
+                continue;
+            }
+        }
         for glyph in run.glyphs.iter() {
             let physical = glyph.physical((0.0, 0.0), 1.0);
             if let Some(loc) = locations.get(&physical.cache_key) {
@@ -806,9 +896,14 @@ fn collect_glyphs(
                     physical.x as f32 + loc.left as f32,
                     run.line_y - loc.top as f32,
                 );
+                let tl = glyph_pos - visual_origin;
+                // 字形级（水平 + 垂直）剔除：与 clip 无交集 → 跳过。
+                if !crate::glyph_in_clip(clip, tl, Vec2::new(loc.region.wh_px.0 as f32, loc.region.wh_px.1 as f32)) {
+                    continue;
+                }
                 glyphs.push(GlyphData {
                     line: line_idx,
-                    top_left: (glyph_pos - visual_origin).ceil(),
+                    top_left: tl.ceil(),
                     size: Vec2::new(loc.region.wh_px.0 as f32, loc.region.wh_px.1 as f32),
                     region: loc.region,
                     color: [1.0; 4],
@@ -859,6 +954,12 @@ pub struct TextRender<'a> {
     color: [f32; 4],
     transform: Option<Transform2D>,
     page_size: f32,
+    /// 文本局部裁剪（相对字形 `top_left`，**不含** origin/offset；`cull` 时绘制期剔除）。
+    clip: Option<Rect>,
+    /// 世界坐标裁剪（整块 + 逐字形保守剔除；`cull` 时生效）。
+    clip_world: Option<Rect>,
+    /// 剔除开关（默认 false）。
+    cull: bool,
 }
 
 impl TextRender<'_> {
@@ -900,6 +1001,50 @@ impl TextRender<'_> {
         self
     }
 
+    /// 文本局部裁剪区域（相对字形 `top_left` 坐标，**不含** origin/offset）。
+    ///
+    /// 配合 [`Self::cull`]：`cull(true)` 时在**绘制期**剔除裁剪区外的字形
+    /// （对 `into_render` 已做收集期剔除的路径为兜底；`render_from` 路径由此获得剔除）。
+    #[inline]
+    pub fn clip(&mut self, clip: impl Into<Option<Rect>>) -> &mut Self {
+        self.clip = clip.into();
+        self
+    }
+
+    /// 世界坐标裁剪区域（**世界坐标**，含 origin/offset/transform）。
+    ///
+    /// 配合 [`Self::cull`]：`cull(true)` 时先做**整块剔除**（文本块世界 AABB 与裁剪区无交集
+    /// → 整个跳过），再对每个字形做**保守 AABB 剔除**（旋转/缩放后取包围盒，不误杀）。
+    #[inline]
+    pub fn clip_world(&mut self, clip: impl Into<Option<Rect>>) -> &mut Self {
+        self.clip_world = clip.into();
+        self
+    }
+
+    /// 是否启用剔除（默认 **false**，保持现状行为；与 [`Self::clip`] / [`Self::clip_world`] 配合）。
+    #[inline]
+    pub fn cull(&mut self, cull: bool) -> &mut Self {
+        self.cull = cull;
+        self
+    }
+
+    /// 文本块世界包围盒（`content_size` 四角经 `delta` 与渲染变换后的保守 AABB）。
+    #[inline]
+    fn block_world_rect(&self) -> Rect {
+        let delta = self.render_delta();
+        let c = self.content_size;
+        let pts = [
+            Vec2::new(0.0, 0.0) + delta,
+            Vec2::new(c.x, 0.0) + delta,
+            Vec2::new(0.0, c.y) + delta,
+            c + delta,
+        ];
+        match self.transform {
+            Some(t) => Rect::from_point_slice(&t.transform_points(&pts)),
+            None => Rect::from_point_slice(&pts),
+        }
+    }
+
     /// 遍历并修改每个字形渲染记录（可改 `top_left` / `size` / `color` / `layer` / `transform` / `glyph_type`）。
     #[inline]
     pub fn map<F>(&mut self, mut f: F) -> &mut Self
@@ -939,6 +1084,9 @@ impl TextRender<'_> {
     ///
     /// 回调**不**携带纹理：字形所属图集页由 `region.page_uid` 标识，调用方自行经
     /// `rjw_render::TEXTURES.get(page_uid)`（`rjw_atlas` → `rjw_render`）查找。
+    ///
+    /// `cull(true)` 且设置 `clip` / `clip_world` 时：先整块剔除，再逐字形剔除——
+    /// **被剔除字形不回调**（回调只收到可见字形）。
     #[inline]
     pub fn draw_with<F>(&self, mut callback: F)
     where F: FnMut(&MeasureInfo, &LineMeasureInfo, &AtlasRegion, Transform2D)
@@ -946,9 +1094,43 @@ impl TextRender<'_> {
         let delta = self.render_delta();
         let render = self.transform;
         let lines = self.lines.as_slice();
+        if self.cull {
+            if let Some(cw) = self.clip_world {
+                if !self.block_world_rect().intersects(&cw) {
+                    return;
+                }
+            }
+        }
         for g in self.glyphs.as_slice() {
             let line = &lines[g.line];
             let tl = g.top_left + delta;
+            if self.cull {
+                if let Some(c) = self.clip {
+                    if !Rect::new(g.top_left.x, g.top_left.y, g.size.x, g.size.y).intersects(&c) {
+                        continue;
+                    }
+                }
+                if let Some(cw) = self.clip_world {
+                    let tr = match g.transform {
+                        Some(t) => t,
+                        None => Transform2D::IDENTITY,
+                    }.with_move_by(tl);
+                    let tr = match render {
+                        Some(t) => tr.with_transform(&t),
+                        None => tr,
+                    };
+                    let local = [
+                        Vec2::ZERO,
+                        Vec2::new(g.size.x, 0.0),
+                        Vec2::new(0.0, g.size.y),
+                        g.size,
+                    ];
+                    let aabb = Rect::from_point_slice(&tr.transform_points(&local));
+                    if !aabb.intersects(&cw) {
+                        continue;
+                    }
+                }
+            }
             let tr = match g.transform {
                 Some(t) => t,
                 None => Transform2D::IDENTITY,
@@ -972,10 +1154,25 @@ impl TextRender<'_> {
         let inv = Vec2::new(1.0 / self.page_size, 1.0 / self.page_size);
         let base: f64 = layer.into().as_f64();
         let render = self.transform;
+        if self.cull {
+            if let Some(cw) = self.clip_world {
+                if !self.block_world_rect().intersects(&cw) {
+                    return;
+                }
+            }
+        }
         for g in self.glyphs.as_slice() {
+            let tl = g.top_left + delta;
+            if self.cull {
+                if let Some(c) = self.clip {
+                    if !Rect::new(g.top_left.x, g.top_left.y, g.size.x, g.size.y).intersects(&c) {
+                        continue;
+                    }
+                }
+            }
             let Some(tex) = TEXTURES.get(g.region.page_uid) else { continue };
             let rect = SpriteRect::from_texture_px(
-                g.top_left + delta, g.size,
+                tl, g.size,
                 Vec2::new(g.region.tl_px.0 as f32, g.region.tl_px.1 as f32),
                 Vec2::new(g.region.wh_px.0 as f32, g.region.wh_px.1 as f32),
                 inv,
@@ -993,6 +1190,21 @@ impl TextRender<'_> {
                 (None, Some(gt)) => gt,
                 (None, None) => Transform2D::default(),
             };
+            if self.cull {
+                if let Some(cw) = self.clip_world {
+                    // 世界坐标 = transform 作用于 rect 四角（mesh_tl + local*mesh_wh）
+                    let local = [
+                        tl,
+                        Vec2::new(tl.x + g.size.x, tl.y),
+                        Vec2::new(tl.x, tl.y + g.size.y),
+                        tl + g.size,
+                    ];
+                    let aabb = Rect::from_point_slice(&transform.transform_points(&local));
+                    if !aabb.intersects(&cw) {
+                        continue;
+                    }
+                }
+            }
             r2d.add_sprite2d(rect, color, transform, layer, &tex);
         }
     }
@@ -1022,6 +1234,14 @@ impl TextRender<'_> {
         let layer: Layer = layer.into();
         let delta = self.render_delta();
         let render = self.transform;
+        // 整块剔除（世界）：不可见则整块跳过；渐变域仍基于全部字形（剔除不影响渐变域）。
+        if self.cull {
+            if let Some(cw) = self.clip_world {
+                if !self.block_world_rect().intersects(&cw) {
+                    return;
+                }
+            }
+        }
         let f32_stops: Vec<(f32, [f32; 4])> = stops.iter().map(|&(t, c)| (t, c.into())).collect();
 
         // 渐变域（相对坐标，未含 delta）
@@ -1059,6 +1279,26 @@ impl TextRender<'_> {
                     let g = &glyphs[i];
                     let tl = g.top_left + delta;
                     let br = tl + g.size;
+                    // 剔除（文本局部 + 世界）：渐变域已算完，仅跳过提交。
+                    if self.cull {
+                        if let Some(c) = self.clip {
+                            if !Rect::new(g.top_left.x, g.top_left.y, g.size.x, g.size.y).intersects(&c) {
+                                continue;
+                            }
+                        }
+                    }
+                    let tl_w = match render { Some(t) => t.transform_point(tl), None => tl };
+                    let tr_w = match render { Some(t) => t.transform_point(Vec2::new(br.x, tl.y)), None => Vec2::new(br.x, tl.y) };
+                    let bl_w = match render { Some(t) => t.transform_point(Vec2::new(tl.x, br.y)), None => Vec2::new(tl.x, br.y) };
+                    let br_w = match render { Some(t) => t.transform_point(br), None => br };
+                    if self.cull {
+                        if let Some(cw) = self.clip_world {
+                            let aabb = Rect::from_point_slice(&[tl_w, tr_w, bl_w, br_w]);
+                            if !aabb.intersects(&cw) {
+                                continue;
+                            }
+                        }
+                    }
                     // (渐变域起, 渐变域止, TL角轴坐标, TR角轴坐标, BL角轴坐标, BR角轴坐标)
                     let (s0, s1, t_tl, t_tr, t_bl, t_br) = match (axis, mode) {
                         (GradientAxis::Horizontal, GradientMode::Glyph) => (tl.x, br.x, tl.x, br.x, tl.x, br.x),
@@ -1089,10 +1329,6 @@ impl TextRender<'_> {
                         g.region.wh_px.1 as f32 / self.page_size,
                     );
                     let col = |c: f32| mul_color(sample_gradient(&f32_stops, frac_t(s0, s1, c)), g.color);
-                    let tl_w = match render { Some(t) => t.transform_point(tl), None => tl };
-                    let tr_w = match render { Some(t) => t.transform_point(Vec2::new(br.x, tl.y)), None => Vec2::new(br.x, tl.y) };
-                    let bl_w = match render { Some(t) => t.transform_point(Vec2::new(tl.x, br.y)), None => Vec2::new(tl.x, br.y) };
-                    let br_w = match render { Some(t) => t.transform_point(br), None => br };
                     let i0 = sink.push_vertex_uv_color(tl_w, uv0, col(t_tl));
                     let i1 = sink.push_vertex_uv_color(tr_w, Vec2::new(uv1.x, uv0.y), col(t_tr));
                     let i2 = sink.push_vertex_uv_color(bl_w, Vec2::new(uv0.x, uv1.y), col(t_bl));

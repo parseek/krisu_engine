@@ -4,7 +4,7 @@ use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use rjw_color::Color;
 use rjw_render::{ArcTextureWrapped, MeshData, MESHES, TEXTURES, TextureWrapped};
-use rjw_transform::Transform2D;
+use rjw_transform::{Rect, Transform2D};
 
 use crate::command::{DrawCommand, DrawCommandQueue, Layer, States};
 use crate::data::{
@@ -669,6 +669,8 @@ pub struct Render2D {
     depth_view: Option<wgpu::TextureView>,
     depth_size: (u32, u32),
     mvp: glam::Mat4,
+    /// 视口剔除开关（默认 **false**；开启后 Sprite 系列在提交前按世界 AABB 与视口矩形做剔除）。
+    culling: bool,
     default_rstates: RStates,
 
     /// 四边形网格（Sprite 合批用）的全局注册表 uid。
@@ -777,6 +779,7 @@ impl Render2D {
             depth_view: None,
             depth_size: (0, 0),
             mvp: glam::Mat4::IDENTITY,
+            culling: false,
             default_rstates: RStates::default(),
             quad_mesh_id,
             sampler_cache: HashMap::new(),
@@ -796,6 +799,58 @@ impl Render2D {
         self.mvp = vp;
         self.draw_page.update_vp(&self.queue, vp);
         self
+    }
+
+    /// 视口剔除开关（默认 **false**）。
+    ///
+    /// 开启后，`add_sprite2d` / `add_sprite2d_matrix`（及经 `add_mesh` 提交的动态 mesh **除外**）
+    /// 在写入实例缓冲前，按精灵世界 AABB 与视口世界矩形（由 [`Self::set_mvp`] 反推）相交测试，
+    /// 剔除完全不可见的精灵——减少实例数与上传量，绘制结果不变（视口外的本来也看不见）。
+    #[inline]
+    pub fn set_culling(&mut self, culling: bool) -> &mut Self {
+        self.culling = culling;
+        self
+    }
+
+    /// 视口世界矩形：由当前 MVP 逆变换 clip 空间四角得到（正交相机下 z 取 0 即可）。
+    fn viewport_world_rect(&self) -> Rect {
+        let inv = self.mvp.inverse();
+        let corners = [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)];
+        let mut pts = [glam::Vec2::ZERO; 4];
+        for (i, (cx, cy)) in corners.iter().enumerate() {
+            let v = inv * glam::Vec4::new(*cx, *cy, 0.0, 1.0);
+            pts[i] = glam::Vec2::new(v.x / v.w, v.y / v.w);
+        }
+        Rect::from_point_slice(&pts)
+    }
+
+    /// 精灵四角经 `model` 变换后的世界 AABB 是否与视口矩形相交（保守：旋转取包围盒）。
+    fn sprite_in_viewport(rect: &SpriteRect, model: glam::Mat4, vp: &Rect) -> bool {
+        let tl = rect.mesh_tl;
+        let wh = rect.mesh_wh;
+        let corners = [
+            tl,
+            glam::Vec2::new(tl.x + wh.x, tl.y),
+            glam::Vec2::new(tl.x, tl.y + wh.y),
+            tl + wh,
+        ];
+        let mut pts = [glam::Vec2::ZERO; 4];
+        for (i, c) in corners.iter().enumerate() {
+            let v = model * glam::Vec4::new(c.x, c.y, 0.0, 1.0);
+            pts[i] = glam::Vec2::new(v.x / v.w, v.y / v.w);
+        }
+        Rect::from_point_slice(&pts).intersects(vp)
+    }
+
+    /// `Transform2D` → 列主序 2D model 矩阵（与 [`InstanceData::from_sprite`] 一致）。
+    fn transform2d_model(t: &Transform2D) -> glam::Mat4 {
+        let (sin, cos) = t.rotation.sin_cos();
+        glam::Mat4::from_cols_array_2d(&[
+            [cos * t.scale.x, sin * t.scale.x, 0.0, 0.0],
+            [-sin * t.scale.y, cos * t.scale.y, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [t.pos.x, t.pos.y, 0.0, 1.0],
+        ])
     }
 
     pub fn reset_default_state(&mut self) -> &mut Self {
@@ -1598,6 +1653,7 @@ impl Render2D {
             }};
         }
 
+        let vp_cull = if self.culling { Some(self.viewport_world_rect()) } else { None };
         for (cmd, layer, states) in self.command_queue.iter() {
             let tu = states.texture_uid;
             let rr = states.rstates.unwrap_or(self.default_rstates).raw();
@@ -1608,6 +1664,13 @@ impl Render2D {
                     transform,
                 } => {
                     flush_dyn!();
+                    // 视口剔除：世界 AABB 与视口无交集 → 跳过（不产生实例）。
+                    if let Some(vp) = vp_cull {
+                        let model = Self::transform2d_model(transform);
+                        if !Self::sprite_in_viewport(rect, model, &vp) {
+                            continue;
+                        }
+                    }
                     self.buf_items.push(BatchItem {
                         mesh_id: Some(self.quad_mesh_id),
                         dyn_seq: 0,
@@ -1625,6 +1688,11 @@ impl Render2D {
                 } => {
                     flush_dyn!();
                     let m = self.command_queue.matrices[*mat_idx];
+                    if let Some(vp) = vp_cull {
+                        if !Self::sprite_in_viewport(rect, m, &vp) {
+                            continue;
+                        }
+                    }
                     self.buf_items.push(BatchItem {
                         mesh_id: Some(self.quad_mesh_id),
                         dyn_seq: 0,

@@ -73,6 +73,29 @@ fn should_use_layout_cache(len: usize) -> bool {
     cfg!(debug_assertions) || release_caches_len(len)
 }
 
+/// 按缓存策略决定是否使用内部 LRU 排版缓存（`create_buffer_policy` 用）。
+#[inline]
+fn should_cache_with_policy(len: usize, policy: CachePolicy) -> bool {
+    match policy {
+        CachePolicy::Auto => should_use_layout_cache(len),
+        CachePolicy::Always => true,
+        CachePolicy::Never | CachePolicy::User => false,
+    }
+}
+
+/// 字形（左上角 `tl`、尺寸 `size`）是否在裁剪区 `clip` 内。
+///
+/// `None` = 不裁剪，恒可见；`Some` = 与裁剪区有交集才可见（区间判定，容忍负尺寸）。
+#[inline]
+pub(crate) fn glyph_in_clip(clip: Option<Rect>, tl: Vec2, size: Vec2) -> bool {
+    match clip {
+        None => true,
+        Some(c) => {
+            !(tl.x >= c.x + c.w || tl.x + size.x <= c.x || tl.y >= c.y + c.h || tl.y + size.y <= c.y)
+        }
+    }
+}
+
 /// cosmic-text `Align` 的 u8 判别（`Align` 未实现 `Hash`，缓存键需可哈希表示）。
 #[inline]
 fn align_disc(align: Align) -> u8 {
@@ -335,7 +358,19 @@ impl Text {
     pub fn create_buffer(
         &mut self, text: &str, attrs: Attrs<'_>, size: f32, line_height: f32, align: Align,
     ) -> Arc<Buffer> {
-        let use_cache = should_use_layout_cache(text.len());
+        self.create_buffer_policy(text, attrs, size, line_height, align, CachePolicy::Auto)
+    }
+
+    /// 同 [`Self::create_buffer`]，但排版缓存策略由调用方指定（默认 [`CachePolicy::Auto`] 即上述规则）。
+    ///
+    /// - [`CachePolicy::Always`]：强制进 LRU（含大文本）；
+    /// - [`CachePolicy::Never`] / [`CachePolicy::User`]：不写 LRU，每帧重新整形
+    ///   （`User` 语义：配合 [`Text::render_from`] / [`TextLayout::into_render_with`] 由用户持缓冲）。
+    pub fn create_buffer_policy(
+        &mut self, text: &str, attrs: Attrs<'_>, size: f32, line_height: f32, align: Align,
+        policy: CachePolicy,
+    ) -> Arc<Buffer> {
+        let use_cache = should_cache_with_policy(text.len(), policy);
         if use_cache {
             let size_bits = size.to_bits();
             let line_height_bits = line_height.to_bits();
@@ -375,7 +410,7 @@ impl Text {
     /// - `world_pos` — 字形精灵**左上角**坐标（已含 bearing），相对文本**视觉原点**
     ///   （第一个字形 bearing 恢复后的左上角），再叠加 `base` 偏移。
     /// - `world_size` — 字形精灵像素宽高。
-    fn visit_glyphs<F>(&mut self, buffer: &Buffer, base: Vec2, mut callback: F)
+    fn visit_glyphs<F>(&mut self, buffer: &Buffer, base: Vec2, clip: Option<Rect>, mut callback: F)
     where F: FnMut(&AtlasRegion, Vec2, Vec2)
     {
         // pass 1：确保所有字形已渲染/打包（buffer_origin 依赖 bearing 数据）
@@ -390,7 +425,8 @@ impl Text {
         // 光栅化过程中图集可能触发去碎片重排（搬动字形），同步各字形区域。
         self.sync_atlas_regions();
         let origin = self.buffer_origin(buffer);
-        // pass 2：逐个字形回调（精灵左上角 = 排版位置 + bearing 偏移）
+        // pass 2：逐个字形回调（精灵左上角 = 排版位置 + bearing 偏移）；
+        // `clip`（相对文本视觉原点的局部坐标）为 Some 时跳过区外字形。
         for run in buffer.layout_runs() {
             let line_y = run.line_y;
             for glyph in run.glyphs.iter() {
@@ -402,6 +438,10 @@ impl Text {
                     );
                     let world_tl = base + glyph_pos - origin;
                     let glyph_size = Vec2::new(loc.region.wh_px.0 as f32, loc.region.wh_px.1 as f32);
+                    let tl = world_tl - base; // 相对文本视觉原点
+                    if !glyph_in_clip(clip, tl, glyph_size) {
+                        continue;
+                    }
                     callback(&loc.region, world_tl.ceil(), glyph_size);
                 }
             }
@@ -413,7 +453,15 @@ impl Text {
     pub fn draw_text<F>(&mut self, buffer: &Buffer, callback: F)
     where F: FnMut(&AtlasRegion, Vec2, Vec2)
     {
-        self.visit_glyphs(buffer, Vec2::ZERO, callback);
+        self.visit_glyphs(buffer, Vec2::ZERO, None, callback);
+    }
+
+    /// 同 [`Self::draw_text`]，但 `clip`（相对文本视觉原点的局部坐标）为 `Some` 时
+    /// 跳过裁剪区外的字形（回调只收到可见字形）。
+    pub fn draw_text_clipped<F>(&mut self, buffer: &Buffer, clip: Option<Rect>, callback: F)
+    where F: FnMut(&AtlasRegion, Vec2, Vec2)
+    {
+        self.visit_glyphs(buffer, Vec2::ZERO, clip, callback);
     }
 
     /// 内部：渲染+打包一个 swash 字形，写入 DynamicAtlas。
@@ -500,7 +548,7 @@ impl Text {
         let buf = self.create_buffer(text, attrs, size, line_height, align);
         let content_size = Text::measure_buffer(&buf);
         let offset = Vec2::new(content_size.x * origin.x, content_size.y * origin.y);
-        self.visit_glyphs(&buf, pos - offset, callback);
+        self.visit_glyphs(&buf, pos - offset, None, callback);
         content_size
     }
 
@@ -786,5 +834,33 @@ mod tests {
         let italic = swash_render_image(&mut fs, &mut ctx, key).expect("fake italic 渲染应成功");
         assert!(!normal.data.is_empty() && !italic.data.is_empty(), "两种渲染都应有像素");
         assert_ne!(normal.data, italic.data, "FAKE_ITALIC 斜切应改变 SimHei 光栅化像素");
+    }
+
+    #[test]
+    fn glyph_in_clip_culls_outside_glyphs() {
+        let clip = Some(Rect::new(0.0, 0.0, 100.0, 50.0));
+        // 完全在区内 → 可见
+        assert!(glyph_in_clip(clip, Vec2::new(10.0, 10.0), Vec2::new(20.0, 20.0)));
+        // 部分相交 → 可见（保守）
+        assert!(glyph_in_clip(clip, Vec2::new(90.0, 0.0), Vec2::new(20.0, 20.0)));
+        // 完全在区外 → 剔除
+        assert!(!glyph_in_clip(clip, Vec2::new(200.0, 0.0), Vec2::new(20.0, 20.0)), "右侧外");
+        assert!(!glyph_in_clip(clip, Vec2::new(0.0, 100.0), Vec2::new(20.0, 20.0)), "下方外");
+        // 边界接触（区间为半开：接触不算相交）→ 剔除
+        assert!(!glyph_in_clip(clip, Vec2::new(100.0, 0.0), Vec2::new(10.0, 10.0)), "右沿接触应剔除");
+        assert!(!glyph_in_clip(clip, Vec2::new(0.0, 50.0), Vec2::new(10.0, 10.0)), "下沿接触应剔除");
+        // None = 不裁剪
+        assert!(glyph_in_clip(None, Vec2::new(99999.0, 99999.0), Vec2::new(1.0, 1.0)));
+    }
+
+    #[test]
+    fn cache_policy_rules() {
+        // Auto：Debug 恒缓存；Release 仅小文本
+        assert!(should_cache_with_policy(10, CachePolicy::Auto) == cfg!(debug_assertions) || cfg!(debug_assertions));
+        assert!(should_cache_with_policy(LARGE_TEXT_CACHE_LIMIT + 1, CachePolicy::Auto) == cfg!(debug_assertions));
+        // Always 强制缓存；Never/User 不缓存
+        assert!(should_cache_with_policy(usize::MAX, CachePolicy::Always));
+        assert!(!should_cache_with_policy(0, CachePolicy::Never));
+        assert!(!should_cache_with_policy(0, CachePolicy::User));
     }
 }
