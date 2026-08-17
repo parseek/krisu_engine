@@ -26,8 +26,6 @@ struct TilemapDemo {
     render2d: Option<Render2D>,
     font: Option<Text>,
     cam: Camera2D,
-    cam_center: Vec2,
-    vp_size: Vec2,
     map: TileMap,
     player_pos: Vec2,
     player_size: Vec2,
@@ -119,8 +117,7 @@ impl App for TilemapDemo {
 
         let render2d = Render2D::new(render);
         let (w, h) = render.size();
-        self.vp_size = Vec2::new(w as f32, h as f32);
-        self.cam = Camera2D::new(self.vp_size);
+        self.cam = Camera2D::new(Vec2::new(w as f32, h as f32));
 
         // 动态图集：运行时插入程序生成的瓦片纹理（任意尺寸/位置裁切贴片）。
         let mut atlas = DynamicAtlas::new(
@@ -145,7 +142,8 @@ impl App for TilemapDemo {
         if let Some(render) = &mut self.render {
             render.resize(width, height);
         }
-        self.vp_size = Vec2::new(width as f32, height as f32);
+        // 更新正交投影尺寸（世界 (0,0) = 视口中心；全窗口相机，viewport_pos 保持 ZERO）。
+        self.cam.set_vp(Vec2::new(width as f32, height as f32), Vec2::ZERO);
     }
 
     fn about_to_wait(&mut self, ctx: &mut MainContext) {
@@ -167,14 +165,14 @@ impl App for TilemapDemo {
             );
         }
 
-        // 方向键：移动相机
+        // 方向键：移动相机（Camera2D::move_by 直接改 position，vp_matrix 才会反映）
         let cam_speed = 700.0;
-        let (mut cx, mut cy) = (0.0f32, 0.0f32);
-        if kb.get(KeyCode::ArrowLeft).pressed() { cx -= cam_speed * dt; }
-        if kb.get(KeyCode::ArrowRight).pressed() { cx += cam_speed * dt; }
-        if kb.get(KeyCode::ArrowUp).pressed() { cy -= cam_speed * dt; }
-        if kb.get(KeyCode::ArrowDown).pressed() { cy += cam_speed * dt; }
-        self.cam_center += Vec2::new(cx, cy);
+        let mut cam_move = Vec2::ZERO;
+        if kb.get(KeyCode::ArrowLeft).pressed() { cam_move.x -= cam_speed * dt; }
+        if kb.get(KeyCode::ArrowRight).pressed() { cam_move.x += cam_speed * dt; }
+        if kb.get(KeyCode::ArrowUp).pressed() { cam_move.y -= cam_speed * dt; }
+        if kb.get(KeyCode::ArrowDown).pressed() { cam_move.y += cam_speed * dt; }
+        self.cam.move_by(cam_move);
 
         // WASD：玩家移动（对 solid 贴片做滑动碰撞）
         let speed = 340.0;
@@ -187,7 +185,7 @@ impl App for TilemapDemo {
         self.player_pos = move_and_collide(self.player_pos, self.player_size, vel, dt, &solids);
 
         // ── 渲染 ──
-        self.cam.set_vp(self.vp_size, self.cam_center);
+        // vp_matrix = P × V（P 以视口中心为原点，V 平移 -position）；set_vp 仅在 resize 时更新。
         let vp = if self.culling { Some(self.viewport_rect()) } else { None };
         let Some(r2d) = &mut self.render2d else { return };
         let Some(font) = &mut self.font else { return };
@@ -203,8 +201,8 @@ impl App for TilemapDemo {
             50.0,
         );
 
-        // HUD
-        let half = self.vp_size * 0.5;
+        // HUD（锚定相机：世界坐标 = cam.position + 屏幕偏移，保证固定屏幕左上角）
+        let half = self.cam.viewport_size * 0.5;
         let hud = format!(
             "C: toggle culling ({})  visible {}/{} | WASD move · Arrows camera · Esc quit",
             if self.culling { "ON" } else { "OFF" },
@@ -213,7 +211,9 @@ impl App for TilemapDemo {
         );
         font.draw_label(
             r2d, &hud, Color::YELLOW,
-            18.0, 26.0, Vec2::new(-half.x + 14.0, -half.y + 14.0), "SimHei", Align::Left, 100.0,
+            18.0, 26.0,
+            self.cam.position + Vec2::new(-half.x + 14.0, -half.y + 14.0),
+            "SimHei", Align::Left, 100.0,
         );
 
         let clear = ClearConfig {
@@ -226,9 +226,15 @@ impl App for TilemapDemo {
 }
 
 impl TilemapDemo {
+    /// 视口世界矩形：世界 (0,0) = 视口中心，故 = position ± viewport/2。
     fn viewport_rect(&self) -> Rect {
-        let half = self.vp_size * 0.5;
-        Rect::new(self.cam_center.x - half.x, self.cam_center.y - half.y, self.vp_size.x, self.vp_size.y)
+        let half = self.cam.viewport_size * 0.5;
+        Rect::new(
+            self.cam.position.x - half.x,
+            self.cam.position.y - half.y,
+            self.cam.viewport_size.x,
+            self.cam.viewport_size.y,
+        )
     }
 }
 
@@ -238,9 +244,7 @@ fn main() -> Result<(), EventLoopError> {
         render: None,
         render2d: None,
         font: None,
-        cam: Camera2D::new(Vec2::splat(1.0)),
-        cam_center: Vec2::ZERO,
-        vp_size: Vec2::new(1280.0, 720.0),
+        cam: Camera2D::new(Vec2::new(1280.0, 720.0)),
         map: TileMap::new(),
         player_pos: Vec2::new(TILE * 4.0, TILE * 4.0),
         player_size: Vec2::new(48.0, 48.0),
