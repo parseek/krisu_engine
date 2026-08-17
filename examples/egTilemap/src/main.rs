@@ -32,6 +32,8 @@ struct TilemapDemo {
     player_pos: Vec2,
     player_size: Vec2,
     culling: bool,
+    /// 窗口 DPI scale factor（物理/逻辑像素）。
+    scale_factor: f32,
     /// 动态图集必须存活（持有 GPU 资源）。
     _atlas: Option<DynamicAtlas>,
 }
@@ -120,6 +122,8 @@ impl App for TilemapDemo {
         let render2d = Render2D::new(render);
         let (w, h) = render.size();
         self.cam = Camera2D::new(Vec2::new(w as f32, h as f32));
+        self.scale_factor = ctx.scale_factor().unwrap_or(1.0) as f32;
+        eprintln!("MARK: on_init  scale_factor={}", self.scale_factor);
 
         // 动态图集：运行时插入程序生成的瓦片纹理。
         let mut atlas = DynamicAtlas::new(
@@ -221,8 +225,9 @@ impl App for TilemapDemo {
             50.0,
         );
 
-        // HUD（锚定相机：世界坐标 = cam.position + 屏幕偏移，固定屏幕左上角）
-        let half = self.cam.view_half_size();
+        // HUD（UI 文本：屏幕固定——screen_fixed 锚定屏幕像素、反旋转、抵消缩放；
+        // 字号与位置按 scale_factor 换算为物理像素，旋转/缩放相机下 HUD 不倾斜、不缩放）
+        let sf = self.scale_factor;
         let hud = format!(
             "C: cull {} · Q/E cam rot {:.0}° · R/F zoom {:.2} · M: map rot {:.0}° | visible {}/{} chunks {} | WASD move · Arrows cam",
             if self.culling { "ON" } else { "OFF" },
@@ -233,12 +238,13 @@ impl App for TilemapDemo {
             self.map.tile_count(),
             self.map.chunk_count(),
         );
-        font.draw_label(
-            r2d, &hud, Color::YELLOW,
-            16.0, 24.0,
-            self.cam.position + Vec2::new(-half.x + 14.0, -half.y + 14.0),
-            "SimHei", Align::Left, 100.0,
-        );
+        font.text(hud.as_str())
+            .size(16.0 * sf)
+            .align(Align::Left)
+            .into_render()
+            .screen_fixed(&self.cam, Vec2::new(14.0 * sf, 14.0 * sf))
+            .color(Color::YELLOW)
+            .draw_sprite2d(r2d, 100.0);
 
         let clear = ClearConfig {
             color: Some(wgpu::Color { r: 0.08, g: 0.09, b: 0.12, a: 1.0 }),
@@ -260,6 +266,7 @@ fn main() -> Result<(), EventLoopError> {
         player_pos: Vec2::new(TILE * 4.0, TILE * 4.0),
         player_size: Vec2::new(48.0, 48.0),
         culling: false,
+        scale_factor: 1.0,
         _atlas: None,
     })
 }

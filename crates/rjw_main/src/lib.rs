@@ -72,6 +72,14 @@ impl MainContext {
         self.primary_window.as_ref()
     }
 
+    /// 主窗口的 DPI scale factor（物理像素 / 逻辑像素），如 1.0 / 1.5 / 2.0。
+    ///
+    /// 供 UI 文本/布局按逻辑尺寸换算：`px_logical * scale_factor = px_physical`。
+    /// 窗口未初始化时返回 `None`。
+    pub fn scale_factor(&self) -> Option<f64> {
+        self.primary_window.as_ref().map(|w| w.scale_factor())
+    }
+
     /// Request the event loop to exit after the current frame.
     /// 请求在当帧结束后退出事件循环。
     pub fn request_exit(&mut self) {
