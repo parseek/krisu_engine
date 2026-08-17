@@ -1,0 +1,18 @@
+[package]
+name = "rjw_tilemap"
+version = "0.1.0"
+edition = "2024"
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "Tile map with arbitrary atlas-region tiles (GameMaker-style grid is a special case): any AtlasRegion from a Static/DynamicAtlas can be pasted at any position/size, with per-tile color/transform, viewport culling and solid collision rects."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+keywords = ["tilemap", "tiles", "2d", "atlas"]
+categories = ["game-development", "graphics"]
+
+[dependencies]
+rjw_2d_render = { path = "../rjw_2d_render", version = "0.1.1" }
+rjw_atlas = { path = "../rjw_atlas", version = "0.1.1" }
+rjw_transform = { path = "../rjw_transform", version = "0.1.1" }
+rjw_render = { path = "../rjw_render", version = "0.1.0" }
+rjw_color = { version = "0.1.0", features = ["wgpu"] }
+glam = "0.33.2"

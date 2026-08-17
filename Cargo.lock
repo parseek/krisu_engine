@@ -587,6 +587,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "egTilemap"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "glam",
+ "log",
+ "rjw_2d_render",
+ "rjw_atlas",
+ "rjw_collision",
+ "rjw_color 0.1.0",
+ "rjw_main",
+ "rjw_render",
+ "rjw_text",
+ "rjw_tilemap",
+ "rjw_transform",
+]
+
+[[package]]
 name = "env_filter"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1846,6 +1864,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rjw_collision"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "rjw_transform",
+]
+
+[[package]]
 name = "rjw_color"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1945,6 +1971,18 @@ dependencies = [
  "rjw_transform",
  "swash",
  "wgpu",
+]
+
+[[package]]
+name = "rjw_tilemap"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "rjw_2d_render",
+ "rjw_atlas",
+ "rjw_color 0.1.0",
+ "rjw_render",
+ "rjw_transform",
 ]
 
 [[package]]

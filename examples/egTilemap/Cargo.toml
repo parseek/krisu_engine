@@ -1,0 +1,18 @@
+[package]
+name = "egTilemap"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glam = "0.33.2"
+rjw_main = { path = "../../crates/rjw_main" }
+rjw_render = { path = "../../crates/rjw_render" }
+rjw_2d_render = { path = "../../crates/rjw_2d_render" }
+rjw_text = { path = "../../crates/rjw_text" }
+rjw_transform = { path = "../../crates/rjw_transform" }
+rjw_atlas = { path = "../../crates/rjw_atlas" }
+rjw_tilemap = { path = "../../crates/rjw_tilemap" }
+rjw_collision = { path = "../../crates/rjw_collision" }
+rjw_color = { version = "0.1.0", features = ["wgpu"] }
+env_logger = "0.11.11"
+log = "0.4.33"

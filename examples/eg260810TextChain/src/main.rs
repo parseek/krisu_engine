@@ -12,8 +12,8 @@ use rjw_color::Color;
 use rjw_main::*;
 use rjw_render::{RenderConfig, RenderContext, TEXTURES, wgpu};
 use rjw_text::{
-    Align, GlyphData, GlyphType, GradientAxis, GradientMode, LineSpace, Style, Text, TextBuffer, TextStyle,
-    Transform2D, cosmic_text,
+    Align, CachePolicy, GlyphData, GlyphType, GradientAxis, GradientMode, LineSpace, Rect, Style, Text,
+    TextBuffer, TextStyle, Transform2D, cosmic_text,
 };
 use rjw_transform::Camera2D;
 
@@ -282,6 +282,39 @@ fn draw_text_demos(r2d: &mut Render2D, font: &mut Text, t: f32, half_w: f32, hal
             .offset(Vec2::new(-half_w + 14.0, -half_h + 520.0))
             .color(Color::CYAN)
             .draw_sprite2d(r2d, 94.0);
+    }
+
+    // ── 8. clip 剔除（收集期） + CachePolicy 缓存策略 ──
+    {
+        let mut log = String::new();
+        for i in 0..12 {
+            log.push_str(&format!("日志行 {i}: clip 收集期剔除演示\n"));
+        }
+        // clip 为文本局部坐标（相对字形 top_left）；cull(true) 启用收集期剔除，
+        // 只收集前 ~3 行可见字形（60px / 行高）；CachePolicy::Always 强制缓存。
+        font.text(log.as_str())
+            .size(14.0)
+            .align(Align::Left)
+            .clip(Rect::new(0.0, 0.0, 300.0, 60.0))
+            .cull(true)
+            .cache(CachePolicy::Always)
+            .into_render()
+            .offset(Vec2::new(-half_w + 14.0, -half_h + 560.0).round())
+            .color(Color::GREEN)
+            .draw_sprite2d(r2d, 93.0);
+        // 对照：同文本不剔除 → 全部 12 行都收集绘制
+        let mut log2 = String::new();
+        for i in 0..12 {
+            log2.push_str(&format!("对照行 {i}（无剔除）\n"));
+        }
+        font.text(log2.as_str())
+            .size(14.0)
+            .align(Align::Left)
+            .cache(CachePolicy::Never)
+            .into_render()
+            .offset(Vec2::new(-half_w + 14.0, -half_h + 640.0).round())
+            .color(Color::GRAY)
+            .draw_sprite2d(r2d, 93.0);
     }
 }
 
