@@ -1866,7 +1866,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rjw_2d_render"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytemuck",
  "glam",
@@ -1881,7 +1881,7 @@ dependencies = [
 
 [[package]]
 name = "rjw_atlas"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "glam",
  "log",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "rjw_keyboard"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rjw_keystate 0.1.0",
  "winit",
@@ -1937,7 +1937,7 @@ version = "0.1.1"
 
 [[package]]
 name = "rjw_main"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rjw_keyboard",
  "rjw_mouse",
@@ -1999,7 +1999,7 @@ version = "0.1.0"
 
 [[package]]
 name = "rjw_transform"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "glam",
  "serde",
