@@ -67,6 +67,16 @@ impl InstanceData {
         IDENTITY_INSTANCE
     }
 
+    /// 带 model 变换的 identity 实例（顶点为**局部坐标**，经 `model` 到世界）。
+    /// 供动态 Mesh 带变换（`add_quads` / `add_mesh_transform`）使用——
+    /// 移动窗口/物体只需改变换矩阵，顶点不变（可缓存）。
+    #[inline]
+    pub(crate) fn from_model(model: glam::Mat4) -> Self {
+        let mut id = IDENTITY_INSTANCE;
+        id.model = model.to_cols_array_2d();
+        id
+    }
+
     pub(crate) fn from_sprite(rect: &SpriteRect, color: Color, transform: Transform2D) -> Self {
         let (sin, cos) = transform.rotation.sin_cos();
         let model = glam::Mat4::from_cols_array_2d(&[

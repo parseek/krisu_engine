@@ -20,6 +20,19 @@ use crate::rstates::{
 
 // ─── Clear 配置 ───────────────────────────────────────────────
 
+/// 命令排序模式（[`Render2D::set_sorting`] / [`Render2D::set_layer_sort`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    /// 按 `(layer, states)` 排序后合批绘制（引擎默认）。
+    #[default]
+    LayerAndStates,
+    /// **仅按 layer 稳定排序**：同 layer 内保持录制顺序（`states` 只参与相邻合批）。
+    /// 适合"每图层一个 layer、图层内部顺序由录制序保证"的场景（如 UI 窗口）。
+    LayerOnly,
+    /// 不排序：按录制顺序绘制（相邻同状态仍合批）。
+    None,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ClearConfig {
     pub color: Option<wgpu::Color>,
@@ -671,6 +684,9 @@ pub struct Render2D {
     mvp: glam::Mat4,
     /// 视口剔除开关（默认 **false**；[`Self::set_culling`]）。
     culling: bool,
+    /// 命令排序模式（默认 [`SortMode::LayerAndStates`]；[`Self::set_sorting`] /
+    /// [`Self::set_layer_sort`]）。
+    sorting: SortMode,
     /// 剔除判定闭包（[`Self::set_cull_with`] / [`Self::set_cull_camera`]）：`Fn(世界 AABB) -> bool`。
     /// 未设置时回退为 [`Self::set_mvp`] 反推的视口矩形相交。
     cull_pred: Option<Box<dyn Fn(&Rect) -> bool + Send + Sync>>,
@@ -783,6 +799,7 @@ impl Render2D {
             depth_size: (0, 0),
             mvp: glam::Mat4::IDENTITY,
             culling: false,
+            sorting: SortMode::LayerAndStates,
             cull_pred: None,
             default_rstates: RStates::default(),
             quad_mesh_id,
@@ -800,8 +817,7 @@ impl Render2D {
     }
 
     pub fn set_mvp(&mut self, vp: glam::Mat4) -> &mut Self {
-        self.mvp = vp;
-        self.draw_page.update_vp(&self.queue, vp);
+        self.mvp = vp;        self.draw_page.update_vp(&self.queue, vp);
         self
     }
 
@@ -816,6 +832,43 @@ impl Render2D {
     pub fn set_culling(&mut self, culling: bool) -> &mut Self {
         self.culling = culling;
         self
+    }
+
+    /// 命令排序模式（默认 **true**）。
+    ///
+    /// - `true`：[`SortMode::LayerAndStates`]——按 `(layer, states)` 排序后合批绘制（默认）；
+    /// - `false`：[`SortMode::None`]——**按录制顺序**直接绘制（跳过排序），相邻同状态仍合批。
+    #[inline]
+    pub fn set_sorting(&mut self, sorting: bool) -> &mut Self {
+        self.sorting = if sorting {
+            SortMode::LayerAndStates
+        } else {
+            SortMode::None
+        };
+        self
+    }
+
+    /// 设置**仅按 layer 的稳定排序**（[`SortMode::LayerOnly`]；`false` 恢复
+    /// [`SortMode::LayerAndStates`]）。
+    ///
+    /// `LayerOnly`：命令**仅按 layer 稳定排序**（`states` 不参与排序，只用于相邻合批）——
+    /// **同 layer 内保持录制顺序**。适合**每图层一个 layer 且图层内部顺序由录制序保证**
+    /// 的场景（如 `rjw_ui` 窗口：每窗口 `layer = base + z*1.0`，窗口内
+    /// 背景 → 控件背景 → 文字按录制顺序提交，窗口间由 layer 排序保证层级）。
+    #[inline]
+    pub fn set_layer_sort(&mut self, layer_only: bool) -> &mut Self {
+        self.sorting = if layer_only {
+            SortMode::LayerOnly
+        } else {
+            SortMode::LayerAndStates
+        };
+        self
+    }
+
+    /// 当前排序模式。
+    #[inline]
+    pub fn sort_mode(&self) -> SortMode {
+        self.sorting
     }
 
     /// 以**判定闭包**驱动剔除：`Some(f)` 开启（`f(世界 AABB) -> bool`，可见返回 true）；
@@ -1219,6 +1272,134 @@ impl Render2D {
             cmd: Some(DrawCommand::Mesh {
                 vert: vs..self.mesh_storage.vertices.len(),
                 tri_index: ts..self.mesh_storage.tri_indices.len(),
+                mat_idx: None,
+            }),
+            layer: layer.into(),
+            rstates: RStates::default(),
+            texture_uid: None,
+            has_rstates: false,
+        }
+    }
+
+    /// **QuadVertices**：以**四个 `VertexP3U2C4` 为一组**的四边形批量绘制。
+    ///
+    /// **Quad 顶点标准**：每组按 **TL, TR, BL, BR** 顺序存储，
+    /// 索引固定为每四边形 `[0,1,3, 3,2,0]`（两三角形共享对角线 TL–BR）。
+    /// 绘制顺序即顶点顺序——适合窗口/面板内部已确定绘制顺序的图元组
+    /// （背景 → 控件背景 → 文字按顶点顺序）。
+    ///
+    /// `transform`：顶点为**局部坐标**（相对 `transform` 原点的屏幕像素），
+    /// 经变换映射到世界——**移动窗口/物体只需改变换**（顶点可缓存不变，
+    /// 支持将窗口嵌入游戏场景）。传 `Transform2D::IDENTITY` 则顶点即世界坐标。
+    /// `texture` 为整组四边形共享的采样纹理。
+    ///
+    /// 注意：动态段顶点为 `u16` 索引，单组顶点数受 [`crate::MAX_MESH_VERTS`] 限制。
+    pub fn add_quads(
+        &mut self,
+        vertices: &[VertexP3U2C4],
+        transform: Transform2D,
+        layer: impl Into<Layer>,
+        texture: &ArcTextureWrapped,
+    ) -> MeshBuilder<'_> {
+        assert!(
+            vertices.len() % 4 == 0,
+            "add_quads: vertex count must be a multiple of 4 (one quad = 4 vertices)"
+        );
+        // Transform2D 未实现 PartialEq；按字段判定单位变换（IDENTITY）
+        let is_identity = transform.pos == glam::Vec2::ZERO
+            && transform.rotation == 0.0
+            && transform.scale == glam::Vec2::ONE;
+        let mat_idx = if is_identity {
+            None
+        } else {
+            let idx = self.command_queue.matrices.len();
+            self.command_queue
+                .matrices
+                .push(Self::transform2d_model(&transform));
+            Some(idx)
+        };
+        let vs = self.mesh_storage.vertices.len();
+        let ts = self.mesh_storage.tri_indices.len();
+        self.mesh_storage.vertices.extend_from_slice(vertices);
+        for i in (0..vertices.len()).step_by(4) {
+            let b = (vs + i) as u32;
+            // Quad 标准索引：TL,TR,BL,BR → 三角形 (0,1,3) + (3,2,0)
+            self.mesh_storage.tri_indices.push(TriIndicies(
+                Index(b as u16),
+                Index((b + 1) as u16),
+                Index((b + 3) as u16),
+            ));
+            self.mesh_storage.tri_indices.push(TriIndicies(
+                Index((b + 3) as u16),
+                Index((b + 2) as u16),
+                Index(b as u16),
+            ));
+        }
+        MeshBuilder {
+            queue: &mut self.command_queue,
+            cmd: Some(DrawCommand::Mesh {
+                vert: vs..self.mesh_storage.vertices.len(),
+                tri_index: ts..self.mesh_storage.tri_indices.len(),
+                mat_idx,
+            }),
+            layer: layer.into(),
+            rstates: RStates::default(),
+            texture_uid: Some(texture.uid),
+            has_rstates: false,
+        }
+    }
+
+    /// `add_mesh` 的带变换版本：顶点为**局部坐标**，经 `transform` 映射到世界
+    /// （同 [`Self::add_quads`] 的 transform 语义；`IDENTITY` 即原 `add_mesh` 行为）。
+    pub fn add_mesh_transform(
+        &mut self,
+        vertices: &[glam::Vec2],
+        tri_indices: &[u16],
+        color: Color,
+        transform: Transform2D,
+        layer: impl Into<Layer>,
+    ) -> MeshBuilder<'_> {
+        assert!(
+            vertices.len() > 0
+                && tri_indices.len() % 3 == 0
+                && tri_indices.iter().all(|&i| (i as usize) < vertices.len())
+        );
+        // Transform2D 未实现 PartialEq；按字段判定单位变换（IDENTITY）
+        let is_identity = transform.pos == glam::Vec2::ZERO
+            && transform.rotation == 0.0
+            && transform.scale == glam::Vec2::ONE;
+        let mat_idx = if is_identity {
+            None
+        } else {
+            let idx = self.command_queue.matrices.len();
+            self.command_queue
+                .matrices
+                .push(Self::transform2d_model(&transform));
+            Some(idx)
+        };
+        let vs = self.mesh_storage.vertices.len();
+        let ts = self.mesh_storage.tri_indices.len();
+        let ca: [f32; 4] = color.into();
+        for p in vertices {
+            self.mesh_storage.vertices.push(VertexP3U2C4 {
+                pos: [p.x, p.y, 0.0],
+                uv: [0.0, 0.0],
+                color: ca,
+            });
+        }
+        for c in tri_indices.chunks_exact(3) {
+            self.mesh_storage.tri_indices.push(TriIndicies(
+                Index((c[0] as u32 + vs as u32) as u16),
+                Index((c[1] as u32 + vs as u32) as u16),
+                Index((c[2] as u32 + vs as u32) as u16),
+            ));
+        }
+        MeshBuilder {
+            queue: &mut self.command_queue,
+            cmd: Some(DrawCommand::Mesh {
+                vert: vs..self.mesh_storage.vertices.len(),
+                tri_index: ts..self.mesh_storage.tri_indices.len(),
+                mat_idx,
             }),
             layer: layer.into(),
             rstates: RStates::default(),
@@ -1273,6 +1454,7 @@ impl Render2D {
             cmd: Some(DrawCommand::Mesh {
                 vert: vo..vo + uv,
                 tri_index: io..io + ut,
+                mat_idx: None,
             }),
             layer: layer.into(),
             rstates: RStates::default(),
@@ -1302,6 +1484,7 @@ impl Render2D {
             cmd: Some(DrawCommand::Mesh {
                 vert: vs..self.mesh_storage.vertices.len(),
                 tri_index: ts..self.mesh_storage.tri_indices.len(),
+                mat_idx: None,
             }),
             layer: layer.into(),
             rstates: RStates::default(),
@@ -1587,7 +1770,13 @@ impl Render2D {
     }
 
     fn prepare(&mut self) {
-        self.command_queue.sort_layer_then_states();
+        // 排序模式：LayerOnly 仅按 layer 稳定排序（同层保持录制顺序，states 只合批）；
+        // None 完全按录制顺序（相邻同状态仍合批）。
+        match self.sorting {
+            SortMode::LayerAndStates => self.command_queue.sort_layer_then_states(),
+            SortMode::LayerOnly => self.command_queue.sort_layer(),
+            SortMode::None => {}
+        }
         self.buf_instances.clear();
         self.buf_ops.clear();
         self.buf_all_verts.clear();
@@ -1602,6 +1791,7 @@ impl Render2D {
         let mut dyn_seg_tri_start: Option<usize> = None;
         let mut dyn_seg_rr: u64 = 0;
         let mut dyn_seg_tu: Option<u64> = None;
+        let mut dyn_seg_mat: Option<usize> = None;
         let mut dyn_seg_layer: Layer = Layer::default();
         let mut dyn_seq_counter = 0u32;
 
@@ -1620,7 +1810,13 @@ impl Render2D {
                             index_range: (start as u32 * 3)..(end as u32 * 3),
                             rstates: dyn_seg_rr,
                             tex_uid: dyn_seg_tu,
-                            instance: InstanceData::identity(),
+                            instance: match dyn_seg_mat {
+                                Some(mi) => {
+                                    let m = self.command_queue.matrices[mi];
+                                    InstanceData::from_model(m)
+                                }
+                                None => InstanceData::identity(),
+                            },
                         });
                     }
                 }
@@ -1804,17 +2000,21 @@ impl Render2D {
                         instance: InstanceData::from_static(*color, m),
                     });
                 }
-                DrawCommand::Mesh { vert, tri_index } => {
+                DrawCommand::Mesh { vert, tri_index, mat_idx } => {
                     let vn = vert.end - vert.start;
                     let tn = tri_index.end - tri_index.start;
-                    // 状态/纹理变化 → 关闭当前动态段，重新打开
-                    if dyn_seg_tri_start.is_some() && (dyn_seg_rr != rr || dyn_seg_tu != tu) {
+                    // 状态/纹理/**变换**变化 → 关闭当前动态段，重新打开
+                    // （不同 transform 的段必须分开，各自 identity 实例带自己的 model）
+                    if dyn_seg_tri_start.is_some()
+                        && (dyn_seg_rr != rr || dyn_seg_tu != tu || dyn_seg_mat != *mat_idx)
+                    {
                         flush_dyn!();
                     }
                     if dyn_seg_tri_start.is_none() {
                         dyn_seg_tri_start = Some(dyn_accum_tris);
                         dyn_seg_rr = rr;
                         dyn_seg_tu = tu;
+                        dyn_seg_mat = *mat_idx;
                         dyn_seg_layer = layer;
                     }
                     if vn != 0 {

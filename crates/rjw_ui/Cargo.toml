@@ -1,0 +1,23 @@
+[package]
+name = "rjw_ui"
+version = "0.1.0"
+edition = "2024"
+authors = ["KrisuRJW <Cmd1loica99@163.com>"]
+description = "Immediate-mode style UI with persistent state, DOM-like auto layout (pack/grid/place) for the krusie engine."
+license = "MIT"
+repository = "https://github.com/parseek/krisu_engine"
+readme = "README.md"
+keywords = ["ui", "gui", "widget", "immediate-mode", "game-development"]
+categories = ["game-development", "gui"]
+
+[dependencies]
+rjw_2d_render = { path = "../rjw_2d_render", version = "0.1.1" }
+rjw_render = { path = "../rjw_render", version = "0.1.0" }
+rjw_text = { path = "../rjw_text", version = "0.2.0" }
+rjw_transform = { path = "../rjw_transform", version = "0.1.1" }
+rjw_color = "0.1.0"
+rjw_mouse = { path = "../rjw_mouse", version = "0.1.2" }
+rjw_keyboard = { path = "../rjw_keyboard", version = "0.1.1" }
+rjw_keystate = "0.1.0"
+glam = "0.33.2"
+winit = "0.30.13"

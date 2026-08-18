@@ -23,6 +23,7 @@
 - [8. DynamicAtlas（纹理图集）](#8-dynamicatlas纹理图集)
 - [9. Text（文本渲染）](#9-text文本渲染)
 - [10. 其他常用小类型速查](#10-其他常用小类型速查)
+- [11. UI（rjw_ui）](#11-uirjw_ui)
 
 ---
 
@@ -677,6 +678,135 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 | `TypedRegistry<T>` | `rjw_render` | 泛型线程安全注册表（纹理/网格共用） |
 | `CustomDraw` | `rjw_2d_render` | 外部绘制 trait（闭包 blanket impl） |
 | `CustomBuilder<'a>` | `rjw_2d_render` | add_custom 返回，可链式 RStates |
+
+---
+
+## 11. UI（rjw_ui）
+
+> crate：`rjw_ui`。坐标一律**屏幕像素**（左上角原点、Y+ 向下）；交互状态经 **ID** 持久化于 `UiState`（应用持有）。完整概念见 [ENGINE_GUIDE.md](ENGINE_GUIDE.md)「18. UI」。
+
+### 入口与生命周期
+
+| 函数 | 签名 / 用法 | 说明 |
+|---|---|---|
+| `Ui::begin` | `Ui::begin(window, &cam, &mouse, &keyboard, &mut text, &mut r2d, &mut state) -> UiInit` | 一帧一次；`window` 用于 IME 候选框定位；借用窗口/相机/输入/文本/渲染器/状态 |
+| `UiInit::theme(Theme)` | `.theme(Theme::dark())` | 主题（默认浅色；`Theme::dark()` 深色） |
+| `UiInit::base_layer(f64)` | `.base_layer(1e7)` | 基层层级（默认 `1e7`） |
+| `UiInit::scale_factor(f64)` | `.scale_factor(ctx.scale_factor().unwrap_or(1.0))` | DPI：控件坐标/字号按逻辑像素，内部换算物理像素（默认 1.0） |
+| `UiInit::debug_layout(bool)` | `.debug_layout(true)` | 调试 UI 布局：给每个控件/容器矩形画描边（颜色/宽度见 [样式小节](#样式theme可-clone-覆盖) 的 `DebugStyle`；默认 false） |
+| `Ui::debug_layout(bool)` | `ui.debug_layout(on)` | 同 `UiInit::debug_layout`，帧内运行时开关 |
+| `UiInit::build()` | → `Ui` | 完成构建（内部 `state.begin_frame()`） |
+| `Ui::finish()` | `ui.finish()` | 排序 `(win, depth, 图形/文字, 录制序)` 并提交绘制；清空帧状态 |
+| `UiState::new()` | 应用持有 | 跨帧持久状态容器 |
+| `UiState::reset()` / `remove(id)` | 示例"R 重开" | 清空全部 / 移除单个控件状态 |
+| `UiState::capturing_text()` | `if !ui_state.capturing_text() { /* 快捷键 */ }` | 输入框聚焦时屏蔽应用快捷键 |
+
+### 容器（布局）
+
+| 函数 | 签名 | 语义 |
+|---|---|---|
+| `label_at` | `ui.label_at(pos, text) -> Vec2` | place：绝对定位 + 内容自然尺寸 |
+| `pack_at` | `ui.pack_at(pos, side, \|p\| ...) -> Vec2` | pack：按 `PackSide::Top/Left` 堆叠，宽/高 = 最大子项 |
+| `panel_at` | `ui.panel_at(pos, \|pp\| ...) -> Vec2` | 背景 + 边框 + 内容垂直堆叠，尺寸自动包裹 |
+| `drag_panel_at` | `ui.drag_panel_at(id, pos, \|pp\| ...) -> Vec2` | 同 panel_at，且按住面板任意处可**拖动**（位置持久于 `UiState.panel_pos`；拖动期间子控件不响应） |
+| `window_at` | `ui.window_at(id, pos, \|w\| ...) -> Vec2` | **可重叠窗口**：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽；窗口内同一 layer 按"背景/图形→文字"绘制，不做元素重叠处理 |
+| `grid_at` | `ui.grid_at(pos, cols, id, \|g\| ...) -> Vec2` | 均匀网格；`id` 缓存单元格尺寸（跨帧稳定） |
+| 容器内 `*_at(offset)` | `p.panel_at(offset, \|inner\| ...)` | 嵌套容器（相对当前容器内容原点，不占光标） |
+
+### 控件（容器内：`p.xxx(...)` 占光标；`*_at` 变体显式 `Rect`）
+
+| 控件 | 签名 | 返回值 / 行为 |
+|---|---|---|
+| `label` | `p.label(text) -> Vec2` | 文本，内容自然尺寸 |
+| `button` | `p.button(id, label) -> ButtonState` | hover / pressed / clicked（按下+释放均在本体） |
+| `slider` | `p.slider(id, range, value) -> f32` | 拖拽；返回更新后的值（越界 clamp） |
+| `checkbox` | `p.checkbox(id, label, checked) -> CheckboxState` | `.toggled()` 本帧切换；checked 由用户维护 |
+| `radio` | `p.radio(id, group, label) -> CheckboxState` | 组内互斥（`UiState.radio_groups`）；`.checked()` 读选中 |
+| `text_input` | `p.text_input(id, &mut String)` | 点击聚焦、打字/退格/删除/方向键、Enter/Esc 失焦、光标闪烁；**支持中文 IME**（上屏 + 灰色组合候选 + **候选框定位到光标**） |
+
+### 状态视图
+
+| 类型 | 方法 | 说明 |
+|---|---|---|
+| `ButtonState` | `hovered()/pressed()/clicked()/released()` | 按钮状态（本帧点击 = 按下+释放均在本体） |
+| `CheckboxState` | `checked()/toggled()/clicked()` | 勾选框 / 单选状态 |
+
+### 样式（`Theme`，可 clone 覆盖）
+
+`Theme { label, panel, button, slider, input, checkbox, debug, gap }`，子样式见 `crates/rjw_ui/src/style.rs`：
+`LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding）、`ButtonStyle`（三态 bg + padding）、
+`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/padding_x/height/min_w）、
+`CheckboxStyle`（box_size/checked_fill/gap）、`DebugStyle`（layout_outline / layout_outline_width）。
+`Theme::default()` 浅色，`Theme::dark()` 深色。
+
+#### 调试样式（`DebugStyle`）
+
+| 字段 | 类型 / 默认 | 说明 |
+|---|---|---|
+| `layout_outline` | `Color` = 青色 | `debug_layout` 布局描边颜色 |
+| `layout_outline_width` | `f32` = 1.0 | `debug_layout` 描边宽度（**物理像素**） |
+
+```rust
+let mut theme = Theme::dark();
+theme.debug.layout_outline = Color::MAGENTA;      // 改描边颜色
+theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像素）
+// .theme(theme) 传入 Ui
+```
+
+> DebugDraw 图元（`ui.debug_*`）的样式 = **每次调用显式传参**（`color` + `width`，逻辑像素）；
+> 需要统一样式时自建常量保存后传入。
+
+### 调试（Debug UI / DebugDraw / 窗口诊断）
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `debug_layout` | `ui.debug_layout(true)` / `.debug_layout(true)`（构建期） | 每个控件/容器矩形画描边（布局 + 命中区域可视化；样式见 `DebugStyle`；开启时跳过窗口顶点缓存） |
+| `debug_line` | `ui.debug_line(a, b, width, color)` | 屏幕空间线段（**绝对逻辑像素**，覆盖在 UI 内容之上） |
+| `debug_rect_outline` | `ui.debug_rect_outline(&Rect, width, color)` | 屏幕空间矩形框 |
+| `debug_circle_outline` | `ui.debug_circle_outline(center, r, segments, width, color)` | 屏幕空间圆环 |
+| `debug_cross` | `ui.debug_cross(center, half, width, color)` | 屏幕空间十字标记 |
+| `debug_grid` | `ui.debug_grid(&Rect, spacing, width, color)` | 屏幕空间网格（每方向 ≤ 512 条） |
+| `window_order` | `ui.window_order() -> Vec<(String, u32)>` | 诊断：窗口 z 序（按 z 升序） |
+| `window_under_mouse` | `ui.window_under_mouse() -> Option<(String, u32)>` | 诊断：鼠标下**最上层**窗口（重叠点击时唯一可交互的窗口） |
+| `UiState::last_press_window` | `state.last_press_window() -> Option<(&str, u32)>` | 诊断：上次按下由哪个窗口接收（重叠点击"赢家"） |
+| `UiState::occluded_hits` | `state.occluded_hits() -> u32` | 诊断：上帧**命中但被更高窗口遮挡而未响应**的控件次数（点击穿透拦截计数） |
+
+> 世界坐标调试图元（游戏场景：碰撞盒 / 网格 / 速度矢量）见 `rjw_2d_render::debug_draw`
+> （`draw_line` / `draw_rect_outline` / `draw_circle_outline` / `draw_circle_filled` /
+> `draw_cross` / `draw_grid`）。示例：`examples/egDebugDraw`（rjw_ui 屏幕空间 + 世界空间 + debug_layout）、
+> `examples/eg260818UI`（右上角窗口诊断面板）。
+>
+> 窗口遮挡（点击穿透）已修复：重叠区域**只有鼠标下最上层窗口**的控件响应——`window_occluded`
+> 判定（`hit.rs`），窗口矩形跨帧缓存于 `UiState.window_rects`；`occluded_hits > 0` 即证明
+> 背后控件被正确抑制。
+
+### 快速上手
+
+```rust
+use rjw_ui::{PackSide, Theme, Ui, UiState};
+
+let mut state = UiState::new();
+state.radio_groups.insert("diff".into(), "diff_normal".into()); // 默认选中
+
+// 每帧：
+let mut ui = Ui::begin(&cam, &ctx.mouse, &ctx.keyboard, &mut font, &mut r2d, &mut state)
+    .theme(Theme::dark()).build();
+
+ui.pack_at(Vec2::new(16.0, 16.0), PackSide::Top, |p| {
+    if p.button("start", "开始游戏").clicked() { /* ... */ }
+    volume = p.slider("vol", 0.0..=1.0, volume);
+    if p.checkbox("fs", "全屏", fs).toggled() { fs = !fs; }
+    p.text_input("name", &mut name);
+});
+ui.finish();
+```
+
+> 约定：交互控件 ID 必须稳定；顶层用 `*_at`；控件坐标 = 屏幕**逻辑**像素（`.scale_factor` 设置 DPI，
+> 不设置则等于物理像素）；文本输入支持中文 IME（`rjw_keyboard::get_ime_commits` / `get_ime_preedit`，
+> 候选框跟随光标）；输入框聚焦时用 `UiState::capturing_text()` 屏蔽应用快捷键；
+> 控件文本排版缓冲自持于 `UiState.text_buffers`（`CachePolicy::User`，不推入 `rjw_text` LRU）；
+> **独立 UI 渲染**：UI 录到单独 Render2D（`Render2D::set_sorting(false)` 关闭排序），与世界
+> `render_command_buffer` 合并提交（一次 present）；`finish` 按 `(win, depth, 图形/文字, 录制序)` 排序。
 
 ---
 

@@ -587,6 +587,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "eg260818UI"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "rjw_2d_render",
+ "rjw_color 0.1.0",
+ "rjw_main",
+ "rjw_render",
+ "rjw_text",
+ "rjw_transform",
+ "rjw_ui",
+]
+
+[[package]]
+name = "egDebugDraw"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "rjw_2d_render",
+ "rjw_color 0.1.0",
+ "rjw_main",
+ "rjw_render",
+ "rjw_text",
+ "rjw_transform",
+ "rjw_ui",
+]
+
+[[package]]
 name = "egTilemap"
 version = "0.1.0"
 dependencies = [
@@ -1891,16 +1919,6 @@ dependencies = [
 
 [[package]]
 name = "rjw_keyboard"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7a92b163db8aefc3c1ab9ba631ba0b66543d503d910339452d8d4514858c770"
-dependencies = [
- "rjw_keystate 0.1.0",
- "winit",
-]
-
-[[package]]
-name = "rjw_keyboard"
 version = "0.1.1"
 dependencies = [
  "rjw_keystate 0.1.0",
@@ -1921,19 +1939,9 @@ version = "0.1.1"
 name = "rjw_main"
 version = "0.1.0"
 dependencies = [
- "rjw_keyboard 0.1.0",
- "rjw_mouse 0.1.1",
+ "rjw_keyboard",
+ "rjw_mouse",
  "rjw_time",
- "winit",
-]
-
-[[package]]
-name = "rjw_mouse"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c348c1f9168e2949c0a050c97f60d512bac15636f8485eabebe7528e498857b"
-dependencies = [
- "rjw_keystate 0.1.0",
  "winit",
 ]
 
@@ -1995,6 +2003,22 @@ version = "0.1.1"
 dependencies = [
  "glam",
  "serde",
+]
+
+[[package]]
+name = "rjw_ui"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "rjw_2d_render",
+ "rjw_color 0.1.0",
+ "rjw_keyboard",
+ "rjw_keystate 0.1.0",
+ "rjw_mouse",
+ "rjw_render",
+ "rjw_text",
+ "rjw_transform",
+ "winit",
 ]
 
 [[package]]

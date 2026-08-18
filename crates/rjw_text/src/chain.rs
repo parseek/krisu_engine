@@ -130,7 +130,8 @@ pub struct MeasureInfo {
 pub struct LineMeasureInfo {
     /// 原始文本行索引
     pub line_i: usize,
-    /// 行盒左上角（相对文本视觉原点；绘制时叠加 `origin` / `offset`）
+    /// 行盒左上角（相对文本视觉原点；**整数像素**——行顶已取整，与字形 tl 一致；
+    /// 绘制时叠加 `origin` / `offset`）
     pub top_left: Vec2,
     /// 行内容宽（像素）
     pub width: f32,
@@ -156,7 +157,8 @@ pub enum GlyphType {
 pub struct GlyphData {
     /// 所在行（`TextRender::lines()` 数组索引）
     pub line: usize,
-    /// 字形精灵左上角（相对文本视觉原点；绘制时叠加 `origin` / `offset`）
+    /// 字形精灵左上角（相对文本视觉原点；**整数像素**——收集期对字形位置逐项取整，
+    /// 与块偏移相加两侧均为整数；绘制时叠加 `origin` / `offset`）
     pub top_left: Vec2,
     /// 字形像素宽高
     pub size: Vec2,
@@ -880,7 +882,7 @@ fn collect_glyphs(
             if top >= c.y + c.h || bottom <= c.y {
                 lines.push(LineMeasureInfo {
                     line_i: run.line_i,
-                    top_left: Vec2::new(0.0, top),
+                    top_left: Vec2::new(0.0, run.line_top.ceil() - visual_origin.y),
                     width: run.line_w,
                     line_height: run.line_height,
                     baseline: run.line_y - run.line_top,
@@ -892,18 +894,27 @@ fn collect_glyphs(
         for glyph in run.glyphs.iter() {
             let physical = glyph.physical((0.0, 0.0), 1.0);
             if let Some(loc) = locations.get(&physical.cache_key) {
+                // 字形相对文本视觉原点的偏移：**全部操作数为整数**——`physical.x` /
+                // `loc.left` / `loc.top` 为整型，`line_y` 先 `ceil` 再减，`visual_origin`
+                // （[`Text::buffer_origin`]）同为整数。整数加减法不会产生小数误差累加，
+                // 结果 `tl` 恒为整数（下方 `debug_assert` 兜底），后续加法链（块偏移 +
+                // 字形偏移）的两侧也都是整数。
                 let glyph_pos = Vec2::new(
                     physical.x as f32 + loc.left as f32,
-                    run.line_y - loc.top as f32,
+                    run.line_y.ceil() - loc.top as f32,
                 );
                 let tl = glyph_pos - visual_origin;
+                debug_assert!(
+                    tl.x.fract() == 0.0 && tl.y.fract() == 0.0,
+                    "glyph tl must be integer (整数不变量)，实际 {tl:?}"
+                );
                 // 字形级（水平 + 垂直）剔除：与 clip 无交集 → 跳过。
                 if !crate::glyph_in_clip(clip, tl, Vec2::new(loc.region.wh_px.0 as f32, loc.region.wh_px.1 as f32)) {
                     continue;
                 }
                 glyphs.push(GlyphData {
                     line: line_idx,
-                    top_left: tl.ceil(),
+                    top_left: tl,
                     size: Vec2::new(loc.region.wh_px.0 as f32, loc.region.wh_px.1 as f32),
                     region: loc.region,
                     color: [1.0; 4],
@@ -923,7 +934,8 @@ fn collect_glyphs(
             line_i: run.line_i,
             top_left: Vec2::new(
                 if glyph_start < glyph_end { min_x } else { 0.0 },
-                run.line_top - visual_origin.y,
+                // 行盒顶取整到整数（与字形 tl 一致）；行盒顶 = 排版行顶 - 视觉原点 y。
+                run.line_top.ceil() - visual_origin.y,
             ),
             width: run.line_w,
             line_height: run.line_height,

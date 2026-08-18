@@ -101,6 +101,8 @@ impl<T: App> ApplicationHandler for MainHandler<T> {
             return;
         }
         let window = event_loop.create_window(self.app.primary_window_attrib()).expect("Initalizing the primary window failed");
+        // 启用 IME（中文输入法等）：否则部分平台（Windows）不产生 `WindowEvent::Ime`。
+        let _ = window.set_ime_allowed(true);
         self.ctx.primary_window = Some(window);
         self.app.on_init(&mut self.ctx);
     }

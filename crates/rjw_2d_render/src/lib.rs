@@ -13,6 +13,7 @@
 //! - [`command`]：绘制命令枚举、层级 `Layer`、状态与命令队列
 //! - [`draw_page`]：GPU 实例数据/缓冲页（`InstanceData`/`VPBuffer`/`MeshDrawItem`/`DrawOp`/`DrawPage`）
 //! - [`render2d`]：`Render2D` 渲染器主体 + `ClearConfig`
+//! - [`debug_draw`]：调试图元（线段 / 矩形框 / 圆 / 十字 / 网格）
 //! - 纹理类型（`TextureWrapped`/`ArcTextureWrapped`）已移入 [`rjw_render`] crate
 //!
 //! [`rjw_render`]: https://docs.rs/rjw_render
@@ -21,6 +22,7 @@
 
 pub mod command;
 pub mod data;
+pub mod debug_draw;
 pub mod draw_page;
 pub mod render2d;
 pub mod rstates;

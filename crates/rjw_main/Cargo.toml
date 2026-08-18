@@ -13,5 +13,5 @@ categories = ["game-engines"]
 [dependencies]
 winit = "0.30.13"
 rjw_time = { path = "../rjw_time", version = "0.1.0" }
-rjw_keyboard = "0.1.0"
-rjw_mouse = "0.1.1"
+rjw_keyboard = { path = "../rjw_keyboard", version = "0.1.1" }
+rjw_mouse = { path = "../rjw_mouse", version = "0.1.2" }

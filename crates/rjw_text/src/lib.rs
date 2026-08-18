@@ -432,9 +432,13 @@ impl Text {
             for glyph in run.glyphs.iter() {
                 let physical = glyph.physical((0.0, 0.0), 1.0);
                 if let Some(loc) = self.locations.get(&physical.cache_key) {
+                    // 字形相对文本视觉原点的偏移：**全部操作数为整数**——
+                    // `physical.x` / `loc.left` / `loc.top` 为整型，`line_y` 先取整，
+                    // `origin`（[`Self::buffer_origin`]）同为整数。整数加减法无小数
+                    // 误差累加；最终再 `ceil` 只吸收外部 `base`（世界放置）的小数。
                     let glyph_pos = Vec2::new(
                         physical.x as f32 + loc.left as f32,
-                        line_y - loc.top as f32,
+                        line_y.ceil() - loc.top as f32,
                     );
                     let world_tl = base + glyph_pos - origin;
                     let glyph_size = Vec2::new(loc.region.wh_px.0 as f32, loc.region.wh_px.1 as f32);
@@ -620,14 +624,25 @@ impl Text {
     }
 
     /// 计算文本的第一个视觉字形的左上角（bearing 恢复后），用于对齐。
+    ///
+    /// **整数不变量**：返回坐标均为**整数像素**（y 轴对 `line_y` 先 `ceil` 再减整型
+    /// bearing）——与 [`Self::visit_glyphs`] / [`collect_glyphs`] 的字形坐标一致，
+    /// 保证后续所有加减法操作数都是整数（无小数误差累加、无亚像素摆放）。
     fn buffer_origin(&self, buffer: &Buffer) -> Vec2 {
         for run in buffer.layout_runs() {
             if let Some(g) = run.glyphs.first() {
                 let physical = g.physical((0.0, 0.0), 1.0);
                 if let Some(loc) = self.locations.get(&physical.cache_key) {
                     return Vec2::new(
-                        physical.x as f32 + loc.left as f32,
-                        run.line_y - loc.top as f32,
+                        // **笔位 x**（不 + 左侧 bearing）：字形按各自 bearing 相对笔位
+                        // 摆放。若以首字形墨迹左缘为原点，首字形的大 left bearing
+                        // （如全角 ！ 的 ~9px 空位）会把**后续所有字形整体左移**
+                        // 相同距离（叠进前段字距空间）；中文开头 bearing 小而一致
+                        // 所以不明显。
+                        physical.x as f32,
+                        // y 先取整再参与减法：`ceil(line_y) - loc.top` 是整数，
+                        // 与字形坐标（同为取整后整数）相减不会引入小数。
+                        run.line_y.ceil() - loc.top as f32,
                     );
                 }
             }

@@ -27,6 +27,9 @@ pub(crate) enum DrawCommand {
         vert: Range<usize>,
         /// 该命令的三角形索引在 `MeshStorage.tri_indices` 中的范围（全局索引）
         tri_index: Range<usize>,
+        /// 可选变换（`DrawCommandQueue.matrices` 索引）：顶点为**局部坐标**，
+        /// 经 model 变换到世界（`None` = 顶点即世界坐标，原语义）。
+        mat_idx: Option<usize>,
     },
     /// 静态网格（注册表）：`mesh_id` → `MESHES` 中的 `Arc<MeshData>`，实例化合并绘制。
     /// 顶点自带 UV，通过 `States.texture_uid` 采样纹理。

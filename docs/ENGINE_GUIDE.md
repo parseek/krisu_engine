@@ -25,6 +25,7 @@
 15. [性能与内存约定](#15-性能与内存约定)
 16. [对 AI 的维护约定](#16-对-ai-的维护约定)
 17. [快速速查表](#17-快速速查表)
+18. [UI（rjw_ui）](#18-uirjw_ui)
 
 ---
 
@@ -38,18 +39,25 @@ crates/
 ├─ rjw_render      # 底层渲染上下文：RenderContext / 纹理 TextureWrapped / 静态网格 MeshData / 泛型注册表 TypedRegistry / wgpu 重导出
 ├─ rjw_2d_render   # ★ 2D 批渲染器：Render2D / SpriteRect / Mesh / StaticMesh / RStates / 分页实例缓冲 / 统一管线
 ├─ rjw_atlas       # ★ 运行时图集：DynamicAtlas（Guillotine 空闲矩形 + 寿命 + clamp_margin + 去碎片重排）+ StaticAtlas（TOML）
+├─ rjw_text        # ★ 文本渲染：cosmic-text 排版 + swash 光栅化 + DynamicAtlas 字形缓存 + 责任链
+├─ rjw_ui          # ★ UI：hybrid 模式（立即外观 + ID 持久状态）+ DOM 风格自动尺寸 + Tkinter 布局（pack/grid/place）
 ├─ rjw_transform   # Transform2D + Camera2D（正交相机、VP 矩阵、坐标转换）
 ├─ rjw_color       # Color(f32) / ColorF64(f64) + 常用常量（RED/GREEN/...）
-├─ rjw_keyboard    # 键盘输入 → KeyState
+├─ rjw_keyboard    # 键盘输入 → KeyState（含 get_chars 字符输入）
 ├─ rjw_keystate    # KeyState 边沿状态机（pressed/edge/true_edge）
 ├─ rjw_mouse       # 鼠标位置/增量/滚轮/按钮状态
-└─ rjw_time        # DeltaTimer（帧间隔 dt 与 FPS）
+├─ rjw_time        # DeltaTimer（帧间隔 dt 与 FPS）
+├─ rjw_collision   # 碰撞（矩形相交等）
+└─ rjw_tilemap     # 瓦片地图（chunk + 组 + 相机剔除）
 
 examples/
 ├─ eg260729           # 最小清屏示例（手动 RenderPass）
 ├─ eg260731           # Render2D 精灵/多边形/mesh 能力演示
 ├─ eg260731CustomDraw # add_custom / CustomDraw 逃逸舱口（自建管线三角形）
-└─ eg260731RPG        # ★ 综合 RPG：y-sort、波次系统、相机跟踪、程序化纹理、静态地形（石头/花经 StaticMesh 合批）
+├─ eg260731RPG        # ★ 综合 RPG：y-sort、波次系统、相机跟踪、程序化纹理、静态地形（石头/花经 StaticMesh 合批）
+├─ eg260810TextChain  # ★ 文本责任链（TextLayout → TextRender）演示
+├─ egTilemap          # ★ 瓦片地图（chunk + 相机剔除 + 屏幕固定 HUD）
+└─ eg260818UI         # ★ rjw_ui 示例：pack 菜单 + grid 背包 + place 状态栏 + 输入框/滑块/单选
 ```
 
 **最核心概念一条线**：
@@ -913,3 +921,120 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 ---
 
 *遇到报错请优先怀疑：坐标系方向、物理/逻辑像素、`down_edge` vs `pressed`、页池覆盖（勿改回单缓冲）、layer 数值大小。这五类占引擎使用失误的 95%。*
+
+---
+
+## 18. UI（rjw_ui）
+
+> 完整 API 见 `crates/rjw_ui` 的 crate 文档与 [API_REFERENCE.md](API_REFERENCE.md)「10. UI」章节；示例：`cargo run -p eg260818UI`。
+
+### 18.1 是什么
+
+`rjw_ui` 是引擎的 UI 模块，三句话概括：
+
+1. **hybrid 模式**：外观逐帧录制（立即模式），交互状态（hover / 按下 / 焦点 / 输入内容 / 滑块拖拽 / 单选组 / grid 单元格缓存）经 **ID** 持久化在 `UiState`（应用持有，跨帧）。
+2. **DOM 风格自动尺寸**：叶子控件由内容测量自然撑开（`Text::measure` + padding），容器（panel / pack / grid）闭包结束时按子控件结算自身尺寸——**默认无需手写宽高**；需要时传显式 `Rect`（`*_at` 变体）覆盖。
+3. **Tkinter 风格几何管理器**：`place`（`*_at(pos)` 绝对定位）、`pack`（按 `PackSide` 堆叠）、`grid`（均匀网格）。
+
+### 18.2 最小用法
+
+```rust
+// UiState 存在应用结构体里（跨帧持久）
+let mut ui = Ui::begin(window, &cam, &ctx.mouse, &ctx.keyboard, &mut text, &mut r2d, &mut ui_state)
+    .theme(Theme::dark())
+    .base_layer(LAYER_UI)                               // 默认 1e7
+    .scale_factor(ctx.scale_factor().unwrap_or(1.0))    // DPI：控件坐标/字号按逻辑像素
+    .build();
+
+ui.label_at(Vec2::new(16.0, 12.0), "FPS: 60");          // place：绝对定位 + 内容自然尺寸
+ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {  // pack：垂直堆叠
+    if p.button("btn_start", "开始游戏").clicked() { /* ... */ }
+    volume = p.slider("vol", 0.0..=1.0, volume);         // 返回新值
+    if p.checkbox("fs", "全屏", fs).toggled() { fs = !fs; }
+    if p.radio("diff_hard", "diff", "困难").checked() { /* 单选组互斥 */ }
+    p.text_input("name", &mut player_name);              // 点击聚焦、打字（IME 已支持）、Enter/Esc 失焦
+});
+ui.window_at("win_a", Vec2::new(560.0, 240.0), |w| {    // 可重叠窗口：点击置顶 + 可拖拽
+    w.label("窗口 A");
+    w.button("win_a_btn", "A 按钮");
+});
+ui.drag_panel_at("inv_panel", Vec2::new(300.0, 90.0), |pp| {  // 可拖拽面板（位置持久）
+    pp.label("背包");
+    pp.grid_at(Vec2::new(0.0, 28.0), 3, "inv", |g| {    // 3 列网格（cell 跨帧缓存）
+        g.button("slot_0", "物品 0");
+    });
+});
+ui.finish();   // 排序（窗口 z → 深度 → 图形/文字 → 录制序）并提交绘制
+```
+
+### 18.3 ⚠️ 易混淆点
+
+- **坐标一律屏幕逻辑像素**（左上角原点、Y+ 向下）：调用 `.scale_factor(ctx.scale_factor().unwrap_or(1.0))` 后，所有控件坐标 / 字号按逻辑像素使用，内部自动换算物理像素绘制与命中；不设置则 scale = 1.0（与物理像素一致）。与引擎世界坐标（中心原点）不同；内部经相机屏幕固定变换绘制，旋转/缩放相机下依然 1:1。
+- **顶层用 `*_at(pos, ...)`**（含 `label_at` / `panel_at` / `pack_at` / `grid_at`）；容器内才可用无位置形式（`p.button(...)` 占光标）。容器内嵌套容器用 `*_at(offset)`（相对当前容器内容原点），**不占光标**——v1 不支持容器内"光标嵌套"。
+- **交互控件必须有稳定 ID 字符串**（按钮 / 滑块 / 勾选 / 单选 / 输入框）；ID 变化 = 状态丢失。`UiState::reset()` 清空全部状态。
+- **闭包内不可借用已被 `ui` 借用的字段**（如 `self.ui_state`）；需要重置等操作时用局部标记，`ui.finish()` 后统一处理（见示例）。
+- **单选**的选中状态完全存于 `UiState.radio_groups`（`group → id`），应用只读 `checked()`；初始选中用 `state.radio_groups.insert("组名", "id")`。
+- **文本输入**：普通字符走 `rjw_keyboard::get_chars()`（含 Shift 组合，控制字符已过滤）；**中文输入法（IME）已支持**——`rjw_main` 建窗时自动 `set_ime_allowed(true)`，`rjw_keyboard` 收集上屏文本（`get_ime_commits`）与组合候选（`get_ime_preedit`，输入框以灰色绘制在光标后），Enter 确认上屏。
+- **可拖拽面板 / 窗口**：`drag_panel_at(id, pos, |p| ...)` 按住面板拖动；`window_at(id, pos, |w| ...)` 是**可重叠窗口**——点击即**置顶**（焦点 z-order，`UiState.window_z`），位置持久于 `UiState.panel_pos`；拖动期间**抑制内部子控件交互**。拖拽位置按**物理像素粒度**跟随（1px 跟手，不受 DPI 逻辑量化影响）。
+- **窗口重叠点击裁决**：重叠区域点击**只让最上层窗口**获得拖拽与置顶（`Ui::finish` 内部 `resolve_win_press`）——不会同时拖动两个窗口。
+- **QuadVertices 渲染（不使用 Sprite）**：全部图元（背景 / 控件背景 / 文字）转为**四边形顶点**（`Render2D::add_quads`，每四顶点一组 **TL,TR,BL,BR**，固定索引 `[0,1,3, 3,2,0]`），按 `(窗口, 纹理)` 分组提交。**UI 自行管理绘制顺序**（独立 UI Render2D 建议 `Render2D::set_sorting(false)` 关闭排序）：`finish` 按 `(win 升序, 白纹理图形组 → 字形文字组, 纹理 uid)` 提交——窗口间层级由提交顺序保证（`layer = base + z*1.0` 仅作兜底），窗口内**“背景/图形 → 文字”严格稳定**，不随纹理 uid / HashMap 顺序抖动。复用默认 `LayerAndStates` 或 `set_layer_sort(true)` 结果一致。
+- **窗口 transform**：四边形顶点为**相对窗口原点的局部像素**，提交时经 `screen_fixed_tf(窗口原点)` 变换到世界——**移动窗口只改变换、顶点不变**（也支持将窗口嵌入游戏场景，给任意世界变换）。`add_quads` / `add_mesh_transform` 均支持 `Transform2D`（`IDENTITY` = 顶点即世界坐标）。
+- **窗口顶点缓存**：窗口内容不变时，四边形顶点**跨帧缓存**（`UiState.window_quads` 按**内容签名**命中）——静态窗口每帧零字形收集/重建；hover 变色、文字编辑等任何内容变化都会使签名变化而自动重建。**移动窗口不影响缓存**（顶点是局部的，transform 每帧用当前原点）。
+- **深度测试**：`RStates::default()` 深度测试**默认关闭**，QuadVertices 纯 2D 覆盖无需深度；世界层需要深度时用 `render2d.default_depth_test(true)`（UI 独立 Render2D 不受影响）。
+- **独立 UI 渲染（推荐）**：UI 录制到**单独 Render2D**（`Render2D::set_sorting(false)` 关闭排序，UI 自行管理绘制顺序），与世界合并提交：`r2d.render_command_buffer(clear, &view, None)`（世界）→ `r2d_ui.render_command_buffer(...)`（UI，color: None 不覆盖）→ `queue.submit([cb_world, cb_ui])` → `queue.present(st)`（一次 present）。
+- **输入屏蔽**：文本输入框聚焦时应用快捷键不应触发——检查 `UiState::capturing_text()`（如示例中 `R` 重置 / `Esc` 退出前）；输入框内 `Esc` 取消焦点（不再传给应用层）。
+- **IME 定位**：输入框聚焦时自动调用 `Window::set_ime_cursor_area`（`Ui::begin` 需传 `&Window`），中文输入法的候选框跟随输入框光标。
+- **文本性能**：控件排版缓冲（`Arc<Buffer>`）自持于 `UiState.text_buffers`（`CachePolicy::User`，**不推入 `rjw_text` 内部 LRU**）；静态标签每帧命中缓存跳过重复整形，容量上限 [`TEXT_BUFFER_CACHE_CAP`]=128（超出整体清空重建）。
+
+### 18.5 调试（Debug UI / DebugDraw / 窗口诊断）
+
+**样式如何设置**：调试视觉风格统一在 `Theme::debug`（`DebugStyle`，可 clone 覆盖）配置——
+`theme.debug.layout_outline`（`debug_layout` 描边颜色，默认青色）与
+`theme.debug.layout_outline_width`（描边宽度，物理像素，默认 1.0）；`ui.debug_*` 图元
+的样式（颜色 / 线宽）**每次调用显式传参**（逻辑像素）。示例：
+
+```rust
+let mut theme = Theme::dark();
+theme.debug.layout_outline = Color::MAGENTA;   // debug_layout 描边改洋红
+theme.debug.layout_outline_width = 2.0;        // 2 物理像素宽
+// Ui::begin(..).theme(theme).debug_layout(true).build()
+```
+
+**Debug UI（调试 rjw_ui 自身）**：
+
+- `UiInit::debug_layout(true)` 或帧内 `ui.debug_layout(on)`：给**每一个录制命令的矩形**
+  （控件 / 容器 / 文本块 / 光标）画描边——可视化布局矩形与命中区域；开启时跳过窗口
+  顶点缓存（每帧重建），是纯调试视图。描边走独立 debug 叠加层，**恒覆盖在 UI 内容之上**。
+
+**rjw_ui 的 DebugDraw（屏幕空间）**：`ui.debug_line` / `ui.debug_rect_outline` /
+`ui.debug_circle_outline` / `ui.debug_cross` / `ui.debug_grid`——坐标 = **绝对逻辑屏幕像素**
+（Y+ 向下，与 UI 控件一致），经独立 `debug_queue` 录制，`finish` 时按窗口分组、白纹理
+四边形提交，**恒覆盖在 UI 内容之上**（不进窗口缓存）。世界坐标调试图元（游戏场景：
+碰撞盒 / 网格 / 速度矢量）见 `rjw_2d_render::debug_draw`——两者分工：**画场景用世界，
+画 UI 用屏幕**。示例 `examples/egDebugDraw` 同时演示三套。
+
+**窗口诊断（重叠点击排查"哪个窗口赢了"）**：
+
+- `ui.window_order()`：全部窗口 z 序（`(id, z)` 升序）；
+- `ui.window_under_mouse()`：鼠标下**最上层**窗口（重叠点击时唯一可交互的窗口）；
+- `UiState::last_press_window()`：上次按下由哪个窗口接收（`finish::resolve_win_press` 的"赢家"）；
+- `UiState::occluded_hits()`：上帧**命中但被更高窗口遮挡而未响应**的控件次数
+  （点击穿透拦截计数——`> 0` 说明鼠标下有叠放、背后控件被正确抑制）。
+
+注意：`occluded_hits` / `last_press_window` 是跨帧持久数据，须在 `Ui::begin` **之前**读取
+（begin 会借用 `ui_state`），上一帧 finish 写入、本帧显示（见 `examples/eg260818UI`
+右上角诊断面板——把窗口 A/B/背包叠在同一处点击即可看到解析结果）。
+
+**点击穿透（窗口遮挡）**：重叠区域**只有鼠标下最上层窗口**的控件响应——`hit_abs`
+（所有控件共用）与窗口/面板自身的拖拽命中都过 `window_occluded(z, mouse, window_rects)`
+闸门（`z=0` 的非窗口内容被任意窗口遮挡）；窗口矩形跨帧缓存于 `UiState.window_rects`
+（`window_at` 录制时更新，`finish` 末尾只保留本帧录制过的窗口，销毁/置顶换 z 的旧条目
+自动清理）。已知边界：窗口**首次出现的那一帧**矩形尚不可知（跨帧缓存盲区），下一帧起
+严格生效——置顶方向从第一帧就正确（`win_press_top` 只保留最上层按下窗口）。
+
+### 18.6 维护约定（对 AI）
+
+- 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
+- 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `widget_api!` 宏里加便捷方法（Panel / Pack / Grid 自动获得）。
+- 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
+- 网格 cell 缓存（`UiState::grid_cells`）保证跨帧布局稳定；无缓存首帧渐进扩展，次帧起稳定。

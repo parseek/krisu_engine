@@ -10,7 +10,7 @@
 
 你以后一定会看见采用了不同 crate 搭配的 example 的（骗你的，现在就已经有了，但……
 
-目前仅实现了基础的 2D 渲染器，计划加入**文本渲染**、**静态瓦片**、**高级特效**等，这些都需要作者（和他用的 Cline 以及里面的 DeepSeek 酱）的辛勤努力  
+已实现：基础 2D 渲染器、**文本渲染**、**静态瓦片**、**UI 模块**等；计划加入**高级特效**等（这些都需要作者（和他用的 Cline 以及里面的 DeepSeek 酱）的辛勤努力  
 
 好在有不少东西都是继承自 [`krjw_rust`](https://github.com/parseek/krjw_rust) 的，不用重复造轮子，yay（
 
@@ -37,9 +37,10 @@
 | `rjw_2d_render` | ★ 2D 批渲染器 `Render2D`、`RStates`、Builder 责任链、`SpriteRect`、`Mesh`、分页实例缓冲、**统一管线缓存** |
 | `rjw_atlas` | ★ 运行时图集：DynamicAtlas（Guillotine 空闲矩形 + 寿命 + clamp_margin）+ StaticAtlas（TOML） |
 | `rjw_text` | ★ 文本渲染（cosmic-text 排版 + swash 字形光栅化 + DynamicAtlas 缓存） |
+| `rjw_ui` | ★ UI：hybrid 模式（立即外观 + ID 持久状态）+ DOM 风格自动尺寸 + Tkinter 布局（pack/grid/place），含按钮/滑块/勾选/单选/输入框 |
 | `rjw_transform` | `Transform2D` + `Camera2D`（正交投影、坐标转换） |
 | `rjw_color` | `Color`(f32) / `ColorF64`(f64) + 常用常量 |
-| `rjw_keyboard` / `rjw_keystate` | 键盘输入与边沿状态机 |
+| `rjw_keyboard` / `rjw_keystate` | 键盘输入（含 `get_chars` 字符输入）与边沿状态机 |
 | `rjw_mouse` | 鼠标状态 |
 | `rjw_time` | `DeltaTimer`（帧间隔 dt / FPS） |
 
@@ -54,6 +55,9 @@ cargo run -p eg260731
 
 # 运行最小清屏示例
 cargo run -p eg260729
+
+# 运行 UI 模块示例（pack 菜单 + grid 背包 + place 状态栏 + 输入框/滑块/单选）
+cargo run -p eg260818UI
 
 # 全工作区编译检查（改公共 crate 后必跑）
 cargo check --workspace
