@@ -728,7 +728,8 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 | `slider` | `p.slider(id, range, value) -> f32` | 拖拽；返回更新后的值（越界 clamp） |
 | `checkbox` | `p.checkbox(id, label, checked) -> CheckboxState` | `.toggled()` 本帧切换；checked 由用户维护 |
 | `radio` | `p.radio(id, group, label) -> CheckboxState` | 组内互斥（`UiState.radio_groups`）；`.checked()` 读选中 |
-| `text_input` | `p.text_input(id, &mut String)` | 点击聚焦、打字/退格/删除/方向键、Enter/Esc 失焦、光标闪烁；**支持中文 IME**（上屏 + 灰色组合候选 + **候选框定位到光标**） |
+| `text_input` | `p.text_input(id, &mut String)` | 单行输入框：点击聚焦/定位光标、打字/退格/删除/方向键、Enter/Esc 失焦、光标闪烁；**超长文本滚动跟随光标**（光标始终可见）、**拖选文本 + Ctrl+C/V/X 复制/粘贴/剪切**（选择优先于窗口拖拽）；**支持中文 IME**（组合候选浮动提示框 + 候选框定位到光标） |
+| `text_area` | `p.text_area(id, &mut String)` / `p.text_area_at(id, rect, &mut String)` | **多行文本输入框**：Enter 换行、↑/↓ 跨行（保持列）、Home/End 行首尾、按宽度自动换行、超出高度垂直滚动（滚轮 + 光标跟随）、跨行选择 + Ctrl+C/V/X、IME 支持；光标按逻辑行（`\n`）定位（超宽长行换行后近似） |
 
 ### 状态视图
 
@@ -741,7 +742,7 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 
 `Theme { label, panel, button, slider, input, checkbox, debug, focus, gap }`，子样式见 `crates/rjw_ui/src/style.rs`：
 `LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**）、`ButtonStyle`（三态 bg + padding + **radius**）、
-`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/padding_x/height/min_w + **radius**）、
+`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius**）、
 `CheckboxStyle`（box_size/checked_fill/gap）、`DebugStyle`（layout_outline / layout_outline_width）、
 `FocusStyle`（color / width，键盘导航焦点描边）。
 `Theme::default()` 浅色，`Theme::dark()` 深色。
@@ -790,7 +791,23 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 
 - 焦点控件画一圈**描边**（`Theme::focus` / `FocusStyle`），裁剪沿用控件自身（滚动容器内正确）；
 - 焦点控件本帧未录制（窗口关闭等）自动清除焦点；`Tab` 从链首重新开始；
+- **IME 组合中禁用方向键/Tab 焦点移动**（上下键是输入法候选选择）；点击其他窗口置顶时自动清除旧窗口的输入框焦点。
 - 示例 `eg260818UI`：Tab 遍历主菜单 → 背包 → 窗口 A/B → 列表 → 下拉框，全程键盘可操作。
+
+### 文本输入增强（单行 / 多行 / IME / 剪贴板）
+
+**单行 `text_input` 与多行 `text_area` 共用能力**（`rjw_ui::edit` 纯逻辑 + 单测）：
+
+| 能力 | 说明 |
+|---|---|
+| **超长滚动跟随光标** | 文本超出内容区时左移（`WidgetState::text_scroll`），光标右侧保留 8 逻辑像素；TextArea 垂直滚动（`scroll_y`）跟随光标行 + 滚轮 |
+| **文本选择** | 按住**拖选**（`WidgetState::sel_anchor`；选择优先于窗口/面板拖拽——从输入框拖拽 = 选择文本）；选择后打字 / 退格 / 删除 / 粘贴**替换选择** |
+| **复制 / 粘贴 / 剪切** | `Ctrl+C` / `Ctrl+V` / `Ctrl+X`（`arboard` 系统剪贴板；TextArea 支持跨行选择） |
+| **IME 组合候选浮动提示框** | 组合串（preedit）画在输入框**下方浮动小框**（底色 + 边框 + 灰色文本，自动宽度），不再占行内；系统候选框 `set_ime_cursor_area` 跟随光标（含水平/垂直滚动） |
+| **多行 TextArea** | `p.text_area(id, &mut String)` / `text_area_at(id, rect, ...)`：Enter 换行、↑/↓ 跨行（保持列，`edit::move_caret_line`）、Home/End 行首尾、按内容区宽度自动换行（`create_buffer_wrap`）、跨行选择高亮逐行绘制；光标按逻辑行（`\n`）定位（超宽长行换行后近似） |
+
+- 输入框按下时置位 `press_claimed`：窗口/面板**不建立拖拽基准**（选择拖拽优先；窗口从空白/标题区拖动），并清除旧拖拽基准（防"瞬移"）；
+- 主题：`InputStyle::sel_bg`（选择高亮色，默认浅蓝 / dark 深蓝）。
 
 ### 渲染增强（圆角 / 渐变，程序化纹理进动态 Atlas）
 

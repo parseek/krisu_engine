@@ -51,6 +51,8 @@ struct UiApp {
     player_name: String,
     win_a_checked: bool,
     win_b_note: String,
+    /// 多行备注（TextArea 演示）。
+    win_b_note_area: String,
     inventory: [bool; 9],
 }
 
@@ -77,6 +79,7 @@ impl UiApp {
             player_name: "Krisu".to_owned(),
             win_a_checked: false,
             win_b_note: String::new(),
+            win_b_note_area: "多行备注：\nEnter 换行，↑↓ 跨行，Home/End 行首尾，\n拖选文本后 Ctrl+C/V/X 复制/粘贴/剪切。".to_owned(),
             inventory: [false; 9],
         }
     }
@@ -270,6 +273,9 @@ impl App for UiApp {
             }
             // 输入内容写入应用状态（跨帧持久），聚焦后打字生效 ✓
             w.text_input("win_b_input", &mut self.win_b_note);
+            // 多行 TextArea：Enter 换行、自动换行 + 垂直滚动、拖选 + Ctrl+C/V/X
+            w.label("多行备注（Enter 换行 · 拖选复制粘贴）");
+            w.text_area("win_b_note_area", &mut self.win_b_note_area);
         });
 
         // ── 窗口诊断面板（调试机制：实时告诉你窗口叠放与点击解析）──
@@ -326,7 +332,7 @@ impl App for UiApp {
         // ── place：底部说明 ───────────────────────────────────
         ui.label_at(
             Vec2::new(16.0, 690.0),
-            "Tab/方向键 遍历焦点 · Enter/Space 激活 · 左右键调滑块 · Esc 收起/失焦（再按退出） · 点击置顶 · R 重置",
+            "Tab/方向键 遍历焦点 · 输入框拖选文本 + Ctrl+C/V/X · Enter 换行（多行） · Esc 收起/失焦（再按退出） · R 重置",
         );
 
         ui.finish();

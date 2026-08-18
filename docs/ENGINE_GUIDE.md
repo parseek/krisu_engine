@@ -1153,7 +1153,38 @@ ui.flex_at(Vec2::new(880.0, 450.0), 150.0, &[1, 2, 1], |f, i| {
 - 子项内容超高时**溢出可见**（需要滚动时在子项内嵌 `scroll_at`）；
 - `pos` 相对当前容器原点，不占父容器光标。
 
-### 18.10 维护约定（对 AI）
+### 18.10 文本输入增强（单行 / 多行 / IME / 剪贴板）
+
+**滚动跟随光标（超长文本）**：单行输入框在绘制时把文本左移 `WidgetState::text_scroll`
+（`edit::scroll_follow_caret(caret_x, content_w, text_w, margin=8)`：光标移出右侧 → 左移，
+clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位都叠加该偏移。
+
+**文本选择 + 剪贴板**：
+
+- 按下时 `sel_anchor = caret`，按住拖动 → 光标跟随鼠标（选择范围 = `[min,max)`，
+  纯逻辑 `edit::sel_range` / `selected_text`）；选择高亮在**文本之下**绘制
+  （同一 elem 图形组先于文字组），颜色 `InputStyle::sel_bg`；
+- `Ctrl+C/V/X`：复制选择 / 粘贴（替换选择）/ 剪切（`arboard` 系统剪贴板；
+  失败静默）；编辑操作（字符 / IME 上屏 / 退格 / 删除）前若存在选择先删除；
+- **窗口/面板拖拽协同**：输入框按下置位 `Ui::press_claimed` → `window_at` /
+  `panel_impl` 不建立拖拽基准（选择拖拽优先，窗口从空白/标题区拖动），并**清除
+  旧拖拽基准**（否则 `update_drag` 已置 dragging，残留 press_mouse 被当作基准 → 窗口"瞬移"）。
+
+**多行 TextArea**（`text_area_at` / 容器内 `p.text_area`）：Enter 插入 `\n`（`get_chars`
+已过滤控制字符，换行必须显式处理）、↑/↓ 跨行（`edit::move_caret_line` 保持列）、
+Home/End 行首尾；渲染用 `create_buffer_wrap`（内容区宽度自动换行），垂直滚动
+（`WidgetState::scroll_y`：滚轮 + 光标行跟随），clip 相对文本块（上缘 = scroll_y）；
+跨行选择高亮**逐逻辑行**绘制。光标/点击按逻辑行（`\n`）定位——内容不换行时精确，
+超宽长行换行后近似（v1 限制）。
+
+**IME 组合候选浮动提示框**：preedit 非空时在输入框**下方**画浮动小框（底色 + 边框 +
+灰色候选，自动宽度），不再占行内；系统候选框 `set_ime_cursor_area` 跟随光标
+（含水平 / 垂直滚动偏移，物理像素）。
+
+**维护约定**：文本编辑的纯逻辑（行/列换算、选择、滚动）在 `edit.rs`（无 GPU，可单测）；
+新增编辑控件时复用 `edit::*` 与 `clipboard_get/set`，并在按下响应中置位 `press_claimed`。
+
+### 18.11 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `widget_api!` 宏里加便捷方法（Panel / Pack / Grid 自动获得）。

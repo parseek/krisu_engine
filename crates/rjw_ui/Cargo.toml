@@ -22,3 +22,5 @@ rjw_keyboard = { path = "../rjw_keyboard", version = "0.1.2" }
 rjw_keystate = "0.1.0"
 glam = "0.33.2"
 winit = "0.30.13"
+# 剪贴板（文本选择复制/粘贴/剪切；跨平台：Windows / macOS / Linux / Web）。
+arboard = "3"

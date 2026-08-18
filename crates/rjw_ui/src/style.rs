@@ -142,6 +142,8 @@ pub struct InputStyle {
     pub caret: Color,
     /// IME 组合候选串颜色（如拼音未上屏时的灰色候选）。
     pub preedit: Color,
+    /// **文本选择高亮**（背景色；选中文本拖拽区域）。
+    pub sel_bg: Color,
     pub border_w: f32,
     /// 内容水平内边距。
     pub padding_x: f32,
@@ -164,6 +166,7 @@ impl Default for InputStyle {
             fg: Color::rgba_u8(30, 30, 30, 255),
             caret: Color::rgba_u8(30, 30, 30, 255),
             preedit: Color::rgba_u8(120, 120, 120, 255),
+            sel_bg: Color::rgba_u8(140, 190, 245, 255),
             border_w: 1.0,
             padding_x: 6.0,
             radius: 0.0,
@@ -278,6 +281,7 @@ impl Theme {
         t.input.fg = Color::rgba_u8(230, 230, 230, 255);
         t.input.caret = Color::rgba_u8(230, 230, 230, 255);
         t.input.preedit = Color::rgba_u8(150, 158, 176, 255);
+        t.input.sel_bg = Color::rgba_u8(70, 120, 190, 255);
         t.checkbox.box_border = Color::rgba_u8(150, 158, 176, 255);
         t.checkbox.checked_fill = Color::rgba_u8(96, 150, 220, 255);
         t.checkbox.fg = Color::rgba_u8(225, 225, 225, 255);

@@ -39,6 +39,10 @@
 //! - **布局增强**：[`Ui::label_wrap_at`]（宽度内自动**换行**的标签，含容器内
 //!   `p.label_wrap`）、**min/max 尺寸约束**（`p.min_size` / `p.max_size`，作用于下一
 //!   子项）、**flex 权重**（[`Ui::flex_at`]：固定总高按权重等分子项，同帧精确分配）。
+//! - **文本输入增强**：单行输入框**超长滚动跟随光标**、**拖选 + Ctrl+C/V/X 复制粘贴
+//!   剪切**（[`crate::edit`] 纯逻辑）、**多行 TextArea**（[`Ui::text_area_at`]：Enter
+//!   换行 / ↑↓ 跨行 / 自动换行 + 垂直滚动）、**IME 组合候选浮动提示框**（preedit 画在
+//!   输入框下方浮动小框，不再占行内）。
 //!
 //! # 快速上手
 //!
@@ -80,6 +84,7 @@
 //! - [`draw`]：屏幕固定变换与绘制命令
 
 pub mod draw;
+pub mod edit;
 pub mod focus;
 pub mod hit;
 pub mod layout;

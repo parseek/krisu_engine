@@ -34,6 +34,12 @@ pub struct WidgetState {
     pub press_mouse: Option<Vec2>,
     /// 文本输入框光标位置（char 索引）。
     pub caret: usize,
+    /// 文本选择锚点（char 索引；`Some` = 有选择，范围 = [min(anchor,caret), max)）。
+    pub sel_anchor: Option<usize>,
+    /// 单行输入框**水平滚动偏移**（逻辑像素）：超长文本时文本左移、光标跟随可见。
+    pub text_scroll: f32,
+    /// 多行输入框（TextArea）**垂直滚动偏移**（逻辑像素）。
+    pub scroll_y: f32,
 }
 
 /// 滚动容器状态（`UiState.scrolls`，跨帧持久）。
