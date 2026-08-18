@@ -680,6 +680,33 @@ impl<'a> Ui<'a> {
         view_size
     }
 
+    /// **选择列表**：`scroll_at` + 逐项回调（选中态由调用方维护）。
+    ///
+    /// `item` 回调 `(容器, 索引, 是否选中) -> bool`：返回 `true` 表示该项被点击。
+    /// 返回本帧被点击的索引（`None` = 无）。
+    pub fn list_at<F>(
+        &mut self,
+        pos: Vec2,
+        view_size: Vec2,
+        id: &str,
+        count: usize,
+        selected: Option<u32>,
+        mut item: F,
+    ) -> Option<u32>
+    where
+        F: FnMut(&mut Scroll<'_, '_>, u32, bool) -> bool,
+    {
+        let mut clicked = None;
+        self.scroll_at(pos, view_size, id, |s| {
+            for i in 0..count as u32 {
+                if item(s, i, selected == Some(i)) && clicked.is_none() {
+                    clicked = Some(i);
+                }
+            }
+        });
+        clicked
+    }
+
     /// 滚动条：右侧竖条（轨道 + thumb）。返回更新后的滚动偏移。
     #[allow(clippy::too_many_arguments)]
     fn scrollbar(
@@ -1071,6 +1098,12 @@ impl<'a> Ui<'a> {
     ///
     /// 独立 UI Render2D 建议 `set_sorting(false)`（关闭排序，完全按提交顺序绘制）；
     /// 复用默认 `LayerAndStates` 或 `set_layer_sort(true)` 亦正确。
+    /// **UI 的 Render2D 必须关闭排序**（`set_sorting(false)`，完全按提交顺序绘制）：
+    /// UI 自行管理绘制顺序，排序键 `(win, depth, elem, group, seq)` 依赖**提交顺序**
+    /// 生效（图形组在文字组之前提交）。⚠ `set_sorting(true)`（`SortMode::LayerAndStates`）
+    /// 会在同一 layer 内按 `(rstates, texture_uid)` 重排——字形图集页先于程序化纹理页
+    /// （圆角/渐变）注册，重排后**圆角/渐变图形会盖住文字**；`set_layer_sort(true)`
+    /// （`SortMode::LayerOnly`，稳定按 layer 排序）可接受（同层保持提交顺序）。
     pub fn finish(&mut self) {
         // 空白点击清焦点（本帧按下且无控件响应）
         if self.mouse_left().down_edge() && !self.any_pressed && self.state.focused.is_some() {
@@ -1147,8 +1180,11 @@ impl<'a> Ui<'a> {
             grp.sort_by_key(|&(g, tex, _)| (g, tex));
             self.state.window_quads.insert(id, (sig, grp));
         }
-        // 提交：**UI 自行管理绘制顺序**，不依赖 Render2D 排序（独立 UI Render2D 建议
-        // `set_sorting(false)` 关闭排序；`set_layer_sort(true)` / 默认排序下结果也一致）。
+        // 提交：**UI 自行管理绘制顺序**，UI 的 Render2D 必须 `set_sorting(false)`
+        // （关闭排序，完全按提交顺序绘制）；`set_layer_sort(true)`（LayerOnly，稳定排序）
+        // 同层保持提交顺序也可。⚠ 不要用 `set_sorting(true)`（LayerAndStates）：
+        // 它按 `(rstates, texture_uid)` 重排，字形图集页 uid < 程序化纹理页 uid →
+        // 圆角/渐变会被排在文字之后绘制，盖住文字。
         //
         // 统一排序键 `(win, 图形/文字组, 纹理 uid)`，每 (窗口, 组, 纹理) 一次 add_quads：
         // 1. **win 升序**：非窗口内容（win=0，layer = base）最底，窗口按 z 从下到上
@@ -1920,6 +1956,23 @@ macro_rules! widget_api {
                 self.ui.label_at(pos, text)
             }
 
+            /// **下拉框**（占光标，自动尺寸）：按钮 + 展开选项浮层；返回本帧新选中索引。
+            pub fn combo(
+                &mut self,
+                id: &str,
+                current: &str,
+                options: &[String],
+                selected: Option<u32>,
+            ) -> Option<u32> {
+                let style = self.ui.theme.button.clone();
+                let tsize =
+                    self.ui.text_size(current, style.font_size, style.font_family.as_deref());
+                let w = (tsize.x + 20.0).max(90.0) + style.padding.x * 2.0;
+                let h = style.padding.y * 2.0 + tsize.y;
+                let rect = self.ui.child_rect(w, h);
+                self.ui.combo_at(id, rect, current, options, selected)
+            }
+
             /// 按钮（文本 + padding 自动尺寸）。
             pub fn button(&mut self, id: &str, label: &str) -> ButtonState {
                 let style = self.ui.theme.button.clone();
@@ -2105,6 +2158,116 @@ widget_api!(Scroll);
 // ─── 控件实现（Ui 内部方法） ────────────────────────────────────
 
 impl Ui<'_> {
+    /// **下拉框**（显式 rect；`rect` 为相对当前容器 origin 的局部坐标）。
+    ///
+    /// 按钮显示 `current`；点击展开**选项浮层**（临时窗口置顶，自动尺寸包裹选项），
+    /// 点击选项选中并收起，点击浮层外收起。`selected` 为当前选中（用于 ✓ 标记）。
+    /// 返回本帧新选中的索引（`None` = 无选择/未展开）。
+    pub(crate) fn combo_at(
+        &mut self,
+        id: &str,
+        rect: Rect,
+        current: &str,
+        options: &[String],
+        selected: Option<u32>,
+    ) -> Option<u32> {
+        let mut picked = None;
+        let open = self.state.combo_open.as_deref() == Some(id);
+        // 按钮交互（点击 toggle）。
+        let hit = self.hit_abs(&rect);
+        let btn = self.mouse_left();
+        let ev = {
+            let ws = self.state.widgets.entry(id.to_owned()).or_default();
+            update_interact(ws, hit, btn)
+        };
+        if ev.pressed {
+            self.any_pressed = true;
+        }
+        if ev.clicked {
+            self.state.combo_open = if open { None } else { Some(id.to_owned()) };
+        }
+        // 按钮绘制（展开时用 pressed 态背景）。
+        let style = self.theme.button.clone();
+        let elem = self.seq + 1;
+        let bg = if open { style.bg_pressed } else { style.bg };
+        self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
+        let text_rect = Rect::new(rect.x, rect.y, (rect.w - 18.0).max(0.0), rect.h);
+        let seq = self.next_seq();
+        self.queue.push(text_cmd(
+            self.depth,
+            seq,
+            self.cur_win,
+            elem,
+            text_rect,
+            current.to_owned(),
+            style.font_size,
+            style.fg,
+            TextAlign::Left,
+            style.font_family.clone(),
+            None,
+            self.clip,
+        ));
+        let arrow_rect = Rect::new(rect.x + rect.w - 18.0, rect.y, 18.0, rect.h);
+        let seq = self.next_seq();
+        self.queue.push(text_cmd(
+            self.depth,
+            seq,
+            self.cur_win,
+            elem,
+            arrow_rect,
+            "▼".to_owned(),
+            style.font_size,
+            style.fg,
+            TextAlign::Center,
+            None,
+            None,
+            self.clip,
+        ));
+        // 展开的选项浮层：临时窗口（z 最高 → 覆盖一切），自动尺寸包裹选项。
+        if open {
+            let popup_pos = Vec2::new(rect.x, rect.y + rect.h + 2.0);
+            let popup_id = format!("{id}::popup");
+            let popup_size = self.window_at(&popup_id, popup_pos, |w| {
+                for (i, opt) in options.iter().enumerate() {
+                    let sel = selected == Some(i as u32);
+                    let label = if sel { format!("✓ {opt}") } else { opt.clone() };
+                    if w.button(&format!("{id}::opt_{i}"), &label).clicked() {
+                        picked = Some(i as u32);
+                    }
+                }
+            });
+            // 点击浮层外（且不在按钮上）→ 收起。
+            let popup_abs = Rect::new(popup_pos.x, popup_pos.y, popup_size.x, popup_size.y);
+            if btn.down_edge()
+                && !hit_test(&popup_abs, self.mouse_logical)
+                && !hit_test(&rect, self.mouse_logical)
+            {
+                self.state.combo_open = None;
+            }
+        }
+        if picked.is_some() {
+            self.state.combo_open = None;
+        }
+        picked
+    }
+
+    /// **下拉框**（顶层定位：`pos` 相对当前容器内容原点，绝对定位；尺寸自动）。
+    pub fn combo(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        current: &str,
+        options: &[String],
+        selected: Option<u32>,
+    ) -> Option<u32> {
+        let style = self.theme.button.clone();
+        let tsize = self.text_size(current, style.font_size, style.font_family.as_deref());
+        let w = (tsize.x + 20.0).max(90.0) + style.padding.x * 2.0;
+        let h = style.padding.y * 2.0 + tsize.y;
+        let rect = Rect::new(pos.x, pos.y, w, h);
+        self.combo_at(id, rect, current, options, selected)
+    }
+
     /// 按钮（显式 rect；`rect` 为相对当前容器 origin 的局部坐标）。
     pub(crate) fn button_at(&mut self, id: &str, rect: Rect, label: &str) -> ButtonState {
         let hit = self.hit_abs(&rect);

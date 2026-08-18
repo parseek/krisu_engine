@@ -776,7 +776,9 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 - 圆角**9-patch**：四角原样、四边/中心拉伸（任意矩形尺寸圆弧不畸变）；
   渐变矩形直接拉伸采样（主轴 64 级已平滑）；
 - 提交分组升级为 `(win, 图形/文字组, 纹理 uid)`：圆角 / 渐变属于**图形组**，先于文字
-  （不会因非白纹理 uid 排序错位盖住文字）；
+  （不会因非白纹理 uid 排序错位盖住文字）；⚠ **UI 的 Render2D 必须 `set_sorting(false)`**
+  （完全按提交顺序绘制）——`set_sorting(true)`（`LayerAndStates`）会按纹理 uid 重排，
+  圆角/渐变会被排在文字之后绘制而盖住文字（示例 `eg260818UI` 即如此配置）；
 - 控件级集成：`Theme` 的 `PanelStyle::radius` / `ButtonStyle::radius` / `InputStyle::radius`。
 
 ### 调试（Debug UI / DebugDraw / 窗口诊断）

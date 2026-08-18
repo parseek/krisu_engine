@@ -98,6 +98,8 @@ pub struct UiState {
     pub(crate) proc: ProcTextures,
     /// **滚动容器状态**：`scroll_at` 的 id → (偏移, 内容高)，跨帧持久。
     pub(crate) scrolls: HashMap<String, ScrollState>,
+    /// **下拉框展开状态**：当前展开的 `combo` 的 id（`None` = 全部收起）。
+    pub(crate) combo_open: Option<String>,
 }
 
 impl UiState {
@@ -146,6 +148,7 @@ impl UiState {
         self.occluded_hits = 0;
         self.last_press_window = None;
         self.scrolls.clear();
+        self.combo_open = None;
     }
 
     /// 是否正在**捕获键盘输入**（有文本输入框持有焦点）。

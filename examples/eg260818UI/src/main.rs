@@ -42,6 +42,10 @@ struct UiApp {
     volume: f32,
     fullscreen: bool,
     difficulty: String,
+    /// combo 选中索引（难度下拉框）。
+    diff_idx: Option<u32>,
+    /// list 选中索引（滚动列表）。
+    list_sel: Option<u32>,
     player_name: String,
     win_a_checked: bool,
     win_b_note: String,
@@ -66,6 +70,8 @@ impl UiApp {
             volume: 0.6,
             fullscreen: false,
             difficulty: "普通".to_owned(),
+            diff_idx: Some(1),
+            list_sel: None,
             player_name: "Krisu".to_owned(),
             win_a_checked: false,
             win_b_note: String::new(),
@@ -86,12 +92,13 @@ impl App for UiApp {
         self.render = Some(RenderContext::new(window, &RenderConfig::default()));
         let render = self.render.as_ref().unwrap();
         let render2d = Render2D::new(render);
-        // 独立 UI 渲染器：**关闭 Render2D 排序**——UI 自行管理绘制顺序：
-        // `finish` 按（窗口 z 升序 → 窗口内白纹理图形 → 字形文字）提交，
-        // 每窗口 `layer = base + z*1.0` 仅作兜底；Render2D 按录制顺序原样绘制，
-        // 不再按纹理/状态重排，窗口图形与文字的先后严格稳定。
+        // 独立 UI 渲染器：**必须关闭 Render2D 排序**（set_sorting(false)）——
+        // UI 自行管理绘制顺序：`finish` 按（窗口 z 升序 → 窗口内图形组 → 字形文字组）提交，
+        // 每窗口 `layer = base + z*1.0` 仅作兜底；Render2D 按提交顺序原样绘制。
+        // ⚠ 不要用 set_sorting(true)（LayerAndStates）：它会在同一 layer 内**按纹理 uid
+        // 重排**，字形图集页先于程序化纹理页（圆角/渐变）注册 → 圆角/渐变会盖住文字。
         let mut render2d_ui = Render2D::new(render);
-        render2d_ui.set_sorting(true);
+        render2d_ui.set_sorting(false);
         let font = Text::new(render2d.device(), render2d.queue(), render2d.tex_bind_group_layout());
         let (w, h) = render.size();
         let mut cam = Camera2D::new(Vec2::new(w as f32, h as f32));
@@ -206,14 +213,12 @@ impl App for UiApp {
                 self.fullscreen = !self.fullscreen;
             }
             p.label("难度");
-            if p.radio("diff_easy", "diff", "简单").checked() {
-                self.difficulty = "简单".to_owned();
-            }
-            if p.radio("diff_normal", "diff", "普通").checked() {
-                self.difficulty = "普通".to_owned();
-            }
-            if p.radio("diff_hard", "diff", "困难").checked() {
-                self.difficulty = "困难".to_owned();
+            // combo 下拉框（难度选择）：展开浮层选一项，点击外部收起
+            const DIFFS: [&str; 3] = ["简单", "普通", "困难"];
+            let diff_opts: Vec<String> = DIFFS.iter().map(|s| s.to_string()).collect();
+            if let Some(i) = p.combo("diff_combo", &self.difficulty, &diff_opts, self.diff_idx) {
+                self.diff_idx = Some(i);
+                self.difficulty = DIFFS[i as usize].to_owned();
             }
             p.label(&format!("难度: {}", self.difficulty));
             p.label(&format!(
@@ -282,16 +287,22 @@ impl App for UiApp {
             ),
         );
 
-        // ── 滚动容器演示：可滚动按钮列表（滚轮 / 拖动滚动条 / 点轨道翻页）──
-        ui.scroll_at(Vec2::new(880.0, 130.0), Vec2::new(240.0, 300.0), "scroll_demo", |s| {
-            s.label("滚动列表（滚轮 / 滚动条）");
-            for i in 0..40 {
-                let label = format!("日志条目 {i}");
-                if s.button(&format!("log_{i}"), &label).clicked() {
-                    self.clicks += 1;
-                }
-            }
-        });
+        // ── 滚动容器演示：可滚动选择列表（list_at：滚轮 / 滚动条 + 选中态）──
+        let sel = ui.list_at(
+            Vec2::new(880.0, 130.0),
+            Vec2::new(240.0, 300.0),
+            "list_demo",
+            40,
+            self.list_sel,
+            |s, i, is_sel| {
+                let label = format!("{}条目 {i}", if is_sel { "✓ " } else { "" });
+                s.button(&format!("log_{i}"), &label).clicked()
+            },
+        );
+        if let Some(i) = sel {
+            self.list_sel = Some(i);
+            self.clicks += 1;
+        }
 
         // ── place：底部说明 ───────────────────────────────────
         ui.label_at(
