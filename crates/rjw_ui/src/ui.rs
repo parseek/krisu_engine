@@ -1785,6 +1785,16 @@ impl<'a> Ui<'a> {
         let max_z = self.state.window_z.values().copied().max().unwrap_or(0);
         let new_z = max_z + 1;
         self.state.window_z.insert(top_id.clone(), new_z);
+        // **焦点归属清理**：焦点控件若在**其他窗口**（本次置顶的窗口之外）——
+        // 清除焦点。否则旧输入框在窗口被盖住后仍持焦点（点击被遮挡无法再聚焦、
+        // 打字落入不可见输入框），表现为"使用其他窗口后文本框失效"。
+        let top_z = new_z;
+        if let Some(fid) = &self.state.focused {
+            let fwin = self.focusables.iter().find(|e| e.id == *fid).map(|e| e.win);
+            if fwin.is_some_and(|w| w != 0 && w != top_z) {
+                self.state.focused = None;
+            }
+        }
         // 诊断：记录本次按下由哪个窗口接收（重叠点击时"赢家"）。
         self.state.last_press_window = Some((top_id, new_z));
     }
@@ -1807,9 +1817,18 @@ impl<'a> Ui<'a> {
             }
         }
         // 移动：Tab（+1）/ Shift+Tab（-1）/ Down（+1）/ Up（-1）。
+        // ⚠ IME 组合中（preedit 非空或上帧在组合）**禁止方向键/Tab 移动焦点**——
+        // 中文输入法用 ↑/↓ 切换候选、Enter 上屏，焦点被移走会立刻打断输入（文本框"失效"）。
+        let composing = self
+            .keyboard
+            .get_ime_preedit()
+            .is_some_and(|p| !p.is_empty())
+            || self.state.ime_composing;
         let shift = self.keyboard.get(KeyCode::ShiftLeft).pressed()
             || self.keyboard.get(KeyCode::ShiftRight).pressed();
-        let dir: i32 = if self.keyboard.get(KeyCode::Tab).down_edge() {
+        let dir: i32 = if composing {
+            0
+        } else if self.keyboard.get(KeyCode::Tab).down_edge() {
             if shift { -1 } else { 1 }
         } else if self.keyboard.get(KeyCode::ArrowDown).down_edge() {
             1

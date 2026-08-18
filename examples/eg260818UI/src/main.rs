@@ -188,8 +188,8 @@ impl App for UiApp {
         );
         ui.label_at(Vec2::new(16.0, 12.0), &format!("FPS: {:.0}", ctx.timer.get_fps()));
         ui.label_at(Vec2::new(16.0, 34.0), &format!("点击次数: {}", self.clicks));
-        ui.panel_at(Vec2::new(200.0, 12.0), |p| {
-            p.label("玩家名");
+        ui.drag_panel_at("name_panel", Vec2::new(200.0, 12.0), |p| {
+            p.label("玩家名（可拖动）");
             p.text_input("name", &mut self.player_name);
         });
 
