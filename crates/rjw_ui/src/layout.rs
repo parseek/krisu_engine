@@ -40,6 +40,15 @@ pub(crate) struct Frame {
     pub max_child: Vec2,
     /// 已放置子项数量（Grid 用）。
     pub count: usize,
+    /// **下一子项的尺寸约束**（min / max；0 = 该轴不约束）。
+    /// 一次性：`child_rect` 消耗并清零（[`Self::set_next_constraint`] 设置）。
+    next_min: Vec2,
+    next_max: Vec2,
+    /// **下一子项的强制高度**（flex 权重分配；`None` = 自然测量）。
+    /// 一次性：`child_rect` 消耗（[`Self::force_next_h`] 设置）。
+    next_fixed_h: Option<f32>,
+    /// **容器固定高度**（flex_at 等；覆盖 `settle_size` 的自然高度）。
+    fixed_h: Option<f32>,
 }
 
 impl Frame {
@@ -51,6 +60,10 @@ impl Frame {
             cursor: Vec2::new(p, p),
             max_child: Vec2::ZERO,
             count: 0,
+            next_min: Vec2::ZERO,
+            next_max: Vec2::ZERO,
+            next_fixed_h: None,
+            fixed_h: None,
         }
     }
 
@@ -62,13 +75,49 @@ impl Frame {
             cursor: Vec2::new(p, p),
             max_child: Vec2::ZERO,
             count: 0,
+            next_min: Vec2::ZERO,
+            next_max: Vec2::ZERO,
+            next_fixed_h: None,
+            fixed_h: None,
         }
     }
 
+    /// 设置**下一子项**的最小尺寸约束（`0` = 该轴不约束）。一次性，`child_rect` 消耗。
+    /// 多次调用取各轴最大值。
+    pub fn set_next_min(&mut self, min: Vec2) {
+        self.next_min = Vec2::new(self.next_min.x.max(min.x), self.next_min.y.max(min.y));
+    }
+
+    /// 设置**下一子项**的最大尺寸约束（`0` = 该轴不约束）。一次性，`child_rect` 消耗。
+    /// 多次调用取各轴最小值（0 表示不约束，取非零较小值）。
+    pub fn set_next_max(&mut self, max: Vec2) {
+        let merge = |cur: f32, v: f32| {
+            if cur <= 0.0 { v } else if v <= 0.0 { cur } else { cur.min(v) }
+        };
+        self.next_max = Vec2::new(merge(self.next_max.x, max.x), merge(self.next_max.y, max.y));
+    }
+
+    /// 强制**下一子项**高度（flex 权重分配）。一次性，`child_rect` 消耗。
+    pub fn force_next_h(&mut self, h: f32) {
+        self.next_fixed_h = Some(h.max(0.0));
+    }
+
+    /// 固定容器结算高度（`settle_size` 覆盖自然高度）。
+    pub fn set_fixed_h(&mut self, h: f32) {
+        self.fixed_h = Some(h.max(0.0));
+    }
+
     /// 为尺寸 `(w, h)` 的子项分配一个局部矩形，并推进光标 / 更新统计。
+    ///
+    /// 应用顺序：**min/max 约束** → **flex 强制高度**（覆盖测量值）。
     pub fn child_rect(&mut self, w: f32, h: f32) -> Rect {
         let w = w.max(0.0);
         let h = h.max(0.0);
+        let w = if self.next_max.x > 0.0 { w.min(self.next_max.x).max(self.next_min.x) } else { w.max(self.next_min.x) };
+        let h = if self.next_max.y > 0.0 { h.min(self.next_max.y).max(self.next_min.y) } else { h.max(self.next_min.y) };
+        let h = self.next_fixed_h.take().unwrap_or(h);
+        self.next_min = Vec2::ZERO;
+        self.next_max = Vec2::ZERO;
         match &mut self.kind {
             FrameKind::Stack { side, gap } => {
                 let local = self.cursor;
@@ -119,10 +168,11 @@ impl Frame {
                     return Vec2::new(p, p);
                 }
                 match side {
-                    PackSide::Top => Vec2::new(
-                        self.max_child.x + self.pad_total * 2.0,
-                        (self.cursor.y - gap).max(0.0) + self.pad_total,
-                    ),
+                    PackSide::Top => {
+                        let w = self.max_child.x + self.pad_total * 2.0;
+                        let h = self.fixed_h.unwrap_or((self.cursor.y - gap).max(0.0) + self.pad_total);
+                        Vec2::new(w, h)
+                    }
                     PackSide::Left => Vec2::new(
                         (self.cursor.x - gap).max(0.0) + self.pad_total,
                         self.max_child.y + self.pad_total * 2.0,
@@ -218,5 +268,38 @@ mod tests {
     #[test]
     fn text_natural_adds_padding() {
         assert_eq!(text_natural(100.0, 20.0, Vec2::new(10.0, 5.0)), Vec2::new(120.0, 30.0));
+    }
+
+    #[test]
+    fn min_max_constraint_clamps_child() {
+        let mut f = Frame::new_stack(PackSide::Top, 6.0, 0.0);
+        // 无约束：自然尺寸
+        assert_eq!(f.child_rect(40.0, 20.0), Rect::new(0.0, 0.0, 40.0, 20.0));
+        // min 约束：宽 < 100 → 抬到 100；高 < 30 → 抬到 30
+        f.set_next_min(Vec2::new(100.0, 30.0));
+        assert_eq!(f.child_rect(40.0, 20.0), Rect::new(0.0, 26.0, 100.0, 30.0));
+        // max 约束：宽 > 80 → 压到 80；高 0 表示不约束
+        f.set_next_max(Vec2::new(80.0, 0.0));
+        assert_eq!(f.child_rect(120.0, 50.0), Rect::new(0.0, 62.0, 80.0, 50.0));
+        // 约束一次性消耗：下一个子项恢复自然
+        assert_eq!(f.child_rect(30.0, 10.0), Rect::new(0.0, 118.0, 30.0, 10.0));
+    }
+
+    #[test]
+    fn force_next_h_overrides_measured_height() {
+        let mut f = Frame::new_stack(PackSide::Top, 6.0, 0.0);
+        f.force_next_h(60.0);
+        assert_eq!(f.child_rect(50.0, 20.0), Rect::new(0.0, 0.0, 50.0, 60.0), "高度被强制为 60");
+        assert_eq!(f.child_rect(50.0, 20.0), Rect::new(0.0, 66.0, 50.0, 20.0), "一次性，后续恢复自然");
+        assert_eq!(f.settle_size(), Vec2::new(50.0, 86.0));
+    }
+
+    #[test]
+    fn fixed_h_overrides_settle_height() {
+        let mut f = Frame::new_stack(PackSide::Top, 6.0, 0.0);
+        f.child_rect(50.0, 20.0);
+        f.child_rect(40.0, 10.0);
+        f.set_fixed_h(200.0);
+        assert_eq!(f.settle_size(), Vec2::new(50.0, 200.0), "固定高覆盖自然结算");
     }
 }

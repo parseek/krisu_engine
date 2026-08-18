@@ -502,6 +502,13 @@ impl<'a> Ui<'a> {
         (Text::measure_buffer(&buf) / self.scale).ceil()
     }
 
+    /// 按**换行宽度**测量文本自然尺寸：`wrap_logical > 0` 时文本在宽度内自动换行
+    /// （宽 = min(自然宽, wrap)，高 = 行数 × 行高）；否则同 [`Self::text_size`]。
+    fn text_size_wrap(&mut self, s: &str, size: f32, family: Option<&str>, wrap_logical: f32) -> Vec2 {
+        let buf = self.cache_buffer_wrap(s, size, family, wrap_logical);
+        (Text::measure_buffer(&buf) / self.scale).ceil()
+    }
+
     /// 按字符**实际宽度**把点击位置（相对内容左缘，逻辑像素）映射为最近的光标 char 索引。
     ///
     /// 用"前缀宽度"二分（宽度随前缀长度单调不减）——混合中英文（字宽不同）时
@@ -526,12 +533,31 @@ impl<'a> Ui<'a> {
     /// 行高 = 字号（`size_px`），保证文本框内字形垂直居中位置正确。
     /// 缓存键包含 `TEXT_LINE_HEIGHT_VERSION`，修改行高策略后旧缓存自动失效。
     fn cache_buffer(&mut self, s: &str, size: f32, family: Option<&str>) -> Arc<Buffer> {
+        self.cache_buffer_wrap(s, size, family, 0.0)
+    }
+
+    /// 取（或创建）共享排版缓冲（物理字号取整到像素；`CachePolicy::User`：不进 rjw_text LRU）。
+    ///
+    /// `wrap_logical <= 0` = 不换行（默认宽裕宽度）；`> 0` = 按该**逻辑像素**宽度换行
+    /// （物理像素取整后传给 rjw_text；换行宽度参与缓存键，不同宽度各自缓存）。
+    ///
+    /// 行高 = 字号（`size_px`），保证文本框内字形垂直居中位置正确。
+    /// 缓存键包含 `TEXT_LINE_HEIGHT_VERSION`，修改行高策略后旧缓存自动失效。
+    fn cache_buffer_wrap(
+        &mut self,
+        s: &str,
+        size: f32,
+        family: Option<&str>,
+        wrap_logical: f32,
+    ) -> Arc<Buffer> {
         // 物理字号取整：字形在像素网格上，避免亚像素渲染模糊；测量/绘制/缓存键一致
         let size_px = (size * self.scale).round();
+        let wrap_px = (wrap_logical * self.scale).round().max(0.0);
         let key = (
             s.to_owned(),
             size_px.to_bits(),
             family.map(|f| f.to_owned()),
+            wrap_px.to_bits(),
             TEXT_LINE_HEIGHT_VERSION,
         );
         if let Some(b) = self.state.text_buffers.get(&key) {
@@ -543,9 +569,15 @@ impl<'a> Ui<'a> {
             Some(f) if !f.is_empty() => Attrs::new().family(Family::Name(f)),
             _ => Attrs::new(),
         };
-        let buf = self
-            .text
-            .create_buffer_policy(s, attrs, size_px, lh, Align::Left, CachePolicy::User);
+        let buf = self.text.create_buffer_wrap(
+            s,
+            attrs,
+            size_px,
+            lh,
+            Align::Left,
+            wrap_px,
+            CachePolicy::User,
+        );
         if self.state.text_buffers.len() >= TEXT_BUFFER_CACHE_CAP {
             self.state.text_buffers.clear();
         }
@@ -867,6 +899,33 @@ impl<'a> Ui<'a> {
         size
     }
 
+    /// **自动换行标签**：`max_w`（逻辑像素）内按词/字换行，返回自然尺寸
+    /// （宽 = min(自然宽, max_w)，高 = 行数 × 行高）。`max_w <= 0` = 不换行（同 [`Self::label_at`]）。
+    ///
+    /// 换行宽度参与排版缓存键（不同宽度各自缓存）；多行文本垂直居中于矩形。
+    pub fn label_wrap_at(&mut self, pos: Vec2, max_w: f32, text: &str) -> Vec2 {
+        let elem = self.seq + 1;
+        let seq = self.next_seq();
+        let style = self.theme.label.clone();
+        let size = self.text_size_wrap(text, style.font_size, style.font_family.as_deref(), max_w);
+        let rect = Rect::new(pos.x, pos.y, size.x, size.y);
+        self.queue.push(text_cmd(
+            self.depth,
+            seq,
+            self.cur_win,
+            elem,
+            rect,
+            text.to_owned(),
+            style.font_size,
+            style.color,
+            TextAlign::from(style.align),
+            style.font_family.clone(),
+            None,
+            self.clip,
+        ));
+        size
+    }
+
     /// 面板：背景 + 边框 + 内容垂直堆叠（pack Top）；尺寸自动包裹内容。
     pub fn panel_at(&mut self, pos: Vec2, f: impl FnOnce(&mut Panel<'_, '_>)) -> Vec2 {
         self.panel_impl(pos, None, f)
@@ -1102,6 +1161,69 @@ impl<'a> Ui<'a> {
             f(&mut p);
         })
         .0
+    }
+
+    /// 当前容器**下一子项**的最小尺寸约束（`0` = 该轴不约束；一次性）。
+    /// 容器内便捷方法：`p.min_size(120.0, 0.0)`（见 [`crate::Ui`] 文档 / 示例）。
+    pub(crate) fn set_next_min(&mut self, min: Vec2) {
+        self.frames
+            .last_mut()
+            .expect("min_size 需在容器内调用（顶层请用 *_at 定位）")
+            .set_next_min(min);
+    }
+
+    /// 当前容器**下一子项**的最大尺寸约束（`0` = 该轴不约束；一次性）。
+    pub(crate) fn set_next_max(&mut self, max: Vec2) {
+        self.frames
+            .last_mut()
+            .expect("max_size 需在容器内调用（顶层请用 *_at 定位）")
+            .set_next_max(max);
+    }
+
+    /// **flex 容器**：固定总高 `total_h`（逻辑像素），子项按 `weights` 权重**等分高度**
+    /// （扣掉子项间距后按权重分配；权重全 0 时子项高为 0），回调按索引布局——
+    /// 同帧精确分配，无需跨帧缓存；返回 `(最大子项宽, total_h)`。
+    ///
+    /// 子项内可放任意控件（`f.label` / `f.button` 等占光标，高度被强制为分配值）；
+    /// 内容超高时**溢出可见**（需要滚动时在子项内嵌 [`Self::scroll_at`]）。
+    /// `pos` 相对当前容器内容原点（顶层即屏幕原点），不占父容器光标。
+    pub fn flex_at<F>(
+        &mut self,
+        pos: Vec2,
+        total_h: f32,
+        weights: &[u32],
+        mut f: F,
+    ) -> Vec2
+    where
+        F: FnMut(&mut FlexCtx<'_, '_>, usize),
+    {
+        let gap = self.theme.gap;
+        let start = self.queue.len();
+        let saved_base = self.abs_base;
+        self.abs_base = saved_base + pos;
+        let mut frame = Frame::new_stack(PackSide::Top, gap, 0.0);
+        frame.set_fixed_h(total_h);
+        self.frames.push(frame);
+        self.depth += 1;
+        let sum: u32 = weights.iter().sum();
+        let gaps = gap * weights.len().saturating_sub(1) as f32;
+        let usable = (total_h - gaps).max(0.0);
+        {
+            let mut fc = FlexCtx { ui: self };
+            for (i, &w) in weights.iter().enumerate() {
+                let h = if sum > 0 { usable * w as f32 / sum as f32 } else { 0.0 };
+                fc.ui.frames.last_mut().expect("flex frame").force_next_h(h);
+                f(&mut fc, i);
+            }
+        }
+        let frame = self.frames.pop().expect("flex frame");
+        let size = frame.settle_size();
+        self.depth -= 1;
+        self.abs_base = saved_base;
+        for d in &mut self.queue[start..] {
+            d.translate(pos);
+        }
+        size
     }
 
     /// grid 容器：`cols` 列均匀网格，单元格尺寸跨帧缓存（`id` 须稳定）。
@@ -2070,6 +2192,45 @@ macro_rules! widget_api {
                 self.ui.label_at(pos, text)
             }
 
+            /// **自动换行标签**（占光标）：`max_w` 逻辑像素内按词/字换行；
+            /// 返回自然尺寸（宽 = min(自然宽, max_w)，高 = 行数 × 行高）。
+            /// `max_w <= 0` = 不换行（同 `label`）。
+            pub fn label_wrap(&mut self, max_w: f32, text: &str) -> Vec2 {
+                let style = self.ui.theme.label.clone();
+                let size = self
+                    .ui
+                    .text_size_wrap(text, style.font_size, style.font_family.as_deref(), max_w);
+                let rect = self.ui.child_rect(size.x, size.y);
+                let elem = self.ui.seq + 1;
+                let seq = self.ui.next_seq();
+                let depth = self.ui.depth;
+                self.ui.queue.push(text_cmd(
+                    depth,
+                    seq,
+                    self.ui.cur_win,
+                    elem,
+                    rect,
+                    text.to_owned(),
+                    style.font_size,
+                    style.color,
+                    TextAlign::from(style.align),
+                    style.font_family.clone(),
+                    None,
+                    self.ui.clip,
+                ));
+                size
+            }
+
+            /// **下一子项的最小尺寸约束**（`0` = 该轴不约束；一次性，作用于紧接着的下一个子项）。
+            pub fn min_size(&mut self, w: f32, h: f32) {
+                self.ui.set_next_min(glam::Vec2::new(w, h));
+            }
+
+            /// **下一子项的最大尺寸约束**（`0` = 该轴不约束；一次性，作用于紧接着的下一个子项）。
+            pub fn max_size(&mut self, w: f32, h: f32) {
+                self.ui.set_next_max(glam::Vec2::new(w, h));
+            }
+
             /// **下拉框**（占光标，自动尺寸）：按钮 + 展开选项浮层；返回本帧新选中索引。
             pub fn combo(
                 &mut self,
@@ -2268,6 +2429,13 @@ pub struct Scroll<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
 }
 widget_api!(Scroll);
+
+/// **flex 容器上下文**（[`Ui::flex_at`]）：子项高度已按权重分配（强制），
+/// 内部可调用任意控件方法占光标（`f.label` / `f.button` 等）。
+pub struct FlexCtx<'ui, 'a> {
+    ui: &'ui mut Ui<'a>,
+}
+widget_api!(FlexCtx);
 
 // ─── 控件实现（Ui 内部方法） ────────────────────────────────────
 

@@ -224,6 +224,17 @@ impl App for UiApp {
                 "全屏: {}",
                 if self.fullscreen { "开" } else { "关" }
             ));
+            // ── 布局增强演示：换行 + min/max 尺寸约束 ──────────
+            p.label("尺寸约束（min 160 / max 120）");
+            p.min_size(160.0, 0.0);
+            if p.button("btn_min", "min 宽").clicked() {
+                self.clicks += 1;
+            }
+            p.max_size(120.0, 0.0);
+            if p.button("btn_max", "max 宽").clicked() {
+                self.clicks += 1;
+            }
+            p.label_wrap(180.0, "自动换行标签：pack 内 180 宽自动换行成多行，适合说明文字。");
         });
 
         // ── 可拖拽面板 + grid：右侧背包 ───────────────────────
@@ -302,6 +313,15 @@ impl App for UiApp {
             self.list_sel = Some(i);
             self.clicks += 1;
         }
+
+        // ── 布局增强演示：flex 权重（固定高 150，[1:2:1] 等分） ──
+        ui.flex_at(Vec2::new(880.0, 450.0), 150.0, &[1, 2, 1], |f, i| {
+            if f.button(&format!("flex_row_{i}"), &format!("行 {i} · 权重 {}", [1, 2, 1][i]))
+                .clicked()
+            {
+                self.clicks += 1;
+            }
+        });
 
         // ── place：底部说明 ───────────────────────────────────
         ui.label_at(

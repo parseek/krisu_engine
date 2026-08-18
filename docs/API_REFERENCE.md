@@ -612,6 +612,7 @@ pub struct Text { /* font_system: FontSystem, glyph_cache: DynamicAtlas<cosmic_t
 | `Text::new(device, queue, layout)` | 创建字体管理器（自动加载系统字体） |
 | `load_font_data(data: Vec<u8>)` | 加载额外的 ttf/otf 字体数据 |
 | `create_buffer(text, attrs, size, line_height, align) -> Arc<Buffer>` | 排版并返回**共享只读** `Arc<Buffer>`（相同输入命中缓存，O(1) 签名预过滤、不深拷贝） |
+| `create_buffer_wrap(text, attrs, size, line_height, align, wrap_width, policy)` | 同 `create_buffer_policy`，但指定**排版宽度**（物理像素）：超出自动**换行**（多行）；宽度参与缓存键 |
 | `measure(text, attrs, size, line_height, align) -> Vec2` | 排版 + 测量内容宽高（GUI 布局用） |
 | `measure_buffer(buffer) -> Vec2` | 已排版 Buffer 的内容宽高（行盒；空文本返回 (0,0)） |
 | `draw_label(r2d, text, color, size, line_height, pos, family, align, layer) -> Vec2` | ★ 一行渲染：pos=左上角，返回内容宽高（feature = `rjw_2d_render`） |
@@ -712,6 +713,7 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 | `window_at` | `ui.window_at(id, pos, \|w\| ...) -> Vec2` | **可重叠窗口**：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽；窗口内同一 layer 按"背景/图形→文字"绘制，不做元素重叠处理 |
 | `scroll_at` | `ui.scroll_at(pos, view_size, id, \|s\| ...) -> Vec2` | **滚动容器**：内容在可视区内垂直堆叠（pack Top），滚轮 / 滚动条（拖 thumb、点轨道翻页）滚动；可视区外**裁剪**；偏移持久于 `UiState.scrolls` |
 | `grid_at` | `ui.grid_at(pos, cols, id, \|g\| ...) -> Vec2` | 均匀网格；`id` 缓存单元格尺寸（跨帧稳定） |
+| `flex_at` | `ui.flex_at(pos, total_h, &[w1,w2,..], \|f, i\| ...) -> Vec2` | **flex 容器**：固定总高 `total_h` 按 `weights` **权重等分**子项高度（扣 gap；回调按索引布局，同帧精确）；内容超高溢出可见（需滚动时内嵌 `scroll_at`） |
 | 容器内 `*_at(offset)` | `p.panel_at(offset, \|inner\| ...)` | 嵌套容器（相对当前容器内容原点，不占光标） |
 
 ### 控件（容器内：`p.xxx(...)` 占光标；`*_at` 变体显式 `Rect`）
@@ -719,6 +721,9 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 | 控件 | 签名 | 返回值 / 行为 |
 |---|---|---|
 | `label` | `p.label(text) -> Vec2` | 文本，内容自然尺寸 |
+| `label_wrap` | `p.label_wrap(max_w, text) -> Vec2` | **自动换行标签**：`max_w`（逻辑像素）内按词/字换行；宽 = min(自然宽, max_w)，高 = 行数 × 行高；`max_w <= 0` = 不换行 |
+| `min_size` | `p.min_size(w, h)` | **下一子项最小尺寸约束**（`0` = 该轴不约束；一次性，作用于紧接着的下一个子项） |
+| `max_size` | `p.max_size(w, h)` | **下一子项最大尺寸约束**（同上） |
 | `button` | `p.button(id, label) -> ButtonState` | hover / pressed / clicked（按下+释放均在本体） |
 | `slider` | `p.slider(id, range, value) -> f32` | 拖拽；返回更新后的值（越界 clamp） |
 | `checkbox` | `p.checkbox(id, label, checked) -> CheckboxState` | `.toggled()` 本帧切换；checked 由用户维护 |

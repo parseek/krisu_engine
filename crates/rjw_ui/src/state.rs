@@ -68,14 +68,14 @@ pub struct UiState {
     pub(crate) window_rects: HashMap<u32, Rect>,
     /// grid 容器：ID → 结算后的单元格尺寸（跨帧缓存，保证布局稳定）。
     pub grid_cells: HashMap<String, Vec2>,
-    /// 控件文本排版缓存：`(文本, 字号位模式, 字体族, 版本)` → 共享 `Arc<Buffer>`。
+    /// 控件文本排版缓存：`(文本, 字号位模式, 字体族, 换行宽度位模式, 版本)` → 共享 `Arc<Buffer>`。
     ///
     /// 用 [`rjw_text::CachePolicy::User`] 创建——**不推入 rjw_text 内部 LRU**
     /// （避免 UI 标签挤占其 128 容量），由本缓存自持；静态标签每帧命中零排版。
     /// 超出 [`TEXT_BUFFER_CACHE_CAP`] 时整体清空（简单策略，动态文本低频触发）。
     /// 
     /// 版本号用于强制刷新缓存（如行高计算方式变更），避免新旧缓存混用导致布局错乱。
-    pub(crate) text_buffers: HashMap<(String, u32, Option<String>, u8), Arc<Buffer>>,
+    pub(crate) text_buffers: HashMap<(String, u32, Option<String>, u32, u8), Arc<Buffer>>,
     /// 帧计数（光标闪烁相位用）。
     pub frame: u64,
     /// 上一帧是否处于 IME 组合中（text_input 退格判定用）：

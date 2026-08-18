@@ -149,21 +149,38 @@ struct LayoutCacheKey {
     size_bits: u32,
     line_height_bits: u32,
     align: u8,
+    /// 排版宽度（wrap width）位模式：`0` = 默认（不换行的宽裕值）。
+    wrap_bits: u32,
     attrs: AttrsOwned,
     sig: u64,
 }
 
 impl LayoutCacheKey {
-    fn new(text: &str, attrs: &Attrs<'_>, size: f32, line_height: f32, align: Align) -> Self {
+    fn new_wrap(
+        text: &str,
+        attrs: &Attrs<'_>,
+        size: f32,
+        line_height: f32,
+        align: Align,
+        wrap: f32,
+    ) -> Self {
         let size_bits = size.to_bits();
         let line_height_bits = line_height.to_bits();
         let align = align_disc(align);
-        let sig = Self::sig_of(text, attrs, size_bits, line_height_bits, align);
-        Self { text: text.to_owned(), size_bits, line_height_bits, align, attrs: AttrsOwned::new(attrs), sig }
+        let wrap_bits = wrap.to_bits();
+        let sig = Self::sig_of(text, attrs, size_bits, line_height_bits, align, wrap_bits);
+        Self { text: text.to_owned(), size_bits, line_height_bits, align, wrap_bits, attrs: AttrsOwned::new(attrs), sig }
     }
 
     /// O(1) 签名：长度 + 首尾字节 + 数值字段 + attrs 摘要。
-    fn sig_of(text: &str, attrs: &Attrs<'_>, size_bits: u32, line_height_bits: u32, align: u8) -> u64 {
+    fn sig_of(
+        text: &str,
+        attrs: &Attrs<'_>,
+        size_bits: u32,
+        line_height_bits: u32,
+        align: u8,
+        wrap_bits: u32,
+    ) -> u64 {
         let mut h = DefaultHasher::new();
         text.len().hash(&mut h);
         if let Some(&b) = text.as_bytes().first() { b.hash(&mut h); }
@@ -171,6 +188,7 @@ impl LayoutCacheKey {
         size_bits.hash(&mut h);
         line_height_bits.hash(&mut h);
         align.hash(&mut h);
+        wrap_bits.hash(&mut h);
         attrs_hash(attrs).hash(&mut h);
         h.finish()
     }
@@ -370,17 +388,32 @@ impl Text {
         &mut self, text: &str, attrs: Attrs<'_>, size: f32, line_height: f32, align: Align,
         policy: CachePolicy,
     ) -> Arc<Buffer> {
+        let wrap_width = 1024.0f32.max(size * text.len() as f32);
+        self.create_buffer_wrap(text, attrs, size, line_height, align, wrap_width, policy)
+    }
+
+    /// 同 [`Self::create_buffer_policy`]，但**排版宽度**由调用方指定（`wrap_width` 物理像素）：
+    /// 文本超出宽度自动**换行**（多行；cosmic-text 按词/字换行）。`wrap_width <= 0` 等价于
+    /// 默认（不换行的宽裕值）。宽度参与排版缓存键（不同宽度各自缓存）。
+    pub fn create_buffer_wrap(
+        &mut self, text: &str, attrs: Attrs<'_>, size: f32, line_height: f32, align: Align,
+        wrap_width: f32, policy: CachePolicy,
+    ) -> Arc<Buffer> {
         let use_cache = should_cache_with_policy(text.len(), policy);
         if use_cache {
             let size_bits = size.to_bits();
             let line_height_bits = line_height.to_bits();
             let align_u8 = align_disc(align);
-            let sig = LayoutCacheKey::sig_of(text, &attrs, size_bits, line_height_bits, align_u8);
+            let wrap_bits = wrap_width.to_bits();
+            let sig = LayoutCacheKey::sig_of(
+                text, &attrs, size_bits, line_height_bits, align_u8, wrap_bits,
+            );
             let matches = |k: &LayoutCacheKey| {
                 k.sig == sig
                     && k.size_bits == size_bits
                     && k.line_height_bits == line_height_bits
                     && k.align == align_u8
+                    && k.wrap_bits == wrap_bits
                     && k.text == text
                     && k.attrs.as_attrs() == attrs
             };
@@ -390,7 +423,11 @@ impl Text {
         }
         let metrics = Metrics::new(size, line_height);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        let wrap_width = 1024.0f32.max(size * text.len() as f32);
+        let wrap_width = if wrap_width > 0.0 {
+            wrap_width
+        } else {
+            1024.0f32.max(size * text.len() as f32)
+        };
         // 高度传 None：cosmic-text 会按 height_opt 裁剪超出范围的行，
         // 若设成单行高度会导致多行文本只保留第一行。
         buffer.set_size(Some(wrap_width), None);
@@ -398,7 +435,7 @@ impl Text {
         buffer.shape_until_scroll(&mut self.font_system, false);
         let arc = Arc::new(buffer);
         if use_cache {
-            let key = LayoutCacheKey::new(text, &attrs, size, line_height, align);
+            let key = LayoutCacheKey::new_wrap(text, &attrs, size, line_height, align, wrap_width);
             self.layout_cache.insert(key, arc.clone());
         }
         arc
@@ -699,13 +736,44 @@ mod tests {
     }
 
     #[test]
+    fn wrap_width_breaks_long_text_into_multiple_lines() {
+        // 显式窄宽度 → 长词/长文本换行：高度 > 单行，宽度 ≤ 宽度。
+        let mut fs = FontSystem::new();
+        fs.db_mut().load_system_fonts();
+        let metrics = Metrics::new(14.0, 20.0);
+        let mut buf = Buffer::new(&mut fs, metrics);
+        let text = "这是很长的一段中文文本，宽度受限时应该自动换行成多行来展示";
+        buf.set_size(Some(120.0), None);
+        buf.set_text(text, &Attrs::new(), Shaping::Advanced, Some(Align::Left));
+        buf.shape_until_scroll(&mut fs, false);
+        let sz = Text::measure_buffer(&buf);
+        assert!(sz.y > 20.0 + 1.0, "窄宽度下应换行成多行，实际高 {sz:?}");
+        assert!(sz.x <= 120.0 + 1.0, "宽应不超过换行宽度，实际 {sz:?}");
+        // 对照：同样文本宽裕宽度 → 单行（高 = 行高）。
+        let mut wide = Buffer::new(&mut fs, metrics);
+        wide.set_size(Some(1024.0), None);
+        wide.set_text(text, &Attrs::new(), Shaping::Advanced, Some(Align::Left));
+        wide.shape_until_scroll(&mut fs, false);
+        let wsz = Text::measure_buffer(&wide);
+        assert!((wsz.y - 20.0).abs() < 1.0, "宽裕宽度应单行，实际 {wsz:?}");
+    }
+
+    #[test]
+    fn wrap_width_in_cache_key() {
+        let a = LayoutCacheKey::new_wrap("Hello", &Attrs::new(), 14.0, 20.0, Align::Left, 0.0);
+        let b = LayoutCacheKey::new_wrap("Hello", &Attrs::new(), 14.0, 20.0, Align::Left, 120.0);
+        assert_ne!(a, b, "换行宽度不同应区分（缓存键）");
+        assert_ne!(a.sig, b.sig, "换行宽度不同签名应区分");
+    }
+
+    #[test]
     fn layout_cache_key_distinguishes_inputs() {
-        let k1 = LayoutCacheKey::new("Hello", &Attrs::new(), 14.0, 20.0, Align::Left);
-        let k2 = LayoutCacheKey::new("Hello", &Attrs::new(), 14.0, 20.0, Align::Left);
-        let k3 = LayoutCacheKey::new("Hello", &Attrs::new(), 16.0, 20.0, Align::Left);
-        let k4 = LayoutCacheKey::new("Hello", &Attrs::new(), 14.0, 20.0, Align::Center);
-        let k5 = LayoutCacheKey::new("World", &Attrs::new(), 14.0, 20.0, Align::Left);
-        let k6 = LayoutCacheKey::new("Hello", &Attrs::new().family(Family::Monospace), 14.0, 20.0, Align::Left);
+        let k1 = LayoutCacheKey::new_wrap("Hello", &Attrs::new(), 14.0, 20.0, Align::Left, 0.0);
+        let k2 = LayoutCacheKey::new_wrap("Hello", &Attrs::new(), 14.0, 20.0, Align::Left, 0.0);
+        let k3 = LayoutCacheKey::new_wrap("Hello", &Attrs::new(), 16.0, 20.0, Align::Left, 0.0);
+        let k4 = LayoutCacheKey::new_wrap("Hello", &Attrs::new(), 14.0, 20.0, Align::Center, 0.0);
+        let k5 = LayoutCacheKey::new_wrap("World", &Attrs::new(), 14.0, 20.0, Align::Left, 0.0);
+        let k6 = LayoutCacheKey::new_wrap("Hello", &Attrs::new().family(Family::Monospace), 14.0, 20.0, Align::Left, 0.0);
         assert_eq!(k1, k2, "相同输入应命中同一缓存键");
         assert_eq!(k1.sig, k2.sig, "相同输入签名应一致");
         assert_ne!(k1, k3, "字号不同应区分");
@@ -738,7 +806,7 @@ mod tests {
             buf.set_size(Some(1024.0), None);
             buf.set_text(text, &attrs, Shaping::Advanced, Some(Align::Left));
             buf.shape_until_scroll(fs, false);
-            (LayoutCacheKey::new(text, &attrs, 14.0, 20.0, Align::Left), Arc::new(buf))
+            (LayoutCacheKey::new_wrap(text, &attrs, 14.0, 20.0, Align::Left, 0.0), Arc::new(buf))
         }
         fn hit(cache: &mut LayoutCache, key: &LayoutCacheKey) -> Option<Arc<Buffer>> {
             cache.find(key.sig, |k| k == key)

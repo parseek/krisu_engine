@@ -1113,7 +1113,47 @@ ui.scroll_at(Vec2::new(880.0, 130.0), Vec2::new(240.0, 300.0), "scroll_demo", |s
 > ⚠️ 焦点是**跨帧持久状态**（`UiState.focused`），但焦点链**每帧重建**（immediate-mode：
 > 控件动态增删自动反映）；焦点描边改变窗口内容签名 → 窗口顶点缓存自动失效重建。
 
-### 18.9 维护约定（对 AI）
+### 18.9 布局增强（换行 / min-max / flex）
+
+**自动换行标签**（宽度内按词/字换行，多行垂直居中）：
+
+```rust
+ui.label_wrap_at(Vec2::new(16.0, 600.0), 240.0, "宽度 240 内自动换行的说明文字……");
+p.label_wrap(180.0, "pack 内 180 宽换行");   // 容器内占光标
+```
+
+- 底层：`rjw_text::create_buffer_wrap(text, attrs, size, lh, align, wrap_width, policy)`
+  （`wrap_width` 物理像素，参与排版缓存键）——cosmic-text 按词/字换行，`buffer.set_size(Some(w), None)`
+  高度留空（设单行高会只保留首行）；
+- 测量 `Text::measure_buffer` 返回（宽 = min(自然宽, wrap)，高 = 行数 × 行高，整数）；
+  UI 侧 `UiState.text_buffers` 缓存键增加**换行宽度**（不同宽度各自缓存）。
+
+**min/max 尺寸约束**（作用于**紧接着的下一个子项**，一次性）：
+
+```rust
+p.min_size(160.0, 0.0);   // 下一子项最小宽 160（0 = 该轴不约束）
+p.max_size(120.0, 0.0);   // 下一子项最大宽 120
+p.button("btn", "按钮");   // 实际宽度被 clamp 到 [160, 120] 交集 → 120..160 语义按序应用
+```
+
+- `Frame` 内部 `next_min` / `next_max` 字段（`set_next_min` / `set_next_max`，多次调用
+  取各轴 max / 非零较小值），`child_rect` 分配时 clamp，**用后自动清零**；
+- 约束只影响该子项的**布局尺寸**（矩形），内容（如按钮文字）在矩形内照常居中。
+
+**flex 权重容器**（固定总高按权重等分，同帧精确分配）：
+
+```rust
+ui.flex_at(Vec2::new(880.0, 450.0), 150.0, &[1, 2, 1], |f, i| {
+    f.button(&format!("row_{i}"), &format!("行 {i}"));  // 高度 = 150 按权重分配（扣 gap）
+});
+```
+
+- 分配：`可用高 = total_h - gap×(n-1)`；子项高 = `可用高 × wᵢ / Σw`；`Frame::force_next_h`
+  强制高度（一次性），`set_fixed_h` 固定容器结算高度；
+- 子项内容超高时**溢出可见**（需要滚动时在子项内嵌 `scroll_at`）；
+- `pos` 相对当前容器原点，不占父容器光标。
+
+### 18.10 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `widget_api!` 宏里加便捷方法（Panel / Pack / Grid 自动获得）。
