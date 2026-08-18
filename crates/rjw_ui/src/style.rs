@@ -14,6 +14,8 @@ pub struct Theme {
     pub checkbox: CheckboxStyle,
     /// 调试样式（debug_layout 描边等；DebugDraw 图元的样式 = 每次调用显式传参）。
     pub debug: DebugStyle,
+    /// **焦点样式**（键盘导航）：当前焦点控件的描边（`finish` 绘制）。
+    pub focus: FocusStyle,
     /// pack / grid 默认子项间距（像素）。
     pub gap: f32,
 }
@@ -224,6 +226,20 @@ impl Default for DebugStyle {
     }
 }
 
+/// **焦点样式**（键盘导航）：`finish` 给当前焦点控件画的描边（颜色 / 宽度）。
+/// 宽度为**逻辑像素**（内部 × scale 后取整）；默认青色 1.0，`Theme::dark` 下偏亮。
+#[derive(Clone, Debug)]
+pub struct FocusStyle {
+    pub color: Color,
+    pub width: f32,
+}
+
+impl Default for FocusStyle {
+    fn default() -> Self {
+        Self { color: Color::CYAN, width: 1.0 }
+    }
+}
+
 impl Theme {
     /// 浅色主题（默认）。
     pub fn default() -> Self {
@@ -235,6 +251,7 @@ impl Theme {
             input: InputStyle::default(),
             checkbox: CheckboxStyle::default(),
             debug: DebugStyle::default(),
+            focus: FocusStyle::default(),
             gap: 6.0,
         }
     }
@@ -264,6 +281,8 @@ impl Theme {
         t.checkbox.box_border = Color::rgba_u8(150, 158, 176, 255);
         t.checkbox.checked_fill = Color::rgba_u8(96, 150, 220, 255);
         t.checkbox.fg = Color::rgba_u8(225, 225, 225, 255);
+        // 焦点描边：深色主题下更亮，便于看清焦点位置
+        t.focus.color = Color::rgba_u8(96, 200, 255, 255);
         t
     }
 }

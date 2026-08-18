@@ -35,6 +35,7 @@ use crate::draw::{
     border_rects, clipped, debug_shape_segments, intersect_rect, screen_fixed_tf, snap_rect,
     text_block_offset, text_cmd, DebugShape, DrawKind, GradientAxis, TextAlign, UiDraw,
 };
+use crate::focus::{focus_step, FocusEntry, FocusKind};
 use crate::hit::{
     clear_frame_flags, hit_test, normalize_x, update_drag, update_interact, window_occluded,
 };
@@ -172,6 +173,7 @@ impl<'a> UiInit<'a> {
             win_press_top: None,
             win_origins: std::collections::HashMap::new(),
             win_ids: std::collections::HashMap::new(),
+            focusables: Vec::new(),
         }
     }
 }
@@ -226,6 +228,9 @@ pub struct Ui<'a> {
     win_origins: std::collections::HashMap<u32, Vec2>,
     /// 窗口 z → 窗口 id（四边形缓存 key 用；window_at 记录）。
     win_ids: std::collections::HashMap<u32, String>,
+    /// **本帧焦点链**（键盘导航）：交互控件录制时注册（[`Self::register_focus`]），
+    /// `finish` 按 (win, 注册序) 排序后处理 Tab / 方向键遍历并绘制焦点描边。
+    focusables: Vec<FocusEntry>,
 }
 
 impl<'a> Ui<'a> {
@@ -270,6 +275,51 @@ impl<'a> Ui<'a> {
     #[inline]
     fn phys_f(&self, f: f32) -> f32 {
         f * self.scale
+    }
+
+    // ── 键盘导航（焦点链） ────────────────────────────────────
+
+    /// 把控件登记进本帧焦点链（键盘导航用）。`rect` 为**相对当前容器**的局部矩形，
+    /// 内部转成**绝对逻辑坐标**（焦点描边绘制 / 排序用）。
+    fn register_focus(&mut self, id: &str, rect: Rect, kind: FocusKind) {
+        let abs = Rect::new(
+            self.abs_base.x + rect.x,
+            self.abs_base.y + rect.y,
+            rect.w,
+            rect.h,
+        );
+        self.focusables.push(FocusEntry {
+            id: id.to_owned(),
+            win: self.cur_win,
+            kind,
+            depth: self.depth,
+            rect: abs,
+            clip: self.clip,
+        });
+    }
+
+    /// 本控件是否持有键盘焦点（`UiState.focused == id`）。
+    #[inline]
+    fn focused_is(&self, id: &str) -> bool {
+        self.state.focused.as_deref() == Some(id)
+    }
+
+    /// **键盘激活**：Enter / Space 在本帧按下、本控件持有焦点且不在 IME 组合中
+    /// → 视为一次点击（按钮 / 勾选 / 单选 / 下拉框用）。文本输入框与滑块不参与
+    /// （前者走打字路径，后者用方向键调值）。
+    fn key_click(&self, id: &str, kind: FocusKind) -> bool {
+        if !self.focused_is(id) || kind == FocusKind::TextInput || kind == FocusKind::Slider {
+            return false;
+        }
+        let composing = self
+            .keyboard
+            .get_ime_preedit()
+            .is_some_and(|p| !p.is_empty());
+        if composing {
+            return false;
+        }
+        self.keyboard.get(KeyCode::Enter).down_edge()
+            || self.keyboard.get(KeyCode::Space).down_edge()
     }
 
     // ── Debug UI / DebugDraw（调试 rjw_ui 自身 + 屏幕空间调试图元） ──
@@ -1096,8 +1146,6 @@ impl<'a> Ui<'a> {
     /// 2. 同一窗口内**"背景/图形 → 文字"严格成立**（白纹理组先于字形图集组），
     ///    跨帧稳定、与 Render2D 任意排序模式结果一致。
     ///
-    /// 独立 UI Render2D 建议 `set_sorting(false)`（关闭排序，完全按提交顺序绘制）；
-    /// 复用默认 `LayerAndStates` 或 `set_layer_sort(true)` 亦正确。
     /// **UI 的 Render2D 必须关闭排序**（`set_sorting(false)`，完全按提交顺序绘制）：
     /// UI 自行管理绘制顺序，排序键 `(win, depth, elem, group, seq)` 依赖**提交顺序**
     /// 生效（图形组在文字组之前提交）。⚠ `set_sorting(true)`（`SortMode::LayerAndStates`）
@@ -1115,6 +1163,8 @@ impl<'a> Ui<'a> {
         }
         // 窗口按下裁决：重叠点击只让**最上层**窗口获得拖拽与置顶（见 window_at）
         self.resolve_win_press();
+        // 键盘导航：Tab / Shift+Tab / 方向键遍历焦点链、Esc 关浮层/失焦、焦点描边。
+        self.handle_focus_keys();
         // 排序（窗口 z → 深度 → 元素序 → 元素内图形/文字 → 命令序）：
         // 元素间按录制顺序（后录元素覆盖先录元素，重叠层级正确），
         // 元素内"背景/图形 → 文字"（DrawKind::group）——文字不被自身图形覆盖。
@@ -1269,6 +1319,7 @@ impl<'a> Ui<'a> {
         self.win_origins.clear();
         self.win_ids.clear();
         self.frames.clear();
+        self.focusables.clear();
     }
 
     /// 把一组命令收集为四边形顶点（**相对窗口原点的局部物理像素**；
@@ -1614,6 +1665,69 @@ impl<'a> Ui<'a> {
         self.state.window_z.insert(top_id.clone(), new_z);
         // 诊断：记录本次按下由哪个窗口接收（重叠点击时"赢家"）。
         self.state.last_press_window = Some((top_id, new_z));
+    }
+
+    /// **键盘导航**（`finish` 末尾调用）：
+    ///
+    /// - **Tab / Shift+Tab / 方向键**：按 `(win, 注册序)` 排序的焦点链遍历
+    ///   （[`focus_step`]），更新 `UiState.focused`；焦点控件本帧未录制时自动清除；
+    /// - **Esc**：优先收起展开的下拉框，否则取消焦点；
+    /// - **焦点描边**：对当前焦点控件画一圈描边（[`crate::style::FocusStyle`]，
+    ///   `Theme::focus`；elem 取全局最大 → 画在窗口内容之上，裁剪沿用控件自身）。
+    fn handle_focus_keys(&mut self) {
+        // 链排序：按 (win, 注册序) 稳定排序（非窗口 0 在前，窗口按 z 从下到上）。
+        let mut chain: Vec<&FocusEntry> = self.focusables.iter().collect();
+        chain.sort_by_key(|e| e.win);
+        // 焦点控件本帧未录制（所在窗口关闭 / 控件移除）→ 清除焦点。
+        if let Some(fid) = &self.state.focused {
+            if !chain.iter().any(|e| e.id == *fid) {
+                self.state.focused = None;
+            }
+        }
+        // 移动：Tab（+1）/ Shift+Tab（-1）/ Down（+1）/ Up（-1）。
+        let shift = self.keyboard.get(KeyCode::ShiftLeft).pressed()
+            || self.keyboard.get(KeyCode::ShiftRight).pressed();
+        let dir: i32 = if self.keyboard.get(KeyCode::Tab).down_edge() {
+            if shift { -1 } else { 1 }
+        } else if self.keyboard.get(KeyCode::ArrowDown).down_edge() {
+            1
+        } else if self.keyboard.get(KeyCode::ArrowUp).down_edge() {
+            -1
+        } else {
+            0
+        };
+        if dir != 0 {
+            let next = focus_step(&chain, self.state.focused.as_deref(), dir);
+            self.state.focused = next;
+        }
+        // Esc：优先收起下拉框，否则取消焦点。
+        if self.keyboard.get(KeyCode::Escape).down_edge() {
+            if self.state.combo_open.is_some() {
+                self.state.combo_open = None;
+            } else if self.state.focused.is_some() {
+                self.state.focused = None;
+            }
+        }
+        // 焦点描边：对当前焦点控件画一圈 Border（elem 全局最大 → 画在窗口内容之上）。
+        if let Some(fid) = &self.state.focused {
+            let Some(entry) = chain.iter().find(|e| e.id == *fid) else {
+                return;
+            };
+            // 先拷贝字段，结束对 chain 的借用（随后需要 &mut self）。
+            let (win, depth, rect, clip) = (entry.win, entry.depth, entry.rect, entry.clip);
+            let focus = self.theme.focus.clone();
+            let elem = self.seq + 1;
+            let seq = self.next_seq();
+            self.queue.push(UiDraw {
+                depth,
+                seq,
+                win,
+                elem,
+                rect,
+                clip,
+                kind: DrawKind::Border { color: focus.color, width: focus.width },
+            });
+        }
     }
 
     /// 文本 → 字形四边形（收集到 `quads`；按字形图集页纹理分组）。
@@ -2173,18 +2287,46 @@ impl Ui<'_> {
     ) -> Option<u32> {
         let mut picked = None;
         let open = self.state.combo_open.as_deref() == Some(id);
+        // 登记焦点链（键盘导航：Tab 可到；Enter/Space 展开收起；方向键切换选项）。
+        self.register_focus(id, rect, FocusKind::Combo);
         // 按钮交互（点击 toggle）。
         let hit = self.hit_abs(&rect);
         let btn = self.mouse_left();
-        let ev = {
+        let key_click = self.key_click(id, FocusKind::Combo);
+        let mut ev = {
             let ws = self.state.widgets.entry(id.to_owned()).or_default();
-            update_interact(ws, hit, btn)
+            let ev = update_interact(ws, hit, btn);
+            if key_click {
+                ws.pressed = true;
+            }
+            ev
         };
+        if key_click {
+            ev.clicked = true;
+        }
         if ev.pressed {
             self.any_pressed = true;
         }
         if ev.clicked {
             self.state.combo_open = if open { None } else { Some(id.to_owned()) };
+        }
+        // 键盘：焦点下展开时，上下方向键切换选项（选中即关闭浮层）；Esc 收起。
+        if open {
+            if self.focused_is(id) {
+                let n = options.len() as u32;
+                if n > 0 {
+                    let cur = selected.unwrap_or(0).min(n - 1);
+                    if self.keyboard.get(KeyCode::ArrowUp).down_edge() {
+                        picked = Some(if cur == 0 { n - 1 } else { cur - 1 });
+                    }
+                    if self.keyboard.get(KeyCode::ArrowDown).down_edge() {
+                        picked = Some(if cur + 1 >= n { 0 } else { cur + 1 });
+                    }
+                }
+            }
+            if self.keyboard.get(KeyCode::Escape).down_edge() {
+                self.state.combo_open = None;
+            }
         }
         // 按钮绘制（展开时用 pressed 态背景）。
         let style = self.theme.button.clone();
@@ -2237,10 +2379,24 @@ impl Ui<'_> {
                 }
             });
             // 点击浮层外（且不在按钮上）→ 收起。
-            let popup_abs = Rect::new(popup_pos.x, popup_pos.y, popup_size.x, popup_size.y);
+            // ⚠ popup_pos / rect 是**相对当前容器**的局部坐标，必须转**绝对**再与
+            // 绝对鼠标坐标比较——否则容器有偏移时（如 pack_at(16,90)）判定错位，
+            // 点选项会被误判为"点外部"导致浮层收起且不选中。
+            let popup_abs = Rect::new(
+                self.abs_base.x + popup_pos.x,
+                self.abs_base.y + popup_pos.y,
+                popup_size.x,
+                popup_size.y,
+            );
+            let btn_abs = Rect::new(
+                self.abs_base.x + rect.x,
+                self.abs_base.y + rect.y,
+                rect.w,
+                rect.h,
+            );
             if btn.down_edge()
                 && !hit_test(&popup_abs, self.mouse_logical)
-                && !hit_test(&rect, self.mouse_logical)
+                && !hit_test(&btn_abs, self.mouse_logical)
             {
                 self.state.combo_open = None;
             }
@@ -2272,9 +2428,19 @@ impl Ui<'_> {
     pub(crate) fn button_at(&mut self, id: &str, rect: Rect, label: &str) -> ButtonState {
         let hit = self.hit_abs(&rect);
         let btn = self.mouse_left();
+        // 键盘激活（Enter/Space + 焦点）→ 视为点击；先取出（不借用 self）
+        let key_click = self.key_click(id, FocusKind::Button);
+        if key_click {
+            self.any_pressed = true;
+        }
         {
             let ws = self.state.widgets.entry(id.to_owned()).or_default();
-            let ev = update_interact(ws, hit, btn);
+            let mut ev = update_interact(ws, hit, btn);
+            if key_click {
+                // 焦点键盘点击：合成 pressed + clicked（触发本帧回调）。
+                ws.pressed = true;
+                ev.clicked = true;
+            }
             if ev.pressed {
                 self.any_pressed = true;
             }
@@ -2341,6 +2507,16 @@ impl Ui<'_> {
             let t = normalize_x(&rect, self.mouse_local_x());
             new_value = lo + t * span;
         }
+        // 键盘：焦点下滑块用左右方向键调值（步进 = 范围的 5%，即时生效）。
+        if self.focused_is(id) && span.abs() > f32::EPSILON {
+            let step = span * 0.05;
+            if self.keyboard.get(KeyCode::ArrowLeft).down_edge() {
+                new_value = (new_value - step).clamp(lo, hi);
+            }
+            if self.keyboard.get(KeyCode::ArrowRight).down_edge() {
+                new_value = (new_value + step).clamp(lo, hi);
+            }
+        }
         let t = if span.abs() > f32::EPSILON {
             ((new_value - lo) / span).clamp(0.0, 1.0)
         } else {
@@ -2405,10 +2581,21 @@ impl Ui<'_> {
     ) -> CheckboxState {
         let hit = self.hit_abs(&rect);
         let btn = self.mouse_left();
-        let ev = {
+        let key_click = self.key_click(id, FocusKind::Checkbox);
+        if key_click {
+            self.any_pressed = true;
+        }
+        let mut ev = {
             let ws = self.state.widgets.entry(id.to_owned()).or_default();
-            update_interact(ws, hit, btn)
+            let ev = update_interact(ws, hit, btn);
+            if key_click {
+                ws.pressed = true;
+            }
+            ev
         };
+        if key_click {
+            ev.clicked = true;
+        }
         if ev.pressed {
             self.any_pressed = true;
         }
@@ -2430,10 +2617,21 @@ impl Ui<'_> {
     ) -> CheckboxState {
         let hit = self.hit_abs(&rect);
         let btn = self.mouse_left();
-        let ev = {
+        let key_click = self.key_click(id, FocusKind::Radio);
+        if key_click {
+            self.any_pressed = true;
+        }
+        let mut ev = {
             let ws = self.state.widgets.entry(id.to_owned()).or_default();
-            update_interact(ws, hit, btn)
+            let ev = update_interact(ws, hit, btn);
+            if key_click {
+                ws.pressed = true;
+            }
+            ev
         };
+        if key_click {
+            ev.clicked = true;
+        }
         if ev.pressed {
             self.any_pressed = true;
         }
@@ -2532,6 +2730,8 @@ impl Ui<'_> {
     pub(crate) fn text_input_at(&mut self, id: &str, rect: Rect, value: &mut String) {
         let hit = self.hit_abs(&rect);
         let btn = self.mouse_left();
+        // 登记焦点链（Tab/方向键可遍历到输入框）。
+        self.register_focus(id, rect, FocusKind::TextInput);
         let mouse_local_x = self.mouse_local_x();
         // 提前测量（避免在 ws 借用期间调用 &mut self 方法）
         let input_style = self.theme.input.clone();

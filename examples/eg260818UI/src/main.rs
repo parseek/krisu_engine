@@ -8,13 +8,15 @@
 //!   "背景/图形 → 文字"顺序绘制（不做元素重叠处理）
 //! - **pack**：左侧主菜单（标题 / 按钮 / 滑块 / 勾选框 / 单选组）垂直堆叠
 //! - **grid**：背包 3 列均匀网格（单元格尺寸跨帧缓存），点击格子切换
-//! - **place**：顶部状态栏（FPS / 玩家名输入框）与底部说明绝对定位
+//! - **place**：顶部状态栏（渐变背景 + 玩家名输入框）与底部说明绝对定位
+//! - **键盘导航**：Tab / Shift+Tab / 方向键遍历焦点（青色描边），Enter / Space 激活、
+//!   左右键调滑块、下拉框展开时方向键切选项、Esc 收起/失焦
 //! - **输入屏蔽**：文本输入框聚焦时（`UiState::capturing_text()`）屏蔽应用快捷键
 //!   （输入 `R` / `Esc` 不再触发重置 / 退出）
 //! - **IME**：中文输入支持（上屏 + 组合候选 + 候选框定位到输入框光标）
 //!
-//! 操作：鼠标点击 / 拖拽 · 拖动面板与窗口 · 点击窗口置顶 · 输入框打字（IME 已支持，
-//! Enter / Esc 失焦） · `R` 重置 UI 状态 · `Esc` 退出
+//! 操作：鼠标点击 / 拖拽 · 键盘 Tab/方向键/Enter/Space/Esc · 输入框打字（IME 已支持，
+//! Enter / Esc 失焦） · `R` 重置 UI 状态 · `Esc`（先失焦）退出
 
 use glam::Vec2;
 use rjw_2d_render::{ClearConfig, Render2D, SpriteRect};
@@ -164,11 +166,9 @@ impl App for UiApp {
             .map(|(id, z)| format!("{id} (z{z})"))
             .unwrap_or_else(|| "无".to_owned());
         let prev_blocked = self.ui_state.occluded_hits();
-        // 渲染增强演示：Theme 圆角（面板 / 按钮 / 输入框）+ 渐变状态栏背景。
-        let mut theme = Theme::dark();
-        theme.panel.radius = 8.0;
-        theme.button.radius = 6.0;
-        theme.input.radius = 4.0;
+        // 渲染增强演示：渐变状态栏背景（圆角样式已弃用——默认 radius=0 方形路径，
+        // 不再生成程序化圆角纹理）。
+        let theme = Theme::dark();
         let mut ui = Ui::begin(window, &self.cam, &ctx.mouse, &ctx.keyboard, font, r2d_ui, &mut self.ui_state)
             .theme(theme)
             .base_layer(LAYER_UI)
@@ -186,7 +186,6 @@ impl App for UiApp {
                 (1.0, Color::rgba_u8(26, 34, 60, 255)),
             ],
         );
-        ui.rounded_rect_at(Vec2::new(240.0, 14.0), Vec2::new(64.0, 28.0), 14.0, Color::rgba_u8(200, 90, 90, 255));
         ui.label_at(Vec2::new(16.0, 12.0), &format!("FPS: {:.0}", ctx.timer.get_fps()));
         ui.label_at(Vec2::new(16.0, 34.0), &format!("点击次数: {}", self.clicks));
         ui.panel_at(Vec2::new(200.0, 12.0), |p| {
@@ -307,7 +306,7 @@ impl App for UiApp {
         // ── place：底部说明 ───────────────────────────────────
         ui.label_at(
             Vec2::new(16.0, 690.0),
-            "点击窗口置顶 · 拖动面板/窗口 · 输入框打字（IME 已支持，Enter/Esc 失焦） · 右侧滚动列表 · R 重置 · Esc 退出",
+            "Tab/方向键 遍历焦点 · Enter/Space 激活 · 左右键调滑块 · Esc 收起/失焦（再按退出） · 点击置顶 · R 重置",
         );
 
         ui.finish();

@@ -734,10 +734,11 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 
 ### 样式（`Theme`，可 clone 覆盖）
 
-`Theme { label, panel, button, slider, input, checkbox, debug, gap }`，子样式见 `crates/rjw_ui/src/style.rs`：
+`Theme { label, panel, button, slider, input, checkbox, debug, focus, gap }`，子样式见 `crates/rjw_ui/src/style.rs`：
 `LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**）、`ButtonStyle`（三态 bg + padding + **radius**）、
 `SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/padding_x/height/min_w + **radius**）、
-`CheckboxStyle`（box_size/checked_fill/gap）、`DebugStyle`（layout_outline / layout_outline_width）。
+`CheckboxStyle`（box_size/checked_fill/gap）、`DebugStyle`（layout_outline / layout_outline_width）、
+`FocusStyle`（color / width，键盘导航焦点描边）。
 `Theme::default()` 浅色，`Theme::dark()` 深色。
 
 > **圆角半径**（`radius`，逻辑像素，默认 0 = 直角）：面板 / 窗口 / 按钮 / 输入框的
@@ -760,6 +761,31 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 
 > DebugDraw 图元（`ui.debug_*`）的样式 = **每次调用显式传参**（`color` + `width`，逻辑像素）；
 > 需要统一样式时自建常量保存后传入。
+
+#### 焦点样式（`FocusStyle`，键盘导航）
+
+| 字段 | 类型 / 默认 | 说明 |
+|---|---|---|
+| `color` | `Color` = 青色（dark 主题下亮青） | 当前焦点控件的描边颜色 |
+| `width` | `f32` = 1.0 | 焦点描边宽度（**逻辑像素**，内部 × scale 取整） |
+
+### 键盘导航（焦点遍历）
+
+交互控件（按钮 / 勾选 / 单选 / 滑块 / 输入框 / 下拉框 / 列表项按钮）每帧注册进
+**焦点链**（[`rjw_ui::focus`]，按 `(win, 录制序)` 排序），`UiState.focused` 即当前焦点：
+
+| 按键 | 行为 |
+|---|---|
+| `Tab` | 焦点链**下一个**（环绕） |
+| `Shift + Tab` | 焦点链**上一个**（环绕） |
+| `↑ / ↓` | 焦点链上 / 下一个（同 Shift+Tab / Tab） |
+| `Enter / Space` | **激活**焦点控件：按钮点击、勾选/单选切换、下拉框展开/收起（输入框与滑块除外） |
+| `← / →` | 焦点为**滑块**时调值（步进 = 范围 5%）；焦点为输入框时移动光标（原有） |
+| `Esc` | 收起展开的下拉框；否则**取消焦点**（输入框内原有行为不变；应用快捷键需在 `capturing_text()` 为 false 时处理） |
+
+- 焦点控件画一圈**描边**（`Theme::focus` / `FocusStyle`），裁剪沿用控件自身（滚动容器内正确）；
+- 焦点控件本帧未录制（窗口关闭等）自动清除焦点；`Tab` 从链首重新开始；
+- 示例 `eg260818UI`：Tab 遍历主菜单 → 背包 → 窗口 A/B → 列表 → 下拉框，全程键盘可操作。
 
 ### 渲染增强（圆角 / 渐变，程序化纹理进动态 Atlas）
 

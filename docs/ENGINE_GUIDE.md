@@ -1088,9 +1088,35 @@ ui.scroll_at(Vec2::new(880.0, 130.0), Vec2::new(240.0, 300.0), "scroll_demo", |s
 - 维护约定：新增控件时，录制命令必须带上 `self.clip`（`UiDraw.clip` 字段），
   否则滚动容器内无法裁剪；`UiDraw::translate` 会同步平移 `clip`。
 
-### 18.8 维护约定（对 AI）
+### 18.8 键盘导航（焦点遍历）
 
-- 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
+交互控件（按钮 / 勾选 / 单选 / 滑块 / 输入框 / 下拉框）录制时调用 `Ui::register_focus`
+登记进**本帧焦点链**（`focus.rs` 的 `FocusEntry`：id / 窗口 z / 类型 / **绝对逻辑矩形** /
+裁剪）。`finish` 末尾 `handle_focus_keys`：
+
+1. 链按 `(win, 注册序)` 稳定排序（非窗口 0 在前，窗口按 z 从下到上）；
+2. **Tab / Shift+Tab / ↑ / ↓** → `focus_step`（纯函数，可单测）取下一个焦点，
+   更新 `UiState.focused`（跨帧持久）；焦点控件本帧未录制 → 自动清除焦点；
+3. **Esc** → 优先收起展开的下拉框（`UiState.combo_open`），否则取消焦点；
+4. **焦点描边**：对焦点控件画一圈 `DrawKind::Border`（`Theme::focus` 样式），
+   `elem = self.seq + 1`（全局最大 → 画在窗口内容之上），`clip` 沿用控件自身。
+
+**激活与调值**（控件录制时即时处理，无跨帧延迟）：
+
+- **Enter / Space**：`Ui::key_click(id, kind)`（焦点匹配 + 非 IME 组合中）→ 按钮 /
+  勾选 / 单选 / 下拉框合成一次 clicked（`key_click` 排除 TextInput / Slider）；
+- **← / →**：焦点为滑块时步进调值（`span × 5%`）；焦点为输入框时移动光标（原有）；
+- **↑ / ↓**：下拉框展开且焦点在按钮上时循环切换选项（选中即收起）；
+- 文本输入框内 Tab 照常遍历焦点（`get_chars` 已过滤 `\t` 控制字符，不会插入制表符）；
+  Enter / Esc 失焦行为保持不变（应用快捷键需检查 `capturing_text()`）。
+
+> ⚠️ 焦点是**跨帧持久状态**（`UiState.focused`），但焦点链**每帧重建**（immediate-mode：
+> 控件动态增删自动反映）；焦点描边改变窗口内容签名 → 窗口顶点缓存自动失效重建。
+
+### 18.9 维护约定（对 AI）
+
+- 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `widget_api!` 宏里加便捷方法（Panel / Pack / Grid 自动获得）。
+- 新增**交互**控件时必须调用 `register_focus(id, rect, FocusKind::X)`（键盘导航 / 焦点描边）；需要 Enter/Space 激活的控件用 `key_click(id, kind)` 合成点击。
 - 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
 - 网格 cell 缓存（`UiState::grid_cells`）保证跨帧布局稳定；无缓存首帧渐进扩展，次帧起稳定。

@@ -32,6 +32,10 @@
 //! - **滚动容器**：[`Ui::scroll_at`]——内容在可视区内堆叠 + 滚轮 / 滚动条
 //!   （拖 thumb、点轨道翻页）滚动，可视区外**裁剪**（`UiDraw.clip` 绝对逻辑矩形，
 //!   收集期与内容求交）；滚动偏移持久于 [`UiState::scrolls`]。
+//! - **键盘导航**：**Tab / Shift+Tab / 方向键**遍历焦点链（[`UiState::focused`]），
+//!   **Enter / Space** 激活焦点控件（按钮 / 勾选 / 单选 / 下拉框），滑块用左右方向键
+//!   调值、下拉框展开时上下方向键切换选项，**Esc** 收起浮层 / 取消焦点；焦点控件
+//!   画描边（`Theme::focus`，[`crate::style::FocusStyle`]）。
 //!
 //! # 快速上手
 //!
@@ -69,9 +73,11 @@
 //! - [`style`]：`Theme` 样式系统
 //! - [`state`]：`UiState` 持久状态 + `ButtonState` / `CheckboxState`
 //! - [`hit`]：命中测试与交互状态机
+//! - [`focus`]：键盘导航（焦点链 / [`focus_step`]）
 //! - [`draw`]：屏幕固定变换与绘制命令
 
 pub mod draw;
+pub mod focus;
 pub mod hit;
 pub mod layout;
 pub mod proc;
