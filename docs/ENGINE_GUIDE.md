@@ -1067,7 +1067,28 @@ ui.gradient_rect_at(Vec2::new(0.0, 0.0), Vec2::new(1280.0, 56.0),
   比较而排序错位（背景不会盖住文字）。窗口顶点缓存（`UiState.window_quads`）同步
   携带分组。
 
-### 18.7 维护约定（对 AI）
+### 18.7 滚动容器（scroll_at）
+
+```rust
+ui.scroll_at(Vec2::new(880.0, 130.0), Vec2::new(240.0, 300.0), "scroll_demo", |s| {
+    s.label("滚动列表");
+    for i in 0..40 {
+        s.button(&format!("log_{i}"), &format!("日志条目 {i}"));
+    }
+});
+```
+
+- 内容在可视区内 **pack Top 堆叠**（子项 `s.label` / `s.button` 等占光标），超出部分
+  滚动查看：**滚轮**（鼠标在可视区内）+ 右侧**滚动条**（拖 thumb 按比例滚动、点轨道
+  翻页）；滚动偏移持久于 `UiState.scrolls`（`id` 键，跨帧，含内容高供 clamp）；
+- **裁剪**：`scroll_at` 把可视区（∩ 外层裁剪）设为 `Ui.clip`，录制命令时写入
+  `UiDraw.clip`（**绝对逻辑屏幕坐标**，随容器平移），`collect_cmds` 收集期与内容矩形
+  求交（[`draw::intersect_rect`]）——Solid / RoundedRect / Gradient / Border / Caret
+  按交集绘制，Text 把外层裁剪转相对文本块后与命令自带裁剪合并（`draw_text_quads`）；
+- 维护约定：新增控件时，录制命令必须带上 `self.clip`（`UiDraw.clip` 字段），
+  否则滚动容器内无法裁剪；`UiDraw::translate` 会同步平移 `clip`。
+
+### 18.8 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `widget_api!` 宏里加便捷方法（Panel / Pack / Grid 自动获得）。

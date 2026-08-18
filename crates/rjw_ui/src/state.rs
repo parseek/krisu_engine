@@ -36,6 +36,15 @@ pub struct WidgetState {
     pub caret: usize,
 }
 
+/// 滚动容器状态（`UiState.scrolls`，跨帧持久）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollState {
+    /// 垂直滚动偏移（内容顶部相对可视区顶部；逻辑像素，已 clamp）。
+    pub offset: f32,
+    /// 内容总高（逻辑像素；clamp 上限 = max(0, content_h - view_h)）。
+    pub content_h: f32,
+}
+
 /// UI 全局持久状态（由应用持有，跨帧复用；一个 `UiState` 可对应多个 `Ui`）。
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
@@ -87,6 +96,8 @@ pub struct UiState {
     pub(crate) last_press_window: Option<(String, u32)>,
     /// **程序化纹理缓存**（圆角矩形 / 渐变 / WHITE）：塞进动态 Atlas，跨帧复用。
     pub(crate) proc: ProcTextures,
+    /// **滚动容器状态**：`scroll_at` 的 id → (偏移, 内容高)，跨帧持久。
+    pub(crate) scrolls: HashMap<String, ScrollState>,
 }
 
 impl UiState {
@@ -134,6 +145,7 @@ impl UiState {
         self.window_quads.clear();
         self.occluded_hits = 0;
         self.last_press_window = None;
+        self.scrolls.clear();
     }
 
     /// 是否正在**捕获键盘输入**（有文本输入框持有焦点）。

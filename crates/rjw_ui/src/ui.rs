@@ -32,8 +32,8 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window as WinitWindow;
 
 use crate::draw::{
-    border_rects, debug_shape_segments, screen_fixed_tf, snap_rect, text_block_offset, text_cmd,
-    DebugShape, DrawKind, GradientAxis, TextAlign, UiDraw,
+    border_rects, clipped, debug_shape_segments, intersect_rect, screen_fixed_tf, snap_rect,
+    text_block_offset, text_cmd, DebugShape, DrawKind, GradientAxis, TextAlign, UiDraw,
 };
 use crate::hit::{
     clear_frame_flags, hit_test, normalize_x, update_drag, update_interact, window_occluded,
@@ -158,6 +158,7 @@ impl<'a> UiInit<'a> {
             frames: Vec::new(),
             queue: Vec::new(),
             debug_queue: Vec::new(),
+            clip: None,
             abs_base: Vec2::ZERO,
             depth: 0,
             seq: 0,
@@ -198,6 +199,9 @@ pub struct Ui<'a> {
     /// **调试 UI 布局开关**（[`UiInit::debug_layout`] / [`Self::debug_layout`]）：
     /// 开启后每个录制命令的矩形都会画青色描边（布局 / 命中区域可视化）。
     debug_layout: bool,
+    /// **当前裁剪区**（**绝对逻辑屏幕坐标**；滚动容器 [`Self::scroll_at`] 等设置）。
+    /// 录制命令时存入 `UiDraw.clip`，收集期与内容求交（越界剔除）。
+    clip: Option<Rect>,
     /// 当前容器绝对原点（命中测试用，逻辑像素）。
     abs_base: Vec2,
     /// 当前录制深度（容器嵌套层数）。
@@ -324,6 +328,7 @@ impl<'a> Ui<'a> {
             elem: 0,
             // 调试形状自带几何（DebugShape），rect 字段未用。
             rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+            clip: None,
             kind: DrawKind::Debug { color, shape },
         });
     }
@@ -357,7 +362,7 @@ impl<'a> Ui<'a> {
         let seq = self.next_seq();
         let depth = self.depth;
         let win = self.cur_win;
-        self.queue.push(UiDraw { depth, seq, win, elem: 0, rect, kind });
+        self.queue.push(UiDraw { depth, seq, win, elem: 0, rect, clip: self.clip, kind });
     }
 
     /// 按样式 push **背景 + 边框**（`radius > 0` 走双层圆角矩形：外圈 border 色、
@@ -376,6 +381,7 @@ impl<'a> Ui<'a> {
         let seq = self.next_seq();
         let depth = self.depth;
         let win = self.cur_win;
+        let clip = self.clip;
         if radius > 0.0 {
             // 圆角边框 ≈ 外圈 border 色圆角 + 内圈 bg 色圆角（内缩 border_w）。
             self.queue.push(UiDraw {
@@ -384,6 +390,7 @@ impl<'a> Ui<'a> {
                 win,
                 elem,
                 rect,
+                clip,
                 kind: DrawKind::RoundedRect { color: border, radius: radius + border_w },
             });
             let bw = border_w.min(rect.w * 0.5).min(rect.h * 0.5);
@@ -400,6 +407,7 @@ impl<'a> Ui<'a> {
                     win,
                     elem,
                     rect: inner,
+                    clip,
                     kind: DrawKind::RoundedRect { color: bg, radius },
                 });
             }
@@ -410,6 +418,7 @@ impl<'a> Ui<'a> {
                 win,
                 elem,
                 rect,
+                clip,
                 kind: DrawKind::Solid(bg),
             });
             if border_w > 0.0 {
@@ -419,6 +428,7 @@ impl<'a> Ui<'a> {
                     win,
                     elem,
                     rect,
+                    clip,
                     kind: DrawKind::Border { color: border, width: border_w },
                 });
             }
@@ -603,6 +613,157 @@ impl<'a> Ui<'a> {
         (size, max_child)
     }
 
+    /// **滚动容器**：内容在 `view_size` 可视区内垂直堆叠（pack Top），超出部分
+    /// 滚动查看——**滚轮**滚动 + 右侧**滚动条**（拖 thumb / 点轨道翻页）。
+    ///
+    /// - `id`：滚动偏移状态键（[`UiState::scrolls`]，跨帧持久）；
+    /// - 内容子项照常录制（`s.label` / `s.button` 等，占光标堆叠）；
+    /// - 可视区之外的图形/文字**裁剪**（`UiDraw.clip` 绝对逻辑矩形，收集期求交）；
+    /// - 返回 `view_size`（内容尺寸超出时可经 [`UiState::scrolls`] 读取）。
+    pub fn scroll_at(
+        &mut self,
+        pos: Vec2,
+        view_size: Vec2,
+        id: &str,
+        f: impl FnOnce(&mut Scroll<'_, '_>),
+    ) -> Vec2 {
+        let saved_clip = self.clip;
+        let view_abs = Rect::new(pos.x, pos.y, view_size.x.max(0.0), view_size.y.max(0.0));
+        // 裁剪区 = 外层裁剪 ∩ 本可视区（绝对逻辑）。
+        self.clip = match saved_clip {
+            Some(c) => intersect_rect(&c, &view_abs),
+            None => Some(view_abs),
+        };
+        // 滚动偏移（跨帧状态；先 Copy 读出，`f` 结束再写回——避免借用冲突）。
+        let mut offset = self
+            .state
+            .scrolls
+            .get(id)
+            .map(|s| s.offset)
+            .unwrap_or(0.0);
+        // 内容 pack 堆叠（手动管理帧栈：平移 = pos - offset，而非 container 的 pos）。
+        let start = self.queue.len();
+        let saved_base = self.abs_base;
+        self.abs_base = saved_base + pos;
+        self.frames.push(Frame::new_stack(PackSide::Top, self.theme.gap, 0.0));
+        self.depth += 1;
+        f(&mut Scroll { ui: self });
+        let frame = self.frames.pop().expect("scroll frame");
+        let content_size = frame.settle_size();
+        self.depth -= 1;
+        self.abs_base = saved_base;
+        let max_off = (content_size.y - view_size.y).max(0.0);
+        offset = offset.clamp(0.0, max_off);
+        // 滚轮（鼠标在可视区内且未被窗口遮挡；wheel y 向上为正 → offset 减小）。
+        let hit = hit_test(&view_abs, self.mouse_logical)
+            && self.mouse_in_window
+            && !window_occluded(self.cur_win, self.mouse_logical, self.window_rects_iter());
+        if hit {
+            let (_, wy) = self.mouse.get_mouse_wheel_delta();
+            if wy != 0.0 {
+                offset = (offset - wy as f32 * 40.0).clamp(0.0, max_off);
+            }
+        }
+        // 滚动条（内容超出可视区时显示；拖 thumb / 点轨道翻页）。
+        if content_size.y > view_size.y + 1.0 && view_size.y > 0.0 {
+            offset = self.scrollbar(id, &view_abs, view_size.y, content_size.y, offset, max_off, saved_clip);
+        }
+        // 写回滚动状态（`f` 借用已结束）。
+        let st = self.state.scrolls.entry(id.to_owned()).or_default();
+        st.offset = offset;
+        st.content_h = content_size.y;
+        // 平移子命令：内容上移 offset（clip 随 translate 同步平移）。
+        for d in &mut self.queue[start..] {
+            d.translate(pos - Vec2::new(0.0, offset));
+        }
+        self.clip = saved_clip;
+        view_size
+    }
+
+    /// 滚动条：右侧竖条（轨道 + thumb）。返回更新后的滚动偏移。
+    #[allow(clippy::too_many_arguments)]
+    fn scrollbar(
+        &mut self,
+        id: &str,
+        view: &Rect,
+        view_h: f32,
+        content_h: f32,
+        offset: f32,
+        max_off: f32,
+        outer_clip: Option<Rect>,
+    ) -> f32 {
+        const SB_W: f32 = 8.0;
+        let mut offset = offset;
+        let track = Rect::new(view.x + view.w - SB_W, view.y, SB_W, view_h);
+        let ratio = (view_h / content_h).clamp(0.0, 1.0);
+        let thumb_h = (view_h * ratio).max(16.0);
+        let thumb_y = view.y + if max_off > 1e-6 {
+            offset / max_off * (view_h - thumb_h)
+        } else {
+            0.0
+        };
+        let thumb = Rect::new(track.x, thumb_y, track.w, thumb_h);
+        // 绘制：轨道 + thumb（白纹理图形，elem=0 装饰层）。
+        let depth = self.depth;
+        let win = self.cur_win;
+        let seq = self.next_seq();
+        self.queue.push(UiDraw {
+            depth,
+            seq,
+            win,
+            elem: 0,
+            rect: track,
+            clip: outer_clip,
+            kind: DrawKind::Solid(self.theme.slider.track),
+        });
+        self.queue.push(UiDraw {
+            depth,
+            seq: seq + 1,
+            win,
+            elem: 0,
+            rect: thumb,
+            clip: outer_clip,
+            kind: DrawKind::Solid(self.theme.slider.handle),
+        });
+        // 交互：thumb 拖拽（复用 WidgetState.press_panel/press_mouse 基准）。
+        let bar_id = format!("{id}::bar");
+        let bar_hit = hit_test(&thumb, self.mouse_logical)
+            && self.mouse_in_window
+            && !window_occluded(win, self.mouse_logical, self.window_rects_iter());
+        let btn = self.mouse_left();
+        let grab = {
+            let ws = self.state.widgets.entry(bar_id.clone()).or_default();
+            let dragging = update_drag(ws, bar_hit, btn);
+            if btn.down_edge() && bar_hit {
+                ws.press_mouse = Some(self.mouse_screen.round());
+                ws.press_panel = Some(Vec2::new(thumb_y, offset));
+            }
+            (dragging, ws.press_panel.unwrap_or(Vec2::ZERO))
+        };
+        if grab.0 {
+            let pm = self
+                .state
+                .widgets
+                .get(&bar_id)
+                .and_then(|w| w.press_mouse)
+                .unwrap_or(self.mouse_screen);
+            let dy = (self.mouse_screen.y - pm.y).round() / self.scale;
+            offset = (grab.1.y + dy / (view_h - thumb_h).max(1.0) * max_off).clamp(0.0, max_off);
+        }
+        // 轨道点击（thumb 外）→ 翻页。
+        let hit_track = hit_test(&track, self.mouse_logical)
+            && self.mouse_in_window
+            && !window_occluded(win, self.mouse_logical, self.window_rects_iter());
+        if btn.down_edge() && hit_track && !bar_hit {
+            if self.mouse_logical.y < thumb_y {
+                offset = (offset - view_h).max(0.0);
+            } else if self.mouse_logical.y > thumb_y + thumb_h {
+                offset = (offset + view_h).min(max_off);
+            }
+        }
+        offset
+    }
+
     // ── 顶层入口（*_at：位置显式，尺寸自动） ─────────────────
 
     /// 绝对定位标签（`pos` 相对当前容器内容原点；顶层即屏幕原点）。
@@ -624,6 +785,7 @@ impl<'a> Ui<'a> {
             TextAlign::from(style.align),
             style.font_family.clone(),
             None,
+            self.clip,
         ));
         size
     }
@@ -1094,34 +1256,91 @@ impl<'a> Ui<'a> {
             None
         };
         for d in cmds {
+            // 裁剪区（绝对物理；内容已随容器平移成绝对逻辑坐标）。
+            let clip_abs = d.clip.map(|c| snap_rect(&self.phys_rect(&c)));
             match &d.kind {
                 DrawKind::Solid(color) => {
                     if d.rect.w > 0.0 && d.rect.h > 0.0 {
                         let pr = snap_rect(&self.phys_rect(&d.rect));
-                        quads.push_white(
-                            win,
-                            Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h),
-                            *color,
-                        );
-                        debug_layout_outline(quads, win, anchor_px, pr, dbg);
+                        if let Some(r) = clipped(pr, clip_abs) {
+                            quads.push_white(
+                                win,
+                                Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h),
+                                *color,
+                            );
+                            debug_layout_outline(quads, win, anchor_px, r, dbg);
+                        }
                     }
                 }
                 DrawKind::RoundedRect { color, radius } => {
                     let pr = snap_rect(&self.phys_rect(&d.rect));
-                    if pr.w > 0.0 && pr.h > 0.0 {
-                        let local = Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h);
-                        // 半径转物理像素并 clamp（与生成纹理时的 clamp 一致）。
-                        let r = (*radius * self.scale)
-                            .clamp(0.0, crate::proc::ROUNDED_TEX_SIZE as f32 * 0.5 - 1.0)
-                            .max(0.0);
-                        if r <= 0.0 {
-                            quads.push_white(win, local, *color);
-                        } else {
+                    if let Some(local) = clipped(pr, clip_abs).map(|r| {
+                        Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
+                    }) {
+                        if local.w > 0.0 && local.h > 0.0 {
+                            // 半径转物理像素并 clamp（与生成纹理时的 clamp 一致）。
+                            let r = (*radius * self.scale)
+                                .clamp(0.0, crate::proc::ROUNDED_TEX_SIZE as f32 * 0.5 - 1.0)
+                                .max(0.0);
+                            if r <= 0.0 {
+                                quads.push_white(win, local, *color);
+                            } else {
+                                let device = self.r2d.device();
+                                let queue = self.r2d.queue();
+                                let layout = self.r2d.tex_bind_group_layout();
+                                if let Some((tex_uid, region)) =
+                                    self.state.proc.rounded(device, queue, layout, r)
+                                {
+                                    if let Some(tex) = TEXTURES.get(tex_uid) {
+                                        let inv_page = 1.0 / tex.width as f32;
+                                        let base = Vec2::new(
+                                            region.tl_px.0 as f32,
+                                            region.tl_px.1 as f32,
+                                        ) * inv_page;
+                                        let tex_wh = Vec2::new(
+                                            region.wh_px.0 as f32,
+                                            region.wh_px.1 as f32,
+                                        ) * inv_page;
+                                        // 9-patch：四角原样、四边/中心拉伸（任意尺寸圆弧不畸变）。
+                                        for (mr, uvtl, uvwh) in crate::proc::rounded_9patch(
+                                            local,
+                                            r,
+                                            crate::proc::ROUNDED_TEX_SIZE,
+                                            r,
+                                        ) {
+                                            if mr.w <= 0.0 || mr.h <= 0.0 {
+                                                continue;
+                                            }
+                                            quads.push_tex_rect(
+                                                win,
+                                                tex_uid,
+                                                base + uvtl * tex_wh,
+                                                uvwh * tex_wh,
+                                                mr,
+                                                *color,
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    quads.push_white(win, local, *color);
+                                }
+                            }
+                            debug_layout_outline(quads, win, anchor_px, pr, dbg);
+                        }
+                    }
+                }
+                DrawKind::Gradient { axis, stops } => {
+                    let pr = snap_rect(&self.phys_rect(&d.rect));
+                    if let Some(local) = clipped(pr, clip_abs).map(|r| {
+                        Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
+                    }) {
+                        if local.w > 0.0 && local.h > 0.0 {
+                            let vertical = matches!(axis, GradientAxis::Vertical);
                             let device = self.r2d.device();
                             let queue = self.r2d.queue();
                             let layout = self.r2d.tex_bind_group_layout();
                             if let Some((tex_uid, region)) =
-                                self.state.proc.rounded(device, queue, layout, r)
+                                self.state.proc.gradient(device, queue, layout, vertical, stops)
                             {
                                 if let Some(tex) = TEXTURES.get(tex_uid) {
                                     let inv_page = 1.0 / tex.width as f32;
@@ -1133,70 +1352,32 @@ impl<'a> Ui<'a> {
                                         region.wh_px.0 as f32,
                                         region.wh_px.1 as f32,
                                     ) * inv_page;
-                                    // 9-patch：四角原样、四边/中心拉伸（任意尺寸圆弧不畸变）。
-                                    for (mr, uvtl, uvwh) in crate::proc::rounded_9patch(
+                                    // 整矩形拉伸采样渐变纹理（主轴 64 级已平滑）。
+                                    quads.push_tex_rect(
+                                        win,
+                                        tex_uid,
+                                        base,
+                                        tex_wh,
                                         local,
-                                        r,
-                                        crate::proc::ROUNDED_TEX_SIZE,
-                                        r,
-                                    ) {
-                                        if mr.w <= 0.0 || mr.h <= 0.0 {
-                                            continue;
-                                        }
-                                        quads.push_tex_rect(
-                                            win,
-                                            tex_uid,
-                                            base + uvtl * tex_wh,
-                                            uvwh * tex_wh,
-                                            mr,
-                                            *color,
-                                        );
-                                    }
+                                        Color::WHITE,
+                                    );
                                 }
-                            } else {
-                                quads.push_white(win, local, *color);
                             }
+                            debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
-                        debug_layout_outline(quads, win, anchor_px, pr, dbg);
-                    }
-                }
-                DrawKind::Gradient { axis, stops } => {
-                    let pr = snap_rect(&self.phys_rect(&d.rect));
-                    if pr.w > 0.0 && pr.h > 0.0 {
-                        let local = Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h);
-                        let vertical = matches!(axis, GradientAxis::Vertical);
-                        let device = self.r2d.device();
-                        let queue = self.r2d.queue();
-                        let layout = self.r2d.tex_bind_group_layout();
-                        if let Some((tex_uid, region)) =
-                            self.state.proc.gradient(device, queue, layout, vertical, stops)
-                        {
-                            if let Some(tex) = TEXTURES.get(tex_uid) {
-                                let inv_page = 1.0 / tex.width as f32;
-                                let base = Vec2::new(
-                                    region.tl_px.0 as f32,
-                                    region.tl_px.1 as f32,
-                                ) * inv_page;
-                                let tex_wh = Vec2::new(
-                                    region.wh_px.0 as f32,
-                                    region.wh_px.1 as f32,
-                                ) * inv_page;
-                                // 整矩形拉伸采样渐变纹理（主轴 64 级已平滑）。
-                                quads.push_tex_rect(win, tex_uid, base, tex_wh, local, Color::WHITE);
-                            }
-                        }
-                        debug_layout_outline(quads, win, anchor_px, pr, dbg);
                     }
                 }
                 DrawKind::Border { color, width } => {
                     let pr = snap_rect(&self.phys_rect(&d.rect));
-                    let local = Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h);
-                    for r in border_rects(&local, self.phys_f(*width).round()) {
-                        if r.w > 0.0 && r.h > 0.0 {
-                            quads.push_white(win, r, *color);
+                    if let Some(r) = clipped(pr, clip_abs) {
+                        let local = Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h);
+                        for br in border_rects(&local, self.phys_f(*width).round()) {
+                            if br.w > 0.0 && br.h > 0.0 {
+                                quads.push_white(win, br, *color);
+                            }
                         }
+                        debug_layout_outline(quads, win, anchor_px, pr, dbg);
                     }
-                    debug_layout_outline(quads, win, anchor_px, pr, dbg);
                 }
                 DrawKind::Text {
                     text,
@@ -1206,6 +1387,17 @@ impl<'a> Ui<'a> {
                     family,
                     clip,
                 } => {
+                    // 外层裁剪（绝对逻辑）→ 相对文本块左上角（与 DrawKind::Text::clip 同空间），
+                    // 与命令自带裁剪求交后传给 draw_text_quads。
+                    let merged = match d.clip.map(|c| {
+                        Rect::new(c.x - d.rect.x, c.y - d.rect.y, c.w, c.h)
+                    }) {
+                        Some(outer) => match clip {
+                            Some(inner) => intersect_rect(&outer, inner),
+                            None => Some(outer),
+                        },
+                        None => *clip,
+                    };
                     self.draw_text_quads(
                         quads,
                         win,
@@ -1216,7 +1408,7 @@ impl<'a> Ui<'a> {
                         *color,
                         *align,
                         family.as_deref(),
-                        *clip,
+                        merged,
                     );
                     let pr = snap_rect(&self.phys_rect(&d.rect));
                     debug_layout_outline(quads, win, anchor_px, pr, dbg);
@@ -1224,13 +1416,15 @@ impl<'a> Ui<'a> {
                 DrawKind::Caret { color, width } => {
                     let r = Rect::new(d.rect.x, d.rect.y, *width, d.rect.h);
                     let pr = snap_rect(&self.phys_rect(&r));
-                    if pr.w > 0.0 && pr.h > 0.0 {
-                        quads.push_white(
-                            win,
-                            Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h),
-                            *color,
-                        );
-                        debug_layout_outline(quads, win, anchor_px, pr, dbg);
+                    if let Some(rr) = clipped(pr, clip_abs) {
+                        if rr.w > 0.0 && rr.h > 0.0 {
+                            quads.push_white(
+                                win,
+                                Rect::new(rr.x - anchor_px.x, rr.y - anchor_px.y, rr.w, rr.h),
+                                *color,
+                            );
+                            debug_layout_outline(quads, win, anchor_px, pr, dbg);
+                        }
                     }
                 }
                 DrawKind::Debug { color, shape } => {
@@ -1716,6 +1910,7 @@ macro_rules! widget_api {
                     TextAlign::from(style.align),
                     style.font_family.clone(),
                     None,
+                    self.ui.clip,
                 ));
                 size
             }
@@ -1901,6 +2096,12 @@ pub struct Window<'ui, 'a> {
 }
 widget_api!(Window);
 
+/// 滚动容器（内容在可视区内堆叠 + 滚动；见 [`Ui::scroll_at`]）。
+pub struct Scroll<'ui, 'a> {
+    ui: &'ui mut Ui<'a>,
+}
+widget_api!(Scroll);
+
 // ─── 控件实现（Ui 内部方法） ────────────────────────────────────
 
 impl Ui<'_> {
@@ -1942,6 +2143,7 @@ impl Ui<'_> {
                 TextAlign::Center,
                 style.font_family.clone(),
                 None,
+                self.clip,
             ));
             ButtonState {
                 hovered,
@@ -2004,6 +2206,7 @@ impl Ui<'_> {
                     win,
                     elem,
                     rect: r,
+                    clip: ui.clip,
                     kind: DrawKind::Solid(c),
                 });
             }
@@ -2019,6 +2222,7 @@ impl Ui<'_> {
                 win,
                 elem,
                 rect: handle_rect,
+                clip: self.clip,
                 kind: DrawKind::Border {
                     color: style.handle_border,
                     width: 1.0,
@@ -2112,6 +2316,7 @@ impl Ui<'_> {
             win,
             elem,
             rect: box_rect,
+            clip: self.clip,
             kind: DrawKind::Border {
                 color: style.box_border,
                 width: 1.0,
@@ -2132,6 +2337,7 @@ impl Ui<'_> {
                     win,
                     elem,
                     rect: inner,
+                    clip: self.clip,
                     kind: DrawKind::Solid(style.checked_fill),
                 });
             }
@@ -2155,6 +2361,7 @@ impl Ui<'_> {
             TextAlign::Left,
             style.font_family.clone(),
             None,
+            self.clip,
         ));
     }
 
@@ -2260,6 +2467,7 @@ impl Ui<'_> {
             TextAlign::Left,
             style.font_family.clone(),
             Some(clip),
+            self.clip,
         ));
         // 光标 x：**前缀实际宽度**（value 前 caret 个字符的测量宽度）——
         // 混合中英文（字宽不同）时光标精确对齐文本；preedit 绘制与光标共用。
@@ -2290,6 +2498,7 @@ impl Ui<'_> {
                             TextAlign::Left,
                             style.font_family.clone(),
                             Some(preedit_clip),
+                            self.clip,
                         ));
                     }
                 }
@@ -2321,6 +2530,7 @@ impl Ui<'_> {
                 win,
                 elem,
                 rect: caret_rect,
+                clip: self.clip,
                 kind: DrawKind::Caret {
                     color: style.caret,
                     width: 1.0,
@@ -2434,8 +2644,7 @@ mod tests {
                 win: 0,
                 elem: 1,
                 rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: DrawKind::Text {
-                    text: "t".into(),
+                clip: None,                kind: DrawKind::Text {                    text: "t".into(),
                     size: 14.0,
                     color: Color::WHITE,
                     align: TextAlign::Left,
@@ -2450,6 +2659,7 @@ mod tests {
                 elem: 1,
                 rect: Rect::new(0.0, 0.0, 1.0, 1.0),
                 kind: DrawKind::Solid(Color::WHITE),
+                clip: None,
             },
             UiDraw {
                 depth: 0,
@@ -2458,6 +2668,7 @@ mod tests {
                 elem: 2,
                 rect: Rect::new(0.0, 0.0, 1.0, 1.0),
                 kind: DrawKind::Solid(Color::WHITE),
+                clip: None,
             },
             UiDraw {
                 depth: 0,
@@ -2465,8 +2676,7 @@ mod tests {
                 win: 1,
                 elem: 2,
                 rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: DrawKind::Text {
-                    text: "w".into(),
+                clip: None,                kind: DrawKind::Text {                    text: "w".into(),
                     size: 14.0,
                     color: Color::WHITE,
                     align: TextAlign::Left,
@@ -2600,8 +2810,7 @@ mod tests {
                 win: 1,
                 elem: 1,
                 rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: DrawKind::Text {
-                    text: "a".into(),
+                clip: None,                kind: DrawKind::Text {                    text: "a".into(),
                     size: 14.0,
                     color: Color::WHITE,
                     align: TextAlign::Left,
@@ -2617,6 +2826,7 @@ mod tests {
                 elem: 2,
                 rect: Rect::new(0.0, 0.0, 1.0, 1.0),
                 kind: DrawKind::Solid(Color::WHITE),
+                clip: None,
             },
         ];
         cmds.sort_by_key(|d| (d.win, d.depth, d.elem, d.kind.group(), d.seq));
@@ -2630,8 +2840,7 @@ mod tests {
                 win: 1,
                 elem: 3,
                 rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: DrawKind::Text {
-                    text: "x".into(),
+                clip: None,                kind: DrawKind::Text {                    text: "x".into(),
                     size: 14.0,
                     color: Color::WHITE,
                     align: TextAlign::Left,
@@ -2646,6 +2855,7 @@ mod tests {
                 elem: 3,
                 rect: Rect::new(0.0, 0.0, 1.0, 1.0),
                 kind: DrawKind::Solid(Color::WHITE),
+                clip: None,
             },
         ];
         inner.sort_by_key(|d| (d.win, d.depth, d.elem, d.kind.group(), d.seq));

@@ -282,10 +282,21 @@ impl App for UiApp {
             ),
         );
 
+        // ── 滚动容器演示：可滚动按钮列表（滚轮 / 拖动滚动条 / 点轨道翻页）──
+        ui.scroll_at(Vec2::new(880.0, 130.0), Vec2::new(240.0, 300.0), "scroll_demo", |s| {
+            s.label("滚动列表（滚轮 / 滚动条）");
+            for i in 0..40 {
+                let label = format!("日志条目 {i}");
+                if s.button(&format!("log_{i}"), &label).clicked() {
+                    self.clicks += 1;
+                }
+            }
+        });
+
         // ── place：底部说明 ───────────────────────────────────
         ui.label_at(
             Vec2::new(16.0, 690.0),
-            "点击窗口置顶 · 拖动面板/窗口 · 输入框打字（IME 已支持，Enter/Esc 失焦） · R 重置 · Esc 退出",
+            "点击窗口置顶 · 拖动面板/窗口 · 输入框打字（IME 已支持，Enter/Esc 失焦） · 右侧滚动列表 · R 重置 · Esc 退出",
         );
 
         ui.finish();

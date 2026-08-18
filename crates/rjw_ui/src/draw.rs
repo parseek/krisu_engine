@@ -66,6 +66,29 @@ pub fn text_block_offset(align: TextAlign, content: Vec2, first_line_top: f32) -
     Vec2::new(off_x, off_y)
 }
 
+/// 两矩形求交（裁剪用；无交集返回 `None`）。纯函数（可单测）。
+#[inline]
+pub fn intersect_rect(a: &Rect, b: &Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.w).min(b.x + b.w);
+    let y1 = (a.y + a.h).min(b.y + b.h);
+    if x1 > x0 && y1 > y0 {
+        Some(Rect::new(x0, y0, x1 - x0, y1 - y0))
+    } else {
+        None
+    }
+}
+
+/// 物理矩形应用裁剪（`clip_abs` = 绝对物理；`None` 返回原矩形，`Some` 求交，空 = 全裁）。
+#[inline]
+pub(crate) fn clipped(pr: Rect, clip_abs: Option<Rect>) -> Option<Rect> {
+    match clip_abs {
+        Some(c) => intersect_rect(&pr, &c),
+        None => (pr.w > 0.0 && pr.h > 0.0).then_some(pr),
+    }
+}
+
 /// 边框四边（画在矩形内边缘；宽度 <= 0 或 宽度 >= 半尺寸时退化）。
 pub fn border_rects(rect: &Rect, width: f32) -> [Rect; 4] {
     let w = width.max(0.0);
@@ -244,6 +267,9 @@ pub struct UiDraw {
     /// 容器背景 / 边框等"容器装饰"用 `elem = 0`（恒画在本容器元素之下）。
     pub elem: u32,
     pub rect: Rect,
+    /// **裁剪区**（**绝对逻辑屏幕坐标**；滚动容器等设置，`None` = 不裁剪）。
+    /// 与 `rect` 一样随容器弹出平移（`translate`）。收集期与内容求交，越界部分剔除。
+    pub clip: Option<Rect>,
     pub kind: DrawKind,
 }
 
@@ -252,6 +278,10 @@ impl UiDraw {
     pub fn translate(&mut self, by: Vec2) {
         self.rect.x += by.x;
         self.rect.y += by.y;
+        if let Some(c) = &mut self.clip {
+            c.x += by.x;
+            c.y += by.y;
+        }
     }
 }
 
@@ -269,6 +299,7 @@ pub fn text_cmd(
     align: TextAlign,
     family: Option<String>,
     clip: Option<Rect>,
+    clip_outer: Option<Rect>,
 ) -> UiDraw {
     UiDraw {
         depth,
@@ -276,6 +307,7 @@ pub fn text_cmd(
         win,
         elem,
         rect,
+        clip: clip_outer,
         kind: DrawKind::Text {
             text,
             size,
@@ -290,6 +322,24 @@ pub fn text_cmd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intersect_rect_math() {
+        // 相交：取交集
+        let i = intersect_rect(&Rect::new(0.0, 0.0, 100.0, 50.0), &Rect::new(50.0, 25.0, 100.0, 50.0)).unwrap();
+        assert_eq!(i, Rect::new(50.0, 25.0, 50.0, 25.0));
+        // 完全包含：取较小
+        let i = intersect_rect(&Rect::new(0.0, 0.0, 100.0, 50.0), &Rect::new(10.0, 10.0, 20.0, 20.0)).unwrap();
+        assert_eq!(i, Rect::new(10.0, 10.0, 20.0, 20.0));
+        // 不相交：None（滚动裁剪 → 全裁）
+        assert!(intersect_rect(&Rect::new(0.0, 0.0, 10.0, 10.0), &Rect::new(20.0, 20.0, 10.0, 10.0)).is_none());
+        // 仅边接触（半开区间）：None
+        assert!(intersect_rect(&Rect::new(0.0, 0.0, 10.0, 10.0), &Rect::new(10.0, 0.0, 10.0, 10.0)).is_none());
+        // clipped helper 语义：None 裁剪返回原矩形
+        assert_eq!(clipped(Rect::new(0.0, 0.0, 5.0, 5.0), None), Some(Rect::new(0.0, 0.0, 5.0, 5.0)));
+        assert_eq!(clipped(Rect::new(0.0, 0.0, 5.0, 5.0), Some(Rect::new(2.0, 2.0, 10.0, 10.0))), Some(Rect::new(2.0, 2.0, 3.0, 3.0)));
+        assert_eq!(clipped(Rect::new(0.0, 0.0, 5.0, 5.0), Some(Rect::new(9.0, 9.0, 10.0, 10.0))), None);
+    }
 
     #[test]
     fn snap_rect_rounds_to_integer_pixels() {
