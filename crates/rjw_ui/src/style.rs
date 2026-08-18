@@ -48,6 +48,8 @@ pub struct PanelStyle {
     pub border_w: f32,
     /// 内容区内边距（像素）。
     pub padding: f32,
+    /// 圆角半径（**逻辑像素**；0 = 直角）。背景与边框都按此半径 9-patch 绘制。
+    pub radius: f32,
 }
 
 impl Default for PanelStyle {
@@ -57,6 +59,7 @@ impl Default for PanelStyle {
             border: Color::rgba_u8(180, 180, 180, 255),
             border_w: 1.0,
             padding: 8.0,
+            radius: 0.0,
         }
     }
 }
@@ -70,6 +73,8 @@ pub struct ButtonStyle {
     pub fg: Color,
     pub border: Color,
     pub border_w: f32,
+    /// 圆角半径（**逻辑像素**；0 = 直角）。
+    pub radius: f32,
     /// 内边距（x = 水平，y = 垂直）。
     pub padding: glam::Vec2,
     pub font_size: f32,
@@ -85,6 +90,7 @@ impl Default for ButtonStyle {
             fg: Color::rgba_u8(30, 30, 30, 255),
             border: Color::rgba_u8(150, 150, 150, 255),
             border_w: 1.0,
+            radius: 0.0,
             padding: glam::Vec2::new(12.0, 6.0),
             font_size: 14.0,
             font_family: None,
@@ -137,6 +143,8 @@ pub struct InputStyle {
     pub border_w: f32,
     /// 内容水平内边距。
     pub padding_x: f32,
+    /// 圆角半径（**逻辑像素**；0 = 直角）。
+    pub radius: f32,
     /// 控件总高。
     pub height: f32,
     /// 控件最小宽。
@@ -156,6 +164,7 @@ impl Default for InputStyle {
             preedit: Color::rgba_u8(120, 120, 120, 255),
             border_w: 1.0,
             padding_x: 6.0,
+            radius: 0.0,
             height: 26.0,
             min_w: 140.0,
             font_size: 14.0,

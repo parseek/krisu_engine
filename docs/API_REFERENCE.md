@@ -734,10 +734,14 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 ### 样式（`Theme`，可 clone 覆盖）
 
 `Theme { label, panel, button, slider, input, checkbox, debug, gap }`，子样式见 `crates/rjw_ui/src/style.rs`：
-`LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding）、`ButtonStyle`（三态 bg + padding）、
-`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/padding_x/height/min_w）、
+`LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**）、`ButtonStyle`（三态 bg + padding + **radius**）、
+`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/padding_x/height/min_w + **radius**）、
 `CheckboxStyle`（box_size/checked_fill/gap）、`DebugStyle`（layout_outline / layout_outline_width）。
 `Theme::default()` 浅色，`Theme::dark()` 深色。
+
+> **圆角半径**（`radius`，逻辑像素，默认 0 = 直角）：面板 / 窗口 / 按钮 / 输入框的
+> 背景与边框走 **9-patch 圆角矩形**（程序化纹理进动态 Atlas，颜色顶点色 tint）——
+> 任意尺寸圆弧不畸变；`radius > 0` 时边框 ≈ 外圈 border 色圆角 + 内圈 bg 色圆角。
 
 #### 调试样式（`DebugStyle`）
 
@@ -755,6 +759,24 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 
 > DebugDraw 图元（`ui.debug_*`）的样式 = **每次调用显式传参**（`color` + `width`，逻辑像素）；
 > 需要统一样式时自建常量保存后传入。
+
+### 渲染增强（圆角 / 渐变，程序化纹理进动态 Atlas）
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `rounded_rect_at` | `ui.rounded_rect_at(pos, size, radius, color)` | 圆角矩形背景原语（radius 逻辑像素；9-patch 绘制，颜色顶点色 tint） |
+| `gradient_rect_at` | `ui.gradient_rect_at(pos, size, axis, stops)` | 线性渐变矩形原语（`axis`：`GradientAxis::Vertical/Horizontal`；`stops: Vec<(f32, Color)>`） |
+| `GradientAxis` | `Vertical` / `Horizontal` | 渐变方向（`Vertical` 沿 y：0 = 顶部） |
+
+- 程序化纹理（圆角矩形 `32×32`、渐变主轴 `64` 级、WHITE `1×1`）**塞进动态 Atlas**
+  （`rjw_ui::ProcTextures` → `UiState` 持有，惰性创建、`insert_permanent` 永久保留、
+  `clamp_margin` 防采样透色），页纹理自动注册进 `rjw_render::TEXTURES`；
+- 圆角纹理只存**白色 + alpha**（同半径一张，颜色由顶点色 tint，不随颜色膨胀图集）；
+- 圆角**9-patch**：四角原样、四边/中心拉伸（任意矩形尺寸圆弧不畸变）；
+  渐变矩形直接拉伸采样（主轴 64 级已平滑）；
+- 提交分组升级为 `(win, 图形/文字组, 纹理 uid)`：圆角 / 渐变属于**图形组**，先于文字
+  （不会因非白纹理 uid 排序错位盖住文字）；
+- 控件级集成：`Theme` 的 `PanelStyle::radius` / `ButtonStyle::radius` / `InputStyle::radius`。
 
 ### 调试（Debug UI / DebugDraw / 窗口诊断）
 

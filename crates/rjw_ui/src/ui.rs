@@ -33,7 +33,7 @@ use winit::window::Window as WinitWindow;
 
 use crate::draw::{
     border_rects, debug_shape_segments, screen_fixed_tf, snap_rect, text_block_offset, text_cmd,
-    DebugShape, DrawKind, TextAlign, UiDraw,
+    DebugShape, DrawKind, GradientAxis, TextAlign, UiDraw,
 };
 use crate::hit::{
     clear_frame_flags, hit_test, normalize_x, update_drag, update_interact, window_occluded,
@@ -326,6 +326,103 @@ impl<'a> Ui<'a> {
             rect: Rect::new(0.0, 0.0, 0.0, 0.0),
             kind: DrawKind::Debug { color, shape },
         });
+    }
+
+    /// **圆角矩形**（背景填充原语；绝对定位，`radius` 逻辑像素，9-patch 绘制——
+    /// 程序化纹理进动态 Atlas，颜色顶点色 tint）。
+    pub fn rounded_rect_at(&mut self, pos: Vec2, size: Vec2, radius: f32, color: Color) {
+        self.push_draw(
+            DrawKind::RoundedRect { color, radius },
+            Rect::new(pos.x, pos.y, size.x, size.y),
+        );
+    }
+
+    /// **线性渐变矩形**（背景填充原语；绝对定位，`stops` 沿 `axis`——
+    /// 程序化渐变纹理进动态 Atlas，按主轴拉伸采样）。
+    pub fn gradient_rect_at(
+        &mut self,
+        pos: Vec2,
+        size: Vec2,
+        axis: GradientAxis,
+        stops: Vec<(f32, Color)>,
+    ) {
+        self.push_draw(
+            DrawKind::Gradient { axis, stops },
+            Rect::new(pos.x, pos.y, size.x, size.y),
+        );
+    }
+
+    /// 录制一条绘制命令（`elem = 0` 装饰层，画在本窗口元素之下——如背景/边框）。
+    fn push_draw(&mut self, kind: DrawKind, rect: Rect) {
+        let seq = self.next_seq();
+        let depth = self.depth;
+        let win = self.cur_win;
+        self.queue.push(UiDraw { depth, seq, win, elem: 0, rect, kind });
+    }
+
+    /// 按样式 push **背景 + 边框**（`radius > 0` 走双层圆角矩形：外圈 border 色、
+    /// 内圈 bg 色内缩 `border_w`，近似圆角边框；否则原 Solid + Border 路径）。
+    /// `elem`：元素序（装饰背景传 0；控件背景传 `self.seq + 1`）。
+    #[allow(clippy::too_many_arguments)]
+    fn push_panel_like(
+        &mut self,
+        rect: Rect,
+        bg: Color,
+        border: Color,
+        border_w: f32,
+        radius: f32,
+        elem: u32,
+    ) {
+        let seq = self.next_seq();
+        let depth = self.depth;
+        let win = self.cur_win;
+        if radius > 0.0 {
+            // 圆角边框 ≈ 外圈 border 色圆角 + 内圈 bg 色圆角（内缩 border_w）。
+            self.queue.push(UiDraw {
+                depth,
+                seq,
+                win,
+                elem,
+                rect,
+                kind: DrawKind::RoundedRect { color: border, radius: radius + border_w },
+            });
+            let bw = border_w.min(rect.w * 0.5).min(rect.h * 0.5);
+            let inner = Rect::new(
+                rect.x + bw,
+                rect.y + bw,
+                (rect.w - bw * 2.0).max(0.0),
+                (rect.h - bw * 2.0).max(0.0),
+            );
+            if inner.w > 0.0 && inner.h > 0.0 {
+                self.queue.push(UiDraw {
+                    depth,
+                    seq: seq + 1,
+                    win,
+                    elem,
+                    rect: inner,
+                    kind: DrawKind::RoundedRect { color: bg, radius },
+                });
+            }
+        } else {
+            self.queue.push(UiDraw {
+                depth,
+                seq,
+                win,
+                elem,
+                rect,
+                kind: DrawKind::Solid(bg),
+            });
+            if border_w > 0.0 {
+                self.queue.push(UiDraw {
+                    depth,
+                    seq: seq + 1,
+                    win,
+                    elem,
+                    rect,
+                    kind: DrawKind::Border { color: border, width: border_w },
+                });
+            }
+        }
     }
 
     /// 取（或创建）文本排版缓冲，并测量其自然尺寸（**逻辑像素**，宽 = 内容宽，高 = 内容高）。
@@ -629,33 +726,10 @@ impl<'a> Ui<'a> {
         } else {
             origin
         };
-        // 背景 + 边框（depth = 进入前深度，画在子控件之下）
-        let depth = self.depth;
-        let win = self.cur_win;
+        // 背景 + 边框（depth = 进入前深度，画在子控件之下；radius > 0 走圆角双层矩形）
         let style = self.theme.panel.clone();
         let bg_rect = Rect::new(0.0, 0.0, size.x, size.y);
-        let seq = self.next_seq();
-        self.queue.push(UiDraw {
-            depth,
-            seq,
-            win,
-            elem: 0,
-            rect: bg_rect,
-            kind: DrawKind::Solid(style.bg),
-        });
-        if style.border_w > 0.0 {
-            self.queue.push(UiDraw {
-                depth,
-                seq: seq + 1,
-                win,
-                elem: 0,
-                rect: bg_rect,
-                kind: DrawKind::Border {
-                    color: style.border,
-                    width: style.border_w,
-                },
-            });
-        }
+        self.push_panel_like(bg_rect, style.bg, style.border, style.border_w, style.radius, 0);
         // 平移全部（子命令 + 背景/边框）：
         // 用 `display_pos`（拖拽中 = 本帧新位置）→ 文字/矩形**当帧生效**。
         for d in &mut self.queue[start..] {
@@ -765,32 +839,10 @@ impl<'a> Ui<'a> {
         self.state
             .window_rects
             .insert(z, Rect::new(display_pos.x, display_pos.y, size.x, size.y));
-        // 背景 + 边框（win = z，画在窗口子控件之下）
-        let depth = self.depth;
+        // 背景 + 边框（win = z，画在窗口子控件之下；radius > 0 走圆角双层矩形）
         let style = self.theme.panel.clone();
         let bg_rect = Rect::new(0.0, 0.0, size.x, size.y);
-        let seq = self.next_seq();
-        self.queue.push(UiDraw {
-            depth,
-            seq,
-            win: z,
-            elem: 0,
-            rect: bg_rect,
-            kind: DrawKind::Solid(style.bg),
-        });
-        if style.border_w > 0.0 {
-            self.queue.push(UiDraw {
-                depth,
-                seq: seq + 1,
-                win: z,
-                elem: 0,
-                rect: bg_rect,
-                kind: DrawKind::Border {
-                    color: style.border,
-                    width: style.border_w,
-                },
-            });
-        }
+        self.push_panel_like(bg_rect, style.bg, style.border, style.border_w, style.radius, 0);
         for d in &mut self.queue[start..] {
             d.translate(display_pos);
         }
@@ -885,7 +937,7 @@ impl<'a> Ui<'a> {
         let mut wins: Vec<u32> = groups.keys().copied().collect();
         wins.sort_unstable();
         let mut quads = QuadCollector::new(white_uid); // 非窗口 + 缓存 miss 重建
-        let mut cached: Vec<(u32, u64, Vec<VertexP3U2C4>)> = Vec::new(); // 缓存命中
+        let mut cached: Vec<(u32, u8, u64, Vec<VertexP3U2C4>)> = Vec::new(); // 缓存命中
         for win in wins {
             let cmds = groups.remove(&win).expect("group exists");
             // debug_layout：每帧重建（布局描边是调试视图，跳过窗口顶点缓存）。
@@ -914,8 +966,8 @@ impl<'a> Ui<'a> {
                     .entry(id.clone())
                     .or_insert((0, Vec::new()));
                 if entry.0 == sig {
-                    for (tex, verts) in &entry.1 {
-                        cached.push((win, *tex, verts.clone()));
+                    for (g, tex, verts) in &entry.1 {
+                        cached.push((win, *g, *tex, verts.clone()));
                     }
                     continue;
                 }
@@ -923,40 +975,37 @@ impl<'a> Ui<'a> {
             // 未命中：收集该窗口命令为局部顶点，写入缓存
             let mut q = QuadCollector::new(white_uid);
             self.collect_cmds(&mut q, win, &cmds);
-            let mut grp: Vec<(u64, Vec<VertexP3U2C4>)> = Vec::new();
-            for ((_, tex), verts) in q.quads {
-                grp.push((tex, verts.clone()));
-                cached.push((win, tex, verts));
+            let mut grp: Vec<(u8, u64, Vec<VertexP3U2C4>)> = Vec::new();
+            for ((_, g, tex), verts) in q.quads {
+                grp.push((g, tex, verts.clone()));
+                cached.push((win, g, tex, verts));
             }
-            // 缓存组顺序与提交顺序一致：白纹理（背景/图形）先于字形图集（文字），
+            // 缓存组顺序与提交顺序一致：图形（白纹理 / 程序化纹理）先于字形文字，
             // 再按纹理 uid——缓存命中的帧沿用该顺序，跨帧稳定。
-            grp.sort_by_key(|&(tex, _)| {
-                // 窗口内组排序只比较 (图形/文字, 纹理 uid)；win 维度由缓存 key 隔离。
-                (submit_group_key(0, tex, white_uid).1, tex)
-            });
+            grp.sort_by_key(|&(g, tex, _)| (g, tex));
             self.state.window_quads.insert(id, (sig, grp));
         }
         // 提交：**UI 自行管理绘制顺序**，不依赖 Render2D 排序（独立 UI Render2D 建议
         // `set_sorting(false)` 关闭排序；`set_layer_sort(true)` / 默认排序下结果也一致）。
         //
-        // 统一排序键 `(win, is_white, tex_uid)`，每 (窗口, 纹理) 一次 add_quads：
+        // 统一排序键 `(win, 图形/文字组, 纹理 uid)`，每 (窗口, 组, 纹理) 一次 add_quads：
         // 1. **win 升序**：非窗口内容（win=0，layer = base）最底，窗口按 z 从下到上
         //    （layer = base + z）——后提交的窗口覆盖先提交的；
-        // 2. **窗口内白纹理组（背景 / 图形）先于字形图集组（文字）**——保证
-        //    "先图形后文字"，且与 Render2D `LayerAndStates` 按纹理 uid 排序的结果一致
-        //    （白纹理 uid 最小恒排最前），任意排序模式下绘制顺序完全相同、跨帧稳定。
+        // 2. **窗口内图形组（白纹理 / 圆角 / 渐变 / 边框）先于字形文字组**——保证
+        //    "先图形后文字"（含程序化纹理，不随纹理 uid 与白纹理比较而错乱），
+        //    任意排序模式下绘制顺序完全相同、跨帧稳定。
         //
         // transform = 屏幕固定变换（窗口原点物理像素）→ 局部顶点映射到世界。
         let layer_base = self.base_layer;
-        let mut ordered: Vec<(u32, u64, Vec<VertexP3U2C4>)> =
+        let mut ordered: Vec<(u32, u8, u64, Vec<VertexP3U2C4>)> =
             Vec::with_capacity(cached.len() + quads.quads.len());
         // mem::take：只移走内容四边形，`quads.debug`（调试叠加）留待最后提交。
-        for ((win, tex_uid), verts) in std::mem::take(&mut quads.quads) {
-            ordered.push((win, tex_uid, verts));
+        for ((win, g, tex_uid), verts) in std::mem::take(&mut quads.quads) {
+            ordered.push((win, g, tex_uid, verts));
         }
         ordered.extend(cached);
-        ordered.sort_by_key(|&(win, tex_uid, _)| submit_group_key(win, tex_uid, white_uid));
-        for (win, tex_uid, verts) in ordered {
+        ordered.sort_by_key(|&(win, g, tex_uid, _)| (win, g, tex_uid));
+        for (win, _g, tex_uid, verts) in ordered {
             let Some(tex) = TEXTURES.get(tex_uid) else {
                 continue;
             };
@@ -1057,6 +1106,88 @@ impl<'a> Ui<'a> {
                         debug_layout_outline(quads, win, anchor_px, pr, dbg);
                     }
                 }
+                DrawKind::RoundedRect { color, radius } => {
+                    let pr = snap_rect(&self.phys_rect(&d.rect));
+                    if pr.w > 0.0 && pr.h > 0.0 {
+                        let local = Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h);
+                        // 半径转物理像素并 clamp（与生成纹理时的 clamp 一致）。
+                        let r = (*radius * self.scale)
+                            .clamp(0.0, crate::proc::ROUNDED_TEX_SIZE as f32 * 0.5 - 1.0)
+                            .max(0.0);
+                        if r <= 0.0 {
+                            quads.push_white(win, local, *color);
+                        } else {
+                            let device = self.r2d.device();
+                            let queue = self.r2d.queue();
+                            let layout = self.r2d.tex_bind_group_layout();
+                            if let Some((tex_uid, region)) =
+                                self.state.proc.rounded(device, queue, layout, r)
+                            {
+                                if let Some(tex) = TEXTURES.get(tex_uid) {
+                                    let inv_page = 1.0 / tex.width as f32;
+                                    let base = Vec2::new(
+                                        region.tl_px.0 as f32,
+                                        region.tl_px.1 as f32,
+                                    ) * inv_page;
+                                    let tex_wh = Vec2::new(
+                                        region.wh_px.0 as f32,
+                                        region.wh_px.1 as f32,
+                                    ) * inv_page;
+                                    // 9-patch：四角原样、四边/中心拉伸（任意尺寸圆弧不畸变）。
+                                    for (mr, uvtl, uvwh) in crate::proc::rounded_9patch(
+                                        local,
+                                        r,
+                                        crate::proc::ROUNDED_TEX_SIZE,
+                                        r,
+                                    ) {
+                                        if mr.w <= 0.0 || mr.h <= 0.0 {
+                                            continue;
+                                        }
+                                        quads.push_tex_rect(
+                                            win,
+                                            tex_uid,
+                                            base + uvtl * tex_wh,
+                                            uvwh * tex_wh,
+                                            mr,
+                                            *color,
+                                        );
+                                    }
+                                }
+                            } else {
+                                quads.push_white(win, local, *color);
+                            }
+                        }
+                        debug_layout_outline(quads, win, anchor_px, pr, dbg);
+                    }
+                }
+                DrawKind::Gradient { axis, stops } => {
+                    let pr = snap_rect(&self.phys_rect(&d.rect));
+                    if pr.w > 0.0 && pr.h > 0.0 {
+                        let local = Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h);
+                        let vertical = matches!(axis, GradientAxis::Vertical);
+                        let device = self.r2d.device();
+                        let queue = self.r2d.queue();
+                        let layout = self.r2d.tex_bind_group_layout();
+                        if let Some((tex_uid, region)) =
+                            self.state.proc.gradient(device, queue, layout, vertical, stops)
+                        {
+                            if let Some(tex) = TEXTURES.get(tex_uid) {
+                                let inv_page = 1.0 / tex.width as f32;
+                                let base = Vec2::new(
+                                    region.tl_px.0 as f32,
+                                    region.tl_px.1 as f32,
+                                ) * inv_page;
+                                let tex_wh = Vec2::new(
+                                    region.wh_px.0 as f32,
+                                    region.wh_px.1 as f32,
+                                ) * inv_page;
+                                // 整矩形拉伸采样渐变纹理（主轴 64 级已平滑）。
+                                quads.push_tex_rect(win, tex_uid, base, tex_wh, local, Color::WHITE);
+                            }
+                        }
+                        debug_layout_outline(quads, win, anchor_px, pr, dbg);
+                    }
+                }
                 DrawKind::Border { color, width } => {
                     let pr = snap_rect(&self.phys_rect(&d.rect));
                     let local = Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h);
@@ -1129,6 +1260,23 @@ impl<'a> Ui<'a> {
             DrawKind::Solid(c) => {
                 0u8.hash(h);
                 color_bits(*c).hash(h);
+            }
+            DrawKind::RoundedRect { color, radius } => {
+                5u8.hash(h);
+                color_bits(*color).hash(h);
+                radius.to_bits().hash(h);
+            }
+            DrawKind::Gradient { axis, stops } => {
+                6u8.hash(h);
+                match axis {
+                    GradientAxis::Vertical => 0u8.hash(h),
+                    GradientAxis::Horizontal => 1u8.hash(h),
+                }
+                stops.len().hash(h);
+                for (t, c) in stops {
+                    t.to_bits().hash(h);
+                    color_bits(*c).hash(h);
+                }
             }
             DrawKind::Border { color, width } => {
                 1u8.hash(h);
@@ -1336,12 +1484,18 @@ impl<'a> Ui<'a> {
 
 // ─── 四边形收集器（QuadVertices） ──────────────────────────────
 
-/// 按 `(窗口 z, 纹理 uid)` 分组的四边形顶点收集器（finish 提交用）。
+/// 分组维度（提交排序用，见 [`submit_group_key`]）：
+/// - `0` = 图形（Solid / RoundedRect / Gradient / Border / Caret——白纹理与程序化纹理）；
+/// - `1` = 文字（字形图集纹理）。
+pub(crate) const GROUP_GRAPHIC: u8 = 0;
+pub(crate) const GROUP_TEXT: u8 = 1;
+
+/// 按 `(窗口 z, 图形/文字组, 纹理 uid)` 分组的四边形顶点收集器（finish 提交用）。
 ///
 /// `debug`：**屏幕调试叠加**（DebugDraw 图元 + debug_layout 布局描边）——
 /// 按 `win` 分组、恒用白纹理，`finish` 时在全部 UI 内容**之后**提交。
 struct QuadCollector {
-    quads: std::collections::HashMap<(u32, u64), Vec<VertexP3U2C4>>,
+    quads: std::collections::HashMap<(u32, u8, u64), Vec<VertexP3U2C4>>,
     /// 调试叠加顶点（白纹理；窗口局部物理坐标）。
     debug: std::collections::HashMap<u32, Vec<VertexP3U2C4>>,
     white_uid: u64,
@@ -1356,12 +1510,12 @@ impl QuadCollector {
         }
     }
 
-    /// 白色纹理四边形（背景 / 边框 / 光标；UV 全纹理）。
+    /// 白色纹理四边形（背景 / 边框 / 光标；UV 全纹理；图形组）。
     fn push_white(&mut self, win: u32, r: Rect, c: Color) {
         self.push_rect(win, self.white_uid, r, c);
     }
 
-    /// 轴对齐矩形四边形（整纹理 UV）。
+    /// 轴对齐矩形四边形（整纹理 UV；图形组）。
     fn push_rect(&mut self, win: u32, tex: u64, r: Rect, c: Color) {
         if r.w <= 0.0 || r.h <= 0.0 {
             return;
@@ -1373,13 +1527,47 @@ impl QuadCollector {
             vertex_p3u2c4(Vec2::new(r.x, r.y + r.h), [0.0, 1.0], ca),
             vertex_p3u2c4(Vec2::new(r.x + r.w, r.y + r.h), [1.0, 1.0], ca),
         ];
-        self.push_tex_quad(win, tex, quad);
+        self.push_tex_quad_group(win, tex, quad, GROUP_GRAPHIC);
     }
 
-    /// 追加一个带 UV 的四边形（字形用）。
+    /// 带 UV 子区域的矩形四边形（图形组；圆角 9-patch / 渐变用）。
+    fn push_tex_rect(
+        &mut self,
+        win: u32,
+        tex: u64,
+        uv_tl: Vec2,
+        uv_wh: Vec2,
+        r: Rect,
+        c: Color,
+    ) {
+        if r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let ca: [f32; 4] = c.into();
+        let uv_br = uv_tl + uv_wh;
+        let quad = [
+            vertex_p3u2c4(Vec2::new(r.x, r.y), [uv_tl.x, uv_tl.y], ca),
+            vertex_p3u2c4(Vec2::new(r.x + r.w, r.y), [uv_br.x, uv_tl.y], ca),
+            vertex_p3u2c4(Vec2::new(r.x, r.y + r.h), [uv_tl.x, uv_br.y], ca),
+            vertex_p3u2c4(Vec2::new(r.x + r.w, r.y + r.h), [uv_br.x, uv_br.y], ca),
+        ];
+        self.push_tex_quad_group(win, tex, quad, GROUP_GRAPHIC);
+    }
+
+    /// 追加一个带 UV 的四边形（字形用；文字组）。
     fn push_tex_quad(&mut self, win: u32, tex: u64, quad: [VertexP3U2C4; 4]) {
+        self.push_tex_quad_group(win, tex, quad, GROUP_TEXT);
+    }
+
+    fn push_tex_quad_group(
+        &mut self,
+        win: u32,
+        tex: u64,
+        quad: [VertexP3U2C4; 4],
+        group: u8,
+    ) {
         self.quads
-            .entry((win, tex))
+            .entry((win, group, tex))
             .or_default()
             .extend_from_slice(&quad);
     }
@@ -1453,19 +1641,6 @@ fn debug_layout_outline(
     };
     let r = Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h);
     quads.push_debug_rect(win, r, width, color);
-}
-
-/// **提交排序键**（[`Ui::finish`] 每 (窗口, 纹理) 一组 `add_quads` 时使用）：
-/// `(win 升序, 图形/文字, 纹理 uid)`。
-///
-/// - `win` 升序：非窗口内容（`win=0`）最底，窗口按 z 从下到上（`layer = base + z`）；
-/// - 同一窗口内**白纹理（背景/图形）组先于字形图集（文字）组**——保证
-///   “先图形后文字”严格成立且跨帧稳定，不随 HashMap 迭代顺序 / 纹理 uid 分配抖动；
-///   也与 Render2D `LayerAndStates` 的 `(rstates, texture_uid)` 排序结果一致
-///   （白纹理 uid 最小恒排最前）。
-#[inline]
-fn submit_group_key(win: u32, tex_uid: u64, white_uid: u64) -> (u32, u8, u64) {
-    (win, if tex_uid == white_uid { 0u8 } else { 1u8 }, tex_uid)
 }
 
 /// 拖拽激活所需的最小**物理像素**位移：按下后鼠标位移 ≥ 此值才视为“拖拽”。
@@ -1752,31 +1927,12 @@ impl Ui<'_> {
             let depth = self.depth;
             let win = self.cur_win;
             let elem = self.seq + 1;
-            let seq = self.next_seq();
-            self.queue.push(UiDraw {
-                depth,
-                seq,
-                win,
-                elem,
-                rect,
-                kind: DrawKind::Solid(bg),
-            });
-            if style.border_w > 0.0 {
-                self.queue.push(UiDraw {
-                    depth,
-                    seq: seq + 1,
-                    win,
-                    elem,
-                    rect,
-                    kind: DrawKind::Border {
-                        color: style.border,
-                        width: style.border_w,
-                    },
-                });
-            }
+            // 背景 + 边框（radius > 0 走圆角双层矩形）。
+            self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
+            let text_seq = self.next_seq();
             self.queue.push(text_cmd(
                 depth,
-                seq + 2,
+                text_seq,
                 win,
                 elem,
                 rect,
@@ -2084,29 +2240,8 @@ impl Ui<'_> {
         let win = self.cur_win;
         let elem = self.seq + 1;
         let border = if focused { style.border_focus } else { style.border };
-        let seq = self.next_seq();
-        self.queue.push(UiDraw {
-            depth,
-            seq,
-            win,
-            elem,
-            rect,
-            kind: DrawKind::Solid(style.bg),
-        });
-        if style.border_w > 0.0 {
-            let seq = self.next_seq();
-            self.queue.push(UiDraw {
-                depth,
-                seq,
-                win,
-                elem,
-                rect,
-                kind: DrawKind::Border {
-                    color: border,
-                    width: style.border_w,
-                },
-            });
-        }
+        // 背景 + 边框（radius > 0 走圆角双层矩形）。
+        self.push_panel_like(rect, style.bg, border, style.border_w, style.radius, elem);
         let content_w = (rect.w - style.padding_x * 2.0).max(0.0);
         let content_rect = Rect::new(rect.x + style.padding_x, rect.y, content_w, rect.h);
         // 裁剪：文本局部坐标（锚点已含 padding），只裁掉溢出内容区右缘的字形；
@@ -2347,46 +2482,37 @@ mod tests {
     }
 
     #[test]
-    fn submit_group_key_graphics_before_text_per_window() {
-        // 回归：窗口图形/文字绘制顺序抖动——同一窗口内白纹理组（背景/图形）必须先于
-        // 字形图集组（文字），且跨帧稳定（不随 HashMap 迭代顺序 / 纹理 uid 分配变化）。
-        let white = 1u64;
-        let page_a = 2u64;
-        let page_b = 3u64;
-        // 模拟 finish() 的提交列表：win=0 非窗口内容 + 窗口 1/2（各含白纹理与字形页组）。
+    fn submit_order_graphics_before_text_per_window() {
+        // 回归：窗口图形/文字绘制顺序抖动——同一窗口内图形组（白纹理 / 圆角 / 渐变）
+        // 必须先于字形文字组，且跨帧稳定（不随 HashMap 迭代顺序 / 纹理 uid 分配变化）。
+        let g = GROUP_GRAPHIC;
+        let t = GROUP_TEXT;
+        // 模拟 finish() 的提交列表：win=0 非窗口内容 + 窗口 1/2（各含图形组与文字组）。
         // 故意用乱序 + 反序 uid 输入（如 HashMap 迭代顺序）。
         let mut groups = vec![
-            (2u32, white),
-            (1u32, page_b),
-            (0u32, page_a),
-            (2u32, page_a),
-            (0u32, white),
-            (1u32, white),
-            (1u32, page_a),
+            (2u32, t, 3u64),
+            (1u32, t, 3u64),
+            (0u32, t, 2u64),
+            (2u32, g, 2u64),
+            (0u32, g, 1u64),
+            (1u32, g, 1u64),
+            (1u32, g, 2u64),
         ];
-        groups.sort_by_key(|&(w, t)| submit_group_key(w, t, white));
-        // 期望：win 升序；同一窗口内白纹理（图形）先于字形页（文字）；页面间按 uid 稳定。
+        groups.sort_by_key(|&(w, gr, tex)| (w, gr, tex));
+        // 期望：win 升序；同一窗口内图形组先于文字组；组内按纹理 uid 稳定。
         assert_eq!(
             groups,
             vec![
-                (0, white),
-                (0, page_a),
-                (1, white),
-                (1, page_a),
-                (1, page_b),
-                (2, white),
-                (2, page_a),
+                (0, g, 1),
+                (0, t, 2),
+                (1, g, 1),
+                (1, g, 2),
+                (1, t, 3),
+                (2, g, 2),
+                (2, t, 3),
             ],
-            "win 升序 + 窗口内图形先于文字，跨帧确定"
+            "win 升序 + 窗口内图形先于文字（含程序化纹理），跨帧确定"
         );
-        // 与 Render2D LayerAndStates 的 (rstates, texture_uid) 排序一致：
-        // 白纹理 uid 最小恒排最前（同层同 rstates 时按纹理 uid）。
-        let by_uid: Vec<(u32, u64)> = {
-            let mut v = groups.clone();
-            v.sort_by_key(|&(w, t)| (w, t));
-            v
-        };
-        assert_eq!(groups, by_uid, "提交顺序与按纹理 uid 排序结果一致");
     }
 
     #[test]

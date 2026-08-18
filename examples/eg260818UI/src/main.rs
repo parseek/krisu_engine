@@ -157,16 +157,31 @@ impl App for UiApp {
             .map(|(id, z)| format!("{id} (z{z})"))
             .unwrap_or_else(|| "无".to_owned());
         let prev_blocked = self.ui_state.occluded_hits();
+        // 渲染增强演示：Theme 圆角（面板 / 按钮 / 输入框）+ 渐变状态栏背景。
+        let mut theme = Theme::dark();
+        theme.panel.radius = 8.0;
+        theme.button.radius = 6.0;
+        theme.input.radius = 4.0;
         let mut ui = Ui::begin(window, &self.cam, &ctx.mouse, &ctx.keyboard, font, r2d_ui, &mut self.ui_state)
-            .theme(Theme::dark())
+            .theme(theme)
             .base_layer(LAYER_UI)
             // DPI 缩放：控件坐标/字号按逻辑像素，内部换算物理像素
             .scale_factor(ctx.scale_factor().unwrap_or(1.0))
             .build();
 
-        // ── place：顶部状态栏 ─────────────────────────────────
+        // ── place：顶部状态栏（渐变背景 + 圆角原语演示） ────────
+        ui.gradient_rect_at(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1280.0, 56.0),
+            rjw_ui::GradientAxis::Horizontal,
+            vec![
+                (0.0, Color::rgba_u8(38, 52, 90, 255)),
+                (1.0, Color::rgba_u8(26, 34, 60, 255)),
+            ],
+        );
+        ui.rounded_rect_at(Vec2::new(240.0, 14.0), Vec2::new(64.0, 28.0), 14.0, Color::rgba_u8(200, 90, 90, 255));
         ui.label_at(Vec2::new(16.0, 12.0), &format!("FPS: {:.0}", ctx.timer.get_fps()));
-        ui.label_at(Vec2::new(16.0, 36.0), &format!("点击次数: {}", self.clicks));
+        ui.label_at(Vec2::new(16.0, 34.0), &format!("点击次数: {}", self.clicks));
         ui.panel_at(Vec2::new(200.0, 12.0), |p| {
             p.label("玩家名");
             p.text_input("name", &mut self.player_name);

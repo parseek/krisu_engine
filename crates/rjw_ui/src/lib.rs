@@ -24,6 +24,11 @@
 //!   [`Ui::window_under_mouse`]（鼠标下最上层窗口）、[`UiState::last_press_window`]
 //!   （上次按下接收窗口）、[`UiState::occluded_hits`]（被窗口遮挡拦截的命中次数）——
 //!   示例 `eg260818UI` 右上角有实时诊断面板。
+//! - **渲染增强（圆角 / 渐变）**：`Theme` 子样式的 `radius`（面板 / 窗口 / 按钮 /
+//!   输入框，逻辑像素，0 = 直角）与绘制原语 [`Ui::rounded_rect_at`] /
+//!   [`Ui::gradient_rect_at`]——程序化纹理（圆角 9-patch / 渐变 / WHITE）**塞进动态
+//!   Atlas**（[`ProcTextures`] → `UiState` 持有），圆角纹理只存白色 + alpha（颜色顶点色
+//!   tint），提交分组升级为 `(win, 图形/文字组, 纹理)` 保证"先图形后文字"。
 //!
 //! # 快速上手
 //!
@@ -66,11 +71,13 @@
 pub mod draw;
 pub mod hit;
 pub mod layout;
+pub mod proc;
 pub mod state;
 pub mod style;
 pub mod ui;
 
-pub use draw::TextAlign;
+pub use draw::{GradientAxis, TextAlign};
+pub use proc::ProcTextures;
 pub use hit::{hit_test, InteractEvents};
 pub use layout::PackSide;
 pub use state::{ButtonState, CheckboxState, UiState, WidgetState};

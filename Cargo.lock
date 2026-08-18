@@ -2011,6 +2011,7 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "rjw_2d_render",
+ "rjw_atlas",
  "rjw_color 0.1.0",
  "rjw_keyboard",
  "rjw_keystate 0.1.0",

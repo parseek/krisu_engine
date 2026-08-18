@@ -11,13 +11,14 @@ keywords = ["ui", "gui", "widget", "immediate-mode", "game-development"]
 categories = ["game-development", "gui"]
 
 [dependencies]
-rjw_2d_render = { path = "../rjw_2d_render", version = "0.1.1" }
+rjw_atlas = { path = "../rjw_atlas", version = "0.1.2" }
+rjw_2d_render = { path = "../rjw_2d_render", version = "0.1.2" }
 rjw_render = { path = "../rjw_render", version = "0.1.0" }
 rjw_text = { path = "../rjw_text", version = "0.2.0" }
-rjw_transform = { path = "../rjw_transform", version = "0.1.1" }
+rjw_transform = { path = "../rjw_transform", version = "0.1.2" }
 rjw_color = "0.1.0"
 rjw_mouse = { path = "../rjw_mouse", version = "0.1.2" }
-rjw_keyboard = { path = "../rjw_keyboard", version = "0.1.1" }
+rjw_keyboard = { path = "../rjw_keyboard", version = "0.1.2" }
 rjw_keystate = "0.1.0"
 glam = "0.33.2"
 winit = "0.30.13"

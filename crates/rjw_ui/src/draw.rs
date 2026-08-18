@@ -168,11 +168,24 @@ pub enum DebugShape {
     Grid { rect: Rect, spacing: f32, width: f32 },
 }
 
+/// 渐变方向（`Gradient` 绘制命令）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradientAxis {
+    /// 沿 y（0 = 顶部 → 底部）。
+    Vertical,
+    /// 沿 x（0 = 左侧 → 右侧）。
+    Horizontal,
+}
+
 /// 绘制命令种类（记录式；`Ui::finish` 逐条提交到 `Render2D`）。
 #[derive(Clone, Debug)]
 pub enum DrawKind {
     /// 实心矩形。
     Solid(Color),
+    /// **圆角矩形**（背景填充；`radius` 逻辑像素，9-patch 绘制，颜色顶点色 tint）。
+    RoundedRect { color: Color, radius: f32 },
+    /// **线性渐变矩形**（`stops` 沿 `axis`；程序化纹理进动态 Atlas）。
+    Gradient { axis: GradientAxis, stops: Vec<(f32, Color)> },
     /// 矩形边框（画在 rect 内缘）。
     Border { color: Color, width: f32 },
     /// 文本（绘制时经 `rjw_text` 责任链渲染）。

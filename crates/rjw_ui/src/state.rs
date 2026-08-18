@@ -8,6 +8,8 @@ use rjw_2d_render::VertexP3U2C4;
 use rjw_text::Buffer;
 use rjw_transform::Rect;
 
+use crate::proc::ProcTextures;
+
 /// 控件文本 `Arc<Buffer>` 缓存容量：超出时整体清空重建（静态标签通常远小于此值）。
 pub const TEXT_BUFFER_CACHE_CAP: usize = 128;
 
@@ -72,16 +74,19 @@ pub struct UiState {
     /// 若只看当前帧候选会误判为"非组合"而执行本地退格（误删已有文本）。
     /// 组合中或刚结束的帧，退格/删除/方向键一律交给 IME 系统处理。
     pub(crate) ime_composing: bool,
-    /// **窗口四边形缓存**：窗口 id → (内容签名, 按纹理分组的**局部顶点**)。
+    /// **窗口四边形缓存**：窗口 id → (内容签名, 按 (组, 纹理) 分组的**局部顶点**)。
+    /// 组：`0` = 图形（白纹理 / 圆角 / 渐变 / 边框）、`1` = 文字（字形图集）。
     /// 窗口内容不变时复用（`finish` 按签名命中），**移动窗口只改变换、顶点不重建**；
     /// 任何内容变化（hover 变色、文字编辑等）都会使签名变化而自动重建。
-    pub(crate) window_quads: HashMap<String, (u64, Vec<(u64, Vec<VertexP3U2C4>)>)>,
+    pub(crate) window_quads: HashMap<String, (u64, Vec<(u8, u64, Vec<VertexP3U2C4>)>)>,
     /// **诊断**：本帧**命中但被更高窗口遮挡而未响应**的控件次数
     /// （点击穿透拦截计数；`Ui::hit_abs` 累加，`begin_frame` 清零）。
     pub(crate) occluded_hits: u32,
     /// **诊断**：最近一次按下由哪个窗口接收（`finish::resolve_win_press` 写入；
     /// 即重叠点击时被置顶/可拖拽的**最上层**窗口）。跨帧保留直至下一次按下。
     pub(crate) last_press_window: Option<(String, u32)>,
+    /// **程序化纹理缓存**（圆角矩形 / 渐变 / WHITE）：塞进动态 Atlas，跨帧复用。
+    pub(crate) proc: ProcTextures,
 }
 
 impl UiState {

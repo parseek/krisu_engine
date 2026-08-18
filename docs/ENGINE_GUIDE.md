@@ -1032,7 +1032,42 @@ theme.debug.layout_outline_width = 2.0;        // 2 物理像素宽
 自动清理）。已知边界：窗口**首次出现的那一帧**矩形尚不可知（跨帧缓存盲区），下一帧起
 严格生效——置顶方向从第一帧就正确（`win_press_top` 只保留最上层按下窗口）。
 
-### 18.6 维护约定（对 AI）
+### 18.6 渲染增强（圆角 / 渐变）
+
+**样式如何设置**：`Theme` 子样式的 `radius` 字段（面板 / 窗口 / 按钮 / 输入框，逻辑像素，
+默认 0 = 直角）；绘制原语 `ui.rounded_rect_at(pos, size, radius, color)` 与
+`ui.gradient_rect_at(pos, size, axis, stops)`（绝对定位，`elem = 0` 装饰层）。
+
+```rust
+let mut theme = Theme::dark();
+theme.panel.radius = 8.0;    // 面板/窗口圆角
+theme.button.radius = 6.0;   // 按钮圆角（三态背景同样生效）
+theme.input.radius = 4.0;    // 输入框圆角
+// Ui::begin(..).theme(theme).build()
+
+ui.gradient_rect_at(Vec2::new(0.0, 0.0), Vec2::new(1280.0, 56.0),
+    GradientAxis::Horizontal,
+    vec![(0.0, Color::rgba_u8(38, 52, 90, 255)), (1.0, Color::rgba_u8(26, 34, 60, 255))]);
+```
+
+**程序化纹理进动态 Atlas**：圆角矩形（`32×32`）、线性渐变（主轴 `64` 级）、WHITE（`1×1`）
+由 `rjw_ui::ProcTextures`（`UiState` 持有，惰性初始化）生成并 `insert_permanent` 塞进
+`rjw_atlas::DynamicAtlas`——与字形图集同机制（Guillotine 打包、页纹理自动注册进
+`TEXTURES`、`clamp_margin` 防采样透色）。要点：
+
+- **圆角纹理只存白色 + alpha**：同半径一张纹理，绘制时用**顶点色 tint** 得到任意颜色
+  （图集不随颜色膨胀）；key 仅含半径；
+- **9-patch 绘制**（`proc::rounded_9patch`）：四角原样采样、四边/中心拉伸——任意
+  矩形尺寸圆弧不畸变；`radius > 0` 的边框 ≈ 外圈 border 色圆角 + 内圈 bg 色圆角
+  （`Ui::push_panel_like`）；
+- 渐变矩形直接拉伸采样（主轴 64 级已平滑）；渐变纹理存**真实颜色**（key 含停靠点，
+  改变停靠即换纹理）；
+- **提交分组升级为 `(win, 图形/文字组, 纹理 uid)`**（`GROUP_GRAPHIC=0` / `GROUP_TEXT=1`）：
+  圆角 / 渐变 / 白纹理属于图形组，恒先于字形文字组——非白纹理 uid 不会因与白纹理
+  比较而排序错位（背景不会盖住文字）。窗口顶点缓存（`UiState.window_quads`）同步
+  携带分组。
+
+### 18.7 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `widget_api!` 宏里加便捷方法（Panel / Pack / Grid 自动获得）。
