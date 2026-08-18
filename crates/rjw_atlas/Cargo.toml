@@ -1,6 +1,6 @@
 [package]
 name = "rjw_atlas"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["KrisuRJW <Cmd1loica99@163.com>"]
 description = "Runtime dynamic (Guillotine free-rect) and static texture atlases with lifetime management and TOML import/export."
