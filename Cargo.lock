@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "rjw_text"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrayvec",
  "cosmic-text",
