@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "rjw_atlas"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "glam",
  "log",
