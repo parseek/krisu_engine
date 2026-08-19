@@ -19,6 +19,9 @@ pub struct KeyboardInput {
     /// 当前 IME **组合候选**串（如拼音未上屏时的候选）；`None` = 无组合。
     /// 持续保留直到上屏（Commit）或取消（Preedit 空 / Disabled）。
     ime_preedit: Option<String>,
+    /// 组合候选内**光标位置**（winit `Ime::Preedit(text, Some((start, end)))` 的 `end`，
+    /// 字节偏移；`None` = 光标在组合末尾）。随候选串实时更新，跨帧保留。
+    ime_preedit_caret: Option<usize>,
 }
 
 impl KeyboardInput {
@@ -52,10 +55,17 @@ impl KeyboardInput {
     }
 
     /// 当前 IME 组合候选串（拼音未上屏时实时更新）；`None` = 无组合。
-    /// 用于输入框绘制候选（如灰色追加在光标后）。
+    /// 用于输入框绘制候选（内联在光标后 + 下划线）。
     #[allow(unused)]
     pub fn get_ime_preedit(&self) -> Option<&str> {
         self.ime_preedit.as_deref()
+    }
+
+    /// 组合候选内**光标位置**（字节偏移，相对候选串；`None` = 组合末尾）。
+    /// 内联组合绘制时把输入光标偏移到组合内该位置（"移动光标"）。
+    #[allow(unused)]
+    pub fn get_ime_preedit_caret(&self) -> Option<usize> {
+        self.ime_preedit_caret
     }
 
     /// 内部：更新单个物理键的状态机（原逻辑，拆出以便无 GPU/无窗口单元测试）。
@@ -103,19 +113,24 @@ impl KeyboardInput {
     fn process_ime(&mut self, ime: &winit::event::Ime) {
         match ime {
             winit::event::Ime::Enabled => {}
-            winit::event::Ime::Preedit(text, _cursor) => {
+            winit::event::Ime::Preedit(text, cursor) => {
                 if text.is_empty() {
                     self.ime_preedit = None;
+                    self.ime_preedit_caret = None;
                 } else {
                     self.ime_preedit = Some(text.clone());
+                    // 光标取选择区间末端（字节偏移；`None` = 组合末尾）
+                    self.ime_preedit_caret = cursor.map(|(_, end)| end);
                 }
             }
             winit::event::Ime::Commit(text) => {
                 self.ime_commits.push(text.clone());
                 self.ime_preedit = None;
+                self.ime_preedit_caret = None;
             }
             winit::event::Ime::Disabled => {
                 self.ime_preedit = None;
+                self.ime_preedit_caret = None;
             }
         }
     }
@@ -256,15 +271,22 @@ mod tests {
         // 组合开始：preedit 实时更新（保留跨帧）
         kb.process_ime(&winit::event::Ime::Preedit("ni".into(), Some((2, 2))));
         assert_eq!(kb.get_ime_preedit(), Some("ni"));
+        assert_eq!(kb.get_ime_preedit_caret(), Some(2), "组合内光标（区间末端）");
         kb.end_frame(); // preedit 不清
         assert_eq!(kb.get_ime_preedit(), Some("ni"), "组合候选跨帧保留");
-        // 更新候选
-        kb.process_ime(&winit::event::Ime::Preedit("你好".into(), Some((2, 2))));
+        assert_eq!(kb.get_ime_preedit_caret(), Some(2), "组合内光标跨帧保留");
+        // 更新候选 + 光标（winit 给 (start, end) 区间 → 取 end）
+        kb.process_ime(&winit::event::Ime::Preedit("你好".into(), Some((3, 6))));
         assert_eq!(kb.get_ime_preedit(), Some("你好"));
-        // 上屏：commit 入队、preedit 清除
-        kb.process_ime(&winit::event::Ime::Commit("你好".into()));
+        assert_eq!(kb.get_ime_preedit_caret(), Some(6));
+        // None = 组合末尾
+        kb.process_ime(&winit::event::Ime::Preedit("你好世界".into(), None));
+        assert_eq!(kb.get_ime_preedit_caret(), None, "None = 光标在组合末尾");
+        // 上屏：commit 入队、preedit 与组合内光标清除
+        kb.process_ime(&winit::event::Ime::Commit("你好世界".into()));
         assert!(kb.get_ime_preedit().is_none(), "上屏后候选清除");
-        assert_eq!(kb.get_ime_commits(), &["你好".to_owned()]);
+        assert!(kb.get_ime_preedit_caret().is_none(), "上屏后组合内光标清除");
+        assert_eq!(kb.get_ime_commits(), &["你好世界".to_owned()]);
         // end_frame 清空 commits（preedit 已空）
         kb.end_frame();
         assert!(kb.get_ime_commits().is_empty(), "end_frame 清空上屏队列");

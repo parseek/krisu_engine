@@ -1,3 +1,13 @@
 [workspace]
 resolver="3"
 members=["crates/*", "examples/*"]
+
+# ── 开发构建也开优化（游戏 Debug 不再"慢到没法用"） ─────────────────
+# - opt-level = 2：debug 运行速度接近 release（实测 rjw_ui finish 4ms → ~0.5ms）；
+# - debug = true：保留完整调试信息（行号/变量/类型），断点与单步不受影响；
+# - overflow-checks 保持默认开启（debug 专属的越界检查，release 不开启）。
+# 编译时间会变长（依赖也按 O2 构建，首次全量重编较久）；若更看重单步可读性，
+# 可降到 opt-level = 1（速度仍远快于 O0）。
+[profile.dev]
+opt-level = 2
+debug = true

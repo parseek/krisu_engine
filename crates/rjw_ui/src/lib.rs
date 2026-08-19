@@ -29,6 +29,11 @@
 //!   [`Ui::gradient_rect_at`]——程序化纹理（圆角 9-patch / 渐变 / WHITE）**塞进动态
 //!   Atlas**（[`ProcTextures`] → `UiState` 持有），圆角纹理只存白色 + alpha（颜色顶点色
 //!   tint），提交分组升级为 `(win, 图形/文字组, 纹理)` 保证"先图形后文字"。
+//! - **控件 trait（非宏）**：[`widget::Widget`] + 属性化 builder（[`widget::Label`] /
+//!   [`widget::Button`] / [`widget::Checkbox`]）——新控件 = 普通 Rust 结构体实现 trait，
+//!   无 `macro_rules!` 展开（报错定位精确、可单测）；逐控件覆盖颜色 / 字号 / 字体 /
+//!   内边距等属性（未设置回落全局 [`Theme`]），统一 [`widget::Response`] 响应，
+//!   经 [`Ui::add`] / [`Ui::add_at`]（容器包装见 [`widget::UiAdd`]）放置。
 //! - **滚动容器**：[`Ui::scroll_at`]——内容在可视区内堆叠 + 滚轮 / 滚动条
 //!   （拖 thumb、点轨道翻页）滚动，可视区外**裁剪**（`UiDraw.clip` 绝对逻辑矩形，
 //!   收集期与内容求交）；滚动偏移持久于 [`UiState::scrolls`]。
@@ -82,6 +87,7 @@
 //! - [`hit`]：命中测试与交互状态机
 //! - [`focus`]：键盘导航（焦点链 / [`focus_step`]）
 //! - [`draw`]：屏幕固定变换与绘制命令
+//! - [`widget`]：`Widget` trait + 属性化 builder（非宏添加控件、逐控件样式覆盖）
 
 pub mod draw;
 pub mod edit;
@@ -92,11 +98,13 @@ pub mod proc;
 pub mod state;
 pub mod style;
 pub mod ui;
+pub mod widget;
 
 pub use draw::{GradientAxis, TextAlign};
 pub use proc::ProcTextures;
 pub use hit::{hit_test, InteractEvents};
 pub use layout::PackSide;
-pub use state::{ButtonState, CheckboxState, UiState, WidgetState};
+pub use state::{ButtonState, CheckboxState, UiState, UiStats, WidgetState};
 pub use style::{ButtonStyle, CheckboxStyle, InputStyle, LabelStyle, PanelStyle, SliderStyle, Theme};
 pub use ui::{Grid, Pack, Panel, Ui, UiInit, Window};
+pub use widget::{Button, Checkbox, Label, Response, UiAdd, Widget};

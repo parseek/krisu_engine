@@ -10,8 +10,10 @@ use rjw_transform::Rect;
 
 use crate::proc::ProcTextures;
 
-/// 控件文本 `Arc<Buffer>` 缓存容量：超出时整体清空重建（静态标签通常远小于此值）。
-pub const TEXT_BUFFER_CACHE_CAP: usize = 128;
+/// 控件文本 `Arc<Buffer>` 缓存容量上限：超出时按"本帧未使用"驱逐（帧级近似 LRU），
+/// **不再整表清空**——高帧率动态文本（FPS 计数、日志、自动刷新的标签）不会把
+/// 静态标签缓存全部冲掉，避免每帧全部重新整形（抖动）。
+pub const TEXT_BUFFER_CACHE_CAP: usize = 256;
 
 /// 单个交互控件的持久状态（按 ID 存放于 [`UiState::widgets`]，跨帧保留）。
 #[derive(Clone, Debug, Default)]
@@ -55,6 +57,35 @@ pub struct ScrollState {
     pub content_h: f32,
 }
 
+/// UI 帧性能统计（`Ui::finish` 各阶段耗时，µs；debug/release 对比与优化决策用）。
+/// 每次 `finish` 覆盖写入——示例里读到的是**上一帧**的统计值。
+#[derive(Clone, Debug, Default)]
+pub struct UiStats {
+    /// 统计帧号（每次 `finish` 自增）。
+    pub frame: u64,
+    /// 本帧录制命令数（排序前队列长度）。
+    pub cmd_count: u32,
+    /// 本帧提交的窗口数（win > 0）。
+    pub win_count: u32,
+    /// 窗口顶点缓存命中 / 未命中次数。
+    pub cache_hits: u32,
+    pub cache_misses: u32,
+    /// 队列排序 + 按窗口分组耗时（µs）。
+    pub sort_us: f64,
+    /// 窗口内容签名（摘要 + 全量哈希）耗时（µs）。
+    pub sig_us: f64,
+    /// 缓存未命中 → 顶点重建（collect_cmds）耗时（µs）。
+    pub collect_us: f64,
+    /// 缓存命中 → 提交列表组装（顶点克隆）耗时（µs）。
+    pub clone_us: f64,
+    /// 提交（ordered 排序 + add_quads）耗时（µs）。
+    pub submit_us: f64,
+    /// `Ui::finish` 总耗时（µs）。
+    pub finish_us: f64,
+    /// 整个 UI 帧（`begin` → `finish` 结束）耗时（µs）。
+    pub ui_frame_us: f64,
+}
+
 /// UI 全局持久状态（由应用持有，跨帧复用；一个 `UiState` 可对应多个 `Ui`）。
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
@@ -78,14 +109,17 @@ pub struct UiState {
     pub(crate) window_rects: HashMap<u32, Rect>,
     /// grid 容器：ID → 结算后的单元格尺寸（跨帧缓存，保证布局稳定）。
     pub grid_cells: HashMap<String, Vec2>,
-    /// 控件文本排版缓存：`(文本, 字号位模式, 字体族, 换行宽度位模式, 版本)` → 共享 `Arc<Buffer>`。
+    /// 控件文本排版缓存：`(文本, 字号位模式, 字体族, 换行宽度位模式, 版本)` →
+    /// `(共享 `Arc<Buffer>`, 最后使用帧号)`。
     ///
     /// 用 [`rjw_text::CachePolicy::User`] 创建——**不推入 rjw_text 内部 LRU**
     /// （避免 UI 标签挤占其 128 容量），由本缓存自持；静态标签每帧命中零排版。
-    /// 超出 [`TEXT_BUFFER_CACHE_CAP`] 时整体清空（简单策略，动态文本低频触发）。
-    /// 
+    /// 超出 [`TEXT_BUFFER_CACHE_CAP`] 时**只驱逐本帧未使用的条目**（帧级近似 LRU），
+    /// 不再整表清空——动态文本（FPS/日志等）不会冲掉静态标签缓存，消除每帧全量
+    /// 重新整形的抖动。
+    ///
     /// 版本号用于强制刷新缓存（如行高计算方式变更），避免新旧缓存混用导致布局错乱。
-    pub(crate) text_buffers: HashMap<(String, u32, Option<String>, u32, u8), Arc<Buffer>>,
+    pub(crate) text_buffers: HashMap<(String, u32, Option<String>, u32, u8), (Arc<Buffer>, u64)>,
     /// 帧计数（光标闪烁相位用）。
     pub frame: u64,
     /// 上一帧是否处于 IME 组合中（text_input 退格判定用）：
@@ -95,8 +129,12 @@ pub struct UiState {
     pub(crate) ime_composing: bool,
     /// **窗口四边形缓存**：窗口 id → (内容签名, 按 **(元素序, 组, 纹理)** 分组的**局部顶点**)。
     /// 组：`0` = 图形（白纹理 / 圆角 / 渐变 / 边框）、`1` = 文字（字形图集）。
-    /// 窗口内容不变时复用（`finish` 按签名命中），**移动窗口只改变换、顶点不重建**；
-    /// 任何内容变化（hover 变色、文字编辑等）都会使签名变化而自动重建。
+    /// 窗口内容不变时复用（`finish` 按**全量签名**命中），**移动窗口只改变换、顶点不重建**；
+    /// 任何内容变化（hover 变色、点击按下、文字编辑、滚动等）都会使签名变化而自动重建。
+    ///
+    /// ⚠ 签名必须是**逐命令全量哈希**（含颜色 / 边框宽 / 圆角 / 对齐 / 光标 / 选择）——
+    /// 轻量摘要曾漏掉颜色位，hover/click 变色被误判"内容未变" → 复用陈旧顶点，
+    /// 窗口内交互效果不刷新（下拉框 / 背包 / 窗口按钮失效）。
     pub(crate) window_quads: HashMap<String, (u64, Vec<(u32, u8, u64, Vec<VertexP3U2C4>)>)>,
     /// **诊断**：本帧**命中但被更高窗口遮挡而未响应**的控件次数
     /// （点击穿透拦截计数；`Ui::hit_abs` 累加，`begin_frame` 清零）。
@@ -110,6 +148,8 @@ pub struct UiState {
     pub(crate) scrolls: HashMap<String, ScrollState>,
     /// **下拉框展开状态**：当前展开的 `combo` 的 id（`None` = 全部收起）。
     pub(crate) combo_open: Option<String>,
+    /// **UI 帧性能统计**（`finish` 各阶段耗时；示例/诊断读取）。
+    pub stats: UiStats,
 }
 
 impl UiState {
@@ -159,6 +199,7 @@ impl UiState {
         self.last_press_window = None;
         self.scrolls.clear();
         self.combo_open = None;
+        self.stats = UiStats::default();
     }
 
     /// 是否正在**捕获键盘输入**（有文本输入框持有焦点）。
@@ -230,6 +271,10 @@ impl ButtonState {
 /// 勾选框 / 单选返回给用户的状态视图。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CheckboxState {
+    /// 鼠标悬停在本体（含按下时）。
+    pub(crate) hovered: bool,
+    /// 处于按下状态（按下后未释放）。
+    pub(crate) pressed: bool,
     /// 当前是否勾选（绘制用；checkbox 由用户维护，radio 由组内互斥决定）。
     pub(crate) checked: bool,
     /// 本帧发生了"切换"（点击且状态翻转）。
@@ -239,6 +284,14 @@ pub struct CheckboxState {
 }
 
 impl CheckboxState {
+    #[inline]
+    pub fn hovered(&self) -> bool {
+        self.hovered
+    }
+    #[inline]
+    pub fn pressed(&self) -> bool {
+        self.pressed
+    }
     #[inline]
     pub fn checked(&self) -> bool {
         self.checked

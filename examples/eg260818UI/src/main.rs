@@ -18,6 +18,8 @@
 //! 操作：鼠标点击 / 拖拽 · 键盘 Tab/方向键/Enter/Space/Esc · 输入框打字（IME 已支持，
 //! Enter / Esc 失焦） · `R` 重置 UI 状态 · `Esc`（先失焦）退出
 
+use std::time::Instant;
+
 use glam::Vec2;
 use rjw_2d_render::{ClearConfig, Render2D, SpriteRect};
 use rjw_color::Color;
@@ -25,7 +27,7 @@ use rjw_main::*;
 use rjw_render::{wgpu, RenderConfig, RenderContext};
 use rjw_text::Text;
 use rjw_transform::{Camera2D, Transform2D};
-use rjw_ui::{PackSide, Theme, Ui, UiState};
+use rjw_ui::{Button, Label, PackSide, Theme, Ui, UiAdd, UiState, UiStats};
 
 const LAYER_UI: f64 = 10_000_000.0;
 
@@ -54,6 +56,13 @@ struct UiApp {
     /// 多行备注（TextArea 演示）。
     win_b_note_area: String,
     inventory: [bool; 9],
+    // —— 性能测量（--auto-drag：自动拖动 win_b 并每帧改内容，模拟"拖动中内容逐帧变化"的最坏路径） ——
+    perf: PerfAgg,
+    auto_drag: bool,
+    /// --script-pos：位置责任链演示——脚本驱动 win_a 摆动（优先级 -10，拖拽优先）。
+    script_pos: bool,
+    drag_t0: Instant,
+    auto_tick: u64,
 }
 
 impl UiApp {
@@ -81,7 +90,122 @@ impl UiApp {
             win_b_note: String::new(),
             win_b_note_area: "多行备注：\nEnter 换行，↑↓ 跨行，Home/End 行首尾，\n拖选文本后 Ctrl+C/V/X 复制/粘贴/剪切。".to_owned(),
             inventory: [false; 9],
+            perf: PerfAgg::new(),
+            auto_drag: false,
+            script_pos: false,
+            drag_t0: Instant::now(),
+            auto_tick: 0,
         }
+    }
+}
+
+/// 帧统计聚合：累加 `PERF_PRINT_EVERY` 帧后打印平均值（stdout），随后清零。
+struct PerfAgg {
+    frames: u32,
+    frame_us: f64,
+    ui_us: f64,
+    finish_us: f64,
+    render_us: f64,
+    begin_us: f64,
+    encode_us: f64,
+    submit_us: f64,
+    present_us: f64,
+    sort_us: f64,
+    sig_us: f64,
+    collect_us: f64,
+    clone_us: f64,
+    submit_ui_us: f64,
+    cmds: u64,
+    wins: u64,
+    hits: u64,
+    misses: u64,
+}
+
+/// 每多少帧打印一次 [perf] 统计（165Hz 下约 0.7 秒一次）。
+const PERF_PRINT_EVERY: u32 = 120;
+
+impl PerfAgg {
+    fn new() -> Self {
+        Self {
+            frames: 0,
+            frame_us: 0.0,
+            ui_us: 0.0,
+            finish_us: 0.0,
+            render_us: 0.0,
+            begin_us: 0.0,
+            encode_us: 0.0,
+            submit_us: 0.0,
+            present_us: 0.0,
+            sort_us: 0.0,
+            sig_us: 0.0,
+            collect_us: 0.0,
+            clone_us: 0.0,
+            submit_ui_us: 0.0,
+            cmds: 0,
+            wins: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        &mut self,
+        s: &UiStats,
+        frame_us: f64,
+        render_us: f64,
+        begin_us: f64,
+        encode_us: f64,
+        submit_us: f64,
+        present_us: f64,
+    ) {
+        self.frames += 1;
+        self.frame_us += frame_us;
+        self.ui_us += s.ui_frame_us;
+        self.finish_us += s.finish_us;
+        self.render_us += render_us;
+        self.begin_us += begin_us;
+        self.encode_us += encode_us;
+        self.submit_us += submit_us;
+        self.present_us += present_us;
+        self.sort_us += s.sort_us;
+        self.sig_us += s.sig_us;
+        self.collect_us += s.collect_us;
+        self.clone_us += s.clone_us;
+        self.submit_ui_us += s.submit_us;
+        self.cmds += s.cmd_count as u64;
+        self.wins += s.win_count as u64;
+        self.hits += s.cache_hits as u64;
+        self.misses += s.cache_misses as u64;
+    }
+
+    /// 打印近 N 帧均值（ms / µs）后清零。
+    fn flush(&mut self, fps: f64) {
+        let n = self.frames.max(1) as f64;
+        println!(
+            "[perf] fps={fps:.0} frame={:.2}ms ui={:.2}ms finish={:.2}ms \
+             | ui: sort={:.1}us sig={:.1}us collect={:.1}us clone={:.1}us submit={:.1}us \
+             | render: total={:.2}ms begin={:.1}us encode={:.1}us submit={:.1}us present={:.1}us \
+             | cmds={:.0} wins={:.0} cache_hit={:.0} cache_miss={:.0}",
+            self.frame_us / n / 1000.0,
+            self.ui_us / n / 1000.0,
+            self.finish_us / n / 1000.0,
+            self.sort_us / n,
+            self.sig_us / n,
+            self.collect_us / n,
+            self.clone_us / n,
+            self.submit_ui_us / n,
+            self.render_us / n / 1000.0,
+            self.begin_us / n,
+            self.encode_us / n,
+            self.submit_us / n,
+            self.present_us / n,
+            self.cmds as f64 / n,
+            self.wins as f64 / n,
+            self.hits as f64 / n,
+            self.misses as f64 / n,
+        );
+        *self = Self::new();
     }
 }
 
@@ -122,6 +246,7 @@ impl App for UiApp {
     }
 
     fn about_to_wait(&mut self, ctx: &mut MainContext) {
+        let t_frame = Instant::now();
         // ── 应用快捷键：**输入框聚焦时屏蔽**（capturing_text）——
         //    输入 `R` / `Esc` 不会被当作重置 / 退出。
         if !self.ui_state.capturing_text() {
@@ -131,6 +256,17 @@ impl App for UiApp {
             if ctx.keyboard.get(KeyCode::KeyR).down_edge() {
                 reset_ui_state(&mut self.ui_state);
             }
+        }
+
+        // 性能测量：--auto-drag 自动拖动 win_b（圆周轨迹）+ 每帧改内容
+        // （等价"拖动中 hover/光标闪烁/滚动"的逐帧内容变化 → 走缓存未命中重建路径）。
+        if self.auto_drag {
+            let t = self.drag_t0.elapsed().as_secs_f64();
+            self.win_b_pos = Vec2::new(
+                640.0 + 220.0 * (t * 0.7).sin() as f32,
+                330.0 + 140.0 * (t * 1.1).cos() as f32,
+            );
+            self.auto_tick = self.auto_tick.wrapping_add(1);
         }
 
         let Some(r2d) = &mut self.render2d else {
@@ -179,6 +315,24 @@ impl App for UiApp {
             .scale_factor(ctx.scale_factor().unwrap_or(1.0))
             .build();
 
+        // ── 位置责任链演示（--script-pos）：脚本让窗口 A 沿正弦摆动 ──
+        // 处理器优先级 -10（< 0）：**用户拖拽优先**——拖住 A 时脚本让位、窗口跟手，
+        // 松开后停在放置处；不拖时脚本每帧驱动位置（脚本"动画"，拖动"覆盖"）。
+        if self.script_pos {
+            let t0 = self.drag_t0; // Instant: Copy，闭包只捕获时间基准（不借 self）
+            ui.pos_handler(-10, move |id| {
+                if id == "win_a" {
+                    let t = t0.elapsed().as_secs_f64();
+                    Some(Vec2::new(
+                        560.0 + 260.0 * (t * 0.5).sin() as f32,
+                        240.0 + 120.0 * (t * 0.9).cos() as f32,
+                    ))
+                } else {
+                    None
+                }
+            });
+        }
+
         // ── place：顶部状态栏（渐变背景 + 圆角原语演示） ────────
         // ui.gradient_rect_at(
         //     Vec2::new(0.0, 0.0),
@@ -202,9 +356,27 @@ impl App for UiApp {
         let mut reset_requested = false;
         ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {
             p.label("主菜单");
-            if p.button("btn_start", "开始游戏").clicked() {
+            // 新控件 API（Widget trait + 属性化 builder，见 rjw_ui::widget）：
+            // `p.add(…)` 占光标，属性逐控件覆盖主题（文本色/背景/圆角等），
+            // 旧 `p.button(…)` API 仍可用。
+            if p
+                .add(
+                    Button::new("btn_start", "开始游戏")
+                        .color(Color::WHITE)
+                        .bg(Color::rgba_u8(52, 120, 200, 255))
+                        .bg_hover(Color::rgba_u8(70, 140, 220, 255))
+                        .bg_pressed(Color::rgba_u8(40, 95, 165, 255))
+                        .radius(6.0),
+                )
+                .clicked()
+            {
                 self.clicks += 1;
             }
+            p.add(
+                Label::new("样式标签：蓝色 16px")
+                    .color(Color::rgba_u8(96, 160, 235, 255))
+                    .font_size(16.0),
+            );
             if p.button("btn_reset", "重置 UI 状态 (R)").clicked() {
                 reset_requested = true;
             }
@@ -268,6 +440,8 @@ impl App for UiApp {
         });
         ui.window_at("win_b", self.win_b_pos, |w| {
             w.label("窗口 B（覆盖在 A 之上）");
+            // 性能测量：auto_drag 时每帧变化的标签（强制窗口内容每帧变化 → 重建路径）
+            w.label(&format!("帧序号 {}", self.auto_tick % 1000));
             if w.button("win_b_btn", "B 按钮").clicked() {
                 self.clicks += 1;
             }
@@ -341,13 +515,18 @@ impl App for UiApp {
         if reset_requested {
             reset_ui_state(&mut self.ui_state);
         }
+        // 性能统计（上一帧 finish 写入的 UI 各阶段耗时）
+        let ui_stats = self.ui_state.stats.clone();
 
         // ── 合并提交：世界 → UI → 一次 present ────────────────
         // 世界用 render_command_buffer（不 present），UI 叠加在同一 surface 视图，
         // 两个 command buffer 一次 submit + 一次 present——UI 覆盖世界且无额外延迟。
+        let t_render = Instant::now();
         let Some((surface_tex, view)) = r2d.begin_frame() else {
             return;
         };
+        let begin_us = t_render.elapsed().as_secs_f64() * 1e6;
+        let t_enc = Instant::now();
         let cb_world = r2d.render_command_buffer(
             &ClearConfig {
                 color: Some(wgpu::Color { r: 0.09, g: 0.11, b: 0.16, a: 1.0 }),
@@ -362,8 +541,21 @@ impl App for UiApp {
             &view,
             None,
         );
+        let encode_us = t_enc.elapsed().as_secs_f64() * 1e6;
+        let t_sub = Instant::now();
         r2d.queue().submit([cb_world, cb_ui]);
+        let submit_us = t_sub.elapsed().as_secs_f64() * 1e6;
+        let t_pr = Instant::now();
         r2d.queue().present(surface_tex);
+        let present_us = t_pr.elapsed().as_secs_f64() * 1e6;
+        let render_us = begin_us + encode_us + submit_us + present_us;
+        // 性能统计：整帧 / 渲染（细分）/ UI 各阶段（每 PERF_PRINT_EVERY 帧打印一次）
+        let frame_us = t_frame.elapsed().as_secs_f64() * 1e6;
+        self.perf
+            .add(&ui_stats, frame_us, render_us, begin_us, encode_us, submit_us, present_us);
+        if self.perf.frames >= PERF_PRINT_EVERY {
+            self.perf.flush(ctx.timer.get_fps());
+        }
     }
 }
 
@@ -389,6 +581,8 @@ fn main() -> Result<(), EventLoopError> {
     let mut app = UiApp::new();
     app.win_a_pos = parse_pos_arg(&args, "--win-a", app.win_a_pos);
     app.win_b_pos = parse_pos_arg(&args, "--win-b", app.win_b_pos);
+    app.auto_drag = args.iter().any(|a| a == "--auto-drag");
+    app.script_pos = args.iter().any(|a| a == "--script-pos");
     run_app(app)
 }
 

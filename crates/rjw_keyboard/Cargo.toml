@@ -1,6 +1,6 @@
 [package]
 name = "rjw_keyboard"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 authors = ["KrisuRJW <Cmd1loica99@163.com>"]
 description = "Winit-based keyboard input manager with per-frame edge and true-edge handling."

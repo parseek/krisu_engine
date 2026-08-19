@@ -219,7 +219,8 @@ pub enum DrawKind {
     Border { color: Color, width: f32 },
     /// 文本（绘制时经 `rjw_text` 责任链渲染）。
     Text {
-        text: String,
+        /// 文本内容（`Arc<str>`：命令间共享，避免每命令 String 克隆）。
+        text: Arc<str>,
         size: f32,
         color: Color,
         align: TextAlign,
@@ -312,7 +313,7 @@ pub fn text_cmd(
     win: u32,
     elem: u32,
     rect: Rect,
-    text: String,
+    text: Arc<str>,
     size: f32,
     color: Color,
     align: TextAlign,
