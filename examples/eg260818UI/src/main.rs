@@ -180,15 +180,15 @@ impl App for UiApp {
             .build();
 
         // ── place：顶部状态栏（渐变背景 + 圆角原语演示） ────────
-        ui.gradient_rect_at(
-            Vec2::new(0.0, 0.0),
-            Vec2::new(1280.0, 56.0),
-            rjw_ui::GradientAxis::Horizontal,
-            vec![
-                (0.0, Color::rgba_u8(38, 52, 90, 255)),
-                (1.0, Color::rgba_u8(26, 34, 60, 255)),
-            ],
-        );
+        // ui.gradient_rect_at(
+        //     Vec2::new(0.0, 0.0),
+        //     Vec2::new(1280.0, 56.0),
+        //     rjw_ui::GradientAxis::Horizontal,
+        //     vec![
+        //         (0.0, Color::rgba_u8(38, 52, 90, 255)),
+        //         (1.0, Color::rgba_u8(26, 34, 60, 255)),
+        //     ],
+        // );
         ui.label_at(Vec2::new(16.0, 12.0), &format!("FPS: {:.0}", ctx.timer.get_fps()));
         ui.label_at(Vec2::new(16.0, 34.0), &format!("点击次数: {}", self.clicks));
         ui.drag_panel_at("name_panel", Vec2::new(200.0, 12.0), |p| {

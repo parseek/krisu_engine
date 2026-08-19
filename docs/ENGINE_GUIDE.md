@@ -977,8 +977,8 @@ ui.finish();   // 排序（窗口 z → 深度 → 图形/文字 → 录制序�
 - **文本输入**：普通字符走 `rjw_keyboard::get_chars()`（含 Shift 组合，控制字符已过滤）；**中文输入法（IME）已支持**——`rjw_main` 建窗时自动 `set_ime_allowed(true)`，`rjw_keyboard` 收集上屏文本（`get_ime_commits`）与组合候选（`get_ime_preedit`，输入框以灰色绘制在光标后），Enter 确认上屏。
 - **可拖拽面板 / 窗口**：`drag_panel_at(id, pos, |p| ...)` 按住面板拖动；`window_at(id, pos, |w| ...)` 是**可重叠窗口**——点击即**置顶**（焦点 z-order，`UiState.window_z`），位置持久于 `UiState.panel_pos`；拖动期间**抑制内部子控件交互**。拖拽位置按**物理像素粒度**跟随（1px 跟手，不受 DPI 逻辑量化影响）。
 - **窗口重叠点击裁决**：重叠区域点击**只让最上层窗口**获得拖拽与置顶（`Ui::finish` 内部 `resolve_win_press`）——不会同时拖动两个窗口。
-- **QuadVertices 渲染（不使用 Sprite）**：全部图元（背景 / 控件背景 / 文字）转为**四边形顶点**（`Render2D::add_quads`，每四顶点一组 **TL,TR,BL,BR**，固定索引 `[0,1,3, 3,2,0]`），按 `(窗口, 图形/文字组, 纹理)` 分组提交。**UI 自行管理绘制顺序**——**UI 的 Render2D 必须 `set_sorting(false)`**（完全按提交顺序绘制）：`finish` 按 `(win 升序, 白纹理图形组 → 字形文字组, 纹理 uid)` 提交——窗口间层级由提交顺序保证（`layer = base + z*1.0` 仅作兜底），窗口内**“背景/图形 → 文字”严格稳定**，不随纹理 uid / HashMap 顺序抖动。⚠ **不要用 `set_sorting(true)`（`SortMode::LayerAndStates`）**：它会在同一 layer 内按 `(rstates, texture_uid)` 重排，字形图集页先于程序化纹理页（圆角/渐变）注册 → 重排后圆角/渐变图形排在文字之后绘制、**盖住文字**（曾因此踩坑：圆角按钮文字消失、渐变状态栏盖住标签）。`set_layer_sort(true)`（`LayerOnly`，稳定排序）同层保持提交顺序，可接受。
-- **白纹理合批（单窗口一次 DrawCall）**：WHITE 基础纹理（1×1，`clamp_margin`）预置进**字形图集页**（[`rjw_text::Text::white_region`]；`DynamicAtlas::insert_white` 为与 key 无关的内置槽位，参与 compact 重排）——实心填充（Solid / 边框 / 光标 / 调试叠加）与字形**同页同纹理**：同一窗口内"图形组 → 文字组"相邻且同纹理，Render2D 合批为**单个 draw call**，省去图形↔文字的纹理状态切换。字形本体保持 `insert_no_clamp`（避免 clamp margin 挤压）。
+- **QuadVertices 渲染（不使用 Sprite）**：全部图元（背景 / 控件背景 / 文字）转为**四边形顶点**（`Render2D::add_quads`，每四顶点一组 **TL,TR,BL,BR**，固定索引 `[0,1,3, 3,2,0]`），按 **(窗口, 元素序, 图形/文字组, 纹理)** 分组提交。**UI 自行管理绘制顺序**——**UI 的 Render2D 必须 `set_sorting(false)`**（完全按提交顺序绘制）：`finish` 按 `(win 升序, 元素序（控件录制序）, 元素内 图形→文字, 纹理 uid)` 提交——窗口间层级由提交顺序保证（`layer = base + z*1.0` 仅作兜底），**窗口内"每个控件 背景→文字 依次绘制"（后录控件完整覆盖先录控件）**，不随纹理 uid / HashMap 顺序抖动。⚠ 不可按 `(win, 图形组, 文字组)` 提交：那会把所有背景排到所有文字之前，后录控件的背景会被先录控件的文字盖住（重叠层级错误）。⚠ **不要用 `set_sorting(true)`（`SortMode::LayerAndStates`）**：它会在同一 layer 内按 `(rstates, texture_uid)` 重排，字形图集页先于程序化纹理页（圆角/渐变）注册 → 重排后圆角/渐变图形排在文字之后绘制、**盖住文字**（曾因此踩坑：圆角按钮文字消失、渐变状态栏盖住标签）。`set_layer_sort(true)`（`LayerOnly`，稳定排序）同层保持提交顺序，可接受。
+- **白纹理合批（单窗口一次 DrawCall）**：WHITE 基础纹理（1×1，`clamp_margin`）预置进**字形图集页**（[`rjw_text::Text::white_region`]；`DynamicAtlas::insert_white` 为与 key 无关的内置槽位，参与 compact 重排）——实心填充（Solid / 边框 / 光标 / 调试叠加）与字形**同页同纹理**：按控件级顺序提交（背景+文字相邻）且同纹理，Render2D 合批为**单个 draw call**，省去图形↔文字的纹理状态切换。字形本体保持 `insert_no_clamp`（避免 clamp margin 挤压）。
 - **窗口 transform**：四边形顶点为**相对窗口原点的局部像素**，提交时经 `screen_fixed_tf(窗口原点)` 变换到世界——**移动窗口只改变换、顶点不变**（也支持将窗口嵌入游戏场景，给任意世界变换）。`add_quads` / `add_mesh_transform` 均支持 `Transform2D`（`IDENTITY` = 顶点即世界坐标）。
 - **窗口顶点缓存**：窗口内容不变时，四边形顶点**跨帧缓存**（`UiState.window_quads` 按**内容签名**命中）——静态窗口每帧零字形收集/重建；hover 变色、文字编辑等任何内容变化都会使签名变化而自动重建。**移动窗口不影响缓存**（顶点是局部的，transform 每帧用当前原点）。
 - **深度测试**：`RStates::default()` 深度测试**默认关闭**，QuadVertices 纯 2D 覆盖无需深度；世界层需要深度时用 `render2d.default_depth_test(true)`（UI 独立 Render2D 不受影响）。
@@ -1168,12 +1168,15 @@ clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位�
 - 按下时 `sel_anchor = caret`，按住拖动 → 光标跟随鼠标（选择范围 = `[min,max)`，
   纯逻辑 `edit::sel_range` / `selected_text`）；选择高亮在**文本之下**绘制
   （同一 elem 图形组先于文字组），颜色 `InputStyle::sel_bg`；
-- **拖选越界跟随**：拖出输入框后光标仍跟随鼠标（越界 clamp 到文本两端，滚动随
-  光标自动跟随）——"看不见的地方也选得到"；**纯单击（无位移）释放时清理 anchor**；
+- **拖选越界跟随 + edge-scroll**：拖出输入框后光标仍跟随鼠标（越界 clamp 到文本两端）；
+  鼠标停在框外右缘/下缘时**自动滚动**（光标位置 = 鼠标 + 上一帧滚动偏移）——"看不见的
+  地方也选得到"；**纯单击（无位移）释放时清理 anchor**；
 - **无 Shift 的方向键移动 = 单选**（清除选择）；**Shift + 方向键/Home/End = 扩展选择**；
+  **Ctrl+A = 全选**；
 - `Ctrl+C/V/X`：复制选择 / 粘贴（替换选择）/ 剪切（`arboard` 系统剪贴板；
   失败静默）；⚠ **Ctrl 按下时过滤 `get_chars`**（winit 会把 'c'/'v'/'x' 当字符给出，
-  否则 Ctrl+C 留下 'c'、Ctrl+V 粘贴后多 'v'）；
+  否则 Ctrl+C 留下 'c'、Ctrl+V 粘贴后多 'v'）；⚠ **单行输入框粘贴过滤换行**
+  （HTML input 语义——多行粘贴拼接成一行，否则 '\n' 进入单行文本错乱）；
 - **选择高亮受内容区裁剪**（不溢出输入框 / 滚动容器），多行高亮随垂直滚动上移；
 - **窗口/面板拖拽协同**：输入框按下置位 `Ui::press_claimed` → `window_at` /
   `panel_impl` 不建立拖拽基准（选择拖拽优先，窗口从空白/标题区拖动），并**清除

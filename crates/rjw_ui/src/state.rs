@@ -93,11 +93,11 @@ pub struct UiState {
     /// 若只看当前帧候选会误判为"非组合"而执行本地退格（误删已有文本）。
     /// 组合中或刚结束的帧，退格/删除/方向键一律交给 IME 系统处理。
     pub(crate) ime_composing: bool,
-    /// **窗口四边形缓存**：窗口 id → (内容签名, 按 (组, 纹理) 分组的**局部顶点**)。
+    /// **窗口四边形缓存**：窗口 id → (内容签名, 按 **(元素序, 组, 纹理)** 分组的**局部顶点**)。
     /// 组：`0` = 图形（白纹理 / 圆角 / 渐变 / 边框）、`1` = 文字（字形图集）。
     /// 窗口内容不变时复用（`finish` 按签名命中），**移动窗口只改变换、顶点不重建**；
     /// 任何内容变化（hover 变色、文字编辑等）都会使签名变化而自动重建。
-    pub(crate) window_quads: HashMap<String, (u64, Vec<(u8, u64, Vec<VertexP3U2C4>)>)>,
+    pub(crate) window_quads: HashMap<String, (u64, Vec<(u32, u8, u64, Vec<VertexP3U2C4>)>)>,
     /// **诊断**：本帧**命中但被更高窗口遮挡而未响应**的控件次数
     /// （点击穿透拦截计数；`Ui::hit_abs` 累加，`begin_frame` 清零）。
     pub(crate) occluded_hits: u32,

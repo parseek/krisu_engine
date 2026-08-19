@@ -536,6 +536,64 @@ impl<'a> Ui<'a> {
         (Text::measure_buffer(&buf) / self.scale).ceil()
     }
 
+    /// 剪贴板快捷键（Ctrl+C/V/X/A）共用实现（单行 / 多行输入框）：复制 / 剪切 /
+    /// 粘贴（替换选择）/ 全选。`filter_newlines`：单行输入框粘贴时过滤换行
+    /// （HTML input 语义——多行拼接成一行，否则 '\n' 进入单行文本错乱）。
+    ///
+    /// free fn（非方法）：`kb`（不可变借 `self.keyboard` 字段）与 `ws`（可变借
+    /// `self.state` 字段）字段级借用分化，可在 `entry()` 持有 ws 期间调用。
+    fn clipboard_shortcuts(
+        kb: &KeyboardInput,
+        ws: &mut WidgetState,
+        value: &mut String,
+        filter_newlines: bool,
+    ) {
+        let c_down = kb.get(KeyCode::KeyC).down_edge();
+        let v_down = kb.get(KeyCode::KeyV).down_edge();
+        let x_down = kb.get(KeyCode::KeyX).down_edge();
+        let a_down = kb.get(KeyCode::KeyA).down_edge();
+        if a_down {
+            // Ctrl+A：全选
+            ws.sel_anchor = Some(0);
+            ws.caret = value.chars().count();
+        }
+        if c_down || x_down {
+            let sel = selected_text(value, ws.sel_anchor, ws.caret);
+            if !sel.is_empty() {
+                clipboard_set(&sel);
+                if x_down {
+                    if let Some((lo, _hi)) = sel_range(ws.sel_anchor, ws.caret) {
+                        delete_range(value, lo, ws.caret.max(lo));
+                        ws.caret = lo;
+                    }
+                    ws.sel_anchor = None;
+                }
+            }
+        }
+        if v_down {
+            if let Some(text) = clipboard_get() {
+                let text = if filter_newlines {
+                    text.replace(['\r', '\n'], "")
+                } else {
+                    text
+                };
+                if !text.is_empty() {
+                    // 粘贴替换选择
+                    let lo = match sel_range(ws.sel_anchor, ws.caret) {
+                        Some((lo, hi)) => {
+                            delete_range(value, lo, hi);
+                            lo
+                        }
+                        None => ws.caret,
+                    };
+                    insert_str_at(value, lo, &text);
+                    ws.caret = lo + text.chars().count();
+                    ws.sel_anchor = None;
+                }
+            }
+        }
+    }
+
     /// **控件自持排版缓冲**：`WidgetState::text_buf` 命中复用（key 含文本/字号/字体/
     /// 换行宽/**行距**/版本），未命中直接构建——**不写** `UiState::text_buffers` 全局缓存
     /// （文本频繁变化的输入框不污染静态标签缓存）。
@@ -1413,7 +1471,7 @@ impl<'a> Ui<'a> {
         let mut wins: Vec<u32> = groups.keys().copied().collect();
         wins.sort_unstable();
         let mut quads = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh); // 非窗口 + 缓存 miss 重建
-        let mut cached: Vec<(u32, u8, u64, Vec<VertexP3U2C4>)> = Vec::new(); // 缓存命中
+        let mut cached: Vec<(u32, u32, u8, u64, Vec<VertexP3U2C4>)> = Vec::new(); // 缓存命中
         for win in wins {
             let cmds = groups.remove(&win).expect("group exists");
             // debug_layout：每帧重建（布局描边是调试视图，跳过窗口顶点缓存）。
@@ -1442,8 +1500,8 @@ impl<'a> Ui<'a> {
                     .entry(id.clone())
                     .or_insert((0, Vec::new()));
                 if entry.0 == sig {
-                    for (g, tex, verts) in &entry.1 {
-                        cached.push((win, *g, *tex, verts.clone()));
+                    for (elem, g, tex, verts) in &entry.1 {
+                        cached.push((win, *elem, *g, *tex, verts.clone()));
                     }
                     continue;
                 }
@@ -1451,14 +1509,13 @@ impl<'a> Ui<'a> {
             // 未命中：收集该窗口命令为局部顶点，写入缓存
             let mut q = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh);
             self.collect_cmds(&mut q, win, &cmds);
-            let mut grp: Vec<(u8, u64, Vec<VertexP3U2C4>)> = Vec::new();
-            for ((_, g, tex), verts) in q.quads {
-                grp.push((g, tex, verts.clone()));
-                cached.push((win, g, tex, verts));
+            let mut grp: Vec<(u32, u8, u64, Vec<VertexP3U2C4>)> = Vec::new();
+            for ((_, elem, g, tex), verts) in q.quads {
+                grp.push((elem, g, tex, verts.clone()));
+                cached.push((win, elem, g, tex, verts));
             }
-            // 缓存组顺序与提交顺序一致：图形（白纹理 / 程序化纹理）先于字形文字，
-            // 再按纹理 uid——缓存命中的帧沿用该顺序，跨帧稳定。
-            grp.sort_by_key(|&(g, tex, _)| (g, tex));
+            // 缓存组顺序与提交顺序一致：控件序 → 元素内图形 → 文字 → 纹理——跨帧稳定。
+            grp.sort_by_key(|&(elem, g, tex, _)| (elem, g, tex));
             self.state.window_quads.insert(id, (sig, grp));
         }
         // 提交：**UI 自行管理绘制顺序**，UI 的 Render2D 必须 `set_sorting(false)`
@@ -1467,24 +1524,26 @@ impl<'a> Ui<'a> {
         // 它按 `(rstates, texture_uid)` 重排，字形图集页 uid < 程序化纹理页 uid →
         // 圆角/渐变会被排在文字之后绘制，盖住文字。
         //
-        // 统一排序键 `(win, 图形/文字组, 纹理 uid)`，每 (窗口, 组, 纹理) 一次 add_quads：
+        // 统一排序键 `(win, 元素序, 图形/文字组, 纹理 uid)`，每 (窗口, 元素, 组, 纹理)
+        // 一次 add_quads：
         // 1. **win 升序**：非窗口内容（win=0，layer = base）最底，窗口按 z 从下到上
         //    （layer = base + z）——后提交的窗口覆盖先提交的；
-        // 2. **窗口内图形组（白纹理 / 圆角 / 渐变 / 边框）先于字形文字组**——保证
-        //    "先图形后文字"（含程序化纹理，不随纹理 uid 与白纹理比较而错乱），
-        //    任意排序模式下绘制顺序完全相同、跨帧稳定。
+        // 2. **窗口内按元素序（控件录制序）**：后录控件覆盖先录控件（重叠层级正确）；
+        //    **元素内"背景/图形 → 文字"**（`g`）——文字不被自身图形覆盖。
+        //    ⚠ 不可按 (win, g, tex) 提交：那会把所有背景排到所有文字之前，后录控件的
+        //    背景会被先录控件的文字盖住（白纹理合批后语义仍错）。
         //
         // transform = 屏幕固定变换（窗口原点物理像素）→ 局部顶点映射到世界。
         let layer_base = self.base_layer;
-        let mut ordered: Vec<(u32, u8, u64, Vec<VertexP3U2C4>)> =
+        let mut ordered: Vec<(u32, u32, u8, u64, Vec<VertexP3U2C4>)> =
             Vec::with_capacity(cached.len() + quads.quads.len());
         // mem::take：只移走内容四边形，`quads.debug`（调试叠加）留待最后提交。
-        for ((win, g, tex_uid), verts) in std::mem::take(&mut quads.quads) {
-            ordered.push((win, g, tex_uid, verts));
+        for ((win, elem, g, tex_uid), verts) in std::mem::take(&mut quads.quads) {
+            ordered.push((win, elem, g, tex_uid, verts));
         }
         ordered.extend(cached);
-        ordered.sort_by_key(|&(win, g, tex_uid, _)| (win, g, tex_uid));
-        for (win, _g, tex_uid, verts) in ordered {
+        ordered.sort_by_key(|&(win, elem, g, tex_uid, _)| (win, elem, g, tex_uid));
+        for (win, _elem, _g, tex_uid, verts) in ordered {
             let Some(tex) = TEXTURES.get(tex_uid) else {
                 continue;
             };
@@ -1575,6 +1634,8 @@ impl<'a> Ui<'a> {
             None
         };
         for d in cmds {
+            // 当前元素序：push 方法按其分组（控件级提交顺序——见 QuadCollector）。
+            quads.cur_elem = d.elem;
             // 裁剪区（绝对物理；内容已随容器平移成绝对逻辑坐标）。
             let clip_abs = d.clip.map(|c| snap_rect(&self.phys_rect(&c)));
             match &d.kind {
@@ -2141,18 +2202,24 @@ impl<'a> Ui<'a> {
 pub(crate) const GROUP_GRAPHIC: u8 = 0;
 pub(crate) const GROUP_TEXT: u8 = 1;
 
-/// 按 `(窗口 z, 图形/文字组, 纹理 uid)` 分组的四边形顶点收集器（finish 提交用）。
+/// 按 `(窗口 z, 元素序, 图形/文字组, 纹理 uid)` 分组的四边形顶点收集器（finish 提交用）。
+///
+/// **控件级提交顺序**：`(win, elem, g, tex)`——同窗内按**元素序**（后录控件覆盖
+/// 先录控件），元素内"背景/图形 → 文字"（`g`）。与队列排序键一致；白纹理与字形
+/// 同页时，控件背景+文字相邻同纹理 → Render2D 合批（单窗口一次 DrawCall）。
 ///
 /// `debug`：**屏幕调试叠加**（DebugDraw 图元 + debug_layout 布局描边）——
 /// 按 `win` 分组、恒用白纹理，`finish` 时在全部 UI 内容**之后**提交。
 struct QuadCollector {
-    quads: std::collections::HashMap<(u32, u8, u64), Vec<VertexP3U2C4>>,
+    quads: std::collections::HashMap<(u32, u32, u8, u64), Vec<VertexP3U2C4>>,
     /// 调试叠加顶点（白纹理；窗口局部物理坐标）。
     debug: std::collections::HashMap<u32, Vec<VertexP3U2C4>>,
     white_uid: u64,
     /// WHITE 纹理区域 UV（字形图集页白纹理 region；兜底为整纹理 [0,1)）。
     white_uv_tl: Vec2,
     white_uv_wh: Vec2,
+    /// **当前元素序**（collect_cmds 每处理一个命令设置；push 方法按其分组）。
+    cur_elem: u32,
 }
 
 impl QuadCollector {
@@ -2163,6 +2230,7 @@ impl QuadCollector {
             white_uid,
             white_uv_tl,
             white_uv_wh,
+            cur_elem: 0,
         }
     }
 
@@ -2207,8 +2275,9 @@ impl QuadCollector {
         quad: [VertexP3U2C4; 4],
         group: u8,
     ) {
+        let elem = self.cur_elem;
         self.quads
-            .entry((win, group, tex))
+            .entry((win, elem, group, tex))
             .or_default()
             .extend_from_slice(&quad);
     }
@@ -3115,15 +3184,23 @@ impl Ui<'_> {
         let input_style = self.theme.input.clone();
         // 鼠标按下时的光标位置（点击定位 / 拖拽选择共用）：按字符**实际宽度**
         // （前缀测量，二分）——混合中英文（字宽不同）时精确落在最近的字符边界。
-        // `btn.pressed()` 而非 `hit`：**拖出输入框后仍跟随**（cx 越界 clamp 到两端，
-        // 支持"拖到看不见的地方继续选中"——滚动随光标自动跟随）。
+        // `btn.pressed()` 而非 `hit`：**拖出输入框后仍跟随**（cx 越界 clamp 到两端）。
+        // **edge-scroll**：cx 叠加上一帧水平滚动 → 鼠标停在框外右缘时，滚动增长、
+        // 光标持续前进（"看不见的地方也能一路选中"）。
         let mouse_caret = if btn.pressed() {
+            let prev_scroll = self
+                .state
+                .widgets
+                .get(id)
+                .map(|w| w.text_scroll)
+                .unwrap_or(0.0);
             let cx = (mouse_local_x - rect.x - input_style.padding_x).max(0.0);
+            let effective = cx + prev_scroll;
             Some(self.caret_index_at_width(
                 value,
                 input_style.font_size,
                 input_style.font_family.as_deref(),
-                cx,
+                effective,
             ))
         } else {
             None
@@ -3162,44 +3239,10 @@ impl Ui<'_> {
                 let in_ime_compose =
                     self.keyboard.get_ime_preedit().is_some_and(|p| !p.is_empty());
                 let ime_owns_keys = in_ime_compose || self.state.ime_composing;
-                // 剪贴板：Ctrl+C / Ctrl+V / Ctrl+X（选择复制粘贴剪切）。
+                // 剪贴板：Ctrl+C/V/X/A（单行：粘贴过滤换行）。
                 let ctrl = self.keyboard.get(KeyCode::ControlLeft).pressed()
                     || self.keyboard.get(KeyCode::ControlRight).pressed();
-                if ctrl {
-                    let c_down = self.keyboard.get(KeyCode::KeyC).down_edge();
-                    let v_down = self.keyboard.get(KeyCode::KeyV).down_edge();
-                    let x_down = self.keyboard.get(KeyCode::KeyX).down_edge();
-                    if c_down || x_down {
-                        let sel = selected_text(value, ws.sel_anchor, ws.caret);
-                        if !sel.is_empty() {
-                            clipboard_set(&sel);
-                            if x_down {
-                                if let Some((lo, _hi)) = sel_range(ws.sel_anchor, ws.caret) {
-                                    delete_range(value, lo, ws.caret.max(lo));
-                                    ws.caret = lo;
-                                }
-                                ws.sel_anchor = None;
-                            }
-                        }
-                    }
-                    if v_down {
-                        if let Some(text) = clipboard_get() {
-                            if !text.is_empty() {
-                                // 粘贴替换选择
-                                let lo = match sel_range(ws.sel_anchor, ws.caret) {
-                                    Some((lo, hi)) => {
-                                        delete_range(value, lo, hi);
-                                        lo
-                                    }
-                                    None => ws.caret,
-                                };
-                                insert_str_at(value, lo, &text);
-                                ws.caret = lo + text.chars().count();
-                                ws.sel_anchor = None;
-                            }
-                        }
-                    }
-                }
+                Self::clipboard_shortcuts(&self.keyboard, ws, value, true);
                 // 编辑操作（字符 / IME 上屏 / 退格 / 删除）前若存在选择 → 先删除选择
                 // ⚠ Ctrl 组合（C/V/X）按下时 `get_chars` 会带出 'c'/'v'/'x'——
                 // 剪贴板分支已处理，字符必须过滤（否则 Ctrl+C 留下 'c'、Ctrl+V 多出 'v'）。
@@ -3482,9 +3525,18 @@ impl Ui<'_> {
                 .unwrap_or(vlines.len().saturating_sub(1))
         };
         // 鼠标位置 → 光标（视觉行 + 行内列）。`btn.pressed()` 而非 `hit`：
-        // **拖出输入框后仍跟随**（y 越界 clamp 到首/末行；垂直滚动随光标自动跟随）。
+        // **拖出输入框后仍跟随**（y 越界 clamp 到首/末行）。**edge-scroll**：
+        // y 叠加上一帧垂直滚动 → 鼠标停在框外下缘时，滚动增长、光标逐行前进。
         let mouse_caret = if btn.pressed() {
-            let row = ((mouse_local_y - rect.y) / line_h).floor().max(0.0) as usize;
+            let prev_scroll = self
+                .state
+                .widgets
+                .get(id)
+                .map(|w| w.scroll_y)
+                .unwrap_or(0.0);
+            let row = ((mouse_local_y - rect.y + prev_scroll) / line_h)
+                .floor()
+                .max(0.0) as usize;
             let li = row.min(vlines.len().saturating_sub(1));
             let line = &vlines[li];
             let ltxt = &value[line.byte_start..line.byte_end.min(value.len())];
@@ -3524,43 +3576,10 @@ impl Ui<'_> {
                 let in_ime_compose =
                     self.keyboard.get_ime_preedit().is_some_and(|p| !p.is_empty());
                 let ime_owns_keys = in_ime_compose || self.state.ime_composing;
-                // 剪贴板（与单行输入框一致）
+                // 剪贴板：Ctrl+C/V/X/A（多行：粘贴保留换行）。
                 let ctrl = self.keyboard.get(KeyCode::ControlLeft).pressed()
                     || self.keyboard.get(KeyCode::ControlRight).pressed();
-                if ctrl {
-                    let c_down = self.keyboard.get(KeyCode::KeyC).down_edge();
-                    let v_down = self.keyboard.get(KeyCode::KeyV).down_edge();
-                    let x_down = self.keyboard.get(KeyCode::KeyX).down_edge();
-                    if c_down || x_down {
-                        let sel = selected_text(value, ws.sel_anchor, ws.caret);
-                        if !sel.is_empty() {
-                            clipboard_set(&sel);
-                            if x_down {
-                                if let Some((lo, _hi)) = sel_range(ws.sel_anchor, ws.caret) {
-                                    delete_range(value, lo, ws.caret.max(lo));
-                                    ws.caret = lo;
-                                }
-                                ws.sel_anchor = None;
-                            }
-                        }
-                    }
-                    if v_down {
-                        if let Some(text) = clipboard_get() {
-                            if !text.is_empty() {
-                                let lo = match sel_range(ws.sel_anchor, ws.caret) {
-                                    Some((lo, hi)) => {
-                                        delete_range(value, lo, hi);
-                                        lo
-                                    }
-                                    None => ws.caret,
-                                };
-                                insert_str_at(value, lo, &text);
-                                ws.caret = lo + text.chars().count();
-                                ws.sel_anchor = None;
-                            }
-                        }
-                    }
-                }
+                Self::clipboard_shortcuts(&self.keyboard, ws, value, false);
                 // 编辑操作前：选择替换（Ctrl 组合字符不触发）
                 let edit_pending = (!self.keyboard.get_chars().is_empty() && !ctrl)
                     || !self.keyboard.get_ime_commits().is_empty()

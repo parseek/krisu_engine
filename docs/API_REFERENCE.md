@@ -803,10 +803,11 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 | 能力 | 说明 |
 |---|---|
 | **超长滚动跟随光标** | 文本超出内容区时左移（`WidgetState::text_scroll`），光标右侧保留 8 逻辑像素；TextArea 垂直滚动（`scroll_y`）跟随光标行 + 滚轮 |
-| **文本选择** | 按住**拖选**（`WidgetState::sel_anchor`；选择优先于窗口/面板拖拽——从输入框拖拽 = 选择文本）；选择后打字 / 退格 / 删除 / 粘贴**替换选择** |
-| **复制 / 粘贴 / 剪切** | `Ctrl+C` / `Ctrl+V` / `Ctrl+X`（`arboard` 系统剪贴板；TextArea 支持跨行选择） |
+| **文本选择** | 按住**拖选**（`WidgetState::sel_anchor`；选择优先于窗口/面板拖拽——从输入框拖拽 = 选择文本）；选择后打字 / 退格 / 删除 / 粘贴**替换选择**；**拖出框外仍跟随 + edge-scroll**（停在框外边缘自动滚动，"看不见的地方也选得到"）；**纯单击（无位移）释放清理 anchor** |
+| **复制 / 粘贴 / 剪切 / 全选** | `Ctrl+C` / `Ctrl+V` / `Ctrl+X` / `Ctrl+A`（`arboard` 系统剪贴板；TextArea 跨行选择）；**单行粘贴过滤换行**（多行拼接成一行） |
+| **Shift 选择** | `Shift + ←/→/↑/↓/Home/End` 扩展 / 收缩选择；**无 Shift 方向键移动 = 单选**（清除选择） |
 | **IME 组合候选浮动提示框** | 组合串（preedit）画在输入框**下方浮动小框**（底色 + 边框 + 灰色文本，自动宽度），不再占行内；系统候选框 `set_ime_cursor_area` 跟随光标（含水平/垂直滚动） |
-| **多行 TextArea** | `p.text_area(id, &mut String)` / `text_area_at(id, rect, ...)`：Enter 换行、↑/↓ 跨行（保持列，`edit::move_caret_line`）、Home/End 行首尾、按内容区宽度自动换行（`create_buffer_wrap`）、跨行选择高亮逐行绘制；光标按逻辑行（`\n`）定位（超宽长行换行后近似） |
+| **多行 TextArea** | `p.text_area(id, &mut String)` / `text_area_at(id, rect, ...)`：Enter 换行、↑/↓ 跨**视觉行**（保持列）、Home/End 行首尾、按内容区宽度自动换行（`create_buffer_wrap`）、**光标/点击/选择按视觉行定位与显示一致**（`Text::visual_lines`）、行距 1.2、跨视觉行选择高亮逐行绘制 |
 
 - 输入框按下时置位 `press_claimed`：窗口/面板**不建立拖拽基准**（选择拖拽优先；窗口从空白/标题区拖动），并清除旧拖拽基准（防"瞬移"）；
 - 主题：`InputStyle::sel_bg`（选择高亮色，默认浅蓝 / dark 深蓝）。
