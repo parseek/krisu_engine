@@ -33,21 +33,25 @@ use winit::window::Window as WinitWindow;
 
 use crate::draw::{
     border_rects, clipped, debug_shape_segments, intersect_rect, screen_fixed_tf, snap_rect,
-    text_block_offset, text_cmd, DebugShape, DrawKind, GradientAxis, TextAlign, UiDraw,
+    text_block_offset, text_cmd, DebugShape, DrawKind, GradientAxis, TextAlign, TextVAlign, UiDraw,
 };
 use crate::edit::{
-    delete_range, index_of_line_col, insert_str_at, line_col_of, move_caret_line,
-    scroll_follow_caret, sel_range, selected_text,
+    byte_to_char, char_to_byte, delete_range, insert_str_at, scroll_follow_caret, sel_range,
+    selected_text,
 };
 use crate::focus::{focus_step, FocusEntry, FocusKind};
 use crate::hit::{
     clear_frame_flags, hit_test, normalize_x, update_drag, update_interact, window_occluded,
 };
 use crate::layout::{Frame, PackSide};
-use crate::state::{ButtonState, CheckboxState, TEXT_BUFFER_CACHE_CAP, UiState};
+use crate::state::{ButtonState, CheckboxState, TEXT_BUFFER_CACHE_CAP, UiState, WidgetState};
 use crate::style::Theme;
 
 // ─── 文本编辑辅助（纯函数，可单测） ─────────────────────────────
+
+/// TextArea **行距倍率**：行高 = 字号 × 该值（1.2 = 略宽松，多行可读性；与
+/// `ensure_text_buf` 的 `line_mult` 一致，cosmic 行盒按此递增）。
+pub(crate) const TEXT_AREA_LINE_SPACING: f32 = 1.2;
 
 /// 读取系统剪贴板文本（失败返回 `None`：无剪贴板 / 权限受限等）。
 fn clipboard_get() -> Option<String> {
@@ -532,6 +536,47 @@ impl<'a> Ui<'a> {
         (Text::measure_buffer(&buf) / self.scale).ceil()
     }
 
+    /// **控件自持排版缓冲**：`WidgetState::text_buf` 命中复用（key 含文本/字号/字体/
+    /// 换行宽/**行距**/版本），未命中直接构建——**不写** `UiState::text_buffers` 全局缓存
+    /// （文本频繁变化的输入框不污染静态标签缓存）。
+    ///
+    /// `line_mult`：行高 = 字号 × 行距倍率（1.0 = 无行距；TextArea 多行用 1.2 加行距）。
+    /// 用两次独立借用实现（`self.state` 与 `self.text` 不能同时可变借用）。
+    fn ensure_text_buf(
+        &mut self,
+        id: &str,
+        s: &str,
+        size: f32,
+        family: Option<&str>,
+        wrap_logical: f32,
+        line_mult: f32,
+    ) -> Arc<Buffer> {
+        let size_px = (size * self.scale).round();
+        let wrap_px = (wrap_logical * self.scale).round().max(0.0);
+        let mult_bits = line_mult.to_bits();
+        let key = format!(
+            "{s}\u{1}{size_px}\u{1}{}\u{1}{wrap_px}\u{1}{mult_bits}\u{1}{TEXT_LINE_HEIGHT_VERSION}",
+            family.unwrap_or("")
+        );
+        if let Some((k, b)) = self.state.widgets.get(id).and_then(|w| w.text_buf.as_ref()) {
+            if *k == key {
+                return b.clone();
+            }
+        }
+        let lh = (size_px as f32 * line_mult.max(1.0)).round();
+        let attrs = match family {
+            Some(f) if !f.is_empty() => Attrs::new().family(Family::Name(f)),
+            _ => Attrs::new(),
+        };
+        let buf = self
+            .text
+            .create_buffer_wrap(s, attrs, size_px, lh, Align::Left, wrap_px, CachePolicy::User);
+        if let Some(ws) = self.state.widgets.get_mut(id) {
+            ws.text_buf = Some((key, buf.clone()));
+        }
+        buf
+    }
+
     /// 按字符**实际宽度**把点击位置（相对内容左缘，逻辑像素）映射为最近的光标 char 索引。
     ///
     /// 用"前缀宽度"二分（宽度随前缀长度单调不减）——混合中英文（字宽不同）时
@@ -915,9 +960,11 @@ impl<'a> Ui<'a> {
             style.font_size,
             style.color,
             TextAlign::from(style.align),
+            TextVAlign::Center,
             style.font_family.clone(),
             None,
             self.clip,
+        None,
         ));
         size
     }
@@ -942,9 +989,11 @@ impl<'a> Ui<'a> {
             style.font_size,
             style.color,
             TextAlign::from(style.align),
+            TextVAlign::Center,
             style.font_family.clone(),
             None,
             self.clip,
+        None,
         ));
         size
     }
@@ -1335,7 +1384,25 @@ impl<'a> Ui<'a> {
         self.queue
             .sort_by_key(|d| (d.win, d.depth, d.elem, d.kind.group(), d.seq));
         let queue = std::mem::take(&mut self.queue);
-        let white_uid = self.r2d.white_texture().uid;
+        // **WHITE 基础纹理优先取字形图集页**（`Text::white_region`，1×1 clamp_margin）：
+        // 实心填充（Solid / 边框 / 光标）与字形**同页同纹理** → 同窗口内"图形组 → 文字组"
+        // 相邻且同纹理，Render2D 合批为单个 draw call，省去图形↔文字的纹理状态切换。
+        // 兜底：渲染器自带白纹理（整纹理 UV）。
+        let (white_uid, white_uv_tl, white_uv_wh) = match self.text.white_region() {
+            Some(r) => {
+                let inv = match TEXTURES.get(r.page_uid) {
+                    Some(t) => 1.0 / t.width as f32,
+                    None => 1.0,
+                };
+                let tl = Vec2::new(r.tl_px.0 as f32, r.tl_px.1 as f32) * inv;
+                let wh = Vec2::new(r.wh_px.0 as f32, r.wh_px.1 as f32) * inv;
+                (r.page_uid, tl, wh)
+            }
+            None => {
+                let uid = self.r2d.white_texture().uid;
+                (uid, Vec2::ZERO, Vec2::ONE)
+            }
+        };
         // 按窗口分组：非窗口（win=0）每帧重建；窗口按**内容签名**缓存局部顶点，
         // 内容不变时复用（移动窗口只改变换，顶点不重建）。
         let mut groups: std::collections::HashMap<u32, Vec<UiDraw>> =
@@ -1345,7 +1412,7 @@ impl<'a> Ui<'a> {
         }
         let mut wins: Vec<u32> = groups.keys().copied().collect();
         wins.sort_unstable();
-        let mut quads = QuadCollector::new(white_uid); // 非窗口 + 缓存 miss 重建
+        let mut quads = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh); // 非窗口 + 缓存 miss 重建
         let mut cached: Vec<(u32, u8, u64, Vec<VertexP3U2C4>)> = Vec::new(); // 缓存命中
         for win in wins {
             let cmds = groups.remove(&win).expect("group exists");
@@ -1382,7 +1449,7 @@ impl<'a> Ui<'a> {
                 }
             }
             // 未命中：收集该窗口命令为局部顶点，写入缓存
-            let mut q = QuadCollector::new(white_uid);
+            let mut q = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh);
             self.collect_cmds(&mut q, win, &cmds);
             let mut grp: Vec<(u8, u64, Vec<VertexP3U2C4>)> = Vec::new();
             for ((_, g, tex), verts) in q.quads {
@@ -1636,8 +1703,10 @@ impl<'a> Ui<'a> {
                     size,
                     color,
                     align,
+                    valign,
                     family,
                     clip,
+                    buf,
                 } => {
                     // 外层裁剪（绝对逻辑）→ 相对文本块左上角（与 DrawKind::Text::clip 同空间），
                     // 与命令自带裁剪求交后传给 draw_text_quads。
@@ -1659,8 +1728,10 @@ impl<'a> Ui<'a> {
                         *size,
                         *color,
                         *align,
+                        *valign,
                         family.as_deref(),
                         merged,
+                        buf.as_ref().map(Arc::clone),
                     );
                     let pr = snap_rect(&self.phys_rect(&d.rect));
                     debug_layout_outline(quads, win, anchor_px, pr, dbg);
@@ -1734,14 +1805,17 @@ impl<'a> Ui<'a> {
                 size,
                 color,
                 align,
+                valign,
                 family,
                 clip,
+                buf: _,
             } => {
                 2u8.hash(h);
                 text.hash(h);
                 size.to_bits().hash(h);
                 color_bits(*color).hash(h);
                 (*align as u8).hash(h);
+                (*valign as u8).hash(h);
                 family.hash(h);
                 // 文本缓存版本号影响排版结果，必须包含在签名中
                 TEXT_LINE_HEIGHT_VERSION.hash(h);
@@ -1815,7 +1889,7 @@ impl<'a> Ui<'a> {
     /// 窗口按下裁决：本帧若有窗口被按下（重叠区域点击），**只保留最上层窗口**
     /// 的拖拽（其余取消，修复"重叠时同时拖动两个窗口"），且仅最上层窗口置顶。
     fn resolve_win_press(&mut self) {
-        let Some((top_id, _)) = self.win_press_top.clone() else {
+        let Some((top_id, old_z)) = self.win_press_top.clone() else {
             return;
         };
         // 只保留最高 z 命中窗口的拖拽
@@ -1831,10 +1905,12 @@ impl<'a> Ui<'a> {
         // **焦点归属清理**：焦点控件若在**其他窗口**（本次置顶的窗口之外）——
         // 清除焦点。否则旧输入框在窗口被盖住后仍持焦点（点击被遮挡无法再聚焦、
         // 打字落入不可见输入框），表现为"使用其他窗口后文本框失效"。
-        let top_z = new_z;
+        // ⚠ 与**置顶前**的 z（`old_z`，win_press_top 记录点击时的窗口 z）比较——
+        // 焦点条目本帧以旧 z 录制；拿置顶后的 `new_z` 比会恒不相等 → 点击输入框
+        // （其所在窗口同时置顶）焦点被立即清除，窗口内文本框"无法使用"。
         if let Some(fid) = &self.state.focused {
             let fwin = self.focusables.iter().find(|e| e.id == *fid).map(|e| e.win);
-            if fwin.is_some_and(|w| w != 0 && w != top_z) {
+            if fwin.is_some_and(|w| w != 0 && w != old_z) {
                 self.state.focused = None;
             }
         }
@@ -1915,6 +1991,10 @@ impl<'a> Ui<'a> {
     }
 
     /// 文本 → 字形四边形（收集到 `quads`；按字形图集页纹理分组）。
+    ///
+    /// **精确裁切**（"半消失"）：字形与裁剪区求交，相交部分生成裁剪后的四边形
+    /// （UV 按比例同步缩放）——字形在裁剪线处被**部分绘制**，而非整字形保留/消失
+    /// （`rjw_text` 的 `cull` 只做整字形剔除，像素级裁剪在此完成）。
     #[allow(clippy::too_many_arguments)]
     fn draw_text_quads(
         &mut self,
@@ -1926,32 +2006,39 @@ impl<'a> Ui<'a> {
         size: f32,
         color: Color,
         align: TextAlign,
+        valign: TextVAlign,
         family: Option<&str>,
         clip: Option<Rect>,
+        buf: Option<Arc<Buffer>>,
     ) {
         if rect.w <= 0.0 || rect.h <= 0.0 || text.is_empty() {
             return;
         }
         // 全部换算物理像素（锚点 / 裁剪区），与屏幕固定变换 1:1 匹配；
-        // 排版缓冲按物理字号自持（cache_buffer），直接 render_from 渲染（跳过重复整形）。
+        // 排版缓冲：控件自持（输入框）或按需缓存（静态标签）。
         let pr = snap_rect(&self.phys_rect(rect));
         // 矩形锚点（**整数像素**，逐项取整，无小数参与加法）：
-        // 水平：左 = 左缘、中 = 左缘 + 半宽取整、右 = 右缘；垂直 = 上缘 + 半高取整。
-        // `pr.w * 0.5` 对偶数宽是精确整数、对奇数宽是精确 .5（f32 可精确表示整数/2），
-        // `round` 在边界一次性消化 0.5 —— 之后的加法两侧均为整数。
+        // 水平：左 = 左缘、中 = 左缘 + 半宽取整、右 = 右缘；
+        // 垂直：Center = 上缘 + 半高取整，Top = 上缘（TextArea 多行顶对齐）。
         let anchor = Vec2::new(
             match align {
                 TextAlign::Left => pr.x,
                 TextAlign::Center => pr.x + (pr.w * 0.5).round(),
                 TextAlign::Right => pr.x + pr.w,
             },
-            pr.y + (pr.h * 0.5).round(),
+            match valign {
+                TextVAlign::Top => pr.y,
+                TextVAlign::Center => pr.y + (pr.h * 0.5).round(),
+            },
         );
         // 局部化基准 = **窗口原点**（anchor_px），不是文字锚点：
         // 字形世界坐标 - 窗口原点世界 = 相对窗口原点的局部顶点，
         // 提交时经窗口 transform（screen_fixed_tf(窗口原点)）映射回世界。
         let win_anchor_world = self.cam.screen_to_world(anchor_px);
-        let buf = self.cache_buffer(text, size, family);
+        let buf = match buf {
+            Some(b) => b,
+            None => self.cache_buffer(text, size, family),
+        };
         let mut tr = self.text.render_from(&buf);
         // 垂直定位按**行盒**（行高），而非字形墨迹内容：
         // 以首行行顶（相对文本视觉原点）为参考，使行盒中心对准锚点（矩形垂直中心）。
@@ -1970,19 +2057,30 @@ impl<'a> Ui<'a> {
         // 在 `round` 边界被一次性消化，不会流入加法链 → 无误差累加；
         // 字形四边形角点 = block_tl + 整数字形偏移 = 整数屏幕像素 → 采样精确落在
         // 纹素中心，消除 1:1 图集双线性采样的亚像素模糊。
-        let block_tl = anchor + text_block_offset(align, content, first_line_top);
+        let block_tl = anchor + text_block_offset(align, valign, content, first_line_top);
         let tf = screen_fixed_tf(self.cam, block_tl);
         tr.origin(Vec2::ZERO).transform(tf).color(color);
-        if let Some(c) = clip {
-            // clip 相对字形局部坐标（物理像素），随字号同比例缩放并取整
+        // 裁剪区：相对命令矩形（`merged`，逻辑）→ **窗口局部**。
+        // ⚠ 相对基准是命令矩形物理 `pr`，**不是**文本块原点 `block_tl`：
+        // `merged` 相对 `d.rect`，而字形窗口局部坐标以 `anchor_px` 为原点——
+        // clip 窗口局部 = merged×scale + (pr - anchor_px)。用 block_tl 会整体错位
+        // (block_tl - pr)（Top 对齐 / 多行时垂直偏差数像素）→ 滚动后文本不消失/错位。
+        let clip_local: Option<Rect> = clip.map(|c| {
             let pc = snap_rect(&Rect::new(
                 c.x * self.scale,
                 c.y * self.scale,
                 c.w * self.scale,
                 c.h * self.scale,
             ));
-            tr.clip(pc).cull(true);
-        }
+            Rect::new(
+                pc.x + pr.x - anchor_px.x,
+                pc.y + pr.y - anchor_px.y,
+                pc.w,
+                pc.h,
+            )
+        });
+        // 像素级裁剪完全由下方逐字形求交完成（完全在外 → 剔除；部分相交 → "半消失"）。
+        // 不再使用 rjw_text 的 clip/cull（其坐标系相对字形 top_left，语义易错位）。
         let page_size = tr.page_size();
         let inv_page = 1.0 / page_size;
         let ca: [f32; 4] = color.into();
@@ -1993,17 +2091,42 @@ impl<'a> Ui<'a> {
             let tl = transform.transform_point(Vec2::new(0.0, 0.0)) - win_anchor_world;
             let tr_p = transform.transform_point(Vec2::new(w, 0.0)) - win_anchor_world;
             let bl = transform.transform_point(Vec2::new(0.0, h)) - win_anchor_world;
-            let br = transform.transform_point(Vec2::new(w, h)) - win_anchor_world;
             let uv_tl = Vec2::new(
                 region.tl_px.0 as f32 * inv_page,
                 region.tl_px.1 as f32 * inv_page,
             );
-            let uv_br = uv_tl + Vec2::new(w * inv_page, h * inv_page);
+            let uv_wh = Vec2::new(w * inv_page, h * inv_page);
+            // 字形窗口局部 AABB（轴对齐；屏幕固定变换下无旋转）。
+            let gx = tl.x;
+            let gy = tl.y;
+            let gw = tr_p.x - tl.x;
+            let gh = bl.y - tl.y;
+            let (qx0, qy0, qx1, qy1) = match &clip_local {
+                Some(c) => {
+                    // 与裁剪区求交：无交集 → 整字形剔除（"完全消失"）；
+                    // 部分相交 → 生成裁剪后四边形（"半消失"，UV 按比例缩放）。
+                    let ix0 = gx.max(c.x);
+                    let iy0 = gy.max(c.y);
+                    let ix1 = (gx + gw).min(c.x + c.w);
+                    let iy1 = (gy + gh).min(c.y + c.h);
+                    if ix1 <= ix0 || iy1 <= iy0 {
+                        return;
+                    }
+                    (ix0, iy0, ix1, iy1)
+                }
+                None => (gx, gy, gx + gw, gy + gh),
+            };
+            let nw = qx1 - qx0;
+            let nh = qy1 - qy0;
+            let u0 = uv_tl.x + (qx0 - gx) / gw * uv_wh.x;
+            let v0 = uv_tl.y + (qy0 - gy) / gh * uv_wh.y;
+            let u1 = u0 + nw / gw * uv_wh.x;
+            let v1 = v0 + nh / gh * uv_wh.y;
             let quad = [
-                vertex_p3u2c4(tl, [uv_tl.x, uv_tl.y], ca),
-                vertex_p3u2c4(tr_p, [uv_br.x, uv_tl.y], ca),
-                vertex_p3u2c4(bl, [uv_tl.x, uv_br.y], ca),
-                vertex_p3u2c4(br, [uv_br.x, uv_br.y], ca),
+                vertex_p3u2c4(Vec2::new(qx0, qy0), [u0, v0], ca),
+                vertex_p3u2c4(Vec2::new(qx1, qy0), [u1, v0], ca),
+                vertex_p3u2c4(Vec2::new(qx0, qy1), [u0, v1], ca),
+                vertex_p3u2c4(Vec2::new(qx1, qy1), [u1, v1], ca),
             ];
             quads.push_tex_quad(win, region.page_uid, quad);
         });
@@ -2027,38 +2150,28 @@ struct QuadCollector {
     /// 调试叠加顶点（白纹理；窗口局部物理坐标）。
     debug: std::collections::HashMap<u32, Vec<VertexP3U2C4>>,
     white_uid: u64,
+    /// WHITE 纹理区域 UV（字形图集页白纹理 region；兜底为整纹理 [0,1)）。
+    white_uv_tl: Vec2,
+    white_uv_wh: Vec2,
 }
 
 impl QuadCollector {
-    fn new(white_uid: u64) -> Self {
+    fn new(white_uid: u64, white_uv_tl: Vec2, white_uv_wh: Vec2) -> Self {
         Self {
             quads: std::collections::HashMap::new(),
             debug: std::collections::HashMap::new(),
             white_uid,
+            white_uv_tl,
+            white_uv_wh,
         }
     }
 
-    /// 白色纹理四边形（背景 / 边框 / 光标；UV 全纹理；图形组）。
+    /// 白色纹理四边形（背景 / 边框 / 光标；WHITE region UV；图形组）。
     fn push_white(&mut self, win: u32, r: Rect, c: Color) {
-        self.push_rect(win, self.white_uid, r, c);
+        self.push_tex_rect(win, self.white_uid, self.white_uv_tl, self.white_uv_wh, r, c);
     }
 
-    /// 轴对齐矩形四边形（整纹理 UV；图形组）。
-    fn push_rect(&mut self, win: u32, tex: u64, r: Rect, c: Color) {
-        if r.w <= 0.0 || r.h <= 0.0 {
-            return;
-        }
-        let ca: [f32; 4] = c.into();
-        let quad = [
-            vertex_p3u2c4(Vec2::new(r.x, r.y), [0.0, 0.0], ca),
-            vertex_p3u2c4(Vec2::new(r.x + r.w, r.y), [1.0, 0.0], ca),
-            vertex_p3u2c4(Vec2::new(r.x, r.y + r.h), [0.0, 1.0], ca),
-            vertex_p3u2c4(Vec2::new(r.x + r.w, r.y + r.h), [1.0, 1.0], ca),
-        ];
-        self.push_tex_quad_group(win, tex, quad, GROUP_GRAPHIC);
-    }
-
-    /// 带 UV 子区域的矩形四边形（图形组；圆角 9-patch / 渐变用）。
+    /// 带 UV 子区域的矩形四边形（图形组；圆角 9-patch / 渐变 / WHITE region 用）。
     fn push_tex_rect(
         &mut self,
         win: u32,
@@ -2100,18 +2213,20 @@ impl QuadCollector {
             .extend_from_slice(&quad);
     }
 
-    /// 调试叠加：一条带厚度线段（白纹理实心色；UV 置 0 对 1×1 白纹理无影响）。
+    /// 调试叠加：一条带厚度线段（白纹理实心色；UV 取 WHITE region 中心）。
     /// 几何复用 [`rjw_2d_render::debug_draw::thick_line_quad`]；退化线段（零长 / 零宽）跳过。
     fn push_debug_line(&mut self, win: u32, a: Vec2, b: Vec2, width: f32, c: Color) {
         let Some([tl, tr, bl, br]) = rjw_2d_render::debug_draw::thick_line_quad(a, b, width) else {
             return;
         };
         let ca: [f32; 4] = c.into();
+        // UV 必须落在 WHITE region 内（[0,0] 会采样字形页左上角，可能是字形像素）。
+        let uv = self.white_uv_tl + self.white_uv_wh * 0.5;
         let quad = [
-            vertex_p3u2c4(tl, [0.0, 0.0], ca),
-            vertex_p3u2c4(tr, [0.0, 0.0], ca),
-            vertex_p3u2c4(bl, [0.0, 0.0], ca),
-            vertex_p3u2c4(br, [0.0, 0.0], ca),
+            vertex_p3u2c4(tl, [uv.x, uv.y], ca),
+            vertex_p3u2c4(tr, [uv.x, uv.y], ca),
+            vertex_p3u2c4(bl, [uv.x, uv.y], ca),
+            vertex_p3u2c4(br, [uv.x, uv.y], ca),
         ];
         self.debug.entry(win).or_default().extend_from_slice(&quad);
     }
@@ -2242,9 +2357,11 @@ macro_rules! widget_api {
                     style.font_size,
                     style.color,
                     TextAlign::from(style.align),
+                    TextVAlign::Center,
                     style.font_family.clone(),
                     None,
                     self.ui.clip,
+                None,
                 ));
                 size
             }
@@ -2276,9 +2393,11 @@ macro_rules! widget_api {
                     style.font_size,
                     style.color,
                     TextAlign::from(style.align),
+                    TextVAlign::Center,
                     style.font_family.clone(),
                     None,
                     self.ui.clip,
+                None,
                 ));
                 size
             }
@@ -2590,9 +2709,11 @@ impl Ui<'_> {
             style.font_size,
             style.fg,
             TextAlign::Left,
+            TextVAlign::Center,
             style.font_family.clone(),
             None,
             self.clip,
+        None,
         ));
         let arrow_rect = Rect::new(rect.x + rect.w - 18.0, rect.y, 18.0, rect.h);
         let seq = self.next_seq();
@@ -2606,9 +2727,11 @@ impl Ui<'_> {
             style.font_size,
             style.fg,
             TextAlign::Center,
+            TextVAlign::Center,
             None,
             None,
             self.clip,
+        None,
         ));
         // 展开的选项浮层：临时窗口（z 最高 → 覆盖一切），自动尺寸包裹选项。
         if open {
@@ -2715,9 +2838,11 @@ impl Ui<'_> {
                 style.font_size,
                 style.fg,
                 TextAlign::Center,
+                TextVAlign::Center,
                 style.font_family.clone(),
                 None,
                 self.clip,
+            None,
             ));
             ButtonState {
                 hovered,
@@ -2965,9 +3090,11 @@ impl Ui<'_> {
             style.font_size,
             style.fg,
             TextAlign::Left,
+            TextVAlign::Center,
             style.font_family.clone(),
             None,
             self.clip,
+        None,
         ));
     }
 
@@ -2988,7 +3115,9 @@ impl Ui<'_> {
         let input_style = self.theme.input.clone();
         // 鼠标按下时的光标位置（点击定位 / 拖拽选择共用）：按字符**实际宽度**
         // （前缀测量，二分）——混合中英文（字宽不同）时精确落在最近的字符边界。
-        let mouse_caret = if hit && btn.pressed() {
+        // `btn.pressed()` 而非 `hit`：**拖出输入框后仍跟随**（cx 越界 clamp 到两端，
+        // 支持"拖到看不见的地方继续选中"——滚动随光标自动跟随）。
+        let mouse_caret = if btn.pressed() {
             let cx = (mouse_local_x - rect.x - input_style.padding_x).max(0.0);
             Some(self.caret_index_at_width(
                 value,
@@ -3011,12 +3140,18 @@ impl Ui<'_> {
                     ws.caret = c;
                 }
                 ws.sel_anchor = Some(ws.caret);
-            } else if ws.pressed && btn.pressed() && hit {
-                // 拖拽选择：按住并移动 → 光标跟随鼠标，选择范围 = [anchor, caret)
+            } else if ws.pressed && btn.pressed() {
+                // 拖拽选择：按住并移动 → 光标跟随鼠标（**即使拖出输入框**——超出部分
+                // clamp 到文本两端；水平滚动随光标自动跟随），选择范围 = [anchor, caret)。
                 self.press_claimed = true;
                 if let Some(c) = mouse_caret {
                     ws.caret = c;
                 }
+            }
+            if ev.released && ws.sel_anchor == Some(ws.caret) {
+                // 纯点击（无位移）：anchor == caret，无实际选择 → 清理，避免残留
+                // anchor 在后续无 Shift 方向键移动时"突然变成多选"。
+                ws.sel_anchor = None;
             }
             let focused = self.state.focused.as_deref() == Some(id);
             if focused {
@@ -3066,7 +3201,9 @@ impl Ui<'_> {
                     }
                 }
                 // 编辑操作（字符 / IME 上屏 / 退格 / 删除）前若存在选择 → 先删除选择
-                let edit_pending = !self.keyboard.get_chars().is_empty()
+                // ⚠ Ctrl 组合（C/V/X）按下时 `get_chars` 会带出 'c'/'v'/'x'——
+                // 剪贴板分支已处理，字符必须过滤（否则 Ctrl+C 留下 'c'、Ctrl+V 多出 'v'）。
+                let edit_pending = (!self.keyboard.get_chars().is_empty() && !ctrl)
                     || !self.keyboard.get_ime_commits().is_empty()
                     || (self.keyboard.get(KeyCode::Backspace).down_edge() && !ime_owns_keys)
                     || (self.keyboard.get(KeyCode::Delete).down_edge() && !ime_owns_keys);
@@ -3082,10 +3219,12 @@ impl Ui<'_> {
                     insert_str_at(value, ws.caret, commit);
                     ws.caret = (ws.caret + commit.chars().count()).min(value.chars().count());
                 }
-                // 普通字符输入 / 编辑
-                for ch in self.keyboard.get_chars() {
-                    insert_char_at(value, ws.caret, *ch);
-                    ws.caret = (ws.caret + 1).min(value.chars().count());
+                // 普通字符输入 / 编辑（Ctrl 组合不产生文本）
+                if !ctrl {
+                    for ch in self.keyboard.get_chars() {
+                        insert_char_at(value, ws.caret, *ch);
+                        ws.caret = (ws.caret + 1).min(value.chars().count());
+                    }
                 }
                 if self.keyboard.get(KeyCode::Backspace).down_edge() && !ime_owns_keys {
                     ws.caret = remove_before(value, ws.caret);
@@ -3093,11 +3232,28 @@ impl Ui<'_> {
                 if self.keyboard.get(KeyCode::Delete).down_edge() && !ime_owns_keys {
                     remove_at(value, ws.caret);
                 }
+                // Shift + 方向键：扩展/收缩选择（anchor 不动；光标越过 anchor 时收缩归零）
+                let shift = self.keyboard.get(KeyCode::ShiftLeft).pressed()
+                    || self.keyboard.get(KeyCode::ShiftRight).pressed();
+                let shift_start = |ws: &mut WidgetState| {
+                    if shift && ws.sel_anchor.is_none() {
+                        ws.sel_anchor = Some(ws.caret);
+                    }
+                };
+                let shift_shrink = |ws: &mut WidgetState| {
+                    if ws.sel_anchor == Some(ws.caret) {
+                        ws.sel_anchor = None;
+                    }
+                };
                 if self.keyboard.get(KeyCode::ArrowLeft).down_edge() && !ime_owns_keys {
+                    shift_start(ws);
                     ws.caret = ws.caret.saturating_sub(1);
+                    shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::ArrowRight).down_edge() && !ime_owns_keys {
+                    shift_start(ws);
                     ws.caret = (ws.caret + 1).min(value.chars().count());
+                    shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::Enter).down_edge() {
                     self.state.focused = None;
@@ -3160,13 +3316,24 @@ impl Ui<'_> {
                     win,
                     elem,
                     rect: sel_rect,
-                    clip: self.clip,
+                    // 选择高亮受内容区裁剪（不溢出输入框 / 滚动容器）。
+                    clip: Some(content_rect),
                     kind: DrawKind::Solid(style.sel_bg),
                 });
             }
         }
-        // 文本（左移 scroll；裁剪内容区——左缘 0 起，不裁首个字形）。
-        let clip = Rect::new(0.0, 0.0, content_w, rect.h);
+        // 文本（左移 scroll；**裁剪窗口固定在内容区**：clip 相对移动后的 rect 起点 = scroll，
+        // 绝对位置 = content_rect.x —— 若 clip.x=0 会随 rect 一起左移，始终显示文本开头
+        // 且偏离文本框；缓冲控件自持）。
+        let clip = Rect::new(scroll, 0.0, content_w, rect.h);
+        let buf = self.ensure_text_buf(
+            id,
+            value,
+            style.font_size,
+            style.font_family.as_deref(),
+            0.0,
+            1.0,
+        );
         let seq = self.next_seq();
         self.queue.push(text_cmd(
             depth,
@@ -3178,9 +3345,11 @@ impl Ui<'_> {
             style.font_size,
             style.fg,
             TextAlign::Left,
+            TextVAlign::Center,
             style.font_family.clone(),
             Some(clip),
             self.clip,
+            Some(buf),
         ));
         // IME 组合候选 → **浮动提示框**（输入框下方小框，不再占行内）：
         // 面板底色 + 边框 + preedit 文本，自动宽度；组合中实时更新。
@@ -3232,9 +3401,11 @@ impl Ui<'_> {
                         style.font_size,
                         style.preedit,
                         TextAlign::Left,
+                        TextVAlign::Center,
                         style.font_family.clone(),
                         None,
                         self.clip,
+                    None,
                     ));
                 }
             }
@@ -3275,33 +3446,52 @@ impl Ui<'_> {
 
     /// 多行文本输入框（显式 rect，**TextArea**）。
     ///
-    /// - **编辑**：Enter 换行、↑/↓ 跨行（保持列）、Home/End 行首/行尾、←/→ 字符移动、
-    ///   Backspace/Delete、选择替换；Esc 失焦；
+    /// - **编辑**：Enter 换行、↑/↓ 跨**视觉行**（保持列）、Home/End 行首/行尾、
+    ///   ←/→ 字符移动、Backspace/Delete、选择替换；Esc 失焦；
     /// - **渲染**：文本按内容区宽度**自动换行**（[`rjw_text::Text::create_buffer_wrap`]）；
     ///   超出高度**垂直滚动**（滚轮 + 光标跟随，`WidgetState::scroll_y`）；
-    /// - **选择 / 复制 / 粘贴 / 剪切**（Ctrl+C/V/X）与单行输入框一致（跨行选择，
-    ///   高亮逐行绘制）；
+    /// - **光标 / 点击 / 选择按"视觉行"（自动换行后）定位**——与显示完全一致
+    ///   （[`rjw_text::Text::visual_lines`]：每个 `LayoutRun` 一行，含字节范围）；
+    /// - **选择 / 复制 / 粘贴 / 剪切**（Ctrl+C/V/X）跨视觉行，高亮逐行绘制。
     /// - **IME**：组合候选浮动提示框 + 候选框定位到光标。
-    /// - 光标/点击按**逻辑行**（`\n`）定位：内容不换行时精确，超宽长行换行后近似
-    ///   （v1 限制，见 [`crate::edit`]）。
     pub(crate) fn text_area_at(&mut self, id: &str, rect: Rect, value: &mut String) {
         let hit = self.hit_abs(&rect);
         let btn = self.mouse_left();
         self.register_focus(id, rect, FocusKind::TextInput);
         let style = self.theme.input.clone();
-        let line_h = style.font_size.max(1.0);
+        // **行距**：多行行高 = 字号 × 1.2（与排版缓冲 `line_mult` 一致；cosmic 行盒
+        // 按此递增，光标/高亮按视觉行序号 × 行高对齐）。
+        let line_h = (style.font_size * TEXT_AREA_LINE_SPACING).max(1.0);
         let content_w = (rect.w - style.padding_x * 2.0).max(0.0);
         let content_rect = Rect::new(rect.x + style.padding_x, rect.y, content_w, rect.h);
-        let line_count = value.split('\n').count().max(1);
         let mouse_local_y = self.mouse_logical.y - self.abs_base.y;
-        // 鼠标位置 → 光标（逻辑行 + 行内列）
-        let mouse_caret = if hit && btn.pressed() {
+        // **视觉行**（自动换行后）：光标/点击/选择/Home-End/↑↓ 全部按它定位，与显示一致。
+        let vbuf = self.ensure_text_buf(
+            id,
+            value,
+            style.font_size,
+            style.font_family.as_deref(),
+            content_w,
+            TEXT_AREA_LINE_SPACING,
+        );
+        let vlines = Text::visual_lines(&vbuf);
+        let vline_of_byte = |byte: usize| -> usize {
+            vlines
+                .iter()
+                .position(|l| byte >= l.byte_start && byte <= l.byte_end)
+                .unwrap_or(vlines.len().saturating_sub(1))
+        };
+        // 鼠标位置 → 光标（视觉行 + 行内列）。`btn.pressed()` 而非 `hit`：
+        // **拖出输入框后仍跟随**（y 越界 clamp 到首/末行；垂直滚动随光标自动跟随）。
+        let mouse_caret = if btn.pressed() {
             let row = ((mouse_local_y - rect.y) / line_h).floor().max(0.0) as usize;
-            let line = row.min(line_count - 1);
-            let ltxt: String = value.split('\n').nth(line).unwrap_or("").to_owned();
+            let li = row.min(vlines.len().saturating_sub(1));
+            let line = &vlines[li];
+            let ltxt = &value[line.byte_start..line.byte_end.min(value.len())];
             let cx = (self.mouse_local_x() - rect.x - style.padding_x).max(0.0);
-            let col = self.caret_index_at_width(&ltxt, style.font_size, style.font_family.as_deref(), cx);
-            Some(index_of_line_col(value, line, col))
+            let col = self.caret_index_at_width(ltxt, style.font_size, style.font_family.as_deref(), cx);
+            let col_byte = char_to_byte(ltxt, col);
+            Some(byte_to_char(value, line.byte_start + col_byte))
         } else {
             None
         };
@@ -3316,11 +3506,18 @@ impl Ui<'_> {
                     ws.caret = c;
                 }
                 ws.sel_anchor = Some(ws.caret);
-            } else if ws.pressed && btn.pressed() && hit {
+            } else if ws.pressed && btn.pressed() {
+                // 拖拽选择：按住并移动 → 光标跟随鼠标（**即使拖出输入框**——y 越界
+                // clamp 到首/末视觉行；垂直滚动随光标自动跟随），范围 = [anchor, caret)。
                 self.press_claimed = true;
                 if let Some(c) = mouse_caret {
                     ws.caret = c;
                 }
+            }
+            if ev.released && ws.sel_anchor == Some(ws.caret) {
+                // 纯点击（无位移）→ 清理 anchor（无实际选择），避免残留 anchor 在
+                // 后续无 Shift 方向键移动时"突然变成多选"。
+                ws.sel_anchor = None;
             }
             let focused = self.state.focused.as_deref() == Some(id);
             if focused {
@@ -3364,8 +3561,8 @@ impl Ui<'_> {
                         }
                     }
                 }
-                // 编辑操作前：选择替换
-                let edit_pending = !self.keyboard.get_chars().is_empty()
+                // 编辑操作前：选择替换（Ctrl 组合字符不触发）
+                let edit_pending = (!self.keyboard.get_chars().is_empty() && !ctrl)
                     || !self.keyboard.get_ime_commits().is_empty()
                     || (self.keyboard.get(KeyCode::Backspace).down_edge() && !ime_owns_keys)
                     || (self.keyboard.get(KeyCode::Delete).down_edge() && !ime_owns_keys)
@@ -3386,12 +3583,14 @@ impl Ui<'_> {
                     insert_str_at(value, ws.caret, commit);
                     ws.caret = (ws.caret + commit.chars().count()).min(value.chars().count());
                 }
-                for ch in self.keyboard.get_chars() {
-                    if *ch == '\n' || *ch == '\r' {
-                        continue; // 换行统一由 Enter 处理
+                if !ctrl {
+                    for ch in self.keyboard.get_chars() {
+                        if *ch == '\n' || *ch == '\r' {
+                            continue; // 换行统一由 Enter 处理
+                        }
+                        insert_char_at(value, ws.caret, *ch);
+                        ws.caret = (ws.caret + 1).min(value.chars().count());
                     }
-                    insert_char_at(value, ws.caret, *ch);
-                    ws.caret = (ws.caret + 1).min(value.chars().count());
                 }
                 if self.keyboard.get(KeyCode::Backspace).down_edge() && !ime_owns_keys {
                     ws.caret = remove_before(value, ws.caret);
@@ -3399,25 +3598,65 @@ impl Ui<'_> {
                 if self.keyboard.get(KeyCode::Delete).down_edge() && !ime_owns_keys {
                     remove_at(value, ws.caret);
                 }
+                // Shift + 方向键/Home/End：扩展选择
+                let shift = self.keyboard.get(KeyCode::ShiftLeft).pressed()
+                    || self.keyboard.get(KeyCode::ShiftRight).pressed();
+                let shift_start = |ws: &mut WidgetState| {
+                    if shift && ws.sel_anchor.is_none() {
+                        ws.sel_anchor = Some(ws.caret);
+                    }
+                };
+                let shift_shrink = |ws: &mut WidgetState| {
+                    if ws.sel_anchor == Some(ws.caret) {
+                        ws.sel_anchor = None;
+                    }
+                };
                 if self.keyboard.get(KeyCode::ArrowLeft).down_edge() && !ime_owns_keys {
+                    shift_start(ws);
                     ws.caret = ws.caret.saturating_sub(1);
+                    shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::ArrowRight).down_edge() && !ime_owns_keys {
+                    shift_start(ws);
                     ws.caret = (ws.caret + 1).min(value.chars().count());
+                    shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::ArrowUp).down_edge() && !ime_owns_keys {
-                    ws.caret = move_caret_line(value, ws.caret, -1);
+                    shift_start(ws);
+                    // 跨**视觉行**（保持列；列 = 相对行首的 char 数）
+                    let cur_byte = char_to_byte(value, ws.caret);
+                    let li = vline_of_byte(cur_byte);
+                    let col = byte_to_char(value, cur_byte) - byte_to_char(value, vlines[li].byte_start);
+                    let tgt = li.saturating_sub(1);
+                    let line = &vlines[tgt];
+                    let ltxt = &value[line.byte_start..line.byte_end.min(value.len())];
+                    let col = col.min(ltxt.chars().count());
+                    ws.caret = byte_to_char(value, line.byte_start + char_to_byte(ltxt, col));
+                    shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::ArrowDown).down_edge() && !ime_owns_keys {
-                    ws.caret = move_caret_line(value, ws.caret, 1);
+                    shift_start(ws);
+                    let cur_byte = char_to_byte(value, ws.caret);
+                    let li = vline_of_byte(cur_byte);
+                    let col = byte_to_char(value, cur_byte) - byte_to_char(value, vlines[li].byte_start);
+                    let tgt = (li + 1).min(vlines.len().saturating_sub(1));
+                    let line = &vlines[tgt];
+                    let ltxt = &value[line.byte_start..line.byte_end.min(value.len())];
+                    let col = col.min(ltxt.chars().count());
+                    ws.caret = byte_to_char(value, line.byte_start + char_to_byte(ltxt, col));
+                    shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::Home).down_edge() && !ime_owns_keys {
-                    let (line, _) = line_col_of(value, ws.caret);
-                    ws.caret = index_of_line_col(value, line, 0);
+                    shift_start(ws);
+                    let li = vline_of_byte(char_to_byte(value, ws.caret));
+                    ws.caret = byte_to_char(value, vlines[li].byte_start);
+                    shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::End).down_edge() && !ime_owns_keys {
-                    let (line, _) = line_col_of(value, ws.caret);
-                    ws.caret = index_of_line_col(value, line, usize::MAX);
+                    shift_start(ws);
+                    let li = vline_of_byte(char_to_byte(value, ws.caret));
+                    ws.caret = byte_to_char(value, vlines[li].byte_end);
+                    shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::Escape).down_edge() {
                     self.state.focused = None;
@@ -3426,23 +3665,18 @@ impl Ui<'_> {
             (focused, ws.caret)
         };
         let (focused, caret) = caret_est;
-        // 光标所在逻辑行 → 光标 x / y（相对内容区；y = 行 × 行高）
-        let (caret_line, caret_col) = line_col_of(value, caret);
+        // 光标所在**视觉行** → 光标 x / y（y = 视觉行序号 × 行高）
+        let caret_byte = char_to_byte(value, caret);
+        let caret_line = vline_of_byte(caret_byte);
         let caret_x = {
-            let prefix: String = value
-                .split('\n')
-                .nth(caret_line)
-                .unwrap_or("")
-                .chars()
-                .take(caret_col)
-                .collect();
-            self.text_size(&prefix, style.font_size, style.font_family.as_deref()).x
+            let line = &vlines[caret_line];
+            let end = caret_byte.min(line.byte_end).max(line.byte_start);
+            let prefix = &value[line.byte_start..end];
+            self.text_size(prefix, style.font_size, style.font_family.as_deref()).x
         };
         let caret_y = caret_line as f32 * line_h;
-        // 垂直滚动：滚轮 + 光标跟随。
-        let content_h = self
-            .text_size_wrap(value, style.font_size, style.font_family.as_deref(), content_w)
-            .y;
+        // 垂直滚动：滚轮 + 光标跟随。内容高用**实际排版缓冲**（含行距 1.2）测量。
+        let content_h = Text::measure_buffer(&vbuf).y / self.scale;
         let max_scroll = (content_h - rect.h).max(0.0);
         let scroll = {
             let ws = self.state.widgets.entry(id.to_owned()).or_default();
@@ -3467,32 +3701,34 @@ impl Ui<'_> {
         let elem = self.seq + 1;
         let border = if focused { style.border_focus } else { style.border };
         self.push_panel_like(rect, style.bg, border, style.border_w, style.radius, elem);
-        // 选择高亮（逐逻辑行；x = 行内前缀宽度，y = 行 × 行高）
+        // 选择高亮（逐**视觉行**；x = 行内前缀宽度，y = 视觉行序号 × 行高——与显示一致）
         if let Some((lo, hi)) = sel_range(
             self.state.widgets.get(id).and_then(|w| w.sel_anchor),
             caret,
         ) {
-            let (lo_line, lo_col) = line_col_of(value, lo);
-            let (hi_line, hi_col) = line_col_of(value, hi);
-            for line in lo_line..=hi_line {
-                let ltxt: String = value.split('\n').nth(line).unwrap_or("").to_owned();
-                let chars_n = ltxt.chars().count();
-                let c0 = if line == lo_line { lo_col.min(chars_n) } else { 0 };
-                let c1 = if line == hi_line { hi_col.min(chars_n) } else { chars_n };
-                if c1 <= c0 {
+            let lo_byte = char_to_byte(value, lo);
+            let hi_byte = char_to_byte(value, hi);
+            let lo_li = vline_of_byte(lo_byte);
+            let hi_li = vline_of_byte(hi_byte);
+            for li in lo_li..=hi_li {
+                let line = &vlines[li];
+                let ls = line.byte_start.min(value.len());
+                let le = line.byte_end.min(value.len());
+                let c0b = if li == lo_li { lo_byte.max(ls).min(le) } else { ls };
+                let c1b = if li == hi_li { hi_byte.max(ls).min(le) } else { le };
+                if c1b <= c0b {
                     continue;
                 }
-                let x0 = {
-                    let p: String = ltxt.chars().take(c0).collect();
-                    self.text_size(&p, style.font_size, style.font_family.as_deref()).x
-                };
-                let x1 = {
-                    let p: String = ltxt.chars().take(c1).collect();
-                    self.text_size(&p, style.font_size, style.font_family.as_deref()).x
-                };
+                let x0 = self
+                    .text_size(&value[ls..c0b], style.font_size, style.font_family.as_deref())
+                    .x;
+                let x1 = self
+                    .text_size(&value[ls..c1b], style.font_size, style.font_family.as_deref())
+                    .x;
+                // y 随垂直滚动上移（-scroll）；clip = 内容区（选择高亮受裁剪，不溢出）。
                 let sel_rect = Rect::new(
                     content_rect.x + x0,
-                    rect.y + line as f32 * line_h,
+                    rect.y + li as f32 * line_h - scroll,
                     (x1 - x0).max(0.0),
                     line_h,
                 );
@@ -3504,13 +3740,14 @@ impl Ui<'_> {
                         win,
                         elem,
                         rect: sel_rect,
-                        clip: self.clip,
+                        clip: Some(content_rect),
                         kind: DrawKind::Solid(style.sel_bg),
                     });
                 }
             }
         }
-        // 文本（换行 + 垂直滚动；clip 相对文本块：上缘 = scroll_y，高 = 可视区）
+        // 文本（换行 + 垂直滚动；clip 相对文本块：上缘 = scroll_y，高 = 可视区；
+        // 缓冲控件自持——`vbuf` 已按内容区宽度排版，直接复用）。
         let seq = self.next_seq();
         self.queue.push(text_cmd(
             depth,
@@ -3522,9 +3759,12 @@ impl Ui<'_> {
             style.font_size,
             style.fg,
             TextAlign::Left,
+            // 多行编辑：**顶对齐**（行盒顶 = 内容区顶），与光标/点击的 TopLeft 定位一致
+            TextVAlign::Top,
             style.font_family.clone(),
             Some(Rect::new(0.0, scroll, content_w, rect.h)),
             self.clip,
+            Some(vbuf),
         ));
         // IME 组合候选浮动提示框（输入框下方）
         if focused {
@@ -3575,9 +3815,11 @@ impl Ui<'_> {
                         style.font_size,
                         style.preedit,
                         TextAlign::Left,
+                        TextVAlign::Center,
                         style.font_family.clone(),
                         None,
                         self.clip,
+                    None,
                     ));
                 }
             }
@@ -3706,7 +3948,9 @@ mod tests {
                 color: Color::WHITE,
                 align: TextAlign::Left,
                 family: None,
+                valign: TextVAlign::Center,
                 clip: None,
+                buf: None,
             }
             .group(),
             1
@@ -3724,7 +3968,9 @@ mod tests {
                     color: Color::WHITE,
                     align: TextAlign::Left,
                     family: None,
+                    valign: TextVAlign::Center,
                     clip: None,
+                    buf: None,
                 },
             },
             UiDraw {
@@ -3756,7 +4002,9 @@ mod tests {
                     color: Color::WHITE,
                     align: TextAlign::Left,
                     family: None,
+                    valign: TextVAlign::Center,
                     clip: None,
+                    buf: None,
                 },
             },
         ];
@@ -3855,7 +4103,7 @@ mod tests {
         let content = Vec2::new(14.0, 17.0);
         let first_line_top = -7.0;
         // 左对齐标签：block = anchor + off，两项均为整数
-        let block = anchor + text_block_offset(TextAlign::Left, content, first_line_top);
+        let block = anchor + text_block_offset(TextAlign::Left, TextVAlign::Center, content, first_line_top);
         assert_eq!(block.x.fract(), 0.0, "标签块 x 必须为整数像素，实际 {}", block.x);
         assert_eq!(block.y.fract(), 0.0, "标签块 y 必须为整数像素，实际 {}", block.y);
         // 行盒中心对准锚点（±0.5px 量化，奇数 content_h 的固有半像素）：
@@ -3867,7 +4115,7 @@ mod tests {
             center - anchor.y
         );
         // 居中按钮 + 奇数物理宽（21px，如 DPI 1.5 下）：水平对齐亦为整数
-        let btn = anchor + text_block_offset(TextAlign::Center, Vec2::new(21.0, 17.0), first_line_top);
+        let btn = anchor + text_block_offset(TextAlign::Center, TextVAlign::Center, Vec2::new(21.0, 17.0), first_line_top);
         assert_eq!(btn.x.fract(), 0.0, "按钮块 x 必须为整数像素，实际 {}", btn.x);
         assert_eq!(btn.y.fract(), 0.0, "按钮块 y 必须为整数像素，实际 {}", btn.y);
     }
@@ -3890,7 +4138,9 @@ mod tests {
                     color: Color::WHITE,
                     align: TextAlign::Left,
                     family: None,
+                    valign: TextVAlign::Center,
                     clip: None,
+                    buf: None,
                 },
             },
             // 元素 B（后录）：图形——应覆盖 A 的文字
@@ -3920,7 +4170,9 @@ mod tests {
                     color: Color::WHITE,
                     align: TextAlign::Left,
                     family: None,
+                    valign: TextVAlign::Center,
                     clip: None,
+                    buf: None,
                 },
             },
             UiDraw {

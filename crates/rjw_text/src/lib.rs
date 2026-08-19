@@ -35,6 +35,15 @@ use swash::zeno::{Angle, Format, Transform, Vector};
 
 pub const DEFAULT_GLYPH_ATLAS_SIZE: u32 = 1024;
 
+/// 视觉行（自动换行后的一行）：字节范围 + 行顶/行宽（见 [`Text::visual_lines`]）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VisualLine {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub top: f32,
+    pub width: f32,
+}
+
 // ─── GlyphLocation ─────────────────────────────────────────────
 
 struct GlyphLocation {
@@ -315,11 +324,15 @@ pub struct Text {
 
 impl Text {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) -> Self {
-        let glyph_cache = DynamicAtlas::new(
+        let mut glyph_cache = DynamicAtlas::new(
             device, queue, layout,
             AtlasConfig { max_pages: 4, padding: 1, ..Default::default() },
             DEFAULT_GLYPH_ATLAS_SIZE,
         );
+        // **WHITE 基础纹理**（1×1，clamp_margin=true）预置进字形图集：
+        // UI 实心填充（背景/边框/光标）可与此页字形**同纹理合批**（省去图形↔文字的
+        // 纹理状态切换）；字形本体用 `insert_no_clamp`（避免 clamp margin 挤压）。
+        glyph_cache.insert_white();
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_system_fonts();
         Self {
@@ -332,6 +345,14 @@ impl Text {
             layout_cache: LayoutCache::new(),
             atlas_generation: 0,
         }
+    }
+
+    /// 字形图集内的 **WHITE 基础纹理** region（1×1，`clamp_margin`）——
+    /// 供 UI 实心填充（Solid / 边框 / 光标）采样：与字形**同一页面**，绘制时
+    /// 图形与文字同纹理、可合批。每次调用都会刷新该条目的寿命并返回**最新**
+    /// region（图集重排后 UV 自动跟随）。返回 `None` 仅当图集满页（1×1 不会）。
+    pub fn white_region(&mut self) -> Option<AtlasRegion> {
+        Some(self.glyph_cache.insert_white())
     }
 
     /// 若字形图集发生过“去碎片重排”（[`rjw_atlas::DynamicAtlas::generation`] 变化），
@@ -660,6 +681,46 @@ impl Text {
         Text::measure_buffer(&buffer)
     }
 
+    /// 已排版 Buffer 的**视觉行**（自动换行后）列表——每个 `LayoutRun` 对应一个视觉行
+    /// （同一原文本行按宽度换行后拆成多行；每行含 `glyphs` 的字节范围）。
+    ///
+    /// 供 GUI 的**光标 / 点击 / 选择定位**与显示对齐（换行后按视觉行，而非原 `\n` 逻辑行）：
+    /// - `byte_start` / `byte_end`：该行覆盖的**字节**范围（相对 `Buffer` 文本）；
+    /// - `top`：行顶（相对文本视觉原点，物理像素）；
+    /// - `width`：行宽（物理像素）。
+    pub fn visual_lines(buffer: &Buffer) -> Vec<VisualLine> {
+        // 原文本行 → 全文起始字节偏移（每行 text + 结尾字符）。字形 glyph 的
+        // start/end 是**相对原文本行**的偏移，须加行偏移才是全文字节范围。
+        let mut line_offsets: Vec<usize> = Vec::new();
+        {
+            let mut off = 0usize;
+            for line in buffer.lines.iter() {
+                line_offsets.push(off);
+                off += line.text().len() + line.ending().as_str().len();
+            }
+        }
+        let mut out = Vec::new();
+        for run in buffer.layout_runs() {
+            let base = line_offsets.get(run.line_i).copied().unwrap_or(0);
+            let mut start = usize::MAX;
+            let mut end = 0usize;
+            for g in run.glyphs {
+                start = start.min(g.start);
+                end = end.max(g.end);
+            }
+            if start == usize::MAX {
+                start = 0;
+            }
+            out.push(VisualLine {
+                byte_start: base + start,
+                byte_end: base + end,
+                top: run.line_top,
+                width: run.line_w,
+            });
+        }
+        out
+    }
+
     /// 计算文本的第一个视觉字形的左上角（bearing 恢复后），用于对齐。
     ///
     /// **整数不变量**：返回坐标均为**整数像素**（y 轴对 `line_y` 先 `ceil` 再减整型
@@ -733,6 +794,41 @@ mod tests {
         assert!(multi.x > 0.0);
         assert!((multi.x - single.x).abs() < 1.0, "width = {} vs {}", multi.x, single.x);
         assert!(single.y > 0.0);
+    }
+
+    #[test]
+    fn visual_lines_follow_wrap() {
+        let mut fs = FontSystem::new();
+        fs.db_mut().load_system_fonts();
+        let metrics = Metrics::new(14.0, 20.0);
+        // 窄宽度 → 长文本换行成多视觉行；字节范围应连续覆盖全文且不重叠。
+        let text = "一二三四五六七八九十一二三四五六七八九十";
+        let mut buf = Buffer::new(&mut fs, metrics);
+        buf.set_size(Some(70.0), None);
+        buf.set_text(text, &Attrs::new(), Shaping::Advanced, Some(Align::Left));
+        buf.shape_until_scroll(&mut fs, false);
+        let lines = Text::visual_lines(&buf);
+        assert!(lines.len() >= 2, "70px 宽度下应换行成 ≥2 视觉行，实际 {}", lines.len());
+        // 首行从 0 开始，末行到文本末尾
+        assert_eq!(lines.first().map(|l| l.byte_start), Some(0));
+        assert_eq!(lines.last().map(|l| l.byte_end), Some(text.len()));
+        // 行间连续（无重叠 / 无空隙）
+        for w in lines.windows(2) {
+            assert_eq!(w[0].byte_end, w[1].byte_start, "视觉行字节范围应连续");
+        }
+        // 行顶递增（每行 line_height）
+        for w in lines.windows(2) {
+            assert!(w[1].top > w[0].top, "行顶应递增");
+        }
+        // 显式 \n 拆行同样正确
+        let mut b2 = Buffer::new(&mut fs, metrics);
+        b2.set_size(Some(1024.0), None);
+        b2.set_text("ab\ncd", &Attrs::new(), Shaping::Advanced, Some(Align::Left));
+        b2.shape_until_scroll(&mut fs, false);
+        let l2 = Text::visual_lines(&b2);
+        assert_eq!(l2.len(), 2);
+        assert_eq!(l2[0].byte_end, 2, "第一逻辑行 'ab' 字节范围 [0,2)");
+        assert_eq!(l2[1].byte_start, 3, "第二逻辑行 'cd' 从 3 起（跳过 \\n）");
     }
 
     #[test]

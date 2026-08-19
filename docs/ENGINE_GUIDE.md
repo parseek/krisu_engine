@@ -978,6 +978,7 @@ ui.finish();   // 排序（窗口 z → 深度 → 图形/文字 → 录制序�
 - **可拖拽面板 / 窗口**：`drag_panel_at(id, pos, |p| ...)` 按住面板拖动；`window_at(id, pos, |w| ...)` 是**可重叠窗口**——点击即**置顶**（焦点 z-order，`UiState.window_z`），位置持久于 `UiState.panel_pos`；拖动期间**抑制内部子控件交互**。拖拽位置按**物理像素粒度**跟随（1px 跟手，不受 DPI 逻辑量化影响）。
 - **窗口重叠点击裁决**：重叠区域点击**只让最上层窗口**获得拖拽与置顶（`Ui::finish` 内部 `resolve_win_press`）——不会同时拖动两个窗口。
 - **QuadVertices 渲染（不使用 Sprite）**：全部图元（背景 / 控件背景 / 文字）转为**四边形顶点**（`Render2D::add_quads`，每四顶点一组 **TL,TR,BL,BR**，固定索引 `[0,1,3, 3,2,0]`），按 `(窗口, 图形/文字组, 纹理)` 分组提交。**UI 自行管理绘制顺序**——**UI 的 Render2D 必须 `set_sorting(false)`**（完全按提交顺序绘制）：`finish` 按 `(win 升序, 白纹理图形组 → 字形文字组, 纹理 uid)` 提交——窗口间层级由提交顺序保证（`layer = base + z*1.0` 仅作兜底），窗口内**“背景/图形 → 文字”严格稳定**，不随纹理 uid / HashMap 顺序抖动。⚠ **不要用 `set_sorting(true)`（`SortMode::LayerAndStates`）**：它会在同一 layer 内按 `(rstates, texture_uid)` 重排，字形图集页先于程序化纹理页（圆角/渐变）注册 → 重排后圆角/渐变图形排在文字之后绘制、**盖住文字**（曾因此踩坑：圆角按钮文字消失、渐变状态栏盖住标签）。`set_layer_sort(true)`（`LayerOnly`，稳定排序）同层保持提交顺序，可接受。
+- **白纹理合批（单窗口一次 DrawCall）**：WHITE 基础纹理（1×1，`clamp_margin`）预置进**字形图集页**（[`rjw_text::Text::white_region`]；`DynamicAtlas::insert_white` 为与 key 无关的内置槽位，参与 compact 重排）——实心填充（Solid / 边框 / 光标 / 调试叠加）与字形**同页同纹理**：同一窗口内"图形组 → 文字组"相邻且同纹理，Render2D 合批为**单个 draw call**，省去图形↔文字的纹理状态切换。字形本体保持 `insert_no_clamp`（避免 clamp margin 挤压）。
 - **窗口 transform**：四边形顶点为**相对窗口原点的局部像素**，提交时经 `screen_fixed_tf(窗口原点)` 变换到世界——**移动窗口只改变换、顶点不变**（也支持将窗口嵌入游戏场景，给任意世界变换）。`add_quads` / `add_mesh_transform` 均支持 `Transform2D`（`IDENTITY` = 顶点即世界坐标）。
 - **窗口顶点缓存**：窗口内容不变时，四边形顶点**跨帧缓存**（`UiState.window_quads` 按**内容签名**命中）——静态窗口每帧零字形收集/重建；hover 变色、文字编辑等任何内容变化都会使签名变化而自动重建。**移动窗口不影响缓存**（顶点是局部的，transform 每帧用当前原点）。
 - **深度测试**：`RStates::default()` 深度测试**默认关闭**，QuadVertices 纯 2D 覆盖无需深度；世界层需要深度时用 `render2d.default_depth_test(true)`（UI 独立 Render2D 不受影响）。
@@ -1158,31 +1159,49 @@ ui.flex_at(Vec2::new(880.0, 450.0), 150.0, &[1, 2, 1], |f, i| {
 **滚动跟随光标（超长文本）**：单行输入框在绘制时把文本左移 `WidgetState::text_scroll`
 （`edit::scroll_follow_caret(caret_x, content_w, text_w, margin=8)`：光标移出右侧 → 左移，
 clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位都叠加该偏移。
+⚠ **裁剪窗口必须固定在内容区**：文本命令 `rect.x -= scroll` 的同时，`clip.x = scroll`
+补偿（clip 相对移动后的 rect）——否则裁剪窗口随文本一起左移，永远只显示文本开头且
+偏离文本框（垂直滚动同理：`clip.y = scroll` 补偿 `rect.y -= scroll`）。
 
 **文本选择 + 剪贴板**：
 
 - 按下时 `sel_anchor = caret`，按住拖动 → 光标跟随鼠标（选择范围 = `[min,max)`，
   纯逻辑 `edit::sel_range` / `selected_text`）；选择高亮在**文本之下**绘制
   （同一 elem 图形组先于文字组），颜色 `InputStyle::sel_bg`；
+- **拖选越界跟随**：拖出输入框后光标仍跟随鼠标（越界 clamp 到文本两端，滚动随
+  光标自动跟随）——"看不见的地方也选得到"；**纯单击（无位移）释放时清理 anchor**；
+- **无 Shift 的方向键移动 = 单选**（清除选择）；**Shift + 方向键/Home/End = 扩展选择**；
 - `Ctrl+C/V/X`：复制选择 / 粘贴（替换选择）/ 剪切（`arboard` 系统剪贴板；
-  失败静默）；编辑操作（字符 / IME 上屏 / 退格 / 删除）前若存在选择先删除；
+  失败静默）；⚠ **Ctrl 按下时过滤 `get_chars`**（winit 会把 'c'/'v'/'x' 当字符给出，
+  否则 Ctrl+C 留下 'c'、Ctrl+V 粘贴后多 'v'）；
+- **选择高亮受内容区裁剪**（不溢出输入框 / 滚动容器），多行高亮随垂直滚动上移；
 - **窗口/面板拖拽协同**：输入框按下置位 `Ui::press_claimed` → `window_at` /
   `panel_impl` 不建立拖拽基准（选择拖拽优先，窗口从空白/标题区拖动），并**清除
   旧拖拽基准**（否则 `update_drag` 已置 dragging，残留 press_mouse 被当作基准 → 窗口"瞬移"）。
 
 **多行 TextArea**（`text_area_at` / 容器内 `p.text_area`）：Enter 插入 `\n`（`get_chars`
-已过滤控制字符，换行必须显式处理）、↑/↓ 跨行（`edit::move_caret_line` 保持列）、
-Home/End 行首尾；渲染用 `create_buffer_wrap`（内容区宽度自动换行），垂直滚动
-（`WidgetState::scroll_y`：滚轮 + 光标行跟随），clip 相对文本块（上缘 = scroll_y）；
-跨行选择高亮**逐逻辑行**绘制。光标/点击按逻辑行（`\n`）定位——内容不换行时精确，
-超宽长行换行后近似（v1 限制）。
+已过滤控制字符，换行必须显式处理）、↑/↓ 跨**视觉行**（保持列）、Home/End 视觉行首尾；
+渲染用 `create_buffer_wrap`（内容区宽度自动换行），垂直滚动（`WidgetState::scroll_y`：
+滚轮 + 光标行跟随），clip 相对文本块（上缘 = scroll_y）。
+
+- **光标 / 点击 / 选择按"视觉行"（自动换行后）定位，与显示完全一致**
+  （[`rjw_text::Text::visual_lines`]：每个 `LayoutRun` 一个视觉行，含全文字节范围；
+  `edit::char_to_byte` / `byte_to_char` 换算）；跨视觉行选择高亮逐行绘制；
+- **行距**：行高 = 字号 × `TEXT_AREA_LINE_SPACING`（1.2）——排版缓冲（`line_mult`）、
+  光标 y、高亮、内容测量（`measure_buffer`）全部一致。
+
+**控件自持排版缓冲**：输入框 / TextArea 的 `Arc<Buffer>` 缓存在
+`WidgetState::text_buf`（key 含文本/字号/字体/换行宽/行距/版本）——文本频繁变化的
+输入框**不写** `UiState::text_buffers` 全局缓存（不污染静态标签缓存）；`DrawKind::Text`
+带 `buf` 字段（不进窗口内容签名——排版由 text/size/family 决定）。
 
 **IME 组合候选浮动提示框**：preedit 非空时在输入框**下方**画浮动小框（底色 + 边框 +
 灰色候选，自动宽度），不再占行内；系统候选框 `set_ime_cursor_area` 跟随光标
 （含水平 / 垂直滚动偏移，物理像素）。
 
-**维护约定**：文本编辑的纯逻辑（行/列换算、选择、滚动）在 `edit.rs`（无 GPU，可单测）；
-新增编辑控件时复用 `edit::*` 与 `clipboard_get/set`，并在按下响应中置位 `press_claimed`。
+**维护约定**：文本编辑的纯逻辑（行/列换算、选择、滚动、byte/char）在 `edit.rs`
+（无 GPU，可单测）；新增编辑控件时复用 `edit::*` 与 `clipboard_get/set`，并在按下
+响应中置位 `press_claimed`。
 
 ### 18.11 维护约定（对 AI）
 

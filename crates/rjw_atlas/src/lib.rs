@@ -319,6 +319,12 @@ pub struct DynamicAtlas<K = String> {
     next_region_id: u64,
     /// region_id → 键（`resolve_by_id` / `acquire_by_id` 用）。
     by_id: HashMap<u64, K>,
+    /// **WHITE 基础纹理**（1×1，`clamp_margin`）：与 `K` 无关的内置条目
+    /// （[`Self::insert_white`] 分配），参与 compact 重排（位置随页整理移动，
+    /// region 每次访问时返回最新值）；不进 `entries` / toml 导出。
+    white: Option<AtlasRegion>,
+    /// white 的分配矩形 `(alloc_tl, alloc_wh)`（含 padding；compact 重建分配器用）。
+    white_alloc: Option<(u32, u32, u32, u32)>,
 }
 
 /// 通用泛型方法（所有 K）。
@@ -331,7 +337,50 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         let queue = queue.clone();
         let layout = layout.clone();
         let page = AtlasPage::new(&device, &queue, &layout, page_size);
-        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout, next_region_id: 1, by_id: HashMap::new() }
+        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout, next_region_id: 1, by_id: HashMap::new(), white: None, white_alloc: None }
+    }
+
+    /// **WHITE 基础纹理**（1×1，`clamp_margin` 防采样透色）——与 `K` 无关的内置条目：
+    /// 首次分配，之后每次调用返回**当前** region（compact 重排后 UV 自动跟随）。
+    /// 同一页面纹理可供 UI 实心填充与字形**合批**（省去图形↔文字的纹理状态切换）。
+    pub fn insert_white(&mut self) -> AtlasRegion {
+        if let Some(r) = self.white {
+            return r;
+        }
+        let rgba = [255u8, 255, 255, 255];
+        let (expanded, alloc_w, alloc_h, margin_offs) =
+            (expand_clamp_margin(&rgba, 1, 1), 3u32, 3u32, (1u32, 1u32));
+        let padding = self.config.padding;
+        let (page_idx, x, y) = loop {
+            match self.try_alloc(alloc_w, alloc_h, padding) {
+                Some(res) => break res,
+                None if self.pages.len() < self.config.max_pages => {
+                    self.pages.push(AtlasPage::new(&self.device, &self.queue, &self.layout, self.page_size));
+                }
+                None => unreachable!("1×1 white should always fit"),
+            }
+        };
+        let page = &self.pages[page_idx];
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: page.texture.raw_texture(), mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+            &expanded,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(alloc_w * 4), rows_per_image: Some(alloc_h) },
+            wgpu::Extent3d { width: alloc_w, height: alloc_h, depth_or_array_layers: 1 },
+        );
+        let region = AtlasRegion {
+            tl_px: (x + margin_offs.0, y + margin_offs.1),
+            wh_px: (1, 1),
+            origin_px: (0, 0),
+            page_uid: page.texture.uid,
+        };
+        self.white_alloc = Some((
+            x.saturating_sub(padding),
+            y.saturating_sub(padding),
+            alloc_w + padding * 2,
+            alloc_h + padding * 2,
+        ));
+        self.white = Some(region);
+        region
     }
 
     /// 按稳定 `region_id` 解析当前区域（重排后仍可用；条目被逐出则返回 `None`）。
@@ -487,8 +536,16 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         }
         let ps = self.page_size;
         for page in &mut self.pages {
-            let occupied: Vec<_> = self.entries.values().filter(|e| e.region.page_uid == page.texture.uid)
+            let mut occupied: Vec<_> = self.entries.values().filter(|e| e.region.page_uid == page.texture.uid)
                 .map(|e| (e.alloc_tl.0, e.alloc_tl.1, e.alloc_wh.0, e.alloc_wh.1)).collect();
+            // white 内置条目占位（同页时）——防止后续分配覆盖
+            if let Some((tx, ty, tw, th)) = self.white_alloc {
+                if let Some(r) = self.white {
+                    if r.page_uid == page.texture.uid {
+                        occupied.push((tx, ty, tw, th));
+                    }
+                }
+            }
             page.allocator = Guillotine::from_occupied(ps, &occupied, 0);
         }
         self.dirty = false;
@@ -500,11 +557,12 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
     /// - 重排成功 → `generation` 递增（外部持有区域缓存者据此刷新），返回 `true`。
     /// - 重排后仍超出 `max_pages` → 放弃，返回 `false`。
     fn repack_all(&mut self) -> bool {
-        if self.entries.is_empty() { return true; }
+        if self.entries.is_empty() && self.white.is_none() { return true; }
         if self.entries.values().any(|e| e.source.is_none()) { return false; }
 
         struct Item<K> {
-            key: K,
+            key: Option<K>,
+            is_white: bool,
             rgba: Vec<u8>,
             alloc_w: u32,
             alloc_h: u32,
@@ -513,7 +571,7 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
             origin_px: (u32, u32),
             lifetime: u32,
         }
-        let mut items: Vec<Item<K>> = Vec::with_capacity(self.entries.len());
+        let mut items: Vec<Item<K>> = Vec::with_capacity(self.entries.len() + 1);
         for (key, e) in &self.entries {
             let (rgba, w, h) = e.source.as_ref().expect("source checked above").extract();
             let (expanded, alloc_w, alloc_h, margin_offs) = if e.clamp_margin {
@@ -521,7 +579,12 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
             } else {
                 (rgba, w, h, (0u32, 0u32))
             };
-            items.push(Item { key: key.clone(), rgba: expanded, alloc_w, alloc_h, margin_offs, wh_px: (w, h), origin_px: e.region.origin_px, lifetime: e.lifetime });
+            items.push(Item { key: Some(key.clone()), is_white: false, rgba: expanded, alloc_w, alloc_h, margin_offs, wh_px: (w, h), origin_px: e.region.origin_px, lifetime: e.lifetime });
+        }
+        // white 内置条目：与 key 无关，参与重排（1×1 clamp_margin → alloc 3×3）。
+        if self.white.is_some() {
+            let expanded = expand_clamp_margin(&[255u8, 255, 255, 255], 1, 1);
+            items.push(Item { key: None, is_white: true, rgba: expanded, alloc_w: 3, alloc_h: 3, margin_offs: (1, 1), wh_px: (1, 1), origin_px: (0, 0), lifetime: u32::MAX });
         }
         // 高优先 → 同高字形聚成整行，契合行式（整宽行）分配器，密度更高。
         items.sort_by(|a, b| b.alloc_h.cmp(&a.alloc_h).then((b.alloc_h * b.alloc_w).cmp(&(a.alloc_h * a.alloc_w))));
@@ -554,7 +617,22 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(it.alloc_w * 4), rows_per_image: Some(it.alloc_h) },
                 wgpu::Extent3d { width: it.alloc_w, height: it.alloc_h, depth_or_array_layers: 1 },
             );
-            let e = self.entries.get_mut(&it.key).expect("entry must exist");
+            if it.is_white {
+                self.white = Some(AtlasRegion {
+                    tl_px: (x + it.margin_offs.0, y + it.margin_offs.1),
+                    wh_px: it.wh_px,
+                    origin_px: it.origin_px,
+                    page_uid: page.texture.uid,
+                });
+                self.white_alloc = Some((
+                    x.saturating_sub(padding),
+                    y.saturating_sub(padding),
+                    it.alloc_w + padding * 2,
+                    it.alloc_h + padding * 2,
+                ));
+                continue;
+            }
+            let e = self.entries.get_mut(&it.key.expect("non-white item has key")).expect("entry must exist");
             e.region = AtlasRegion {
                 tl_px: (x + it.margin_offs.0, y + it.margin_offs.1),
                 wh_px: it.wh_px,
@@ -620,11 +698,6 @@ impl DynamicAtlas<String> {
             });
         }
         toml::to_string(&data)
-    }
-
-    pub fn insert_white(&mut self) -> AtlasRegion {
-        self.insert("white".to_string(), &[255,255,255,255], 1, 1, (0,0), true)
-            .expect("white pixel should always fit in atlas")
     }
 
     pub fn insert_ex(&mut self, name: &str, rgba: &[u8], w: u32, h: u32) -> Option<AtlasRegion> {

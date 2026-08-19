@@ -9,7 +9,9 @@
 use glam::Vec2;
 use rjw_2d_render::SpriteRect;
 use rjw_color::Color;
+use rjw_text::Buffer;
 use rjw_transform::{Camera2D, Rect, Transform2D};
+use std::sync::Arc;
 
 /// 屏幕固定变换：把屏幕像素锚点映射为世界中的 `Transform2D`。
 #[inline]
@@ -47,7 +49,8 @@ pub fn snap_point(p: Vec2) -> Vec2 {
 /// **文本块内容对齐偏移**（屏幕像素，UI"浮点整数"不变量的一部分）。
 ///
 /// 水平：左 `0`、中 `-round(content_w/2)`、右 `-content_w`；
-/// 垂直：`-first_line_top - round(content_h/2)`（行盒垂直居中）。
+/// 垂直：`Top` = `-first_line_top`（行盒顶对齐矩形顶），
+///       `Center` = `-first_line_top - round(content_h/2)`（行盒垂直居中）。
 ///
 /// 前置条件（调用方保证）：`content`（排版内容**物理**尺寸，`measure_buffer` 已取整）
 /// 与 `first_line_top`（行盒顶相对视觉原点，`rjw_text` 收集期已取整）均为**整数像素**。
@@ -56,13 +59,16 @@ pub fn snap_point(p: Vec2) -> Vec2 {
 /// 小数（如 0.5px 的居中奇数宽 / 行盒偏移）只在 `round` 边界被消化，
 /// 不会流入加法链 → 无误差累加、无亚像素摆放。
 #[inline]
-pub fn text_block_offset(align: TextAlign, content: Vec2, first_line_top: f32) -> Vec2 {
+pub fn text_block_offset(align: TextAlign, valign: TextVAlign, content: Vec2, first_line_top: f32) -> Vec2 {
     let off_x = match align {
         TextAlign::Left => 0.0,
         TextAlign::Center => -(content.x * 0.5).round(),
         TextAlign::Right => -content.x,
     };
-    let off_y = -first_line_top - (content.y * 0.5).round();
+    let off_y = match valign {
+        TextVAlign::Top => -first_line_top,
+        TextVAlign::Center => -first_line_top - (content.y * 0.5).round(),
+    };
     Vec2::new(off_x, off_y)
 }
 
@@ -217,9 +223,13 @@ pub enum DrawKind {
         size: f32,
         color: Color,
         align: TextAlign,
+        valign: TextVAlign,
         family: Option<String>,
         /// 文本局部裁剪（相对内容起点；`None` = 不裁剪）。
         clip: Option<Rect>,
+        /// **预排版缓冲**（控件自持，输入框/TextArea 用；`None` = 绘制期按需缓存）。
+        /// 不进内容签名（排版结果由 `text`/`size`/`family` 决定；窗口顶点缓存已固化字形）。
+        buf: Option<Arc<Buffer>>,
     },
     /// 文本输入框光标（竖条）。
     Caret { color: Color, width: f32 },
@@ -227,12 +237,21 @@ pub enum DrawKind {
     Debug { color: Color, shape: DebugShape },
 }
 
-/// 文本水平对齐（垂直恒居中）。
+/// 文本水平对齐。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+/// 文本**垂直**对齐（锚点在矩形内的位置）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextVAlign {
+    /// 顶对齐（行盒顶 = 矩形顶；TextArea 多行编辑用——光标按逻辑行 TopLeft 定位）。
+    Top,
+    /// 垂直居中（默认；单行控件）。
+    Center,
 }
 
 impl DrawKind {
@@ -297,9 +316,11 @@ pub fn text_cmd(
     size: f32,
     color: Color,
     align: TextAlign,
+    valign: TextVAlign,
     family: Option<String>,
     clip: Option<Rect>,
     clip_outer: Option<Rect>,
+    buf: Option<Arc<Buffer>>,
 ) -> UiDraw {
     UiDraw {
         depth,
@@ -313,8 +334,10 @@ pub fn text_cmd(
             size,
             color,
             align,
+            valign,
             family,
             clip,
+            buf,
         },
     }
 }
@@ -445,30 +468,42 @@ mod tests {
         // content（物理尺寸）与 first_line_top（行盒顶）均为整数输入。
         // 居中 + 奇数内容宽 21：off_x = -round(10.5) = -11（整数）；
         // 垂直：-(-7) - round(17/2) = 7 - 9 = -2（整数）。
-        let off = text_block_offset(TextAlign::Center, Vec2::new(21.0, 17.0), -7.0);
+        let off = text_block_offset(TextAlign::Center, TextVAlign::Center, Vec2::new(21.0, 17.0), -7.0);
         assert_eq!(off, Vec2::new(-11.0, -2.0), "居中奇数宽 + 行盒偏移应为整数");
         assert_eq!(off.x.fract(), 0.0, "off.x 必须为整数像素，实际 {}", off.x);
         assert_eq!(off.y.fract(), 0.0, "off.y 必须为整数像素，实际 {}", off.y);
         // 左对齐：水平偏移恒为 0
-        let off_l = text_block_offset(TextAlign::Left, Vec2::new(21.0, 17.0), -7.0);
+        let off_l = text_block_offset(TextAlign::Left, TextVAlign::Center, Vec2::new(21.0, 17.0), -7.0);
         assert_eq!(off_l.x, 0.0);
         assert_eq!(off_l.y.fract(), 0.0);
         // 右对齐：-content_w
-        let off_r = text_block_offset(TextAlign::Right, Vec2::new(30.0, 17.0), -7.0);
+        let off_r = text_block_offset(TextAlign::Right, TextVAlign::Center, Vec2::new(30.0, 17.0), -7.0);
         assert_eq!(off_r.x, -30.0);
         // 偶数宽/高：取整无偏差（round(20/2)=10、round(16/2)=8）
-        let off_e = text_block_offset(TextAlign::Center, Vec2::new(20.0, 16.0), -6.0);
+        let off_e = text_block_offset(TextAlign::Center, TextVAlign::Center, Vec2::new(20.0, 16.0), -6.0);
         assert_eq!(off_e, Vec2::new(-10.0, -2.0));
         // 空文本（content = 0）：偏移为 0
         assert_eq!(
-            text_block_offset(TextAlign::Center, Vec2::ZERO, 0.0),
+            text_block_offset(TextAlign::Center, TextVAlign::Center, Vec2::ZERO, 0.0),
             Vec2::ZERO
         );
         // 锚点 + 偏移 = 整数 + 整数：任意组合结果恒为整数
         for anchor in [Vec2::new(100.0, 200.0), Vec2::new(0.5, -3.5).round()] {
-            let block = anchor + text_block_offset(TextAlign::Center, Vec2::new(21.0, 17.0), -7.0);
+            let block = anchor + text_block_offset(TextAlign::Center, TextVAlign::Center, Vec2::new(21.0, 17.0), -7.0);
             assert_eq!(block.x.fract(), 0.0, "block.x 必须为整数，实际 {}", block.x);
             assert_eq!(block.y.fract(), 0.0, "block.y 必须为整数，实际 {}", block.y);
         }
+    }
+
+    #[test]
+    fn text_block_offset_top_aligns_to_rect_top() {
+        // TextVAlign::Top：垂直偏移 = -first_line_top（行盒顶对齐矩形顶，整数不变量）。
+        let off = text_block_offset(TextAlign::Left, TextVAlign::Top, Vec2::new(100.0, 60.0), -7.0);
+        assert_eq!(off, Vec2::new(0.0, 7.0));
+        assert_eq!(off.y.fract(), 0.0);
+        // 多行内容（行盒高 60）：Top 与 Center 的差异 = round(60/2) = 30。
+        let top = text_block_offset(TextAlign::Left, TextVAlign::Top, Vec2::new(100.0, 60.0), -7.0);
+        let ctr = text_block_offset(TextAlign::Left, TextVAlign::Center, Vec2::new(100.0, 60.0), -7.0);
+        assert_eq!(ctr.y - top.y, -30.0, "Center 比 Top 上移半个内容高");
     }
 }

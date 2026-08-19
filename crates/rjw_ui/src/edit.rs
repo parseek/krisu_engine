@@ -112,6 +112,16 @@ pub fn insert_str_at(s: &mut String, caret: usize, text: &str) {
     *s = chars.into_iter().collect();
 }
 
+/// char 索引 → 字节偏移（越界 → 末尾字节）。
+pub fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// 字节偏移 → char 索引（`byte` 需落在 char 边界；越界 clamp）。
+pub fn byte_to_char(s: &str, byte: usize) -> usize {
+    s[..byte.min(s.len())].chars().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +210,18 @@ mod tests {
         let mut s = String::from("你好");
         insert_str_at(&mut s, 1, "啊");
         assert_eq!(s, "你啊好");
+    }
+
+    #[test]
+    fn char_byte_roundtrip() {
+        let s = "你好ab";
+        assert_eq!(char_to_byte(s, 0), 0);
+        assert_eq!(char_to_byte(s, 1), 3);
+        assert_eq!(char_to_byte(s, 3), 7);
+        assert_eq!(char_to_byte(s, 99), 8, "越界 → 文本末尾字节（len）");
+        assert_eq!(byte_to_char(s, 0), 0);
+        assert_eq!(byte_to_char(s, 3), 1);
+        assert_eq!(byte_to_char(s, 7), 3);
+        assert_eq!(byte_to_char(s, 999), 4);
     }
 }

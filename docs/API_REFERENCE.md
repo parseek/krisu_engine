@@ -615,6 +615,8 @@ pub struct Text { /* font_system: FontSystem, glyph_cache: DynamicAtlas<cosmic_t
 | `create_buffer_wrap(text, attrs, size, line_height, align, wrap_width, policy)` | 同 `create_buffer_policy`，但指定**排版宽度**（物理像素）：超出自动**换行**（多行）；宽度参与缓存键 |
 | `measure(text, attrs, size, line_height, align) -> Vec2` | 排版 + 测量内容宽高（GUI 布局用） |
 | `measure_buffer(buffer) -> Vec2` | 已排版 Buffer 的内容宽高（行盒；空文本返回 (0,0)） |
+| `visual_lines(buffer) -> Vec<VisualLine>` | **视觉行**（自动换行后）列表：`(byte_start, byte_end, top, width)`——光标/点击/选择与显示对齐（TextArea） |
+| `white_region() -> Option<AtlasRegion>` | **字形图集页内的 WHITE 基础纹理**（1×1 clamp_margin）——UI 实心填充与字形同页合批 |
 | `draw_label(r2d, text, color, size, line_height, pos, family, align, layer) -> Vec2` | ★ 一行渲染：pos=左上角，返回内容宽高（feature = `rjw_2d_render`） |
 | `draw_label_ex(r2d, text, color, size, line_height, pos, family, align, layer, origin) -> Vec2` | 扩展版：origin 归一化到 [0,1]，(0.5,0.5)=居中（feature = `rjw_2d_render`） |
 | `draw_label_with(text, size, line_height, pos, family, align, origin, callback) -> Vec2` | 回调版标签渲染：不绑定 Render2D，GUI 自定义字形绘制 |

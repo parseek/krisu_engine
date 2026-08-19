@@ -40,6 +40,10 @@ pub struct WidgetState {
     pub text_scroll: f32,
     /// 多行输入框（TextArea）**垂直滚动偏移**（逻辑像素）。
     pub scroll_y: f32,
+    /// **控件自持的文本排版缓冲**：`(key, Arc<Buffer>)`，key 含文本/字号/字体/换行宽/
+    /// 版本。文本频繁变化的输入框在此缓存（**不污染** `UiState::text_buffers` 全局缓存）；
+    /// 静态标签仍走全局缓存（`CachePolicy::User`）。
+    pub(crate) text_buf: Option<(String, Arc<Buffer>)>,
 }
 
 /// 滚动容器状态（`UiState.scrolls`，跨帧持久）。
