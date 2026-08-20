@@ -2,15 +2,16 @@
 //!
 //! 用法（见 crate 文档与示例）：
 //! ```no_run
-//! # let cam = todo!(); let mouse = todo!(); let keyboard = todo!();
+//! # let viewport = todo!(); let mouse = todo!(); let keyboard = todo!();
 //! # let text = todo!(); let r2d = todo!(); let state = todo!(); let window = todo!();
 //! use rjw_ui::{Theme, Ui};
-//! let mut ui = Ui::begin(&window, &cam, &mouse, &keyboard, &mut text, &mut r2d, &mut state)
+//! let mut ui = Ui::begin(&window, &mut text, &mut state)
+//!     .capture(&mouse, &keyboard)
 //!     .theme(Theme::dark())
 //!     .base_layer(1e7)
 //!     .build();
 //! ui.label_at(glam::Vec2::new(20.0, 20.0), "Hello UI");
-//! ui.finish();
+//! ui.finish(&viewport, &mut r2d);
 //! ```
 //!
 //! 坐标语义：所有位置为**屏幕逻辑像素**（左上角原点，Y+ 向下）；容器内 `*_at` 的 `pos`
@@ -28,7 +29,7 @@ use rjw_keystate::KeyState;
 use rjw_mouse::{MouseButton, MouseInput};
 use rjw_render::TEXTURES;
 use rjw_text::{Align, Attrs, Buffer, CachePolicy, Family, Text, VisualLine};
-use rjw_transform::{Camera2D, Rect};
+use rjw_transform::{Rect, Viewport};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window as WinitWindow;
 
@@ -37,16 +38,19 @@ use crate::draw::{
     text_block_offset, text_cmd, DebugShape, DrawKind, GradientAxis, TextAlign, TextVAlign, UiDraw,
 };
 use crate::edit::{
-    byte_to_char, caret_at_visual_click, caret_index_by_width, char_to_byte, delete_range,
-    insert_str_at, scroll_follow_caret, sel_range, selected_text, vline_of_byte,
+    byte_to_char, caret_at_visual_click, caret_index_by_width, char_to_byte, insert_char_at,
+    scroll_follow_caret, sel_range, vline_of_byte,
 };
 use crate::focus::{focus_step, FocusEntry, FocusKind};
 use crate::hit::{
     clear_frame_flags, hit_test, normalize_x, update_drag, update_interact, window_occluded,
 };
+use crate::input::{KeyboardSnapshot, MouseSnapshot};
 use crate::layout::{Frame, PackSide};
 use crate::state::{ButtonState, CheckboxState, TEXT_BUFFER_CACHE_CAP, UiState, UiStats, WidgetState};
 use crate::style::{ButtonStyle, CheckboxStyle, Theme};
+use crate::view::{clip_for_view, ViewCtx, ViewMode};
+use crate::widget::Widget as _;
 
 // ─── 文本编辑辅助（纯函数，可单测） ─────────────────────────────
 
@@ -54,53 +58,30 @@ use crate::style::{ButtonStyle, CheckboxStyle, Theme};
 /// `ensure_text_buf` 的 `line_mult` 一致，cosmic 行盒按此递增）。
 pub(crate) const TEXT_AREA_LINE_SPACING: f32 = 1.2;
 
+/// 滚动条宽度（**逻辑像素**；`scroll_at` 与文本编辑框共用）。文本编辑框的滚动条
+/// 条带排除（按下滚动条不建立文本选择）也用它。
+pub(crate) const SCROLLBAR_W: f32 = 8.0;
+
+/// **双击判定帧数**：两次按下间隔 ≤ 该帧数（≈330ms @60fps，与光标闪烁同用
+/// `UiState.frame` 时钟）且位移 < [`DOUBLE_CLICK_DIST`] 视为双击。
+pub(crate) const DOUBLE_CLICK_FRAMES: u64 = 20;
+
+/// **双击判定位移阈值**（逻辑像素）。
+pub(crate) const DOUBLE_CLICK_DIST: f32 = 4.0;
+
+/// **勾选框中心填充内边距**（物理像素）：中心蓝色矩形 = 外框 shrink
+/// `floor(border_w·scale) + floor(CHECKBOX_INNER·scale)`（减法内缩，非写死偏移）。
+pub(crate) const CHECKBOX_INNER: f32 = 1.0;
+
 /// **置顶哨兵 z 值**：IME 组合候选提示框、下拉浮层等**顶层浮层**用它——
 /// 绘制（win 升序排序恒最后）与命中（`window_occluded` 无更高 z）都恒在一切窗口之上。
 /// 真实窗口的 z 分配 / 置顶运算必须**排除本值**（`filter(|&z| z < WIN_TOPMOST)`、
 /// `saturating_add`），避免普通窗口递增碰撞到哨兵。
 pub(crate) const WIN_TOPMOST: u32 = u32::MAX;
 
-/// 读取系统剪贴板文本（失败返回 `None`：无剪贴板 / 权限受限等）。
-fn clipboard_get() -> Option<String> {
-    arboard::Clipboard::new()
-        .ok()
-        .and_then(|mut c| c.get_text().ok())
-}
-
-/// 写入系统剪贴板文本（失败静默——非致命）。
-fn clipboard_set(text: &str) {
-    if let Ok(mut c) = arboard::Clipboard::new() {
-        let _ = c.set_text(text.to_owned());
-    }
-}
-
-/// 在 char 索引 `caret` 处插入字符。
-pub(crate) fn insert_char_at(s: &mut String, caret: usize, c: char) {
-    let mut chars: Vec<char> = s.chars().collect();
-    let idx = caret.min(chars.len());
-    chars.insert(idx, c);
-    *s = chars.into_iter().collect();
-}
-
-/// 删除 `caret` 前一个字符，返回新 caret。
-pub(crate) fn remove_before(s: &mut String, caret: usize) -> usize {
-    let mut chars: Vec<char> = s.chars().collect();
-    if caret > 0 && caret <= chars.len() {
-        chars.remove(caret - 1);
-    }
-    let n = chars.len();
-    *s = chars.into_iter().collect();
-    caret.saturating_sub(1).min(n)
-}
-
-/// 删除 `caret` 处字符。
-pub(crate) fn remove_at(s: &mut String, caret: usize) {
-    let mut chars: Vec<char> = s.chars().collect();
-    if caret < chars.len() {
-        chars.remove(caret);
-    }
-    *s = chars.into_iter().collect();
-}
+// 纯文本编辑函数（字符插入/删除/剪贴板/编辑状态机）已迁入 [`crate::edit`]：
+// `insert_char_at` / `remove_before` / `remove_at` / `clipboard_shortcuts` /
+// `apply_frame_edits` / `caret_horiz`。
 
 // ─── 文本排版版本号 ─────────────────────────────────────────────
 
@@ -110,15 +91,60 @@ const TEXT_LINE_HEIGHT_VERSION: u8 = 1;
 
 // ─── Ui ─────────────────────────────────────────────────────────
 
-/// `Ui::begin` 返回的构建器：设置主题 / 基层层级 / scale_factor / 调试开关后 `build()`。
+/// 视口锚点（[`Ui::anchor_pos`]）：内容在视口（窗口客户区）内的停靠位置。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    CenterLeft,
+    Center,
+    CenterRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+/// 系统光标（控件作者经 [`Ui::set_cursor`] 设置；`finish` 统一应用，优先级低于
+/// 内置拖拽抓握）。窗体悬停/拖动保持 [`UiCursor::Default`]（Arrow）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiCursor {
+    /// 默认箭头（窗体悬停 / 拖动）。
+    Default,
+    /// 文本输入 I 型（内置：输入框悬停）。
+    Text,
+    /// 可拖拽悬停（张手；内置：滑块 / 滚动条 thumb）。
+    Grab,
+    /// 正在拖拽（抓握；内置：滑块 / 滚动条拖拽中）。
+    Grabbing,
+    /// 水平双向箭头（↔；拖拽调值手柄 / 窗口宽度缩放柄）。
+    EwResize,
+}
+
+impl UiCursor {
+    pub(crate) fn to_winit(self) -> winit::window::CursorIcon {
+        match self {
+            UiCursor::Default => winit::window::CursorIcon::Default,
+            UiCursor::Text => winit::window::CursorIcon::Text,
+            UiCursor::Grab => winit::window::CursorIcon::Grab,
+            UiCursor::Grabbing => winit::window::CursorIcon::Grabbing,
+            UiCursor::EwResize => winit::window::CursorIcon::EwResize,
+        }
+    }
+}
+
+/// `Ui::begin` 返回的构建器：捕获输入快照 / 设置主题 / 基层层级 / scale_factor /
+/// 调试开关后 `build()`。
+///
+/// **输入与绘制解耦**：`Ui` 不借用键盘 / 鼠标设备（[`Self::capture`] 拷贝快照），
+/// 相机与渲染器**延迟到 [`Ui::finish`] 传入**——`begin` 只依赖 IME 窗口 / 文本 /
+/// 持久状态。
 pub struct UiInit<'a> {
     window: &'a WinitWindow,
-    cam: &'a Camera2D,
-    mouse: &'a MouseInput,
-    keyboard: &'a KeyboardInput,
     text: &'a mut Text,
-    r2d: &'a mut Render2D,
     state: &'a mut UiState,
+    mouse: MouseSnapshot,
+    keyboard: KeyboardSnapshot,
     theme: Theme,
     base_layer: f64,
     scale: f32,
@@ -126,6 +152,15 @@ pub struct UiInit<'a> {
 }
 
 impl<'a> UiInit<'a> {
+    /// **捕获输入快照**（帧开始时调用一次）：把键盘 / 鼠标设备的完整状态
+    /// （按键边沿 / IME / 鼠标位置与滚轮）拷贝为 `Ui` 自持数据——之后 `Ui` 与设备
+    /// 解耦，可独立存在；**不调用 = 空输入**（headless：纯布局 / 纯绘制，无交互）。
+    pub fn capture(mut self, mouse: &MouseInput, keyboard: &KeyboardInput) -> Self {
+        self.mouse = MouseSnapshot::capture(mouse);
+        self.keyboard = KeyboardSnapshot::capture(keyboard);
+        self
+    }
+
     /// 主题（默认浅色）。
     pub fn theme(mut self, theme: Theme) -> Self {
         self.theme = theme;
@@ -159,12 +194,10 @@ impl<'a> UiInit<'a> {
     pub fn build(self) -> Ui<'a> {
         let UiInit {
             window,
-            cam,
+            text,
+            state,
             mouse,
             keyboard,
-            text,
-            r2d,
-            state,
             theme,
             base_layer,
             scale,
@@ -173,14 +206,13 @@ impl<'a> UiInit<'a> {
         state.begin_frame();
         let (mx, my) = mouse.get_mouse_position();
         let mouse_screen = Vec2::new(mx as f32, my as f32);
+        let mouse_in_window = mouse.in_window();
         Ui {
             window,
-            cam,
+            text,
+            state,
             mouse,
             keyboard,
-            text,
-            r2d,
-            state,
             theme,
             base_layer,
             scale,
@@ -189,6 +221,7 @@ impl<'a> UiInit<'a> {
             queue: Vec::new(),
             debug_queue: Vec::new(),
             clip: None,
+            avail_stack: Vec::new(),
             abs_base: Vec2::ZERO,
             depth: 0,
             seq: 0,
@@ -196,7 +229,7 @@ impl<'a> UiInit<'a> {
             // 鼠标屏幕坐标：物理（拖拽/IME 基准用）与逻辑（命中测试用）各存一份
             mouse_screen,
             mouse_logical: mouse_screen / scale,
-            mouse_in_window: mouse.in_window(),
+            mouse_in_window,
             any_pressed: false,
             press_claimed: false,
             drag_panel: None,
@@ -209,6 +242,10 @@ impl<'a> UiInit<'a> {
             // 位置责任链：预置内置"用户拖拽状态"环（优先级 0）
             pos_chain: vec![(0, PosLink::Drag)],
             cursor_text: false,
+            cursor_grab: false,
+            cursor_grabbing: false,
+            cursor_window_drag: false,
+            cursor_custom: None,
         }
     }
 }
@@ -249,17 +286,19 @@ fn resolve_pos_link(
     pos
 }
 
-/// UI 录制器（借用窗口 / 相机 / 输入 / 文本 / 渲染器 / 状态，一帧一用）。
+/// UI 录制器（借用窗口 / 文本 / 状态；**输入为自持快照**，相机 / 渲染器延迟到
+/// [`Ui::finish`] 传入——一帧一用）。
 pub struct Ui<'a> {
     window: &'a WinitWindow,
-    cam: &'a Camera2D,
-    mouse: &'a MouseInput,
-    keyboard: &'a KeyboardInput,
+    /// 键盘快照（[`UiInit::capture`] 拷贝，与设备解耦）。
+    mouse: MouseSnapshot,
+    /// 鼠标快照（同上）。
+    keyboard: KeyboardSnapshot,
     text: &'a mut Text,
-    r2d: &'a mut Render2D,
     state: &'a mut UiState,
-    /// 主题样式（`pub(crate)`：widget 层合并全局样式与逐控件覆盖用）。
-    pub(crate) theme: Theme,
+    /// 主题样式（**公开**：widget 层 / 跨 crate 控件合并全局样式与逐控件覆盖用；
+    /// 帧内可改，影响后续录制）。
+    pub theme: Theme,
     base_layer: f64,
     /// DPI scale factor（物理 / 逻辑）。
     scale: f32,
@@ -275,7 +314,12 @@ pub struct Ui<'a> {
     debug_layout: bool,
     /// **当前裁剪区**（**绝对逻辑屏幕坐标**；滚动容器 [`Self::scroll_at`] 等设置）。
     /// 录制命令时存入 `UiDraw.clip`，收集期与内容求交（越界剔除）。
+    /// 语义 = **强制裁剪层**（ScrollView 可视区 / Clip 沙箱）：所有绘制命令
+    /// （含 `push_*_noclip` 变体）都服从；普通容器（Expand）不产生强制层。
     clip: Option<Rect>,
+    /// **可用宽度栈**（逻辑像素）：`view_at` 沙箱进入时压入沙箱宽，弹出恢复。
+    /// [`Self::avail_w`] 的唯一沙箱来源（容器固定宽经 `Frame::fixed_avail_w` 兜底）。
+    avail_stack: Vec<Option<f32>>,
     /// 当前容器绝对原点（命中测试用，逻辑像素）。
     abs_base: Vec2,
     /// 当前录制深度（容器嵌套层数）。
@@ -314,27 +358,32 @@ pub struct Ui<'a> {
     pos_chain: Vec<(i32, PosLink)>,
     /// **本帧鼠标是否悬停在文本输入框上**（`finish` 据此把系统光标设为 I 型）。
     cursor_text: bool,
+    /// 悬停可拖拽对象（滑块/滚动条 thumb）→ 手型光标（`finish` 应用）。
+    cursor_grab: bool,
+    /// 正在拖拽（滑块/滚动条）→ 抓握光标（`finish` 应用）。
+    cursor_grabbing: bool,
+    /// 窗口/面板**正在被拖拽** → 强制普通 Arrow（UI_NEEDS：窗体拖动无需 <->）。
+    cursor_window_drag: bool,
+    /// 控件作者经 [`Self::set_cursor`] 设置的自定义光标（如数字输入拖动手柄的 ↔）。
+    cursor_custom: Option<winit::window::CursorIcon>,
 }
 
 impl<'a> Ui<'a> {
-    /// 一帧一次。`window` 用于 IME 候选框定位（[`winit::window::Window::set_ime_cursor_area`]）。
+    /// 一帧一次。`window` 用于 IME 候选框定位（[`winit::window::Window::set_ime_cursor_area`]）
+    /// 与光标图标。**不接收输入设备与绘制资源**：
+    /// - 输入：`UiInit::capture(&mouse, &keyboard)` 快照（自持，可省略）；
+    /// - 绘制（相机 / 渲染器）：延迟到 [`Self::finish`] 传入。
     pub fn begin(
         window: &'a WinitWindow,
-        cam: &'a Camera2D,
-        mouse: &'a MouseInput,
-        keyboard: &'a KeyboardInput,
         text: &'a mut Text,
-        r2d: &'a mut Render2D,
         state: &'a mut UiState,
     ) -> UiInit<'a> {
         UiInit {
             window,
-            cam,
-            mouse,
-            keyboard,
             text,
-            r2d,
             state,
+            mouse: MouseSnapshot::default(),
+            keyboard: KeyboardSnapshot::default(),
             theme: Theme::default(),
             base_layer: 1e7,
             scale: 1.0,
@@ -350,6 +399,158 @@ impl<'a> Ui<'a> {
         self.seq
     }
 
+    // ── 控件作者公开 API（跨 crate 自定义控件用） ─────────────
+
+    /// 跨帧 UI 状态（只读；交互控件状态持久于此）。
+    #[inline]
+    pub fn state(&self) -> &UiState {
+        self.state
+    }
+
+    /// 跨帧 UI 状态（可变；控件作者用 [`UiState::widget`] 读写指定 ID 的状态）。
+    #[inline]
+    pub fn state_mut(&mut self) -> &mut UiState {
+        self.state
+    }
+
+    /// 鼠标**逻辑**屏幕坐标（命中测试 / 拖拽基准用；= 物理坐标 ÷ scale）。
+    #[inline]
+    pub fn mouse_logical(&self) -> Vec2 {
+        self.mouse_logical
+    }
+
+    /// 鼠标**物理**屏幕坐标（warp 边缘判定 / 物理像素增量拖拽用）。
+    #[inline]
+    pub fn mouse_screen(&self) -> Vec2 {
+        self.mouse_screen
+    }
+
+    /// 按键本帧按下边沿（控件作者键盘交互用，如 Esc 关闭模态对话框）。
+    #[inline]
+    pub fn key_down_edge(&self, key: winit::keyboard::KeyCode) -> bool {
+        self.keyboard.get(key).down_edge()
+    }
+
+    /// 当前容器光标位置（局部坐标；自写"占光标"式组合布局时用于放置子容器）。
+    #[inline]
+    pub fn cursor_pos(&self) -> Vec2 {
+        self.frames.last().map(|f| f.cursor).unwrap_or(Vec2::ZERO)
+    }
+
+    /// **声明本次按下归本控件**：自定义交互控件（自身有**拖拽语义**，如数字输入的
+    /// 拖动手柄）在 `down_edge && hit` 时调用——阻止外层窗口/面板把本次按下当作
+    /// **窗口拖拽基准**（否则窗口内拖滑块/手柄会连窗口一起动）。内置滑块 / 滚动条
+    /// / 文本框已自行调用。
+    #[inline]
+    pub fn claim_press(&mut self) {
+        self.press_claimed = true;
+    }
+
+    /// **通用拖拽缩放柄**（控件作者原语）：`handle` 为**当前容器局部坐标**的柄矩形
+    /// （通常右下角）。按住拖拽把 `current` 改为新尺寸（返回 `Some(new)`；`None` =
+    /// 本帧无变化）；范围 clamp 到 `min`。拖动中置位 `press_claimed`（阻止外层
+    /// 窗口/面板把本次按下当拖拽基准），悬停/拖拽显示 `cursor`（如 ↔ / ↖↘）。
+    ///
+    /// 持久尺寸由调用方写入（推荐 [`UiState::sizes`]）；可缩放 widget 的 `size()`
+    /// 优先读持久值，配合 [`crate::widget::Widget::resizable`] 声明。
+    /// `window_at_w` / [`Self::window_at_strict_w`] 的宽度缩放即基于本原语。
+    pub fn resize_handle(
+        &mut self,
+        id: &str,
+        handle: Rect,
+        current: Vec2,
+        min: Vec2,
+        cursor: crate::UiCursor,
+    ) -> Option<Vec2> {
+        let hhit = self.hit_abs(&handle);
+        let hbtn = self.mouse_left();
+        if hbtn.down_edge() && hhit {
+            // 缩放柄自身有拖拽语义：阻止外层窗口/面板把本次按下当作拖拽基准。
+            self.press_claimed = true;
+        }
+        let mut new = current;
+        let active = {
+            let ws = self.state.widgets.entry(id.to_owned()).or_default();
+            let a = update_drag(ws, hhit, hbtn);
+            if hbtn.down_edge() && hhit {
+                ws.press_mouse = Some(self.mouse_screen.round());
+                ws.press_panel = Some(current);
+            }
+            if a {
+                let pm = ws.press_mouse.unwrap_or(self.mouse_screen);
+                let base = ws.press_panel.unwrap_or(current);
+                let d = (self.mouse_screen - pm).round() / self.scale;
+                new = Vec2::new((base.x + d.x).max(min.x), (base.y + d.y).max(min.y));
+            }
+            a
+        };
+        if active || hhit {
+            self.set_cursor(cursor);
+        }
+        active.then_some(new)
+    }
+
+    /// **设置本帧系统光标**（控件作者用）：如数字输入拖动手柄悬停/拖拽时
+    /// [`UiCursor::EwResize`]（↔），点击文本框时由内置逻辑显示 I 型。优先级低于
+    /// 内置拖拽（滑块/滚动条抓握）、高于 I 型文本光标；窗体悬停/拖动保持默认箭头。
+    #[inline]
+    pub fn set_cursor(&mut self, icon: UiCursor) {
+        self.cursor_custom = Some(icon.to_winit());
+    }
+
+    /// 窗口客户区**物理尺寸**（`(w, h)` 像素；拖拽调值的 warp 边缘判定用）。
+    #[inline]
+    pub fn window_physical_size(&self) -> (u32, u32) {
+        let s = self.window.inner_size();
+        (s.width, s.height)
+    }
+
+    /// 视口**逻辑**尺寸（窗口客户区物理 ÷ scale；锚定布局 / 全屏遮罩用）。
+    #[inline]
+    pub fn viewport_size(&self) -> Vec2 {
+        let s = self.window.inner_size();
+        Vec2::new(s.width as f32, s.height as f32) / self.scale
+    }
+
+    /// 按锚点计算**绝对逻辑 pos**（顶层容器用）：内容尺寸 `size` 在视口内按
+    /// `anchor` 停靠、距视口边 `margin`（逻辑像素；内容超视口时 clamp 到视口内
+    /// 不溢出）。纯几何（[`Self::anchor_pos_in`]，可单测）。
+    #[inline]
+    pub fn anchor_pos(&self, a: Anchor, size: Vec2, margin: Vec2) -> Vec2 {
+        Self::anchor_pos_in(self.viewport_size(), a, size, margin)
+    }
+
+    /// 锚定位置纯计算：`vp` 视口内按 `anchor` 停靠（可单测）。
+    pub fn anchor_pos_in(vp: Vec2, a: Anchor, size: Vec2, margin: Vec2) -> Vec2 {
+        let m = margin.max(Vec2::ZERO);
+        let sx = (vp.x - m.x * 2.0).max(0.0);
+        let sy = (vp.y - m.y * 2.0).max(0.0);
+        let x = match a {
+            Anchor::TopLeft | Anchor::CenterLeft | Anchor::BottomLeft => m.x,
+            Anchor::TopCenter | Anchor::Center | Anchor::BottomCenter => m.x + (sx - size.x) * 0.5,
+            Anchor::TopRight | Anchor::CenterRight | Anchor::BottomRight => {
+                (vp.x - m.x - size.x).max(m.x)
+            }
+        };
+        let y = match a {
+            Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => m.y,
+            Anchor::CenterLeft | Anchor::Center | Anchor::CenterRight => m.y + (sy - size.y) * 0.5,
+            Anchor::BottomLeft | Anchor::BottomCenter | Anchor::BottomRight => {
+                (vp.y - m.y - size.y).max(m.y)
+            }
+        };
+        Vec2::new(x, y)
+    }
+
+    /// 设置鼠标光标**物理屏幕位置**（warp 用：拖到窗口边缘跳到对侧继续拖；
+    /// 下一帧输入快照生效，配合拖拽基准偏移保持增量连续）。
+    #[inline]
+    pub fn set_cursor_position(&mut self, x: f32, y: f32) {
+        let _ = self
+            .window
+            .set_cursor_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
+    }
+
     #[inline]
     fn phys_rect(&self, r: &Rect) -> Rect {
         Rect::new(r.x * self.scale, r.y * self.scale, r.w * self.scale, r.h * self.scale)
@@ -363,8 +564,8 @@ impl<'a> Ui<'a> {
     // ── 键盘导航（焦点链） ────────────────────────────────────
 
     /// 把控件登记进本帧焦点链（键盘导航用）。`rect` 为**相对当前容器**的局部矩形，
-    /// 内部转成**绝对逻辑坐标**（焦点描边绘制 / 排序用）。
-    fn register_focus(&mut self, id: &str, rect: Rect, kind: FocusKind) {
+    /// 内部转成**绝对逻辑坐标**（焦点描边绘制 / 排序用）。**交互控件必须调用**。
+    pub fn register_focus(&mut self, id: &str, rect: Rect, kind: FocusKind) {
         let abs = Rect::new(
             self.abs_base.x + rect.x,
             self.abs_base.y + rect.y,
@@ -390,7 +591,7 @@ impl<'a> Ui<'a> {
     /// **键盘激活**：Enter / Space 在本帧按下、本控件持有焦点且不在 IME 组合中
     /// → 视为一次点击（按钮 / 勾选 / 单选 / 下拉框用）。文本输入框与滑块不参与
     /// （前者走打字路径，后者用方向键调值）。
-    fn key_click(&self, id: &str, kind: FocusKind) -> bool {
+    pub fn key_click(&self, id: &str, kind: FocusKind) -> bool {
         if !self.focused_is(id) || kind == FocusKind::TextInput || kind == FocusKind::Slider {
             return false;
         }
@@ -501,8 +702,9 @@ impl<'a> Ui<'a> {
     /// 按样式 push **背景 + 边框**（`radius > 0` 走双层圆角矩形：外圈 border 色、
     /// 内圈 bg 色内缩 `border_w`，近似圆角边框；否则原 Solid + Border 路径）。
     /// `elem`：元素序（装饰背景传 0；控件背景传 `self.seq + 1`）。
+    /// **控件作者绘制原语**（逻辑坐标，内部 ×scale 取整到物理像素）。
     #[allow(clippy::too_many_arguments)]
-    fn push_panel_like(
+    pub fn push_panel_like(
         &mut self,
         rect: Rect,
         bg: Color,
@@ -592,85 +794,22 @@ impl<'a> Ui<'a> {
     /// 
     /// **行高版本**：行高 = 字号（而非 1.2 倍），保证字形在文本框内垂直居中位置正确。
     /// 版本号改变时，所有缓存会自动失效，避免新旧行高混用。
-    pub(crate) fn text_size(&mut self, s: &str, size: f32, family: Option<&str>) -> Vec2 {
+    /// 测量文本自然尺寸（**逻辑像素**，ceil 取整；控件作者在 [`Widget::size`] 测量用；
+    /// 内部排版缓冲按物理字号缓存，`family = None` = 系统默认字体）。
+    pub fn text_size(&mut self, s: &str, size: f32, family: Option<&str>) -> Vec2 {
         let buf = self.cache_buffer(s, size, family);
         (Text::measure_buffer(&buf) / self.scale).ceil()
     }
 
     /// 按**换行宽度**测量文本自然尺寸：`wrap_logical > 0` 时文本在宽度内自动换行
     /// （宽 = min(自然宽, wrap)，高 = 行数 × 行高）；否则同 [`Self::text_size`]。
-    pub(crate) fn text_size_wrap(&mut self, s: &str, size: f32, family: Option<&str>, wrap_logical: f32) -> Vec2 {
+    pub fn text_size_wrap(&mut self, s: &str, size: f32, family: Option<&str>, wrap_logical: f32) -> Vec2 {
         let buf = self.cache_buffer_wrap(s, size, family, wrap_logical);
         (Text::measure_buffer(&buf) / self.scale).ceil()
     }
 
-    /// 剪贴板快捷键（Ctrl+C/V/X/A）共用实现（单行 / 多行输入框）：复制 / 剪切 /
-    /// 粘贴（替换选择）/ 全选。`filter_newlines`：单行输入框粘贴时过滤换行
-    /// （HTML input 语义——多行拼接成一行，否则 '\n' 进入单行文本错乱）。
-    ///
-    /// free fn（非方法）：`kb`（不可变借 `self.keyboard` 字段）与 `ws`（可变借
-    /// `self.state` 字段）字段级借用分化，可在 `entry()` 持有 ws 期间调用。
-    fn clipboard_shortcuts(
-        kb: &KeyboardInput,
-        ws: &mut WidgetState,
-        value: &mut String,
-        filter_newlines: bool,
-    ) {
-        // **必须按住 Ctrl（或 Cmd）才生效**——否则直接打字 a/c/v/x 会误触发
-        // 全选 / 复制 / 粘贴 / 剪切（不按 Ctrl 时它们只是普通字符）。
-        let ctrl = kb.get(KeyCode::ControlLeft).pressed()
-            || kb.get(KeyCode::ControlRight).pressed();
-        if !ctrl {
-            return;
-        }
-        let c_down = kb.get(KeyCode::KeyC).down_edge();
-        let v_down = kb.get(KeyCode::KeyV).down_edge();
-        let x_down = kb.get(KeyCode::KeyX).down_edge();
-        let a_down = kb.get(KeyCode::KeyA).down_edge();
-        if a_down {
-            // Ctrl+A：全选
-            ws.sel_anchor = Some(0);
-            ws.caret = value.chars().count();
-        }
-        if c_down || x_down {
-            let sel = selected_text(value, ws.sel_anchor, ws.caret);
-            if !sel.is_empty() {
-                clipboard_set(&sel);
-                if x_down {
-                    // 删除选中范围 [lo, hi)——⚠ 用 sel_range 的 **hi**，不是 caret.max(lo)：
-                    // 反向选择（向左拖选）时 caret < anchor，用 caret.max(lo) 会删
-                    // [caret, caret) = 空 → "剪切只复制不删字"。
-                    if let Some((lo, hi)) = sel_range(ws.sel_anchor, ws.caret) {
-                        delete_range(value, lo, hi);
-                        ws.caret = lo;
-                    }
-                    ws.sel_anchor = None;
-                }
-            }
-        }
-        if v_down {
-            if let Some(text) = clipboard_get() {
-                let text = if filter_newlines {
-                    text.replace(['\r', '\n'], "")
-                } else {
-                    text
-                };
-                if !text.is_empty() {
-                    // 粘贴替换选择
-                    let lo = match sel_range(ws.sel_anchor, ws.caret) {
-                        Some((lo, hi)) => {
-                            delete_range(value, lo, hi);
-                            lo
-                        }
-                        None => ws.caret,
-                    };
-                    insert_str_at(value, lo, &text);
-                    ws.caret = lo + text.chars().count();
-                    ws.sel_anchor = None;
-                }
-            }
-        }
-    }
+    /// 剪贴板快捷键（Ctrl+C/V/X/A）共用实现已迁至 [`crate::edit::clipboard_shortcuts`]
+    /// （纯逻辑，单行 / 多行输入框共用），本处不再保留。
 
     /// **控件自持排版缓冲**：`WidgetState::text_buf` 命中复用（key 含文本/字号/字体/
     /// 换行宽/**行距**/版本），未命中直接构建——**不写** `UiState::text_buffers` 全局缓存
@@ -730,6 +869,27 @@ impl<'a> Ui<'a> {
             let s: String = chars[..k].iter().collect();
             self.text_size(&s, size, family).x
         })
+    }
+
+    /// 文本超宽时省略（内容自洽，noclip）：宽度 > `max_w` → 返回 "…" 截断串；
+    /// 否则 `None`（原样绘制）。按钮 / 勾选 / 下拉等固定 rect 控件的文本自动省略
+    /// （Resizable 窗口缩窄 / max 约束下不溢出）。
+    fn ellipsized(
+        &mut self,
+        s: &str,
+        size: f32,
+        family: Option<&str>,
+        max_w: f32,
+    ) -> Option<String> {
+        let natural = self.text_size(s, size, family).x;
+        if natural > max_w {
+            Some(
+                crate::edit::ellipsize(s, max_w, |t| self.text_size(t, size, family).x)
+                    .into_owned(),
+            )
+        } else {
+            None
+        }
     }
 
     /// 取（或创建）共享排版缓冲（物理字号取整到像素；`CachePolicy::User`：不进 rjw_text LRU）。
@@ -808,7 +968,9 @@ impl<'a> Ui<'a> {
 
     /// 取（或创建）**自动换行**排版缓冲（`wrap_logical > 0`；`<= 0` = 不换行同
     /// [`Self::cache_buffer`]）。供 widget 层与绘制路径按"渲染与测量同缓冲"使用。
-    pub(crate) fn wrap_buffer(
+    /// 取（或创建）**按宽度换行**的排版缓冲（`wrap_logical <= 0` = 不换行）；
+    /// 控件作者画多行/换行文本时用（配 [`Self::push_text_rect`] 的 `buf` 参数）。
+    pub fn wrap_buffer(
         &mut self,
         s: &str,
         size: f32,
@@ -818,9 +980,48 @@ impl<'a> Ui<'a> {
         self.cache_buffer_wrap(s, size, family, wrap_logical)
     }
 
+    /// **控件作者绘制原语**：实心矩形（逻辑坐标；`w/h <= 0` 跳过）。
+    pub fn push_solid_rect(&mut self, rect: Rect, color: Color) {
+        if rect.w > 0.0 && rect.h > 0.0 {
+            let elem = self.seq + 1;
+            let seq = self.next_seq();
+            let depth = self.depth;
+            let win = self.cur_win;
+            self.queue.push(UiDraw {
+                depth,
+                seq,
+                win,
+                elem,
+                rect,
+                clip: self.clip,
+                kind: DrawKind::Solid(color),
+            });
+        }
+    }
+
+    /// **控件作者绘制原语**：矩形边框（逻辑坐标；画在矩形内边缘，宽度取整到物理像素）。
+    pub fn push_border_rect(&mut self, rect: Rect, color: Color, width: f32) {
+        if rect.w > 0.0 && rect.h > 0.0 {
+            let elem = self.seq + 1;
+            let seq = self.next_seq();
+            let depth = self.depth;
+            let win = self.cur_win;
+            self.queue.push(UiDraw {
+                depth,
+                seq,
+                win,
+                elem,
+                rect,
+                clip: self.clip,
+                kind: DrawKind::Border { color, width },
+            });
+        }
+    }
+
     /// 推送一条文本绘制命令（供 widget 层与 `*_at` 方法共用；`clip` 为文本局部裁剪，
     /// 外层裁剪自动取当前容器 `self.clip`；`buf = Some` 时直接用预排版缓冲）。
-    pub(crate) fn push_text_rect(
+    /// **控件作者绘制原语**（逻辑坐标；`family` 传 `None` = 系统默认字体）。
+    pub fn push_text_rect(
         &mut self,
         rect: Rect,
         text: &str,
@@ -853,8 +1054,30 @@ impl<'a> Ui<'a> {
         ));
     }
 
+    /// **不服从内容裁剪的文本绘制**（控件作者原语）：
+    ///
+    /// 语义 = [`Self::push_text_rect`] 且**不附加任何软层（内容裁剪）**——调用方
+    /// 承诺文本**内容自洽**（自动换行后高 = 自然高、"…"省略后宽 = 分配宽、滚动
+    /// 内容受限），无需按控件边界裁剪。**仍服从强制层**（ScrollView 可视区 /
+    /// Clip 沙箱，即 `self.clip`）：父级如 ScrollView 强制裁切时躲不掉；无 Scroll
+    /// 的普通容器本来就没有强制层 → 自洽内容画出界（自洽内容本就不会出界）。
+    pub fn push_text_rect_noclip(
+        &mut self,
+        rect: Rect,
+        text: &str,
+        size: f32,
+        color: Color,
+        family: Option<String>,
+        align: TextAlign,
+        valign: TextVAlign,
+        buf: Option<Arc<Buffer>>,
+    ) {
+        self.push_text_rect(rect, text, size, color, family, align, valign, None, buf)
+    }
+
+    /// 鼠标左键状态（含本帧边沿；控件作者交互判断用）。
     #[inline]
-    fn mouse_left(&self) -> KeyState {
+    pub fn mouse_left(&self) -> KeyState {
         self.mouse.get(MouseButton::Left)
     }
 
@@ -868,8 +1091,11 @@ impl<'a> Ui<'a> {
     ///
     /// 遮挡时若控件矩形本身命中鼠标，累加 [`UiState::occluded_hits`]（诊断机制：
     /// 告诉你"本帧有多少次点击被窗口遮挡拦截"——见示例 `eg260818UI` 的诊断面板）。
+    /// **强制裁剪层命中**：鼠标在 [`Self::clip`]（ScrollView 可视区 / Clip 沙箱）
+    /// 之外时**不命中**——修复"滚出可视区的控件边缘仍可交互"缺口。
+    /// 控件作者交互判断用（与 [`Self::mouse_left`] / `hit::update_interact` 组合）。
     #[inline]
-    fn hit_abs(&mut self, local: &Rect) -> bool {
+    pub fn hit_abs(&mut self, local: &Rect) -> bool {
         if !self.mouse_in_window {
             return false;
         }
@@ -886,6 +1112,12 @@ impl<'a> Ui<'a> {
         );
         if !hit_test(&abs, self.mouse_logical) {
             return false;
+        }
+        // 强制裁剪层（Clip 沙箱 / ScrollView 可视区）：层外命中失效。
+        if let Some(c) = self.clip {
+            if !c.contains_point(self.mouse_logical) {
+                return false;
+            }
         }
         // **窗口遮挡**（点击穿透修复）：鼠标下若有更高 z 的窗口（`win=0` 内容被任意
         // 窗口）覆盖本控件所在窗口 → 本窗口不得响应——重叠区域只让最上层窗口交互，
@@ -934,23 +1166,33 @@ impl<'a> Ui<'a> {
     }
 
     /// 当前容器为子项分配局部矩形（顶层无容器时 panic，顶层请用 `*_at`）。
-    pub(crate) fn child_rect(&mut self, w: f32, h: f32) -> Rect {
+    /// 控件作者做"占光标"式自定义容器时用（相对当前容器内容原点）。
+    pub fn child_rect(&mut self, w: f32, h: f32) -> Rect {
         self.frames
             .last_mut()
             .expect("顶层控件请用 *_at(pos, ...) 定位（容器内才可用无 pos 形式）")
             .child_rect(w, h)
     }
 
+    /// 同 [`Self::child_rect`]，但 `expands = false` 时该子项**不撑大父级**
+    /// （[`crate::widget::Expansion::DisableAutoExpansion`] 控件用）。
+    pub fn child_rect_exp(&mut self, w: f32, h: f32, expands: bool) -> Rect {
+        self.frames
+            .last_mut()
+            .expect("顶层控件请用 *_at(pos, ...) 定位（容器内才可用无 pos 形式）")
+            .child_rect_exp(w, h, expands)
+    }
+
     /// **放置控件**（[`crate::widget::Widget`] trait）：容器内**占光标**（尺寸 = 控件
-    /// 测量值）；返回统一交互响应 [`crate::widget::Response`]。顶层无容器时请用
-    /// [`Self::add_at`]。
+    /// 测量值经 [`crate::widget::SizeConstraints`] clamp 与膨胀模式调整）；返回统一
+    /// 交互响应 [`crate::widget::Response`]。顶层无容器时请用 [`Self::add_at`]。
     ///
     /// 属性化 builder 示例：`ui.add(Button::new("ok", "确定").color(Color::WHITE))`。
     /// 容器包装（`Panel` / `Pack` / `Grid` / `Window` / `Scroll` / `FlexCtx`）经
-    /// [`crate::widget::UiAdd`] 提供同样的 `add` / `add_at`。
+    /// [`UiAdd`] 提供同样的 `add` / `add_at` 与全部便捷方法（`p.button` / `p.label` 等）。
     pub fn add(&mut self, w: impl crate::widget::Widget) -> crate::widget::Response {
-        let size = w.size(self);
-        let rect = self.child_rect(size.x, size.y);
+        let (size, expands) = self.widget_size(&w);
+        let rect = self.child_rect_exp(size.x, size.y, expands);
         w.ui(self, rect)
     }
 
@@ -960,8 +1202,30 @@ impl<'a> Ui<'a> {
         pos: Vec2,
         w: impl crate::widget::Widget,
     ) -> crate::widget::Response {
-        let size = w.size(self);
+        let (size, _) = self.widget_size(&w);
         w.ui(self, Rect::new(pos.x, pos.y, size.x, size.y))
+    }
+
+    /// 测量控件最终放置尺寸：`size()` 自然值 → `SizeConstraints` clamp → 按
+    /// `Expansion` 模式调整（`LimitedInParent` 限制在父级可用宽内），并返回该
+    /// 控件是否**撑大父级**（`DisableAutoExpansion` = 否）。
+    fn widget_size(&mut self, w: &impl crate::widget::Widget) -> (Vec2, bool) {
+        let natural = w.size(self);
+        let c = w.constraints();
+        let mut size = crate::widget::apply_constraints(natural, c);
+        let expands = match w.expansion() {
+            crate::widget::Expansion::DisableAutoExpansion => false,
+            crate::widget::Expansion::LimitedInParent => {
+                if let Some(avail) = self.avail_w() {
+                    if avail < size.x {
+                        size.x = avail;
+                    }
+                }
+                true
+            }
+            crate::widget::Expansion::UnlimitedExpansion => true,
+        };
+        (size, expands)
     }
 
     /// 通用容器：push 帧 → 闭包 → 结算（返回尺寸与最大子尺寸）→ 平移子命令 → pop。
@@ -986,13 +1250,97 @@ impl<'a> Ui<'a> {
         (size, max_child)
     }
 
-    /// **滚动容器**：内容在 `view_size` 可视区内垂直堆叠（pack Top），超出部分
-    /// 滚动查看——**滚轮**滚动 + 右侧**滚动条**（拖 thumb / 点轨道翻页）。
+    /// **View 沙箱**（闭包作用域，见 [`crate::view`]）：进入沙箱后——
+    ///
+    /// - [`ViewMode::Clip`]：内容超出沙箱**强制裁剪**（外层裁剪 ∩ 沙箱可视区），
+    ///   沙箱外的鼠标**命中失效**（`hit_abs` 带沙箱判定）；
+    /// - [`ViewMode::Expand`]：不裁剪，内容自然尺寸可溢出沙箱并撑大外层容器；
+    ///   沙箱提供"可用宽度"（[`Self::avail_w`]），供 `LimitedInParent` 控件自洽
+    ///   （自动换行 / "…"省略）。
+    ///
+    /// 沙箱内录制的命令随弹出统一平移 `pos`（相对当前容器内容原点，不占父光标）。
+    /// 返回内容结算尺寸（`Expand` 下可大于 `size`）。**ScrollView**（[`Self::scroll_at`]、
+    /// 文本编辑框）与严格窗口（[`Self::window_at_strict`]）的公共底座。
+    pub fn view_at(
+        &mut self,
+        pos: Vec2,
+        size: Vec2,
+        mode: ViewMode,
+        f: impl FnOnce(&mut ViewCtx<'_, '_>),
+    ) -> Vec2 {
+        let saved_clip = self.clip;
+        let saved_base = self.abs_base;
+        let view_rel = Rect::new(pos.x, pos.y, size.x.max(0.0), size.y.max(0.0));
+        let view_abs = Rect::new(
+            saved_base.x + view_rel.x,
+            saved_base.y + view_rel.y,
+            view_rel.w,
+            view_rel.h,
+        );
+        // 强制裁剪层（Clip 模式：外层 ∩ 可视区；Expand：原样传递）。
+        self.clip = clip_for_view(saved_clip, view_abs, mode);
+        // 可用宽度栈：沙箱内 avail_w() = 沙箱宽。
+        self.avail_stack.push(Some(view_rel.w));
+        let start = self.queue.len();
+        self.abs_base = saved_base + pos;
+        self.frames.push(Frame::new_stack(PackSide::Top, self.theme.gap, 0.0));
+        self.depth += 1;
+        f(&mut ViewCtx { ui: self });
+        let frame = self.frames.pop().expect("view frame");
+        let content = frame.settle_size();
+        self.depth -= 1;
+        self.abs_base = saved_base;
+        self.avail_stack.pop();
+        self.clip = saved_clip;
+        for d in &mut self.queue[start..] {
+            d.translate(pos);
+        }
+        content
+    }
+
+    /// 当前可用的**内容宽度**（逻辑像素）：沙箱宽 → 容器固定宽（`window_at_w` 等，
+    /// 经 `Frame::fixed_avail_w`）→ 下一子项 max 约束，取最小；无任何约束 = `None`
+    /// （内容自然宽度）。供 `LimitedInParent` 控件（如 [`crate::widget::Label`]）自洽
+    /// 溢出（自动换行 / 省略号）。
+    #[inline]
+    pub fn avail_w(&self) -> Option<f32> {
+        let base = self
+            .avail_stack
+            .last()
+            .copied()
+            .flatten()
+            .or_else(|| self.frames.last().and_then(|f| f.fixed_avail_w()));
+        let nm = self.frames.last().map(|f| f.next_max_w()).unwrap_or(0.0);
+        match (base, nm) {
+            (Some(b), n) if n > 0.0 => Some(b.min(n)),
+            (b, _) => b,
+        }
+    }
+
+    /// **分割线**（绝对定位水平线）：`pos` 相对当前容器内容原点，宽 `w`（逻辑像素）。
+    /// 线画在 `pos.y + margin`（上下留白由调用方行高体现）。样式取
+    /// [`Theme::divider`](crate::style::Theme::divider)。
+    pub fn divider_at(&mut self, pos: Vec2, w: f32) {
+        let st = self.theme.divider.clone();
+        if w > 0.0 && st.thickness > 0.0 {
+            self.push_solid_rect(Rect::new(pos.x, pos.y + st.margin, w, st.thickness), st.color);
+        }
+    }
+
+    /// **滚动容器（ScrollView）**：内容在 `view_size` 可视区内垂直堆叠（pack Top），
+    /// 超出部分滚动查看——**滚轮**滚动 + 右侧**滚动条**（拖 thumb / 点轨道翻页）。
     ///
     /// - `id`：滚动偏移状态键（[`UiState::scrolls`]，跨帧持久）；
     /// - 内容子项照常录制（`s.label` / `s.button` 等，占光标堆叠）；
-    /// - 可视区之外的图形/文字**裁剪**（`UiDraw.clip` 绝对逻辑矩形，收集期求交）；
+    /// - 可视区之外的图形/文字**强制裁剪**（Clip 沙箱：`UiDraw.clip` 绝对逻辑矩形，
+    ///   收集期求交，**含 noclip 绘制**）；
+    /// - 沙箱内 `avail_w()` = 可视区宽（`LimitedInParent` 控件自洽）；
     /// - 返回 `view_size`（内容尺寸超出时可经 [`UiState::scrolls`] 读取）。
+    ///
+    /// **内部计算一律物理像素**（DPI 只在该换算处出现一次）：滚动偏移
+    /// [`ScrollState::offset`] 为**物理像素**整数步进（滚轮 / 拖 thumb 均取整），
+    /// 内容按 `offset_px / scale` 逻辑平移后 ×scale 回到整物理像素——
+    /// **整体刚性移动**，非整数 DPI（125%/150%）下相邻元素取整相位不抖。
     pub fn scroll_at(
         &mut self,
         pos: Vec2,
@@ -1001,23 +1349,36 @@ impl<'a> Ui<'a> {
         f: impl FnOnce(&mut Scroll<'_, '_>),
     ) -> Vec2 {
         let saved_clip = self.clip;
-        let view_abs = Rect::new(pos.x, pos.y, view_size.x.max(0.0), view_size.y.max(0.0));
-        // 裁剪区 = 外层裁剪 ∩ 本可视区（绝对逻辑）。
-        self.clip = match saved_clip {
-            Some(c) => intersect_rect(&c, &view_abs),
-            None => Some(view_abs),
-        };
-        // 滚动偏移（跨帧状态；先 Copy 读出，`f` 结束再写回——避免借用冲突）。
-        let mut offset = self
+        let saved_base = self.abs_base;
+        // 可视区（**相对**当前容器 origin：内容 / 滚动条命令都录在容器局部坐标，
+        // 随外层容器弹出统一平移成绝对坐标）。
+        let view_rel = Rect::new(pos.x, pos.y, view_size.x.max(0.0), view_size.y.max(0.0));
+        // 可视区（**绝对**逻辑屏幕坐标：裁剪 / 滚轮命中用）。
+        let view_abs = Rect::new(
+            saved_base.x + pos.x,
+            saved_base.y + pos.y,
+            view_size.x.max(0.0),
+            view_size.y.max(0.0),
+        );
+        // 强制裁剪层 = 外层裁剪 ∩ 本可视区（View 沙箱 Clip 语义）。
+        self.clip = clip_for_view(saved_clip, view_abs, ViewMode::Clip);
+        // 滚动偏移（**物理像素**，跨帧状态；先 Copy 读出，`f` 结束再写回——避免
+        // 借用冲突）。以整物理像素步进（滚轮 / 拖 thumb 均取整）。
+        let mut offset_px = self
             .state
             .scrolls
             .get(id)
             .map(|s| s.offset)
             .unwrap_or(0.0);
-        // 内容 pack 堆叠（手动管理帧栈：平移 = pos - offset，而非 container 的 pos）。
+        // 可用宽度栈：滚动容器内 avail_w() = 可视区宽（LimitedInParent 控件自洽）。
+        self.avail_stack.push(Some(view_rel.w));
+        // 内容 pack 堆叠（手动管理帧栈：平移 = pos - offset_px/scale，而非 container 的 pos）。
         let start = self.queue.len();
-        let saved_base = self.abs_base;
-        self.abs_base = saved_base + pos;
+        // abs_base = 内容**渲染**原点（已含 -offset 滚动偏移）——`hit_abs`（点击
+        // 命中）/ `register_focus`（焦点描边）/ IME 光标定位都经 abs_base 换算，
+        // 必须与平移后的绘制位置一致，否则点击位置跟不上滚动视图（offset ≠ 0 时
+        // 命中落在未滚动坐标上）。
+        self.abs_base = saved_base + pos - Vec2::new(0.0, offset_px / self.scale);
         self.frames.push(Frame::new_stack(PackSide::Top, self.theme.gap, 0.0));
         self.depth += 1;
         f(&mut Scroll { ui: self });
@@ -1025,30 +1386,44 @@ impl<'a> Ui<'a> {
         let content_size = frame.settle_size();
         self.depth -= 1;
         self.abs_base = saved_base;
-        let max_off = (content_size.y - view_size.y).max(0.0);
-        offset = offset.clamp(0.0, max_off);
+        self.avail_stack.pop();
+        let max_off_px = ((content_size.y - view_size.y).max(0.0) * self.scale).round();
+        offset_px = offset_px.clamp(0.0, max_off_px);
         // 滚轮（鼠标在可视区内且未被窗口遮挡；wheel y 向上为正 → offset 减小）。
+        // 每格 40 逻辑像素 → 物理像素取整（trackpad 连续增量同样按格取整步进）。
         let hit = hit_test(&view_abs, self.mouse_logical)
             && self.mouse_in_window
             && !window_occluded(self.cur_win, self.mouse_logical, self.window_rects_iter());
         if hit {
             let (_, wy) = self.mouse.get_mouse_wheel_delta();
             if wy != 0.0 {
-                offset = (offset - wy as f32 * 40.0).clamp(0.0, max_off);
+                offset_px = (offset_px - (wy as f32 * 40.0 * self.scale).round())
+                    .clamp(0.0, max_off_px);
             }
         }
-        // 滚动条（内容超出可视区时显示；拖 thumb / 点轨道翻页）。
-        if content_size.y > view_size.y + 1.0 && view_size.y > 0.0 {
-            offset = self.scrollbar(id, &view_abs, view_size.y, content_size.y, offset, max_off, saved_clip);
-        }
-        // 写回滚动状态（`f` 借用已结束）。
-        let st = self.state.scrolls.entry(id.to_owned()).or_default();
-        st.offset = offset;
-        st.content_h = content_size.y;
-        // 平移子命令：内容上移 offset（clip 随 translate 同步平移）。
+        // 平移内容子命令：局部坐标 → 绝对（`UiDraw::clip` 已是绝对，不随平移——见其
+        // 文档）。offset_px/scale 为逻辑小数：绘制时 ×scale 回到整物理像素 → 刚性平移。
         for d in &mut self.queue[start..] {
-            d.translate(pos - Vec2::new(0.0, offset));
+            d.translate(pos - Vec2::new(0.0, offset_px / self.scale));
         }
+        // 滚动条（内容超出可视区时显示；拖 thumb / 点轨道翻页）——在**当前容器局部
+        // 坐标**绘制，**不参与**上面的内容平移；随外层容器弹出统一平移成绝对坐标。
+        if content_size.y > view_size.y + 1.0 && view_size.y > 0.0 {
+            offset_px = self.scrollbar(
+                id,
+                &view_rel,
+                view_size.y,
+                content_size.y,
+                offset_px,
+                max_off_px,
+                saved_clip,
+                0,
+            );
+        }
+        // 写回滚动状态（`f` 借用已结束；offset 为物理像素）。
+        let st = self.state.scrolls.entry(id.to_owned()).or_default();
+        st.offset = offset_px;
+        st.content_h = content_size.y;
         self.clip = saved_clip;
         view_size
     }
@@ -1080,7 +1455,14 @@ impl<'a> Ui<'a> {
         clicked
     }
 
-    /// 滚动条：右侧竖条（轨道 + thumb）。返回更新后的滚动偏移。
+    /// 滚动条：右侧竖条（轨道 + thumb）。返回更新后的滚动偏移（**物理像素**）。
+    ///
+    /// `view` 为**当前容器局部坐标**的可视区（与内容同空间，**不随内容滚动**；
+    /// 由外层容器弹出统一平移成绝对坐标）；命中用局部坐标鼠标（`mouse_logical −
+    /// abs_base`），遮挡判定仍用绝对鼠标。thumb 几何在物理像素里取整，拖拽按
+    /// **整物理像素 1:1** 步进——内容与 thumb 刚性移动（非整数 DPI 不抖）。
+    /// `elem`：所属元素序（`scroll_at` 传 `0` 装饰层；文本编辑框传 `seq+1` 使
+    /// 滚动条覆盖在文本之上）。
     #[allow(clippy::too_many_arguments)]
     fn scrollbar(
         &mut self,
@@ -1088,22 +1470,27 @@ impl<'a> Ui<'a> {
         view: &Rect,
         view_h: f32,
         content_h: f32,
-        offset: f32,
-        max_off: f32,
+        offset_px: f32,
+        max_off_px: f32,
         outer_clip: Option<Rect>,
+        elem: u32,
     ) -> f32 {
-        const SB_W: f32 = 8.0;
-        let mut offset = offset;
-        let track = Rect::new(view.x + view.w - SB_W, view.y, SB_W, view_h);
+        let mut offset_px = offset_px;
+        let track = Rect::new(view.x + view.w - SCROLLBAR_W, view.y, SCROLLBAR_W, view_h);
         let ratio = (view_h / content_h).clamp(0.0, 1.0);
-        let thumb_h = (view_h * ratio).max(16.0);
-        let thumb_y = view.y + if max_off > 1e-6 {
-            offset / max_off * (view_h - thumb_h)
+        // thumb 几何：**物理像素**计算（整像素步进 → 刚性），绘制转回逻辑坐标。
+        let scale = self.scale;
+        let view_h_px = (view_h * scale).round();
+        let thumb_h_px = (view_h_px * ratio).max(16.0 * scale).round();
+        let thumb_y_px = if max_off_px > 1e-6 {
+            (offset_px / max_off_px * (view_h_px - thumb_h_px)).round()
         } else {
             0.0
         };
-        let thumb = Rect::new(track.x, thumb_y, track.w, thumb_h);
-        // 绘制：轨道 + thumb（白纹理图形，elem=0 装饰层）。
+        // thumb 顶 = 可视区顶（view.y，局部坐标）+ 视图内偏移（物理像素 / scale）
+        let thumb_y = view.y + thumb_y_px / scale;
+        let thumb = Rect::new(track.x, thumb_y, track.w, thumb_h_px / scale);
+        // 绘制：轨道 + thumb（白纹理图形，`elem` 所属元素）。
         let depth = self.depth;
         let win = self.cur_win;
         let seq = self.next_seq();
@@ -1111,7 +1498,7 @@ impl<'a> Ui<'a> {
             depth,
             seq,
             win,
-            elem: 0,
+            elem,
             rect: track,
             clip: outer_clip,
             kind: DrawKind::Solid(self.theme.slider.track),
@@ -1120,23 +1507,34 @@ impl<'a> Ui<'a> {
             depth,
             seq: seq + 1,
             win,
-            elem: 0,
+            elem,
             rect: thumb,
             clip: outer_clip,
             kind: DrawKind::Solid(self.theme.slider.handle),
         });
         // 交互：thumb 拖拽（复用 WidgetState.press_panel/press_mouse 基准）。
+        // 局部坐标鼠标 = 绝对鼠标 − 当前容器绝对原点（abs_base 已恢复为外层值）。
+        let mouse_rel = self.mouse_logical - self.abs_base;
         let bar_id = format!("{id}::bar");
-        let bar_hit = hit_test(&thumb, self.mouse_logical)
+        let bar_hit = hit_test(&thumb, mouse_rel)
             && self.mouse_in_window
             && !window_occluded(win, self.mouse_logical, self.window_rects_iter());
         let btn = self.mouse_left();
+        // 滚动条自身有拖拽语义：按下（thumb / 轨道区域）置位 press_claimed，
+        // 阻止外层窗口把本次按下当作窗口拖拽基准（窗口内拖滚动条不连窗口一起动）。
+        if btn.down_edge()
+            && hit_test(&track, mouse_rel)
+            && self.mouse_in_window
+            && !window_occluded(win, self.mouse_logical, self.window_rects_iter())
+        {
+            self.press_claimed = true;
+        }
         let grab = {
             let ws = self.state.widgets.entry(bar_id.clone()).or_default();
             let dragging = update_drag(ws, bar_hit, btn);
             if btn.down_edge() && bar_hit {
                 ws.press_mouse = Some(self.mouse_screen.round());
-                ws.press_panel = Some(Vec2::new(thumb_y, offset));
+                ws.press_panel = Some(Vec2::new(thumb_y_px, offset_px));
             }
             (dragging, ws.press_panel.unwrap_or(Vec2::ZERO))
         };
@@ -1147,21 +1545,32 @@ impl<'a> Ui<'a> {
                 .get(&bar_id)
                 .and_then(|w| w.press_mouse)
                 .unwrap_or(self.mouse_screen);
-            let dy = (self.mouse_screen.y - pm.y).round() / self.scale;
-            offset = (grab.1.y + dy / (view_h - thumb_h).max(1.0) * max_off).clamp(0.0, max_off);
+            // thumb **跟随鼠标 1:1**（保持按下时的抓取点偏移），滚动偏移由 thumb
+            // 位置反推——否则 thumb 按比例慢于鼠标（内容越高越明显，"不同步"）。
+            let dy_px = (self.mouse_screen.y - pm.y).round();
+            let thumb_y_px_new = grab.1.x + dy_px; // grab.1.x = 按下时 thumb_y_px
+            offset_px = if view_h_px - thumb_h_px > 1.0 {
+                (thumb_y_px_new / (view_h_px - thumb_h_px) * max_off_px)
+                    .round()
+                    .clamp(0.0, max_off_px)
+            } else {
+                0.0
+            };
         }
-        // 轨道点击（thumb 外）→ 翻页。
-        let hit_track = hit_test(&track, self.mouse_logical)
+        // 光标：视口滑条（thumb/轨道）保持普通 Arrow（UI_NEEDS：滑条不用 <->）。
+        // 轨道点击（thumb 外）→ 翻页（整物理像素步长）。
+        let hit_track = hit_test(&track, mouse_rel)
             && self.mouse_in_window
             && !window_occluded(win, self.mouse_logical, self.window_rects_iter());
+        let page_px = (view_h * scale).round();
         if btn.down_edge() && hit_track && !bar_hit {
-            if self.mouse_logical.y < thumb_y {
-                offset = (offset - view_h).max(0.0);
-            } else if self.mouse_logical.y > thumb_y + thumb_h {
-                offset = (offset + view_h).min(max_off);
+            if mouse_rel.y < thumb_y {
+                offset_px = (offset_px - page_px).max(0.0);
+            } else if mouse_rel.y > thumb_y + thumb_h_px / scale {
+                offset_px = (offset_px + page_px).min(max_off_px);
             }
         }
-        offset
+        offset_px
     }
 
     // ── 顶层入口（*_at：位置显式，尺寸自动） ─────────────────
@@ -1248,10 +1657,11 @@ impl<'a> Ui<'a> {
     ///
     /// 示例（HUD 自动左右摆动，但用户仍可拖动——`-10 < 0` 拖拽优先）：
     /// ```no_run
-    /// # let cam = todo!(); let mouse = todo!(); let keyboard = todo!();
+    /// # let viewport = todo!(); let mouse = todo!(); let keyboard = todo!();
     /// # let text = todo!(); let r2d = todo!(); let state = todo!(); let window = todo!();
-    /// use rjw_ui::{Theme, Ui};
-    /// let mut ui = Ui::begin(&window, &cam, &mouse, &keyboard, &mut text, &mut r2d, &mut state)
+    /// use rjw_ui::{Theme, Ui, UiAdd};
+    /// let mut ui = Ui::begin(&window, &mut text, &mut state)
+    ///     .capture(&mouse, &keyboard)
     ///     .theme(Theme::dark())
     ///     .build();
     /// let t0 = std::time::Instant::now();
@@ -1264,7 +1674,7 @@ impl<'a> Ui<'a> {
     ///     }
     /// });
     /// ui.window_at("hud", glam::Vec2::new(400.0, 40.0), |w| { w.label("HUD"); });
-    /// ui.finish();
+    /// ui.finish(&viewport, &mut r2d);
     /// ```
     pub fn pos_handler(&mut self, priority: i32, f: impl Fn(&str) -> Option<Vec2> + 'static) {
         self.pos_chain.push((priority, PosLink::Script(Box::new(f))));
@@ -1383,6 +1793,10 @@ impl<'a> Ui<'a> {
                 // 按下面板（或拖拽中）都算"已响应按下"——避免空白点击清焦点
                 self.any_pressed = true;
             }
+            // 面板拖动激活 → 强制普通 Arrow（UI_NEEDS：窗体拖动无需 <->）。
+            if active {
+                self.cursor_window_drag = true;
+            }
             new_pos
         } else {
             origin
@@ -1421,6 +1835,63 @@ impl<'a> Ui<'a> {
         pos: Vec2,
         f: impl FnOnce(&mut Window<'_, '_>),
     ) -> Vec2 {
+        self.window_impl(id, pos, None, true, false, f)
+    }
+
+    /// **严格裁剪窗口**：同 [`Self::window_at`]（可重叠 / 置顶 / 可拖拽 / 自动尺寸），
+    /// 且窗口内容**强制裁剪**到窗口矩形（Clip 沙箱：超出窗口的内容被裁，含 noclip
+    /// 绘制；外层 ScrollView 裁切一并生效）。命中仍由窗口遮挡机制隔离。
+    ///
+    /// 默认的 [`Self::window_at`] / [`Self::window_at_w`] 是 **Expand 语义**（不裁剪，
+    /// 内容自然尺寸自动换行 / 撑高窗口）——需要严格裁剪时显式用本方法。
+    pub fn window_at_strict(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
+        self.window_impl(id, pos, None, true, true, f)
+    }
+
+    /// **固定宽窗口**（宽度指定、**高度自动**，如同 egui；**右下角可鼠标缩放**）：
+    /// 内容子项宽度 clamp 到 `width`（未达宽的内容按内容自动排布），高度按内容
+    /// 自然结算；拖动右下角缩放柄改宽度（跨帧持久于 `UiState::window_widths`）。
+    /// 其余语义同 [`Self::window_at`]（可重叠 / 置顶 / 可拖拽）。
+    pub fn window_at_w(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        width: f32,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
+        // 宽度取持久值（鼠标缩放后的结果；首次 = 传入 width）
+        let w = *self.state.window_widths.get(id).unwrap_or(&width);
+        self.window_impl(id, pos, Some(w), true, false, f)
+    }
+
+    /// **固定宽严格裁剪窗口**：同 [`Self::window_at_w`]，内容强制裁剪到窗口矩形。
+    pub fn window_at_strict_w(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        width: f32,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
+        let w = *self.state.window_widths.get(id).unwrap_or(&width);
+        self.window_impl(id, pos, Some(w), true, true, f)
+    }
+
+    /// 窗口公共实现（`width = Some(w)` 时固定宽、高度自然；`topmost`：点击是否置顶——
+    /// modal 对话框为 `false`，见 [`Self::modal_at`]；`strict`：窗口内容强制裁剪）。
+    fn window_impl(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        width: Option<f32>,
+        topmost: bool,
+        strict: bool,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
         // z-order：首次分配 max+1；点击置顶在拖拽判定处处理
         let z = {
             // z-order：首次分配 max+1；点击置顶在拖拽判定处处理。
@@ -1436,6 +1907,7 @@ impl<'a> Ui<'a> {
             *self.state.window_z.entry(id.to_owned()).or_insert(max_z + 1)
         };
         let saved_win = std::mem::replace(&mut self.cur_win, z);
+        let saved_clip = self.clip;
         // 位置经**责任链**解析（脚本处理器 → 用户拖拽状态 → 传入 pos，见 pos_handler）
         let origin = self.resolve_pos(id, pos);
         let start = self.queue.len();
@@ -1445,7 +1917,11 @@ impl<'a> Ui<'a> {
         };
         let saved_base = self.abs_base;
         self.abs_base = saved_base + origin;
-        self.frames.push(Frame::new_stack(PackSide::Top, gap, pad_total));
+        let mut frame = Frame::new_stack(PackSide::Top, gap, pad_total);
+        if let Some(w) = width {
+            frame.set_fixed_w(w);
+        }
+        self.frames.push(frame);
         self.depth += 1;
         let mut w = Window { ui: self };
         f(&mut w);
@@ -1457,6 +1933,24 @@ impl<'a> Ui<'a> {
         // 重叠区域点击按下时，记录"本帧按下命中的**最上层**窗口"（win_press_top），
         // `finish::resolve_win_press` 只保留它的拖拽与置顶——避免同时拖动多个窗口。
         let panel_rect = Rect::new(origin.x, origin.y, size.x, size.y);
+        // 固定宽窗口：右下角**缩放柄**（鼠标拖动改宽度，高度自动；跨帧持久于
+        // `UiState::window_widths`）。⚠ 交互须在窗口拖拽判定**之前**（claim_press
+        // 阻止按下缩放柄时同时建立窗口拖拽基准）。基于通用 [`Self::resize_handle`]。
+        if let Some(w) = width {
+            let hw = 14.0_f32;
+            // handle 为**外层容器局部坐标**（此处 abs_base 已恢复为外层原点）。
+            let handle = Rect::new(origin.x + size.x - hw, origin.y + size.y - hw, hw, hw);
+            let h_id = format!("{id}::resize");
+            if let Some(new_size) = self.resize_handle(
+                &h_id,
+                handle,
+                Vec2::new(w, size.y),
+                Vec2::new(120.0, size.y),
+                crate::UiCursor::EwResize,
+            ) {
+                self.state.window_widths.insert(id.to_owned(), new_size.x);
+            }
+        }
         // 窗口遮挡：被更高 z 的窗口覆盖的区域，本窗口不响应拖拽 / 置顶 /
         // 子控件交互（点击穿透修复——重叠区域只让最上层窗口可交互）。
         let hit = hit_test(&panel_rect, self.mouse_logical)
@@ -1467,7 +1961,8 @@ impl<'a> Ui<'a> {
         // 输入框等文本控件按下时置位 press_claimed：**不建立窗口拖拽基准**
         // （从输入框上拖拽 = 选择文本；窗口改从空白/标题区拖动）。
         let drag_here = press_here && !self.press_claimed;
-        if press_here {
+        // 点击置顶（modal 对话框**不主动置顶**——它已最上，且避免 z 漂移/与浮层冲突）
+        if topmost && press_here {
             if self                .win_press_top
                 .as_ref()
                 .is_none_or(|(_, top_z)| self.cur_win > *top_z)
@@ -1515,6 +2010,10 @@ impl<'a> Ui<'a> {
             // 按下窗口（或拖拽中）都算"已响应按下"——避免空白点击清焦点
             self.any_pressed = true;
         }
+        // 窗口拖动激活 → 强制普通 Arrow（UI_NEEDS：移动窗口时无需 <->，是 BUG）。
+        if active {
+            self.cursor_window_drag = true;
+        }
         let display_pos = new_pos;
         // 记录窗口原点（顶点局部化基准；win=0 非窗口默认 (0,0)）与窗口 id（缓存 key）
         self.win_origins.insert(z, display_pos);
@@ -1535,15 +2034,128 @@ impl<'a> Ui<'a> {
                     size.y,
                 ),
             );
+        // 严格裁剪（`window_at_strict`）：窗口内容**强制裁剪**到窗口矩形——结算后
+        // 统一改写本窗口命令的裁剪层（录制期窗口尺寸未知，背景/子控件命令都覆盖；
+        // 命中裁剪由窗口遮挡机制负责）。默认窗口为 Expand 语义（不裁剪）。
+        if strict {
+            let win_abs = Rect::new(
+                saved_base.x + display_pos.x,
+                saved_base.y + display_pos.y,
+                size.x,
+                size.y,
+            );
+            for d in &mut self.queue[start..] {
+                d.clip = clip_for_view(saved_clip, win_abs, ViewMode::Clip);
+            }
+        }
         // 背景 + 边框（win = z，画在窗口子控件之下；radius > 0 走圆角双层矩形）
         let style = self.theme.panel.clone();
         let bg_rect = Rect::new(0.0, 0.0, size.x, size.y);
         self.push_panel_like(bg_rect, style.bg, style.border, style.border_w, style.radius, 0);
+        // 固定宽窗口：右下角缩放柄图案（3 条递减小斜杠；窗口局部坐标，随窗口平移）
+        if width.is_some() {
+            let grip = style.border;
+            for k in 0..3 {
+                let o = 5.0 * (k as f32 + 1.0);
+                self.push_solid_rect(
+                    Rect::new(size.x - o, size.y - o, 4.0, 4.0),
+                    grip,
+                );
+            }
+        }
         for d in &mut self.queue[start..] {
             d.translate(display_pos);
         }
         self.cur_win = saved_win;
         size
+    }
+
+    /// **模态对话框**：全屏半透明遮罩（[`Theme::modal`](crate::style::Theme::modal)
+    /// 的颜色/尺寸，默认全屏半透明黑）置于最上层，背后一切交互被遮挡（遮罩矩形
+    /// 经窗口遮挡判定阻断，含顶层 win=0 内容）；对话框（可拖拽）浮于遮罩之上。
+    /// `pos` 为对话框左上角（逻辑，相对当前容器原点；按顶层使用）。`Esc` 关闭由
+    /// 调用方处理（见 [`crate::builtin::FontModal`]）。
+    ///
+    /// ⚠ **应在帧末（其它窗口之后）调用**：遮罩/对话框 z 每帧重写为"当前最大+1/+2"，
+    /// 但本帧**之后**录制的窗口会分到更高 z 并绘制在其上——先录制窗口、最后录制
+    /// modal，才能保证 Modal 恒在最上。
+    pub fn modal_at(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
+        self.modal_impl(id, pos, None, f)
+    }
+
+    /// **固定宽模态对话框**（宽度指定、高度自动，如同 egui）。
+    pub fn modal_at_w(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        width: f32,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
+        self.modal_impl(id, pos, Some(width), f)
+    }
+
+    /// 模态对话框公共实现：遮罩窗口（低 z）+ 对话框窗口（高 z）。
+    fn modal_impl(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        width: Option<f32>,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
+        // 遮罩 z = 当前最大 + 1（普通窗口之上）；对话框 z 再 +1（window_impl 自动
+        // 分配）。**每帧强制重写**（不是 or_insert）——Modal 打开期间恒在最上，
+        // 不会被其它后置顶的窗口盖住；点击对话框/背景不触发额外 z 提升。
+        let max_z = self
+            .state
+            .window_z
+            .values()
+            .copied()
+            .filter(|&z| z < WIN_TOPMOST)
+            .max()
+            .unwrap_or(0);
+        let dim_id = format!("{id}::dim");
+        let z_dim = max_z + 1;
+        // 遮罩与对话框 z **每帧强制重写**（不是 or_insert）——Modal 打开期间恒在最上：
+        // ① 遮罩不被后置顶的窗口盖住；② 对话框不被自家遮罩盖住（or_insert 会保留
+        // 旧 z，其它窗口置顶后遮罩 max+1 反超对话框旧 z → 字体窗口跑到遮罩后面）。
+        self.state.window_z.insert(dim_id.clone(), z_dim);
+        self.state.window_z.insert(id.to_owned(), z_dim + 1);
+        // 遮罩矩形（**绝对逻辑坐标**；默认全屏 = 窗口客户区物理 ÷ scale，
+        // 可被 [`Theme::modal`] 的 `size` 覆盖）。
+        let (mw, mh) = match self.theme.modal.size {
+            Some(s) => (s.x, s.y),
+            None => {
+                let s = self.window.inner_size();
+                (s.width as f32 / self.scale, s.height as f32 / self.scale)
+            }
+        };
+        let dim_rect = Rect::new(0.0, 0.0, mw, mh);
+        // 遮罩录制（win = z_dim；按顶层使用，局部 == 绝对）。
+        let saved_win = std::mem::replace(&mut self.cur_win, z_dim);
+        let seq = self.next_seq();
+        let depth = self.depth;
+        self.queue.push(UiDraw {
+            depth,
+            seq,
+            win: z_dim,
+            elem: 0,
+            rect: dim_rect,
+            clip: self.clip,
+            kind: DrawKind::Solid(self.theme.modal.dim),
+        });
+        // 遮罩窗口矩形（遮挡判定用；绝对）。
+        self.state.window_rects.insert(z_dim, dim_rect);
+        self.win_ids.insert(z_dim, dim_id);
+        self.win_origins.insert(z_dim, Vec2::ZERO);
+        self.cur_win = saved_win;
+        // 对话框窗口（window_impl 按 max+1 分配 → z = z_dim + 1，浮于遮罩之上；
+        // **不主动置顶**——点击对话框/背景不触发 z 提升）。
+        self.window_impl(id, pos, width, false, false, f)
     }
 
     /// pack 容器：按 `side` 堆叠，尺寸自动。
@@ -1563,7 +2175,7 @@ impl<'a> Ui<'a> {
 
     /// 当前容器**下一子项**的最小尺寸约束（`0` = 该轴不约束；一次性）。
     /// 容器内便捷方法：`p.min_size(120.0, 0.0)`（见 [`crate::Ui`] 文档 / 示例）。
-    pub(crate) fn set_next_min(&mut self, min: Vec2) {
+    pub fn set_next_min(&mut self, min: Vec2) {
         self.frames
             .last_mut()
             .expect("min_size 需在容器内调用（顶层请用 *_at 定位）")
@@ -1571,7 +2183,7 @@ impl<'a> Ui<'a> {
     }
 
     /// 当前容器**下一子项**的最大尺寸约束（`0` = 该轴不约束；一次性）。
-    pub(crate) fn set_next_max(&mut self, max: Vec2) {
+    pub fn set_next_max(&mut self, max: Vec2) {
         self.frames
             .last_mut()
             .expect("max_size 需在容器内调用（顶层请用 *_at 定位）")
@@ -1638,10 +2250,9 @@ impl<'a> Ui<'a> {
             let mut g = Grid { ui: ctx.ui };
             f(&mut g);
         });
-        // 回写单元格缓存（实际最大子尺寸；跨帧稳定布局）
-        if max_child.x > 0.0 && max_child.y > 0.0 {
-            self.state.grid_cells.insert(id.to_owned(), max_child);
-        }
+        // 回写单元格缓存：**内容变化时同时允许扩大与缩小**（未达到 max 的控件按
+        // 内容自动改大小——如背包格子文字变长/变短；内容不变时布局依旧跨帧稳定）。
+        self.state.grid_cells.insert(id.to_owned(), max_child);
         size
     }
 
@@ -1672,7 +2283,10 @@ impl<'a> Ui<'a> {
     /// 会在同一 layer 内按 `(rstates, texture_uid)` 重排——字形图集页先于程序化纹理页
     /// （圆角/渐变）注册，重排后**圆角/渐变图形会盖住文字**；`set_layer_sort(true)`
     /// （`SortMode::LayerOnly`，稳定按 layer 排序）可接受（同层保持提交顺序）。
-    pub fn finish(&mut self) {
+    /// 提交本帧 UI 到渲染器。**视口与渲染器在此延迟传入**（`begin` 时不需要）——
+    /// 录制阶段可完全独立于绘制资源；`viewport`（大小 + 位置）提供屏幕固定变换，
+    /// `r2d` 接收四边形。UI 不需要相机（恒为 identity：不旋转/缩放），仅需视口。
+    pub fn finish(&mut self, viewport: &Viewport, r2d: &mut Render2D) {
         let t_finish = Instant::now();
         // 空白点击清焦点（本帧按下且无控件响应）
         if self.mouse_left().down_edge() && !self.any_pressed && self.state.focused.is_some() {
@@ -1709,7 +2323,7 @@ impl<'a> Ui<'a> {
                 (r.page_uid, tl, wh)
             }
             None => {
-                let uid = self.r2d.white_texture().uid;
+                let uid = r2d.white_texture().uid;
                 (uid, Vec2::ZERO, Vec2::ONE)
             }
         };
@@ -1739,11 +2353,11 @@ impl<'a> Ui<'a> {
             let cmds = groups.remove(&win).expect("group exists");
             // debug_layout：每帧重建（布局描边是调试视图，跳过窗口顶点缓存）。
             if win == 0 || self.debug_layout {
-                self.collect_cmds(&mut quads, win, &cmds);
+                self.collect_cmds(&mut quads, win, &cmds, viewport, r2d);
                 continue;
             }
             let Some(id) = self.win_ids.get(&win).cloned() else {
-                self.collect_cmds(&mut quads, win, &cmds);
+                self.collect_cmds(&mut quads, win, &cmds, viewport, r2d);
                 continue;
             };
             win_count += 1;
@@ -1784,7 +2398,7 @@ impl<'a> Ui<'a> {
             // 未命中：收集该窗口命令为局部顶点，写入缓存
             let t_collect = Instant::now();
             let mut q = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh);
-            self.collect_cmds(&mut q, win, &cmds);
+            self.collect_cmds(&mut q, win, &cmds, viewport, r2d);
             collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
             let mut grp: Vec<(u32, u8, u64, Vec<VertexP3U2C4>)> = Vec::new();
             for ((_, elem, g, tex), verts) in q.quads {
@@ -1835,9 +2449,9 @@ impl<'a> Ui<'a> {
                 .copied()
                 .unwrap_or(Vec2::ZERO)
                 * self.scale;
-            let tf = screen_fixed_tf(self.cam, anchor_px);
+            let tf = screen_fixed_tf(viewport, anchor_px);
             let layer = Layer::from(layer_base + win as f64 * 1.0);
-            self.r2d.add_quads(&verts, tf, layer, &tex);
+            r2d.add_quads(&verts, tf, layer, &tex);
             // MeshBuilder Drop 即提交 ✓
         }
 
@@ -1857,7 +2471,7 @@ impl<'a> Ui<'a> {
             dwins.sort_unstable();
             for win in dwins {
                 let cmds = debug_groups.remove(&win).expect("group exists");
-                self.collect_cmds(&mut quads, win, &cmds);
+                self.collect_cmds(&mut quads, win, &cmds, viewport, r2d);
             }
         }
         let mut dwins: Vec<u32> = quads.debug.keys().copied().collect();
@@ -1873,9 +2487,9 @@ impl<'a> Ui<'a> {
                 .copied()
                 .unwrap_or(Vec2::ZERO)
                 * self.scale;
-            let tf = screen_fixed_tf(self.cam, anchor_px);
+            let tf = screen_fixed_tf(viewport, anchor_px);
             let layer = Layer::from(layer_base + win as f64 * 1.0);
-            self.r2d.add_quads(&verts, tf, layer, &tex);
+            r2d.add_quads(&verts, tf, layer, &tex);
         }
         // 记录 IME 组合状态（供下一帧退格判定，见 text_input_at）
         self.state.ime_composing =
@@ -1896,14 +2510,42 @@ impl<'a> Ui<'a> {
             finish_us: t_finish.elapsed().as_secs_f64() * 1e6,
             ui_frame_us: self.frame_t0.elapsed().as_secs_f64() * 1e6,
         };
-        // 系统光标图案：文本输入框上 = I 型；拖动窗口/面板时保持普通箭头
-        // （Resize 手柄等场景未来再用 <-> / ↑↓ 方向光标）。
-        let icon = if self.cursor_text {
+        // 系统光标图案（优先级：窗口拖拽(Arrow) > 内置拖拽抓握 > 控件作者自定义 >
+        // 文本输入 > 可拖拽悬停 > 默认）。窗体悬停/拖动保持普通 Arrow（UI_NEEDS）；
+        // 移动窗口时即使悬停数字手柄/输入框也强制 Arrow（修复拖动中 <-> 的 BUG）。
+        // **抑制**：本帧没有任何 UI 光标意图（未悬停任何 UI 内容）时不主动设置——
+        // 保留应用自定义光标（如游戏准星）；仅当上一帧设过时清一次回 Default。
+        let intent = self.cursor_text
+            || self.cursor_grab
+            || self.cursor_grabbing
+            || self.cursor_window_drag
+            || self.cursor_custom.is_some();
+        let icon = if self.cursor_window_drag {
+            winit::window::CursorIcon::Default
+        } else if self.cursor_grabbing {
+            winit::window::CursorIcon::Grabbing
+        } else if let Some(icon) = self.cursor_custom {
+            icon
+        } else if self.cursor_text {
             winit::window::CursorIcon::Text
+        } else if self.cursor_grab {
+            winit::window::CursorIcon::Grab
         } else {
             winit::window::CursorIcon::Default
         };
-        self.window.set_cursor(icon);
+        if intent {
+            self.window.set_cursor(icon);
+            self.state.cursor_was_set = true;
+        } else if self.state.cursor_was_set {
+            // 无 UI 光标意图但上一帧设过 → 清一次回 Default（避免残留 I 型等）
+            self.window.set_cursor(winit::window::CursorIcon::Default);
+            self.state.cursor_was_set = false;
+        }
+        self.cursor_text = false;
+        self.cursor_grab = false;
+        self.cursor_grabbing = false;
+        self.cursor_window_drag = false;
+        self.cursor_custom = None;
         self.state.window_rects.retain(|z, _| self.win_origins.contains_key(z));
         self.depth = 0;
         self.seq = 0;
@@ -1924,7 +2566,14 @@ impl<'a> Ui<'a> {
     /// `debug_layout` 开启时，每个命令的矩形同时向 `quads.debug` 追加**青色描边**
     /// （调试 rjw_ui 自身的布局 / 命中区域）；`DrawKind::Debug` 命令（[`Self::debug_line`]
     /// 等屏幕空间调试图元）则只写入 `quads.debug`（覆盖在 UI 内容之上）。
-    fn collect_cmds(&mut self, quads: &mut QuadCollector, win: u32, cmds: &[UiDraw]) {
+    fn collect_cmds(
+        &mut self,
+        quads: &mut QuadCollector,
+        win: u32,
+        cmds: &[UiDraw],
+        viewport: &Viewport,
+        r2d: &Render2D,
+    ) {
         let anchor_px = self
             .win_origins
             .get(&win)
@@ -1970,9 +2619,9 @@ impl<'a> Ui<'a> {
                             if r <= 0.0 {
                                 quads.push_white(win, local, *color);
                             } else {
-                                let device = self.r2d.device();
-                                let queue = self.r2d.queue();
-                                let layout = self.r2d.tex_bind_group_layout();
+                                let device = r2d.device();
+                                let queue = r2d.queue();
+                                let layout = r2d.tex_bind_group_layout();
                                 if let Some((tex_uid, region)) =
                                     self.state.proc.rounded(device, queue, layout, r)
                                 {
@@ -2021,9 +2670,9 @@ impl<'a> Ui<'a> {
                     }) {
                         if local.w > 0.0 && local.h > 0.0 {
                             let vertical = matches!(axis, GradientAxis::Vertical);
-                            let device = self.r2d.device();
-                            let queue = self.r2d.queue();
-                            let layout = self.r2d.tex_bind_group_layout();
+                            let device = r2d.device();
+                            let queue = r2d.queue();
+                            let layout = r2d.tex_bind_group_layout();
                             if let Some((tex_uid, region)) =
                                 self.state.proc.gradient(device, queue, layout, vertical, stops)
                             {
@@ -2098,6 +2747,7 @@ impl<'a> Ui<'a> {
                         family.as_deref(),
                         merged,
                         buf.as_ref().map(Arc::clone),
+                        viewport,
                     );
                     let pr = snap_rect(&self.phys_rect(&d.rect));
                     debug_layout_outline(quads, win, anchor_px, pr, dbg);
@@ -2262,9 +2912,16 @@ impl<'a> Ui<'a> {
         let Some((top_id, old_z)) = self.win_press_top.clone() else {
             return;
         };
-        // 只保留最高 z 命中窗口的拖拽
+        // 只保留最高 z 命中窗口的拖拽：按下新窗口时停止**其它窗口**（含本帧未按下
+        // 的旧窗口）的拖拽。⚠ 只清**窗口 id**（`win_ids`）的拖拽状态——不能碰控件
+        // 自身的拖拽（滑块 / 滚动条 / 窗口缩放柄等），否则窗口内控件的拖拽会被
+        // finish 误清（Resize 手柄按下后下一帧即失效）。
         for (wid, ws) in self.state.widgets.iter_mut() {
-            if wid != &top_id && ws.dragging && !ws.pressed {
+            if wid != &top_id
+                && self.win_ids.values().any(|i| i == wid)
+                && ws.dragging
+                && !ws.pressed
+            {
                 ws.dragging = false;
             }
         }
@@ -2396,6 +3053,7 @@ impl<'a> Ui<'a> {
         family: Option<&str>,
         clip: Option<Rect>,
         buf: Option<Arc<Buffer>>,
+        viewport: &Viewport,
     ) {
         if rect.w <= 0.0 || rect.h <= 0.0 || text.is_empty() {
             return;
@@ -2420,7 +3078,7 @@ impl<'a> Ui<'a> {
         // 局部化基准 = **窗口原点**（anchor_px），不是文字锚点：
         // 字形世界坐标 - 窗口原点世界 = 相对窗口原点的局部顶点，
         // 提交时经窗口 transform（screen_fixed_tf(窗口原点)）映射回世界。
-        let win_anchor_world = self.cam.screen_to_world(anchor_px);
+        let win_anchor_world = viewport.screen_to_world(anchor_px);
         let buf = match buf {
             Some(b) => b,
             None => self.cache_buffer(text, size, family),
@@ -2444,7 +3102,7 @@ impl<'a> Ui<'a> {
         // 字形四边形角点 = block_tl + 整数字形偏移 = 整数屏幕像素 → 采样精确落在
         // 纹素中心，消除 1:1 图集双线性采样的亚像素模糊。
         let block_tl = anchor + text_block_offset(align, valign, content, first_line_top);
-        let tf = screen_fixed_tf(self.cam, block_tl);
+        let tf = screen_fixed_tf(viewport, block_tl);
         tr.origin(Vec2::ZERO).transform(tf).color(color);
         // 裁剪区：相对命令矩形（`merged`，逻辑）→ **窗口局部**。
         // ⚠ 相对基准是命令矩形物理 `pr`，**不是**文本块原点 `block_tl`：
@@ -2641,6 +3299,38 @@ impl QuadCollector {
     }
 }
 
+/// 取视觉行的文本切片（**字符边界安全**）：视觉行的字节区间来自排版缓冲，
+/// 编辑（粘贴/打字/IME）同帧改写文本后可能过期——按 char 边界对齐并防
+/// `start > end`，避免 `&value[a..b]` 落在多字节字符中间 panic（短暂错位，
+/// 次帧重新排版后自愈）。
+#[inline]
+fn safe_line_slice<'a>(value: &'a str, line: &VisualLine) -> &'a str {
+    let s = value.floor_char_boundary(line.byte_start);
+    let e = value.floor_char_boundary(line.byte_end.min(value.len()));
+    if s < e {
+        &value[s..e]
+    } else {
+        ""
+    }
+}
+
+/// 文本坐标 y（逻辑像素）→ 视觉行序号：按**真实行顶**（`VisualLine.top`，物理像素）
+/// 定位。不要用 `行号 × line_h`——排版行高是 `round(font×1.2)`（取整），逻辑 `line_h`
+/// 每行差 ~0.2px，长文本累积后点击/拖选错行、视图滚不到真正的底部（"卡在纵轴
+/// 范围内"）。
+#[inline]
+fn line_row_at_y(vlines: &[VisualLine], y: f32, line_h: f32, scale: f32) -> usize {
+    if vlines.is_empty() {
+        return 0;
+    }
+    let py = y * scale;
+    let lh_px = (line_h * scale).round();
+    vlines
+        .iter()
+        .position(|l| py < l.top + lh_px)
+        .unwrap_or(vlines.len() - 1)
+}
+
 /// 构造一个顶点（世界坐标 + UV + 颜色）。
 #[inline]
 fn vertex_p3u2c4(pos: Vec2, uv: [f32; 2], color: [f32; 4]) -> VertexP3U2C4 {
@@ -2698,262 +3388,380 @@ fn drag_moved(current_px: Vec2, press_px: Option<Vec2>) -> bool {
     }
 }
 
-// ─── 容器包装（Panel / Pack / Grid / Window 共享同一控件 API） ──
+// ─── 容器控件 API（UiAdd trait，替代旧的 widget_api! 宏） ─────────
 
-macro_rules! widget_api {
-    ($T:ident) => {
-        impl<'ui, 'a> $T<'ui, 'a> {
-            /// 标签（占光标，内容自然尺寸）。
-            pub fn label(&mut self, text: &str) -> Vec2 {
-                let elem = self.ui.seq + 1;
-                let style = self.ui.theme.label.clone();
-                let size =
-                    self.ui.text_size(text, style.font_size, style.font_family.as_deref());
-                let rect = self.ui.child_rect(size.x, size.y);
-                let seq = self.ui.next_seq();
-                let depth = self.ui.depth;
-                self.ui.queue.push(text_cmd(
-                    depth,
-                    seq,
-                    self.ui.cur_win,
-                    elem,
-                    rect,
-                    Arc::from(text),
-                    style.font_size,
-                    style.color,
-                    TextAlign::from(style.align),
-                    TextVAlign::Center,
-                    style.font_family.clone(),
-                    None,
-                    self.ui.clip,
-                None,
-                ));
-                size
-            }
+/// **容器控件 API**：全部容器包装（[`Panel`] / [`Pack`] / [`Grid`] / [`Window`] /
+/// [`Scroll`] / [`FlexCtx`]）共享的便捷方法，**替代旧的 `widget_api!` 宏**。
+///
+/// - 唯一必需方法 [`UiAdd::ui_mut`]（返回容器持有的 `Ui`）——**新容器只需一行 impl**
+///   即可获得全部方法；
+/// - 全部便捷方法都是**默认方法**（占光标、内容自动尺寸；`*_at` 变体为显式尺寸
+///   逃生舱）——**新增控件便捷方法 = 在本 trait 加一个默认方法**，所有容器自动获得，
+///   无需改宏；
+/// - 顶层（无容器）请用 `Ui` 的 `*_at` 绝对定位方法（如 [`Ui::add_at`] /
+///   [`Ui::label_at`]）。
+pub trait UiAdd<'a> {
+    /// 容器持有的 `Ui`（包装字段，仅本 crate 内实现）。
+    fn ui_mut(&mut self) -> &mut Ui<'a>;
 
-            /// 绝对定位标签（`pos` 相对当前容器内容原点）。
-            pub fn label_at(&mut self, pos: Vec2, text: &str) -> Vec2 {
-                self.ui.label_at(pos, text)
-            }
+    /// 在容器内**占光标**放置 [`crate::widget::Widget`] 控件（尺寸 = 控件测量值
+    /// 经约束 clamp 与膨胀模式调整）。
+    fn add(&mut self, w: impl crate::widget::Widget) -> crate::widget::Response {
+        let ui = self.ui_mut();
+        let (size, expands) = ui.widget_size(&w);
+        let rect = ui.child_rect_exp(size.x, size.y, expands);
+        w.ui(ui, rect)
+    }
 
-            /// **自动换行标签**（占光标）：`max_w` 逻辑像素内按词/字换行；
-            /// 返回自然尺寸（宽 = min(自然宽, max_w)，高 = 行数 × 行高）。
-            /// `max_w <= 0` = 不换行（同 `label`）。
-            pub fn label_wrap(&mut self, max_w: f32, text: &str) -> Vec2 {
-                let style = self.ui.theme.label.clone();
-                let size = self
-                    .ui
-                    .text_size_wrap(text, style.font_size, style.font_family.as_deref(), max_w);
-                let rect = self.ui.child_rect(size.x, size.y);
-                let elem = self.ui.seq + 1;
-                let seq = self.ui.next_seq();
-                let depth = self.ui.depth;
-                self.ui.queue.push(text_cmd(
-                    depth,
-                    seq,
-                    self.ui.cur_win,
-                    elem,
-                    rect,
-                    Arc::from(text),
-                    style.font_size,
-                    style.color,
-                    TextAlign::from(style.align),
-                    TextVAlign::Center,
-                    style.font_family.clone(),
-                    None,
-                    self.ui.clip,
-                None,
-                ));
-                size
-            }
+    /// **绝对定位**放置 [`crate::widget::Widget`] 控件（`pos` 相对当前容器内容原点；
+    /// 不占光标）。
+    fn add_at(&mut self, pos: Vec2, w: impl crate::widget::Widget) -> crate::widget::Response {
+        let ui = self.ui_mut();
+        let (size, _) = ui.widget_size(&w);
+        w.ui(ui, Rect::new(pos.x, pos.y, size.x, size.y))
+    }
 
-            /// **多行文本输入框**（占光标；默认约 200×90，可 `text_area_at` 显式尺寸）。
-            /// Enter 换行、↑/↓ 跨行、Home/End 行首尾；自动换行 + 垂直滚动；选择/复制/
-            /// 粘贴/剪切（Ctrl+C/V/X）；IME 支持。返回 `()`（内容写回 `value`）。
-            pub fn text_area(&mut self, id: &str, value: &mut String) {
-                let style = self.ui.theme.input.clone();
-                let w = style.min_w.max(200.0);
-                let rect = self.ui.child_rect(w, 90.0);
-                self.ui.text_area_at(id, rect, value);
-            }
+    /// 标签（占光标，内容自然尺寸；默认 `LimitedInParent`——在父级可用宽内
+    /// **自动换行**，Resizable 窗口缩窄后不溢出）。
+    fn label(&mut self, text: &str) -> Vec2 {
+        let ui = self.ui_mut();
+        let l = crate::widget::Label::new(text);
+        let size = l.size(ui);
+        let rect = ui.child_rect(size.x, size.y);
+        l.ui(ui, rect);
+        size
+    }
 
-            /// **多行文本输入框**（显式 `Rect`）。
-            pub fn text_area_at(&mut self, id: &str, rect: Rect, value: &mut String) {
-                self.ui.text_area_at(id, rect, value);
-            }
+    /// 绝对定位标签（`pos` 相对当前容器内容原点）。
+    fn label_at(&mut self, pos: Vec2, text: &str) -> Vec2 {
+        self.ui_mut().label_at(pos, text)
+    }
 
-            /// **下一子项的最小尺寸约束**（`0` = 该轴不约束；一次性，作用于紧接着的下一个子项）。
-            pub fn min_size(&mut self, w: f32, h: f32) {
-                self.ui.set_next_min(glam::Vec2::new(w, h));
-            }
+    /// **自动换行标签**（占光标）：`max_w` 逻辑像素内按词/字换行；
+    /// 返回自然尺寸（宽 = min(自然宽, max_w)，高 = 行数 × 行高）。
+    /// `max_w <= 0` = 不换行（同 `label`）。
+    fn label_wrap(&mut self, max_w: f32, text: &str) -> Vec2 {        let ui = self.ui_mut();
+        let style = ui.theme.label.clone();
+        let size = ui.text_size_wrap(text, style.font_size, style.font_family.as_deref(), max_w);
+        let rect = ui.child_rect(size.x, size.y);
+        let elem = ui.seq + 1;
+        let seq = ui.next_seq();
+        let depth = ui.depth;
+        ui.queue.push(text_cmd(
+            depth,
+            seq,
+            ui.cur_win,
+            elem,
+            rect,
+            Arc::from(text),
+            style.font_size,
+            style.color,
+            TextAlign::from(style.align),
+            TextVAlign::Center,
+            style.font_family.clone(),
+            None,
+            ui.clip,
+            None,
+        ));
+        size
+    }
 
-            /// **下一子项的最大尺寸约束**（`0` = 该轴不约束；一次性，作用于紧接着的下一个子项）。
-            pub fn max_size(&mut self, w: f32, h: f32) {
-                self.ui.set_next_max(glam::Vec2::new(w, h));
-            }
-
-            /// **下拉框**（占光标，自动尺寸）：按钮 + 展开选项浮层；返回本帧新选中索引。
-            pub fn combo(
-                &mut self,
-                id: &str,
-                current: &str,
-                options: &[String],
-                selected: Option<u32>,
-            ) -> Option<u32> {
-                let style = self.ui.theme.button.clone();
-                let tsize =
-                    self.ui.text_size(current, style.font_size, style.font_family.as_deref());
-                let w = (tsize.x + 20.0).max(90.0) + style.padding.x * 2.0;
-                let h = style.padding.y * 2.0 + tsize.y;
-                let rect = self.ui.child_rect(w, h);
-                self.ui.combo_at(id, rect, current, options, selected)
-            }
-
-            /// 按钮（文本 + padding 自动尺寸）。
-            pub fn button(&mut self, id: &str, label: &str) -> ButtonState {
-                let style = self.ui.theme.button.clone();
-                let tsize =
-                    self.ui.text_size(label, style.font_size, style.font_family.as_deref());
-                let size = Vec2::new(
-                    tsize.x + style.padding.x * 2.0,
-                    tsize.y + style.padding.y * 2.0,
-                );
-                let rect = self.ui.child_rect(size.x, size.y);
-                self.ui.button_at(id, rect, label)
-            }
-
-            /// 显式尺寸按钮（逃生舱）。
-            pub fn button_at(&mut self, id: &str, rect: Rect, label: &str) -> ButtonState {
-                self.ui.button_at(id, rect, label)
-            }
-
-            /// 滑块（自动尺寸：高度固定，宽度取样式最小宽）。
-            pub fn slider(&mut self, id: &str, range: RangeInclusive<f32>, value: f32) -> f32 {
-                let style = self.ui.theme.slider.clone();
-                let size = Vec2::new(style.min_w.max(40.0), style.height);
-                let rect = self.ui.child_rect(size.x, size.y);
-                self.ui.slider_at(id, rect, range, value)
-            }
-
-            /// 显式尺寸滑块（逃生舱）。
-            pub fn slider_at(
-                &mut self,
-                id: &str,
-                rect: Rect,
-                range: RangeInclusive<f32>,
-                value: f32,
-            ) -> f32 {
-                self.ui.slider_at(id, rect, range, value)
-            }
-
-            /// 勾选框（勾选值由用户维护，返回含 `toggled` 的状态）。
-            pub fn checkbox(&mut self, id: &str, label: &str, checked: bool) -> CheckboxState {
-                let style = self.ui.theme.checkbox.clone();
-                let tsize =
-                    self.ui.text_size(label, style.font_size, style.font_family.as_deref());
-                let size = Vec2::new(
-                    style.box_size + style.gap + tsize.x,
-                    style.box_size.max(tsize.y),
-                );
-                let rect = self.ui.child_rect(size.x, size.y);
-                self.ui.checkbox_at(id, rect, label, checked)
-            }
-
-            /// 显式尺寸勾选框（逃生舱）。
-            pub fn checkbox_at(
-                &mut self,
-                id: &str,
-                rect: Rect,
-                label: &str,
-                checked: bool,
-            ) -> CheckboxState {
-                self.ui.checkbox_at(id, rect, label, checked)
-            }
-
-            /// 单选（同组 ID 互斥；返回 `checked` / `toggled`）。
-            pub fn radio(&mut self, id: &str, group: &str, label: &str) -> CheckboxState {
-                let style = self.ui.theme.checkbox.clone();
-                let tsize =
-                    self.ui.text_size(label, style.font_size, style.font_family.as_deref());
-                let size = Vec2::new(
-                    style.box_size + style.gap + tsize.x,
-                    style.box_size.max(tsize.y),
-                );
-                let rect = self.ui.child_rect(size.x, size.y);
-                self.ui.radio_at(id, group, rect, label)
-            }
-
-            /// 显式尺寸单选（逃生舱）。
-            pub fn radio_at(
-                &mut self,
-                id: &str,
-                group: &str,
-                rect: Rect,
-                label: &str,
-            ) -> CheckboxState {
-                self.ui.radio_at(id, group, rect, label)
-            }
-
-            /// 文本输入框（内容写入 `value`；自动尺寸：高度固定，宽度取样式最小宽）。
-            pub fn text_input(&mut self, id: &str, value: &mut String) {
-                let style = self.ui.theme.input.clone();
-                let size = Vec2::new(style.min_w, style.height);
-                let rect = self.ui.child_rect(size.x, size.y);
-                self.ui.text_input_at(id, rect, value);
-            }
-
-            /// 显式尺寸文本输入框（逃生舱）。
-            pub fn text_input_at(&mut self, id: &str, rect: Rect, value: &mut String) {
-                self.ui.text_input_at(id, rect, value);
-            }
-
-            /// 嵌套面板（`pos` 相对当前容器内容原点；不占光标）。
-            pub fn panel_at(&mut self, pos: Vec2, f: impl FnOnce(&mut Panel<'_, '_>)) -> Vec2 {
-                self.ui.panel_at(pos, f)
-            }
-
-            /// 嵌套**可拖拽**面板（位置持久于 `UiState.panel_pos`）。
-            pub fn drag_panel_at(
-                &mut self,
-                id: &str,
-                pos: Vec2,
-                f: impl FnOnce(&mut Panel<'_, '_>),
-            ) -> Vec2 {
-                self.ui.drag_panel_at(id, pos, f)
-            }
-
-            /// 嵌套**窗口**（可重叠 + 焦点置顶 + 可拖拽）。
-            pub fn window_at(
-                &mut self,
-                id: &str,
-                pos: Vec2,
-                f: impl FnOnce(&mut Window<'_, '_>),
-            ) -> Vec2 {
-                self.ui.window_at(id, pos, f)
-            }
-
-            /// 嵌套 pack（`pos` 相对当前容器内容原点；不占光标）。
-            pub fn pack_at(
-                &mut self,
-                pos: Vec2,
-                side: PackSide,
-                f: impl FnOnce(&mut Pack<'_, '_>),
-            ) -> Vec2 {
-                self.ui.pack_at(pos, side, f)
-            }
-
-            /// 嵌套 grid（`pos` 相对当前容器内容原点；不占光标）。
-            pub fn grid_at(
-                &mut self,
-                pos: Vec2,
-                cols: usize,
-                id: &str,
-                f: impl FnOnce(&mut Grid<'_, '_>),
-            ) -> Vec2 {
-                self.ui.grid_at(pos, cols, id, f)
-            }
+    /// **水平行容器**（占光标）：子项按 [`PackSide::Left`] 水平堆叠
+    /// （`{Label} {Input} {Button}` 排列），整体在父容器（垂直 pack 等）中**占一行**：
+    /// 宽 = 子项结算、撑大父级。**行内所有子项强制等高**（[`Theme::row_h`]，
+    /// 含单行情况的多行文本框/TextArea——多行内容走垂直滚动）——各自内容垂直居中
+    /// → 文字中心线对齐（近似基线，Label 不再偏上）。
+    fn row(&mut self, f: impl FnOnce(&mut Pack<'_, '_>)) -> Vec2 {
+        let ui = self.ui_mut();
+        let origin = ui.cursor_pos();
+        let gap = ui.theme.gap;
+        let row_h = ui.theme.row_h;
+        let (size, _) = ui.container(
+            origin,
+            Frame::new_stack(PackSide::Left, gap, 0.0),
+            |ctx| {
+                ctx.ui.frames.last_mut().expect("row frame").set_force_h_all(row_h);
+                let mut p = Pack { ui: ctx.ui };
+                f(&mut p);
+            },
+        );
+        // 结算后补记父容器光标（占一行）。
+        if let Some(fr) = ui.frames.last_mut() {
+            fr.place_external(size);
         }
-    };
+        size
+    }
+
+    /// **分割线**（占光标）：容器内占一行（高 = 线厚 + 上下留白），水平线宽 =
+    /// 可用宽（容器固定宽 / 沙箱 `avail_w`），否则当前最宽子项，再否则默认 120。
+    fn divider(&mut self) {
+        let ui = self.ui_mut();
+        let st = ui.theme.divider.clone();
+        let w = ui.avail_w().unwrap_or_else(|| {
+            ui.frames
+                .last()
+                .map(|f| f.max_child_w())
+                .filter(|&w| w > 0.0)
+                .unwrap_or(120.0)
+        });
+        let h = st.thickness + st.margin * 2.0;
+        let rect = ui.child_rect(w, h);
+        ui.divider_at(Vec2::new(rect.x, rect.y), w);
+    }
+
+    /// **多行文本输入框**（占光标；默认约 200×90，可 `text_area_at` 显式尺寸）。
+    /// Enter 换行、↑/↓ 跨行、Home/End 行首尾；自动换行 + 垂直滚动；选择/复制/
+    /// 粘贴/剪切（Ctrl+C/V/X）；IME 支持。返回 `()`（内容写回 `value`）。
+    fn text_area(&mut self, id: &str, value: &mut String) {
+        let ui = self.ui_mut();
+        let style = ui.theme.input.clone();
+        let w = style.min_w.max(200.0);
+        let rect = ui.child_rect(w, 90.0);
+        ui.text_area_at(id, rect, value);
+    }
+
+    /// **多行文本输入框**（显式 `Rect`）。
+    fn text_area_at(&mut self, id: &str, rect: Rect, value: &mut String) {
+        self.ui_mut().text_area_at(id, rect, value);
+    }
+
+    /// **多行文本输入框（不自动换行）**（占光标；默认约 200×90）：行宽不限
+    /// （显式 `\n` 分行），超出内容区**水平滚动**跟随光标；垂直滚动/选择/IME
+    /// 与 [`UiAdd::text_area`] 一致。
+    fn text_area_nw(&mut self, id: &str, value: &mut String) {
+        let ui = self.ui_mut();
+        let style = ui.theme.input.clone();
+        let w = style.min_w.max(200.0);
+        let rect = ui.child_rect(w, 90.0);
+        ui.text_area_at_nw(id, rect, value);
+    }
+
+    /// **多行文本输入框（不自动换行）**（显式 `Rect`）。
+    fn text_area_at_nw(&mut self, id: &str, rect: Rect, value: &mut String) {
+        self.ui_mut().text_area_at_nw(id, rect, value);
+    }
+
+    /// **下一子项的最小尺寸约束**（`0` = 该轴不约束；一次性，作用于紧接着的下一个子项）。
+    fn min_size(&mut self, w: f32, h: f32) {
+        self.ui_mut().set_next_min(glam::Vec2::new(w, h));
+    }
+
+    /// **下一子项的最大尺寸约束**（`0` = 该轴不约束；一次性，作用于紧接着的下一个子项）。
+    fn max_size(&mut self, w: f32, h: f32) {
+        self.ui_mut().set_next_max(glam::Vec2::new(w, h));
+    }
+
+    /// **下拉框**（占光标，自动尺寸）：按钮 + 展开选项浮层；返回本帧新选中索引。
+    fn combo(
+        &mut self,
+        id: &str,
+        current: &str,
+        options: &[String],
+        selected: Option<u32>,
+    ) -> Option<u32> {
+        let ui = self.ui_mut();
+        let style = ui.theme.button.clone();
+        let tsize = ui.text_size(current, style.font_size, style.font_family.as_deref());
+        let w = (tsize.x + 20.0).max(90.0) + style.padding.x * 2.0;
+        let h = style.padding.y * 2.0 + tsize.y;
+        let rect = ui.child_rect(w, h);
+        ui.combo_at(id, rect, current, options, selected)
+    }
+
+    /// 按钮（文本 + padding 自动尺寸）。
+    fn button(&mut self, id: &str, label: &str) -> ButtonState {
+        let ui = self.ui_mut();
+        let style = ui.theme.button.clone();
+        let tsize = ui.text_size(label, style.font_size, style.font_family.as_deref());
+        let size = Vec2::new(
+            tsize.x + style.padding.x * 2.0,
+            tsize.y + style.padding.y * 2.0,
+        );
+        let rect = ui.child_rect(size.x, size.y);
+        ui.button_at(id, rect, label)
+    }
+
+    /// 显式尺寸按钮（逃生舱）。
+    fn button_at(&mut self, id: &str, rect: Rect, label: &str) -> ButtonState {
+        self.ui_mut().button_at(id, rect, label)
+    }
+
+    /// 滑块（自动尺寸：高度固定，宽度取样式最小宽）。
+    fn slider(&mut self, id: &str, range: RangeInclusive<f32>, value: f32) -> f32 {
+        let ui = self.ui_mut();
+        let style = ui.theme.slider.clone();
+        let size = Vec2::new(style.min_w.max(40.0), style.height);
+        let rect = ui.child_rect(size.x, size.y);
+        ui.slider_at(id, rect, range, value)
+    }
+
+    /// 显式尺寸滑块（逃生舱）。
+    fn slider_at(
+        &mut self,
+        id: &str,
+        rect: Rect,
+        range: RangeInclusive<f32>,
+        value: f32,
+    ) -> f32 {
+        self.ui_mut().slider_at(id, rect, range, value)
+    }
+
+    /// 勾选框（勾选值由用户维护，返回含 `toggled` 的状态）。
+    fn checkbox(&mut self, id: &str, label: &str, checked: bool) -> CheckboxState {
+        let ui = self.ui_mut();
+        let style = ui.theme.checkbox.clone();
+        let tsize = ui.text_size(label, style.font_size, style.font_family.as_deref());
+        let size = Vec2::new(
+            style.box_size + style.gap + tsize.x,
+            style.box_size.max(tsize.y),
+        );
+        let rect = ui.child_rect(size.x, size.y);
+        ui.checkbox_at(id, rect, label, checked)
+    }
+
+    /// 显式尺寸勾选框（逃生舱）。
+    fn checkbox_at(
+        &mut self,
+        id: &str,
+        rect: Rect,
+        label: &str,
+        checked: bool,
+    ) -> CheckboxState {
+        self.ui_mut().checkbox_at(id, rect, label, checked)
+    }
+
+    /// 勾选框（**状态自持**）：`checked` 由调用方持有，点击时本方法**直接翻转**，
+    /// 无需手动 `toggled()` 维护。
+    ///
+    /// `id` 灵活指定（[`crate::widget::WidgetId`]，经 [`From`] 转换）：
+    /// - `None` → 以 `label` 文本为 ID（同容器内标签唯一时最简）；
+    /// - `Some("id")` / `"id"` → 显式字符串 ID；
+    /// - `42u64` → 数字 ID（如列表行索引 `i as u64`）。
+    ///
+    /// 用法：`w.checkbox_mut(None, "窗口 A 选项", &mut self.win_a_checked);`
+    fn checkbox_mut<'x>(
+        &mut self,
+        id: impl Into<crate::widget::WidgetId<'x>>,
+        label: &str,
+        checked: &mut bool,
+    ) -> CheckboxState {
+        let id = id.into().resolve(label);
+        let st = self.checkbox(&id, label, *checked);
+        if st.toggled() {
+            *checked = !*checked;
+        }
+        st
+    }
+
+    /// 单选（同组 ID 互斥；返回 `checked` / `toggled`）。
+    fn radio(&mut self, id: &str, group: &str, label: &str) -> CheckboxState {
+        let ui = self.ui_mut();
+        let style = ui.theme.checkbox.clone();
+        let tsize = ui.text_size(label, style.font_size, style.font_family.as_deref());
+        let size = Vec2::new(
+            style.box_size + style.gap + tsize.x,
+            style.box_size.max(tsize.y),
+        );
+        let rect = ui.child_rect(size.x, size.y);
+        ui.radio_at(id, group, rect, label)
+    }
+
+    /// 显式尺寸单选（逃生舱）。
+    fn radio_at(&mut self, id: &str, group: &str, rect: Rect, label: &str) -> CheckboxState {
+        self.ui_mut().radio_at(id, group, rect, label)
+    }
+
+    /// 文本输入框（内容写入 `value`；自动尺寸：高度固定，宽度取样式最小宽）。
+    fn text_input(&mut self, id: &str, value: &mut String) {
+        let ui = self.ui_mut();
+        let style = ui.theme.input.clone();
+        let size = Vec2::new(style.min_w, style.height);
+        let rect = ui.child_rect(size.x, size.y);
+        ui.text_input_at(id, rect, value);
+    }
+
+    /// 显式尺寸文本输入框（逃生舱）。
+    fn text_input_at(&mut self, id: &str, rect: Rect, value: &mut String) {
+        self.ui_mut().text_input_at(id, rect, value);
+    }
+
+    /// 嵌套面板（`pos` 相对当前容器内容原点；不占光标）。
+    fn panel_at(&mut self, pos: Vec2, f: impl FnOnce(&mut Panel<'_, '_>)) -> Vec2 {
+        self.ui_mut().panel_at(pos, f)
+    }
+
+    /// 嵌套**可拖拽**面板（位置持久于 `UiState.panel_pos`）。
+    fn drag_panel_at(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        f: impl FnOnce(&mut Panel<'_, '_>),
+    ) -> Vec2 {
+        self.ui_mut().drag_panel_at(id, pos, f)
+    }
+
+    /// 嵌套**窗口**（可重叠 + 焦点置顶 + 可拖拽）。
+    fn window_at(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
+        self.ui_mut().window_at(id, pos, f)
+    }
+
+    /// 嵌套**固定宽窗口**（宽度指定、高度自动，如同 egui）。
+    fn window_at_w(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        width: f32,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
+        self.ui_mut().window_at_w(id, pos, width, f)
+    }
+
+    /// 嵌套**模态对话框**（全屏遮罩 + 对话框，背后交互被阻断）。
+    fn modal_at(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
+        self.ui_mut().modal_at(id, pos, f)
+    }
+
+    /// 嵌套**固定宽模态对话框**（宽度指定、高度自动）。
+    fn modal_at_w(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        width: f32,
+        f: impl FnOnce(&mut Window<'_, '_>),
+    ) -> Vec2 {
+        self.ui_mut().modal_at_w(id, pos, width, f)
+    }
+
+    /// 嵌套 pack（`pos` 相对当前容器内容原点；不占光标）。
+    fn pack_at(
+        &mut self,
+        pos: Vec2,
+        side: PackSide,
+        f: impl FnOnce(&mut Pack<'_, '_>),
+    ) -> Vec2 {
+        self.ui_mut().pack_at(pos, side, f)
+    }
+
+    /// 嵌套 grid（`pos` 相对当前容器内容原点；不占光标）。
+    fn grid_at(
+        &mut self,
+        pos: Vec2,
+        cols: usize,
+        id: &str,
+        f: impl FnOnce(&mut Grid<'_, '_>),
+    ) -> Vec2 {
+        self.ui_mut().grid_at(pos, cols, id, f)
+    }
 }
 
 /// 容器闭包上下文（内部类型）。
@@ -2965,68 +3773,58 @@ pub(crate) struct ContainerCtx<'ui, 'a> {
 pub struct Panel<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
 }
-widget_api!(Panel);
+impl<'ui, 'a> UiAdd<'a> for Panel<'ui, 'a> {
+    fn ui_mut(&mut self) -> &mut Ui<'a> {
+        self.ui
+    }
+}
 
 /// pack 容器（无背景，纯布局）。
 pub struct Pack<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
 }
-widget_api!(Pack);
+impl<'ui, 'a> UiAdd<'a> for Pack<'ui, 'a> {
+    fn ui_mut(&mut self) -> &mut Ui<'a> {
+        self.ui
+    }
+}
 
 /// grid 容器（无背景，均匀网格）。
 pub struct Grid<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
 }
-widget_api!(Grid);
+impl<'ui, 'a> UiAdd<'a> for Grid<'ui, 'a> {
+    fn ui_mut(&mut self) -> &mut Ui<'a> {
+        self.ui
+    }
+}
 
 /// 窗口容器（可重叠 + 焦点置顶 + 可拖拽；见 [`Ui::window_at`]）。
 pub struct Window<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
 }
-widget_api!(Window);
+impl<'ui, 'a> UiAdd<'a> for Window<'ui, 'a> {
+    fn ui_mut(&mut self) -> &mut Ui<'a> {
+        self.ui
+    }
+}
 
 /// 滚动容器（内容在可视区内堆叠 + 滚动；见 [`Ui::scroll_at`]）。
 pub struct Scroll<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
 }
-widget_api!(Scroll);
+impl<'ui, 'a> UiAdd<'a> for Scroll<'ui, 'a> {
+    fn ui_mut(&mut self) -> &mut Ui<'a> {
+        self.ui
+    }
+}
 
 /// **flex 容器上下文**（[`Ui::flex_at`]）：子项高度已按权重分配（强制），
 /// 内部可调用任意控件方法占光标（`f.label` / `f.button` 等）。
 pub struct FlexCtx<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
 }
-widget_api!(FlexCtx);
-
-// ── Widget trait 放置（UiAdd）：容器包装共享 add / add_at ──────────
-// （`ui.add(Button::new(…))` / `p.add(Label::new(…))` 等；见 crate::widget）
-
-impl<'ui, 'a> crate::widget::UiAdd<'a> for Panel<'ui, 'a> {
-    fn ui_mut(&mut self) -> &mut Ui<'a> {
-        self.ui
-    }
-}
-impl<'ui, 'a> crate::widget::UiAdd<'a> for Pack<'ui, 'a> {
-    fn ui_mut(&mut self) -> &mut Ui<'a> {
-        self.ui
-    }
-}
-impl<'ui, 'a> crate::widget::UiAdd<'a> for Grid<'ui, 'a> {
-    fn ui_mut(&mut self) -> &mut Ui<'a> {
-        self.ui
-    }
-}
-impl<'ui, 'a> crate::widget::UiAdd<'a> for Window<'ui, 'a> {
-    fn ui_mut(&mut self) -> &mut Ui<'a> {
-        self.ui
-    }
-}
-impl<'ui, 'a> crate::widget::UiAdd<'a> for Scroll<'ui, 'a> {
-    fn ui_mut(&mut self) -> &mut Ui<'a> {
-        self.ui
-    }
-}
-impl<'ui, 'a> crate::widget::UiAdd<'a> for FlexCtx<'ui, 'a> {
+impl<'ui, 'a> UiAdd<'a> for FlexCtx<'ui, 'a> {
     fn ui_mut(&mut self) -> &mut Ui<'a> {
         self.ui
     }
@@ -3040,7 +3838,7 @@ impl Ui<'_> {
     /// 按钮显示 `current`；点击展开**选项浮层**（临时窗口置顶，自动尺寸包裹选项），
     /// 点击选项选中并收起，点击浮层外收起。`selected` 为当前选中（用于 ✓ 标记）。
     /// 返回本帧新选中的索引（`None` = 无选择/未展开）。
-    pub(crate) fn combo_at(
+    pub fn combo_at(
         &mut self,
         id: &str,
         rect: Rect,
@@ -3097,6 +3895,14 @@ impl Ui<'_> {
         let bg = if open { style.bg_pressed } else { style.bg };
         self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
         let text_rect = Rect::new(rect.x, rect.y, (rect.w - 18.0).max(0.0), rect.h);
+        // 按钮文本自动省略（缩窄 / max 约束下不溢出，内容自洽）。
+        let cur_owned = self.ellipsized(
+            current,
+            style.font_size,
+            style.font_family.as_deref(),
+            text_rect.w,
+        );
+        let draw_current: &str = cur_owned.as_deref().unwrap_or(current);
         let seq = self.next_seq();
         self.queue.push(text_cmd(
             self.depth,
@@ -3104,7 +3910,7 @@ impl Ui<'_> {
             self.cur_win,
             elem,
             text_rect,
-            Arc::from(current),
+            Arc::from(draw_current),
             style.font_size,
             style.fg,
             TextAlign::Left,
@@ -3194,16 +4000,15 @@ impl Ui<'_> {
         self.combo_at(id, rect, current, options, selected)
     }
 
-    /// 按钮（显式 rect；`rect` 为相对当前容器 origin 的局部坐标）。
     /// 按钮（显式 rect；样式取全局 `Theme::button`）。
-    pub(crate) fn button_at(&mut self, id: &str, rect: Rect, label: &str) -> ButtonState {
+    pub fn button_at(&mut self, id: &str, rect: Rect, label: &str) -> ButtonState {
         let style = self.theme.button.clone();
         self.button_at_styled(id, rect, label, &style)
     }
 
     /// 按钮（显式 rect + **样式可覆盖**——widget 层 [`crate::widget::Button`] 经此
     /// 合并主题与逐控件属性；旧 `button_at` 委托本方法）。
-    pub(crate) fn button_at_styled(
+    pub fn button_at_styled(
         &mut self,
         id: &str,
         rect: Rect,
@@ -3242,6 +4047,15 @@ impl Ui<'_> {
             let elem = self.seq + 1;
             // 背景 + 边框（radius > 0 走圆角双层矩形）。
             self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
+            // 按钮文本自动省略（Resizable 窗口缩窄 / max 约束下不溢出）：
+            // 文本超出可用区（rect 宽 - 水平内边距）→ "…"截断（内容自洽，noclip）。
+            let label_owned = self.ellipsized(
+                label,
+                style.font_size,
+                style.font_family.as_deref(),
+                (rect.w - style.padding.x * 2.0).max(0.0),
+            );
+            let draw_label: &str = label_owned.as_deref().unwrap_or(label);
             let text_seq = self.next_seq();
             self.queue.push(text_cmd(
                 depth,
@@ -3249,7 +4063,7 @@ impl Ui<'_> {
                 win,
                 elem,
                 rect,
-                Arc::from(label),
+                Arc::from(draw_label),
                 style.font_size,
                 style.fg,
                 TextAlign::Center,
@@ -3269,7 +4083,7 @@ impl Ui<'_> {
     }
 
     /// 滑块（显式 rect）。
-    pub(crate) fn slider_at(
+    pub fn slider_at(
         &mut self,
         id: &str,
         rect: Rect,
@@ -3278,10 +4092,21 @@ impl Ui<'_> {
     ) -> f32 {
         let hit = self.hit_abs(&rect);
         let btn = self.mouse_left();
+        // 滑块自身有拖拽语义：按下即置位 press_claimed——阻止外层窗口/面板把本次
+        // 按下当作拖拽基准（窗口内拖滑块不再连窗口一起动）。
+        if btn.down_edge() && hit {
+            self.press_claimed = true;
+        }
         let active = {
             let ws = self.state.widgets.entry(id.to_owned()).or_default();
             update_drag(ws, hit, btn)
         };
+        // 拖动光标：拖拽中 = 抓握；悬停滑块 = 张手。
+        if active {
+            self.cursor_grabbing = true;
+        } else if hit {
+            self.cursor_grab = true;
+        }
         if active {
             self.any_pressed = true;
         }
@@ -3313,8 +4138,11 @@ impl Ui<'_> {
         let elem = self.seq + 1;
         let track_rect =
             Rect::new(rect.x, rect.y + (rect.h - style.track_h) * 0.5, rect.w, style.track_h);
-        let fill_rect = Rect::new(rect.x, track_rect.y, rect.w * t, style.track_h);
-        let handle_cx = rect.x + rect.w * t;
+        // 手柄**中心**夹在轨道两端之内（t=0/1 时手柄不伸出轨道/控件外）；
+        // 填充画到手柄**左缘**（与手柄无缝衔接，而非只到手柄中心——消除"错位"）。
+        let handle_cx = rect.x + style.handle_w * 0.5 + (rect.w - style.handle_w) * t;
+        let fill_w = (handle_cx - style.handle_w * 0.5 - rect.x).max(0.0);
+        let fill_rect = Rect::new(rect.x, track_rect.y, fill_w, style.track_h);
         let handle_rect = Rect::new(
             handle_cx - style.handle_w * 0.5,
             rect.y + (rect.h - style.handle_w) * 0.5,
@@ -3357,7 +4185,7 @@ impl Ui<'_> {
     }
 
     /// 勾选框（显式 rect；样式取全局 `Theme::checkbox`）。
-    pub(crate) fn checkbox_at(
+    pub fn checkbox_at(
         &mut self,
         id: &str,
         rect: Rect,
@@ -3370,7 +4198,7 @@ impl Ui<'_> {
 
     /// 勾选框（显式 rect + **样式可覆盖**——widget 层 [`crate::widget::Checkbox`] 经此
     /// 合并主题与逐控件属性；旧 `checkbox_at` 委托本方法）。
-    pub(crate) fn checkbox_at_styled(
+    pub fn checkbox_at_styled(
         &mut self,
         id: &str,
         rect: Rect,
@@ -3413,7 +4241,7 @@ impl Ui<'_> {
     }
 
     /// 单选（显式 rect）。
-    pub(crate) fn radio_at(
+    pub fn radio_at(
         &mut self,
         id: &str,
         group: &str,
@@ -3491,16 +4319,16 @@ impl Ui<'_> {
             clip: self.clip,
             kind: DrawKind::Border {
                 color: style.box_border,
-                width: 1.0,
+                width: style.border_w,
             },
         });
         if checked {
-            let inner = Rect::new(
-                box_rect.x + 3.0,
-                box_rect.y + 3.0,
-                box_rect.w - 6.0,
-                box_rect.h - 6.0,
-            );
+            // 中心填充 = 外框 **内缩**（减法，非写死偏移）：
+            // inset（物理像素）= floor(border_w·scale) + floor(CHECKBOX_INNER·scale)，
+            // 转回逻辑后 shrink —— 内缩量与边框/DPI 一致，任意缩放不溢出。
+            let inset_px = (style.border_w * self.scale).floor()
+                + (CHECKBOX_INNER * self.scale).floor();
+            let inner = box_rect.shrink(inset_px / self.scale);
             if inner.w > 0.0 && inner.h > 0.0 {
                 let seq = self.next_seq();
                 self.queue.push(UiDraw {
@@ -3520,6 +4348,9 @@ impl Ui<'_> {
             (rect.w - style.box_size - style.gap).max(0.0),
             rect.h,
         );
+        // 标签文本自动省略（缩窄 / max 约束下不溢出，内容自洽）。
+        let label_owned = self.ellipsized(label, style.font_size, style.font_family.as_deref(), text_rect.w);
+        let draw_label: &str = label_owned.as_deref().unwrap_or(label);
         let seq = self.next_seq();
         self.queue.push(text_cmd(
             depth,
@@ -3527,7 +4358,7 @@ impl Ui<'_> {
             win,
             elem,
             text_rect,
-            Arc::from(label),
+            Arc::from(draw_label),
             style.font_size,
             style.fg,
             TextAlign::Left,
@@ -3546,7 +4377,7 @@ impl Ui<'_> {
     /// - **文本选择**：按住拖拽选择（`WidgetState::sel_anchor`），选择优先于窗口/面板拖拽
     ///   （按下时置位 `press_claimed`）；Ctrl+C/V/X 复制/粘贴/剪切；选择后打字/退格替换选择；
     /// - **IME 组合候选移入浮动提示框**：组合串（preedit）画在输入框下方浮动小框中（不再占行内）。
-    pub(crate) fn text_input_at(&mut self, id: &str, rect: Rect, value: &mut String) {
+    pub fn text_input_at(&mut self, id: &str, rect: Rect, value: &mut String) {
         let hit = self.hit_abs(&rect);
         if hit {
             // 鼠标悬停在输入框上 → 本帧系统光标设为 I 型（finish 统一设置）
@@ -3563,6 +4394,7 @@ impl Ui<'_> {
         // 视口内的 J-K 位置 → 映射到全文 J-K（而非文本前部 A-B），光标落在点击处、
         // 视图不跳回起点。（曾用纯视口 cx：滚动后点击会定位到文本起点附近，随后
         // scroll 跟随把视图拉回开头——"点击右侧视图，视图跳回 A-B"）。
+        // `text_scroll` 为**物理像素**（内部计算一律物理），文本坐标 = cx + 物理/scale。
         let prev_scroll = self
             .state
             .widgets
@@ -3578,7 +4410,7 @@ impl Ui<'_> {
                 value,
                 input_style.font_size,
                 input_style.font_family.as_deref(),
-                cx + prev_scroll,
+                cx + prev_scroll / self.scale,
             ))
         } else {
             None
@@ -3588,11 +4420,14 @@ impl Ui<'_> {
                 value,
                 input_style.font_size,
                 input_style.font_family.as_deref(),
-                cx_raw + prev_scroll,
+                cx_raw + prev_scroll / self.scale,
             ))
         } else {
             None
         };
+        // 记录帧首光标：仅"光标移动"（打字/方向键/点击/拖选）时做滚动跟随——
+        // 滚轮滚动不移动光标 → 不跟随（滚轮自由滚动、光标可滚出视图，不被拉回）。
+        let prev_caret = self.state.widgets.get(id).map(|w| w.caret);
         let caret_est = {
             let ws = self.state.widgets.entry(id.to_owned()).or_default();
             let ev = update_interact(ws, hit, btn);
@@ -3604,9 +4439,27 @@ impl Ui<'_> {
                 if let Some(c) = click_caret {
                     ws.caret = c;
                 }
+                // 双击检测（同控件帧间隔 ≤ DOUBLE_CLICK_FRAMES 且位移 < 阈值）：
+                // 第二击选中光标所在"词"并进入词模式——按住继续拖拽按词扩散。
+                let is_dbl = {
+                    let (pf, pp) = (ws.last_click_frame, ws.last_click_pos);
+                    ws.last_click_frame = self.state.frame;
+                    ws.last_click_pos = self.mouse_logical;
+                    pf != 0
+                        && self.state.frame.wrapping_sub(pf) <= DOUBLE_CLICK_FRAMES
+                        && (self.mouse_logical - pp).length() < DOUBLE_CLICK_DIST
+                };
                 // 拖选位移基准（物理像素；微动不触发拖选 → 单击保持插入模式）
                 ws.press_mouse = Some(self.mouse_screen.round());
-                ws.sel_anchor = Some(ws.caret);
+                if is_dbl {
+                    let (w0, w1) = crate::edit::word_range(value, ws.caret);
+                    ws.sel_anchor = Some(w0);
+                    ws.caret = w1;
+                    ws.sel_word = true;
+                } else {
+                    ws.sel_word = false;
+                    ws.sel_anchor = Some(ws.caret);
+                }
             } else if ws.pressed && btn.pressed() {
                 // 拖拽选择：**位移 ≥ 3 物理像素**才扩展选择（单击微动不误选）；
                 // 光标跟随鼠标（**即使拖出输入框**——edge-scroll 持续滚动），
@@ -3618,14 +4471,24 @@ impl Ui<'_> {
                     .unwrap_or(false);
                 if moved {
                     if let Some(c) = drag_caret {
-                        ws.caret = c;
+                        if ws.sel_word {
+                            // 词模式（双击后拖拽）：按词边界扩散选择
+                            let anchor = ws.sel_anchor.unwrap_or(c);
+                            ws.caret = crate::edit::extend_word_caret(value, anchor, c);
+                        } else {
+                            ws.caret = c;
+                        }
                     }
                 }
             }
-            if ev.released && ws.sel_anchor == Some(ws.caret) {
+            if ev.released {
                 // 纯点击（无位移）：anchor == caret，无实际选择 → 清理，避免残留
                 // anchor 在后续无 Shift 方向键移动时"突然变成多选"。
-                ws.sel_anchor = None;
+                if ws.sel_anchor == Some(ws.caret) {
+                    ws.sel_anchor = None;
+                }
+                // 释放后退出词模式（选择保留；下次单击/双击重开）。
+                ws.sel_word = false;
             }
             let focused = self.state.focused.as_deref() == Some(id);
             if focused {
@@ -3636,77 +4499,17 @@ impl Ui<'_> {
                 let in_ime_compose =
                     self.keyboard.get_ime_preedit().is_some_and(|p| !p.is_empty());
                 let ime_owns_keys = in_ime_compose || self.state.ime_composing;
-                // 剪贴板：Ctrl+C/V/X/A（单行：粘贴过滤换行）。
-                let ctrl = self.keyboard.get(KeyCode::ControlLeft).pressed()
-                    || self.keyboard.get(KeyCode::ControlRight).pressed();
-                Self::clipboard_shortcuts(&self.keyboard, ws, value, true);
-                // 编辑操作（字符 / IME 上屏 / 退格 / 删除）前若存在选择 → 先删除选择
-                // ⚠ Ctrl 组合（C/V/X）按下时 `get_chars` 会带出 'c'/'v'/'x'——
-                // 剪贴板分支已处理，字符必须过滤（否则 Ctrl+C 留下 'c'、Ctrl+V 多出 'v'）。
-                let edit_pending = (!self.keyboard.get_chars().is_empty() && !ctrl)
-                    || !self.keyboard.get_ime_commits().is_empty()
-                    || (self.keyboard.get(KeyCode::Backspace).down_edge() && !ime_owns_keys)
-                    || (self.keyboard.get(KeyCode::Delete).down_edge() && !ime_owns_keys);
-                // 选择删除是否已**消费**本次 Backspace/Delete——避免"选择 + 退格"时
-                // 选择删完又执行独立退格，多删选择前一个字符（ABCDE 选 BCD 退格连 A 一起删）。
-                let mut sel_consumed = false;
-                if edit_pending {
-                    if let Some((lo, hi)) = sel_range(ws.sel_anchor, ws.caret) {
-                        delete_range(value, lo, hi);
-                        ws.caret = lo;
-                        ws.sel_anchor = None;
-                        sel_consumed = true;
-                    }
-                }
-                // IME 上屏文本（中文输入法等）：优先级高于普通字符
-                for commit in self.keyboard.get_ime_commits() {
-                    insert_str_at(value, ws.caret, commit);
-                    ws.caret = (ws.caret + commit.chars().count()).min(value.chars().count());
-                }
-                // 普通字符输入 / 编辑（Ctrl 组合不产生文本）
-                if !ctrl {
-                    for ch in self.keyboard.get_chars() {
-                        insert_char_at(value, ws.caret, *ch);
-                        ws.caret = (ws.caret + 1).min(value.chars().count());
-                    }
-                }
-                if self.keyboard.get(KeyCode::Backspace).down_edge() && !ime_owns_keys && !sel_consumed {
-                    ws.caret = remove_before(value, ws.caret);
-                }
-                if self.keyboard.get(KeyCode::Delete).down_edge() && !ime_owns_keys && !sel_consumed {
-                    remove_at(value, ws.caret);
-                }
-                // Shift + 方向键：扩展/收缩选择（anchor 不动；光标越过 anchor 时收缩归零）
+                // 编辑状态机（单行）：剪贴板 Ctrl+C/V/X/A（粘贴过滤换行）、选择替换、
+                // IME 上屏、普通字符、退格/删除（见 [`crate::edit::apply_frame_edits`]）。
+                crate::edit::apply_frame_edits(&self.keyboard, ws, value, false, ime_owns_keys);
+                // Shift + ←/→：扩展/收缩选择（无 Shift 取消选择）。
                 let shift = self.keyboard.get(KeyCode::ShiftLeft).pressed()
                     || self.keyboard.get(KeyCode::ShiftRight).pressed();
-                let shift_start = |ws: &mut WidgetState| {
-                    if shift && ws.sel_anchor.is_none() {
-                        ws.sel_anchor = Some(ws.caret);
-                    }
-                };
-                // 无 Shift 的方向键：**取消选择**（否则 Shift 多选后松开再按 ←/→/↑/↓
-                // 残留 anchor 会继续扩展选择）。
-                let shift_clear = |ws: &mut WidgetState| {
-                    if !shift {
-                        ws.sel_anchor = None;
-                    }
-                };
-                let shift_shrink = |ws: &mut WidgetState| {
-                    if ws.sel_anchor == Some(ws.caret) {
-                        ws.sel_anchor = None;
-                    }
-                };
                 if self.keyboard.get(KeyCode::ArrowLeft).down_edge() && !ime_owns_keys {
-                    shift_start(ws);
-                    shift_clear(ws);
-                    ws.caret = ws.caret.saturating_sub(1);
-                    shift_shrink(ws);
+                    crate::edit::caret_horiz(ws, value, -1, shift);
                 }
                 if self.keyboard.get(KeyCode::ArrowRight).down_edge() && !ime_owns_keys {
-                    shift_start(ws);
-                    shift_clear(ws);
-                    ws.caret = (ws.caret + 1).min(value.chars().count());
-                    shift_shrink(ws);
+                    crate::edit::caret_horiz(ws, value, 1, shift);
                 }
                 if self.keyboard.get(KeyCode::Enter).down_edge() {
                     self.state.focused = None;
@@ -3725,6 +4528,12 @@ impl Ui<'_> {
         let win = self.cur_win;
         let elem = self.seq + 1;
         let border = if focused { style.border_focus } else { style.border };
+        // 视觉框绝对矩形（Clip 沙箱用）：**整个输入框**——高亮/光标/文本命令
+        // 受其强制裁剪（滚出视图不画出框，且外层 ScrollView 裁切一并生效）。
+        let box_clip = Rect::new(self.abs_base.x + rect.x, self.abs_base.y + rect.y, rect.w, rect.h);
+        // **Clip 子沙箱**（控件内）：强制裁剪层 = 外层强制 ∩ 输入框矩形。
+        let saved_clip = self.clip;
+        self.clip = clip_for_view(saved_clip, box_clip, ViewMode::Clip);
         // 背景 + 边框（radius > 0 走圆角双层矩形）。
         self.push_panel_like(rect, style.bg, border, style.border_w, style.radius, elem);
         let content_w = (rect.w - style.padding_x * 2.0).max(0.0);
@@ -3732,18 +4541,19 @@ impl Ui<'_> {
         // **IME 组合内联融入**：显示串 = value[..caret] + preedit + value[caret..]——
         // 后续文本（"xXXXXAAAA" 的 AAAA）右移而非被组合盖住；组合较长时滚动跟随
         // 组合光标（提示文字不裁切）。无组合时全部回落到 value（零开销路径）。
+        // IME 组合串先拷出（owned）：闭包内要 &mut self（text_size 测量），
+        // 与自持快照字段 self.keyboard 的借用不能共存。
+        let preedit = self.keyboard.get_ime_preedit().map(|p| p.to_owned());
+        let preedit_caret = self.keyboard.get_ime_preedit_caret();
         let composed: Option<(String, std::ops::Range<usize>, f32, usize)> = if focused {
-            self.keyboard
-                .get_ime_preedit()
+            preedit
                 .filter(|p| !p.is_empty())
                 .map(|p| {
                     let insert_b = char_to_byte(value, caret);
                     let disp = format!("{}{}{}", &value[..insert_b], p, &value[insert_b..]);
-                    let w = self.text_size(p, style.font_size, style.font_family.as_deref()).x;
+                    let w = self.text_size(&p, style.font_size, style.font_family.as_deref()).x;
                     // 组合内光标：字节 → 显示串偏移（None = 组合末尾）
-                    let caret_b = self
-                        .keyboard
-                        .get_ime_preedit_caret()
+                    let caret_b = preedit_caret
                         .map(|b| p.floor_char_boundary(b.min(p.len())))
                         .unwrap_or(p.len());
                     (disp, insert_b..insert_b + p.len(), w, insert_b + caret_b)
@@ -3767,13 +4577,29 @@ impl Ui<'_> {
                 self.text_size(&prefix, style.font_size, style.font_family.as_deref()).x
             }
         };
-        // 水平滚动跟随光标（跨帧状态；光标右侧保留 8 逻辑像素；组合时跟随组合光标）。
+        // 水平滚动（**物理像素**）：**水平滚轮（触控板）优先**（自由滚动，可把光标
+        // 滚出视图，**仅鼠标在框内时**——指针离开输入框后不再滚动）；
+        // 否则仅**光标移动**（打字/方向键/点击/拖选）时跟随光标（右侧保留 8 逻辑
+        // 像素；滚轮自由滚动后不被光标拉回；组合时跟随组合光标）。
         let scroll = {
             let ws = self.state.widgets.entry(id.to_owned()).or_default();
-            ws.text_scroll = scroll_follow_caret(ws.text_scroll, caret_x, content_w, text_w, 8.0);
+            let (wx, _) = self.mouse.get_mouse_wheel_delta();
+            if hit && wx != 0.0 {
+                let max_h_px = ((text_w - content_w).max(0.0) * self.scale).round();
+                ws.text_scroll = (ws.text_scroll - (wx as f32 * 40.0 * self.scale).round())
+                    .clamp(0.0, max_h_px);
+            } else if Some(caret) != prev_caret {
+                ws.text_scroll = scroll_follow_caret(
+                    ws.text_scroll,
+                    caret_x * self.scale,
+                    content_w * self.scale,
+                    text_w * self.scale,
+                    8.0 * self.scale,
+                );
+            }
             ws.text_scroll
         };
-        let text_dx = -scroll;
+        let text_dx = -scroll / self.scale;
         // 文本选择高亮（在文本之下绘制：同一 elem 的图形组先于文字组）。
         if let Some((lo, hi)) = sel_range(
             self.state.widgets.get(id).and_then(|w| w.sel_anchor),
@@ -3801,16 +4627,16 @@ impl Ui<'_> {
                     win,
                     elem,
                     rect: sel_rect,
-                    // 选择高亮受内容区裁剪（不溢出输入框 / 滚动容器）。
-                    clip: Some(content_rect),
+                    // 选择高亮受输入框强制裁剪（不溢出输入框 / 外层滚动容器）。
+                    clip: self.clip,
                     kind: DrawKind::Solid(style.sel_bg),
                 });
             }
         }
-        // 文本（左移 scroll；**裁剪窗口固定在内容区**：clip 相对移动后的 rect 起点 = scroll，
-        // 绝对位置 = content_rect.x —— 若 clip.x=0 会随 rect 一起左移，始终显示文本开头
-        // 且偏离文本框；缓冲控件自持）。
-        let clip = Rect::new(scroll, 0.0, content_w, rect.h);
+        // 文本（左移 scroll；**裁剪窗口固定在视觉框**：clip 相对移动后的 rect 起点 =
+        // scroll/scale - padding_x，绝对位置 = 框左缘 —— 若 clip.x=0 会随 rect 一起
+        // 左移，始终显示文本开头且偏离文本框；缓冲控件自持）。
+        let clip = Rect::new(scroll / self.scale - style.padding_x, 0.0, rect.w, rect.h);
         // 绘制文本：组合时画**显示串**（preedit 已融入）；缓冲控件自持（按键变化重排）。
         let (draw_text, buf) = match &composed {
             Some((disp, ..)) => {
@@ -3873,7 +4699,7 @@ impl Ui<'_> {
                     win,
                     elem,
                     rect: ul,
-                    clip: Some(content_rect),
+                    clip: self.clip,
                     kind: DrawKind::Solid(style.preedit),
                 });
             }
@@ -3912,6 +4738,8 @@ impl Ui<'_> {
                 },
             });
         }
+        // 退出 Clip 子沙箱（恢复外层强制裁剪层）。
+        self.clip = saved_clip;
     }
 
     /// 多行文本输入框（显式 rect，**TextArea**）。
@@ -3924,7 +4752,24 @@ impl Ui<'_> {
     ///   （[`rjw_text::Text::visual_lines`]：每个 `LayoutRun` 一行，含字节范围）；
     /// - **选择 / 复制 / 粘贴 / 剪切**（Ctrl+C/V/X）跨视觉行，高亮逐行绘制。
     /// - **IME**：组合候选浮动提示框 + 候选框定位到光标。
-    pub(crate) fn text_area_at(&mut self, id: &str, rect: Rect, value: &mut String) {
+    ///
+    /// 自动换行模式（`wrap = true`）：行宽 = 内容区宽，超出自动换行，仅垂直滚动。
+    /// 不自动换行模式（`wrap = false`）：行宽不限（显式 `\n` 分行），**水平滚动**
+    /// 跟随光标（同单行输入框），垂直滚动不变。对应公开入口
+    /// [`Self::text_area_at`]（换行）/ [`Self::text_area_at_nw`]（不换行）。
+    pub fn text_area_at(&mut self, id: &str, rect: Rect, value: &mut String) {
+        self.text_area_impl(id, rect, value, true)
+    }
+
+    /// **多行文本输入框（不自动换行）**：同 [`Self::text_area_at`]，但行宽不限
+    /// （显式 `\n` 分行），超出内容区**水平滚动**跟随光标（光标右侧保留 8 逻辑像素）；
+    /// 垂直滚动/选择/IME 与换行模式一致。
+    pub fn text_area_at_nw(&mut self, id: &str, rect: Rect, value: &mut String) {
+        self.text_area_impl(id, rect, value, false)
+    }
+
+    /// 多行文本输入框公共实现（`wrap`：是否按内容区宽自动换行；`false` = 水平滚动）。
+    fn text_area_impl(&mut self, id: &str, rect: Rect, value: &mut String, wrap: bool) {
         let hit = self.hit_abs(&rect);
         if hit {
             // 鼠标悬停在输入框上 → 本帧系统光标设为 I 型（finish 统一设置）
@@ -3938,19 +4783,26 @@ impl Ui<'_> {
         let line_h = (style.font_size * TEXT_AREA_LINE_SPACING).max(1.0);
         let content_w = (rect.w - style.padding_x * 2.0).max(0.0);
         let content_rect = Rect::new(rect.x + style.padding_x, rect.y, content_w, rect.h);
+        // 视觉框裁剪（**绝对坐标**：`UiDraw.clip` 收集期按绝对逻辑矩形求交；局部
+        // content_rect 随容器平移后会错位——高亮/下划线因此被裁到错误区域"看不见"）。
+        // 裁剪 = 整个输入框（"完全对应视觉文本框大小"）。
+        let box_clip = Rect::new(self.abs_base.x + rect.x, self.abs_base.y + rect.y, rect.w, rect.h);
         let mouse_local_y = self.mouse_logical.y - self.abs_base.y;
+        // 排版换行宽：换行模式 = 内容区宽；不换行模式 = 0（不限宽）。
+        let wrap_w = if wrap { content_w } else { 0.0 };
         // **视觉行**（自动换行后）：光标/点击/选择/Home-End/↑↓ 全部按它定位，与显示一致。
         let vbuf = self.ensure_text_buf(
             id,
             value,
             style.font_size,
             style.font_family.as_deref(),
-            content_w,
+            wrap_w,
             TEXT_AREA_LINE_SPACING,
         );
         let vlines = Text::visual_lines(&vbuf);
         // 字节 → 视觉行（半开区间 + 换行边界归属修正，见 edit::vline_of_byte）
-        let vline_of_byte = |byte: usize| vline_of_byte(&vlines, byte);
+        // 注意：不用闭包捕获 `vlines`——编辑改写文本后会重新排版出**新的** vlines，
+        // 闭包会一直引用旧绑定导致行号/行区间错位（选择高亮消失、切片 panic）。
         // 鼠标位置 → 光标（视觉行 + 行内列）。**单击与拖选都按"文本坐标"**
         // （视口 y + 垂直滚动）：长内容（自动换行后多行）滚动后点击，行号 = 视口行 +
         // 滚动行——否则点击可视区任意行都会定位到文本前部、光标行随即被滚动跟随
@@ -3961,11 +4813,29 @@ impl Ui<'_> {
             .get(id)
             .map(|w| w.scroll_y)
             .unwrap_or(0.0);
-        let click_caret = if btn.down_edge() && hit {
-            let row = ((mouse_local_y - rect.y + prev_scroll) / line_h)
-                .floor()
-                .max(0.0) as usize;
-            let cx = (self.mouse_local_x() - rect.x - style.padding_x).max(0.0);
+        // 不换行模式：点击列要加**水平滚动**（同单行输入框；换行模式 hscroll = 0）。
+        // `scroll_y` / `text_scroll` 均为**物理像素**（内部计算一律物理）→ 文本坐标
+        // = 视口坐标 + 物理/scale。
+        let hscroll = if wrap {
+            0.0
+        } else {
+            self.state.widgets.get(id).map(|w| w.text_scroll).unwrap_or(0.0)
+        };
+        // 滚动条条带排除：内容超出可视区（预估，编辑前后高度变化微小）时，右缘
+        // `SCROLLBAR_W` 条带属于滚动条——按下不建立文本选择（锚点为空，拖拽分支
+        // 由 `sel_anchor.is_some()` 守卫，滚动条自身交互不受影响）。
+        let content_h_pre = Text::measure_buffer(&vbuf).y / self.scale;
+        let sb_w = if content_h_pre > rect.h + 1.0 && rect.h > 0.0 {
+            SCROLLBAR_W
+        } else {
+            0.0
+        };
+        let hit_text = hit && (self.mouse_local_x() - rect.x) < rect.w - sb_w;
+        let click_caret = if btn.down_edge() && hit_text {
+            // 行号按**真实行顶**定位（见 line_row_at_y：逻辑 line_h 每行差 ~0.2px，
+            // 长文本累积会错行 / 视图卡住）。
+            let row = line_row_at_y(&vlines, mouse_local_y - rect.y + prev_scroll / self.scale, line_h, self.scale);
+            let cx = (self.mouse_local_x() - rect.x - style.padding_x + hscroll / self.scale).max(0.0);
             Some(caret_at_visual_click(value, &vlines, row, cx, |s| {
                 self.text_size(s, style.font_size, style.font_family.as_deref()).x
             }))
@@ -3973,29 +4843,51 @@ impl Ui<'_> {
             None
         };
         let drag_caret = if btn.pressed() && !btn.down_edge() {
-            let row = ((mouse_local_y - rect.y + prev_scroll) / line_h)
-                .floor()
-                .max(0.0) as usize;
-            let cx = (self.mouse_local_x() - rect.x - style.padding_x).max(0.0);
+            let row = line_row_at_y(&vlines, mouse_local_y - rect.y + prev_scroll / self.scale, line_h, self.scale);
+            let cx = (self.mouse_local_x() - rect.x - style.padding_x + hscroll / self.scale).max(0.0);
             Some(caret_at_visual_click(value, &vlines, row, cx, |s| {
                 self.text_size(s, style.font_size, style.font_family.as_deref()).x
             }))
         } else {
             None
         };
+        // 记录帧首光标：仅"光标移动"（打字/方向键/点击/拖选）时做光标跟随——
+        // 滚轮滚动不移动光标 → 不跟随（滚轮自由滚动、光标可滚出视图，不被拉回）。
+        let prev_caret = self.state.widgets.get(id).map(|w| w.caret);
         let caret_est = {
             let ws = self.state.widgets.entry(id.to_owned()).or_default();
             let ev = update_interact(ws, hit, btn);
             if ev.pressed {
                 self.any_pressed = true;
-                self.press_claimed = true;
-                self.state.focused = Some(id.to_owned());
-                if let Some(c) = click_caret {
-                    ws.caret = c;
+                // 仅按下在**文本区**（滚动条条带外）时建立文本选择/焦点：
+                // 按下滚动条由滚动条自身交互处理（anchor 保持 None）。
+                if hit_text {
+                    self.press_claimed = true;
+                    self.state.focused = Some(id.to_owned());
+                    if let Some(c) = click_caret {
+                        ws.caret = c;
+                    }
+                    // 双击检测（同单行输入框）：第二击选中"词"并进入词模式。
+                    let is_dbl = {
+                        let (pf, pp) = (ws.last_click_frame, ws.last_click_pos);
+                        ws.last_click_frame = self.state.frame;
+                        ws.last_click_pos = self.mouse_logical;
+                        pf != 0
+                            && self.state.frame.wrapping_sub(pf) <= DOUBLE_CLICK_FRAMES
+                            && (self.mouse_logical - pp).length() < DOUBLE_CLICK_DIST
+                    };
+                    ws.press_mouse = Some(self.mouse_screen.round());
+                    if is_dbl {
+                        let (w0, w1) = crate::edit::word_range(value, ws.caret);
+                        ws.sel_anchor = Some(w0);
+                        ws.caret = w1;
+                        ws.sel_word = true;
+                    } else {
+                        ws.sel_word = false;
+                        ws.sel_anchor = Some(ws.caret);
+                    }
                 }
-                ws.press_mouse = Some(self.mouse_screen.round());
-                ws.sel_anchor = Some(ws.caret);
-            } else if ws.pressed && btn.pressed() {
+            } else if ws.pressed && btn.pressed() && ws.sel_anchor.is_some() {
                 // 拖拽选择：**位移 ≥ 3 物理像素**才扩展选择（单击微动不误选）；
                 // 光标跟随鼠标（**即使拖出输入框**——edge-scroll 持续滚动）。
                 self.press_claimed = true;
@@ -4005,63 +4897,38 @@ impl Ui<'_> {
                     .unwrap_or(false);
                 if moved {
                     if let Some(c) = drag_caret {
-                        ws.caret = c;
+                        if ws.sel_word {
+                            // 词模式（双击后拖拽）：按词边界扩散选择
+                            let anchor = ws.sel_anchor.unwrap_or(c);
+                            ws.caret = crate::edit::extend_word_caret(value, anchor, c);
+                        } else {
+                            ws.caret = c;
+                        }
                     }
                 }
             }
-            if ev.released && ws.sel_anchor == Some(ws.caret) {
+            if ev.released {
                 // 纯点击（无位移）→ 清理 anchor（无实际选择），避免残留 anchor 在
                 // 后续无 Shift 方向键移动时"突然变成多选"。
-                ws.sel_anchor = None;
+                if ws.sel_anchor == Some(ws.caret) {
+                    ws.sel_anchor = None;
+                }
+                // 释放后退出词模式（选择保留；下次单击/双击重开）。
+                ws.sel_word = false;
             }
             let focused = self.state.focused.as_deref() == Some(id);
             if focused {
                 let in_ime_compose =
                     self.keyboard.get_ime_preedit().is_some_and(|p| !p.is_empty());
                 let ime_owns_keys = in_ime_compose || self.state.ime_composing;
-                // 剪贴板：Ctrl+C/V/X/A（多行：粘贴保留换行）。
-                let ctrl = self.keyboard.get(KeyCode::ControlLeft).pressed()
-                    || self.keyboard.get(KeyCode::ControlRight).pressed();
-                Self::clipboard_shortcuts(&self.keyboard, ws, value, false);
-                // 编辑操作前：选择替换（Ctrl 组合字符不触发）
-                let edit_pending = (!self.keyboard.get_chars().is_empty() && !ctrl)
-                    || !self.keyboard.get_ime_commits().is_empty()
-                    || (self.keyboard.get(KeyCode::Backspace).down_edge() && !ime_owns_keys)
-                    || (self.keyboard.get(KeyCode::Delete).down_edge() && !ime_owns_keys)
-                    || self.keyboard.get(KeyCode::Enter).down_edge();
-                // 选择删除是否已**消费**本次 Backspace/Delete（见单行输入框同款说明）
-                let mut sel_consumed = false;
-                if edit_pending {
-                    if let Some((lo, hi)) = sel_range(ws.sel_anchor, ws.caret) {
-                        delete_range(value, lo, hi);
-                        ws.caret = lo;
-                        ws.sel_anchor = None;
-                        sel_consumed = true;
-                    }
-                }
-                // 换行（Enter；TextArea 语义：插入 '\n'，Esc 失焦）
+                // 编辑状态机（多行）：剪贴板保留换行、选择替换（Enter 计入）、
+                // IME 上屏、普通字符（过滤 '\n'）、退格/删除。
+                crate::edit::apply_frame_edits(&self.keyboard, ws, value, true, ime_owns_keys);
+                // 换行（Enter；TextArea 语义：插入 '\n'，Esc 失焦）——选择替换已由
+                // apply_frame_edits 在 Enter 计入 edit_pending 时先消费。
                 if self.keyboard.get(KeyCode::Enter).down_edge() {
                     insert_char_at(value, ws.caret, '\n');
                     ws.caret = (ws.caret + 1).min(value.chars().count());
-                }
-                for commit in self.keyboard.get_ime_commits() {
-                    insert_str_at(value, ws.caret, commit);
-                    ws.caret = (ws.caret + commit.chars().count()).min(value.chars().count());
-                }
-                if !ctrl {
-                    for ch in self.keyboard.get_chars() {
-                        if *ch == '\n' || *ch == '\r' {
-                            continue; // 换行统一由 Enter 处理
-                        }
-                        insert_char_at(value, ws.caret, *ch);
-                        ws.caret = (ws.caret + 1).min(value.chars().count());
-                    }
-                }
-                if self.keyboard.get(KeyCode::Backspace).down_edge() && !ime_owns_keys && !sel_consumed {
-                    ws.caret = remove_before(value, ws.caret);
-                }
-                if self.keyboard.get(KeyCode::Delete).down_edge() && !ime_owns_keys && !sel_consumed {
-                    remove_at(value, ws.caret);
                 }
                 // Shift + 方向键/Home/End：扩展选择
                 let shift = self.keyboard.get(KeyCode::ShiftLeft).pressed()
@@ -4083,57 +4950,58 @@ impl Ui<'_> {
                         ws.sel_anchor = None;
                     }
                 };
+                // ←/→：字符移动（Shift 扩展，共用状态机）。
                 if self.keyboard.get(KeyCode::ArrowLeft).down_edge() && !ime_owns_keys {
-                    shift_start(ws);
-                    shift_clear(ws);
-                    ws.caret = ws.caret.saturating_sub(1);
-                    shift_shrink(ws);
+                    crate::edit::caret_horiz(ws, value, -1, shift);
                 }
                 if self.keyboard.get(KeyCode::ArrowRight).down_edge() && !ime_owns_keys {
-                    shift_start(ws);
-                    shift_clear(ws);
-                    ws.caret = (ws.caret + 1).min(value.chars().count());
-                    shift_shrink(ws);
+                    crate::edit::caret_horiz(ws, value, 1, shift);
                 }
                 if self.keyboard.get(KeyCode::ArrowUp).down_edge() && !ime_owns_keys {
                     shift_start(ws);
                     shift_clear(ws);
                     // 跨**视觉行**（保持列；列 = 相对行首的 char 数）
                     let cur_byte = char_to_byte(value, ws.caret);
-                    let li = vline_of_byte(cur_byte);
+                    let li = vline_of_byte(&vlines, cur_byte);
                     let col = byte_to_char(value, cur_byte) - byte_to_char(value, vlines[li].byte_start);
                     let tgt = li.saturating_sub(1);
                     let line = &vlines[tgt];
-                    let ltxt = &value[line.byte_start..line.byte_end.min(value.len())];
+                    // 编辑同帧改写文本后 vlines 可能过期：字节边界对齐防 panic
+                    // （短暂错位次帧重排后自愈）。
+                    let ls = value.floor_char_boundary(line.byte_start);
+                    let ltxt = safe_line_slice(value, line);
                     let col = col.min(ltxt.chars().count());
-                    ws.caret = byte_to_char(value, line.byte_start + char_to_byte(ltxt, col));
+                    ws.caret = byte_to_char(value, ls + char_to_byte(ltxt, col));
                     shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::ArrowDown).down_edge() && !ime_owns_keys {
                     shift_start(ws);
                     shift_clear(ws);
                     let cur_byte = char_to_byte(value, ws.caret);
-                    let li = vline_of_byte(cur_byte);
+                    let li = vline_of_byte(&vlines, cur_byte);
                     let col = byte_to_char(value, cur_byte) - byte_to_char(value, vlines[li].byte_start);
                     let tgt = (li + 1).min(vlines.len().saturating_sub(1));
                     let line = &vlines[tgt];
-                    let ltxt = &value[line.byte_start..line.byte_end.min(value.len())];
+                    let ls = value.floor_char_boundary(line.byte_start);
+                    let ltxt = safe_line_slice(value, line);
                     let col = col.min(ltxt.chars().count());
-                    ws.caret = byte_to_char(value, line.byte_start + char_to_byte(ltxt, col));
+                    ws.caret = byte_to_char(value, ls + char_to_byte(ltxt, col));
                     shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::Home).down_edge() && !ime_owns_keys {
                     shift_start(ws);
                     shift_clear(ws);
-                    let li = vline_of_byte(char_to_byte(value, ws.caret));
-                    ws.caret = byte_to_char(value, vlines[li].byte_start);
+                    let li = vline_of_byte(&vlines, char_to_byte(value, ws.caret));
+                    ws.caret =
+                        byte_to_char(value, value.floor_char_boundary(vlines[li].byte_start));
                     shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::End).down_edge() && !ime_owns_keys {
                     shift_start(ws);
                     shift_clear(ws);
-                    let li = vline_of_byte(char_to_byte(value, ws.caret));
-                    ws.caret = byte_to_char(value, vlines[li].byte_end);
+                    let li = vline_of_byte(&vlines, char_to_byte(value, ws.caret));
+                    ws.caret =
+                        byte_to_char(value, value.floor_char_boundary(vlines[li].byte_end.min(value.len())));
                     shift_shrink(ws);
                 }
                 if self.keyboard.get(KeyCode::Escape).down_edge() {
@@ -4143,20 +5011,36 @@ impl Ui<'_> {
             (focused, ws.caret)
         };
         let (focused, caret) = caret_est;
+        // 光标是否移动（编辑/点击/拖选/方向键）；false = 纯滚轮滚动 → 不做光标跟随
+        let caret_moved = Some(caret) != prev_caret;
+        // 编辑（粘贴/打字/IME/退格/删除）可能已改写 `value` → **重新排版**：
+        // 视觉行字节区间必须对齐新文本，否则显示/光标定位用旧区间切片会落在
+        // 多字节字符中间（如粘贴中文时 `&value[a..b]` panic）。`ws` 已随
+        // `caret_est` 结束释放，可安全 `&mut self` 重排。
+        let vbuf = self.ensure_text_buf(
+            id,
+            value,
+            style.font_size,
+            style.font_family.as_deref(),
+            wrap_w,
+            TEXT_AREA_LINE_SPACING,
+        );
+        let vlines = Text::visual_lines(&vbuf);
         // **IME 组合内联融入**（多行）：显示串 = value[..caret] + preedit + value[caret..]，
         // 按内容宽度**重新换行**——组合后的后续文本右移/换行而非被盖住；组合较长时
         // 垂直滚动跟随组合光标。无组合时回落 value（零开销路径）。
+        // IME 组合串先拷出（owned）：闭包内要 &mut self（text_size 测量），
+        // 与自持快照字段 self.keyboard 的借用不能共存。
+        let preedit = self.keyboard.get_ime_preedit().map(|p| p.to_owned());
+        let preedit_caret = self.keyboard.get_ime_preedit_caret();
         let composed: Option<(String, std::ops::Range<usize>, f32, usize)> = if focused {
-            self.keyboard
-                .get_ime_preedit()
+            preedit
                 .filter(|p| !p.is_empty())
                 .map(|p| {
                     let insert_b = char_to_byte(value, caret);
                     let disp = format!("{}{}{}", &value[..insert_b], p, &value[insert_b..]);
-                    let w = self.text_size(p, style.font_size, style.font_family.as_deref()).x;
-                    let caret_b = self
-                        .keyboard
-                        .get_ime_preedit_caret()
+                    let w = self.text_size(&p, style.font_size, style.font_family.as_deref()).x;
+                    let caret_b = preedit_caret
                         .map(|b| p.floor_char_boundary(b.min(p.len())))
                         .unwrap_or(p.len());
                     (disp, insert_b..insert_b + p.len(), w, insert_b + caret_b)
@@ -4173,7 +5057,7 @@ impl Ui<'_> {
                         disp,
                         style.font_size,
                         style.font_family.as_deref(),
-                        content_w,
+                        wrap_w,
                         TEXT_AREA_LINE_SPACING,
                     );
                     (b.clone(), Text::visual_lines(&b), Some(disp.clone()))
@@ -4193,16 +5077,55 @@ impl Ui<'_> {
             let prefix = &draw_text[line.byte_start..end];
             self.text_size(prefix, style.font_size, style.font_family.as_deref()).x
         };
-        let caret_y = caret_line as f32 * line_h;
+        // 不换行模式：**水平滚动**跟随光标（同单行输入框；光标右侧保留 8 逻辑像素）；
+        // **水平滚轮（触控板）优先**——自由滚动（可把光标滚出视图，**仅鼠标在框内
+        // 时**），否则仅光标移动时跟随。换行模式：无水平滚动（text_dx = 0）。
+        let (wx, wy) = self.mouse.get_mouse_wheel_delta();
+        let text_dx = if wrap {
+            0.0
+        } else {
+            let line = &draw_vlines[caret_line];
+            let ls = value.floor_char_boundary(line.byte_start);
+            let le = value.floor_char_boundary(line.byte_end.min(value.len()));
+            let line_w = if ls < le {
+                self.text_size(&draw_text[ls..le], style.font_size, style.font_family.as_deref())
+                    .x
+            } else {
+                0.0
+            };
+            let ws = self.state.widgets.entry(id.to_owned()).or_default();
+            if hit && wx != 0.0 {
+                // 水平滚轮（触控板）：自由滚动（可超出光标），clamp 到内容宽
+                let max_h_px = ((line_w - content_w).max(0.0) * self.scale).round();
+                ws.text_scroll = (ws.text_scroll - (wx as f32 * 40.0 * self.scale).round())
+                    .clamp(0.0, max_h_px);
+            } else if caret_moved {
+                // 光标移动（打字/方向键/点击/拖选）→ 跟随；滚轮滚动不跟随
+                ws.text_scroll = scroll_follow_caret(
+                    ws.text_scroll,
+                    caret_x * self.scale,
+                    content_w * self.scale,
+                    line_w * self.scale,
+                    8.0 * self.scale,
+                );
+            }
+            -ws.text_scroll / self.scale
+        };
+        // 光标 y = **真实行顶**（`VisualLine.top` **物理像素**）——与渲染行网格
+        // 完全一致；`行号 × line_h` 每行差 ~0.2px，长文本累积后光标/滚动目标漂移
+        // （视图卡在短于真正底部的纵轴范围内）。`caret_y`（逻辑）供绘制用。
+        let caret_y_px = draw_vlines[caret_line].top;
+        let caret_y = caret_y_px / self.scale;
         // 垂直滚动：滚轮 + 光标跟随。内容高用**实际排版缓冲**（组合时 = 显示串缓冲）。
         let content_h = Text::measure_buffer(&draw_buf).y / self.scale;
-        let max_scroll = (content_h - rect.h).max(0.0);
+        let max_scroll_px = ((content_h - rect.h).max(0.0) * self.scale).round();
         let scroll = {
             let ws = self.state.widgets.entry(id.to_owned()).or_default();
-            if !ws.pressed {
-                let (_, wy) = self.mouse.get_mouse_wheel_delta();
+            // 滚轮（**仅鼠标在框内时**——指针离开输入框后不再滚动；拖选中不滚轮）。
+            if hit && !ws.pressed {
                 if wy != 0.0 {
-                    ws.scroll_y = (ws.scroll_y - wy as f32 * 30.0).clamp(0.0, max_scroll);
+                    ws.scroll_y = (ws.scroll_y - (wy as f32 * 30.0 * self.scale).round())
+                        .clamp(0.0, max_scroll_px);
                 }
             }
             // **拖选 edge-scroll**：鼠标越出可视区上下缘时按越出量持续滚动
@@ -4210,18 +5133,24 @@ impl Ui<'_> {
             if ws.pressed {
                 let y = mouse_local_y - rect.y;
                 if y > rect.h {
-                    ws.scroll_y = (ws.scroll_y + (y - rect.h)).min(max_scroll);
+                    ws.scroll_y = (ws.scroll_y + (y - rect.h) * self.scale).min(max_scroll_px);
                 } else if y < 0.0 {
-                    ws.scroll_y = (ws.scroll_y + y).max(0.0);
+                    ws.scroll_y = (ws.scroll_y + y * self.scale).max(0.0);
                 }
             }
-            // 光标跟随：光标行滚出可视区时调整
-            if caret_y < ws.scroll_y {
-                ws.scroll_y = caret_y;
-            } else if caret_y + line_h > ws.scroll_y + rect.h {
-                ws.scroll_y = (caret_y + line_h - rect.h).min(max_scroll);
+            // 光标跟随（仅**光标移动**时，如打字/方向键/点击/拖选）：光标行滚出
+            // 可视区时调整——滚轮滚动不移动光标 → 不跟随（滚轮自由滚动、光标可
+            // 滚出视图，且不被下一帧拉回）。
+            if caret_moved {
+                if caret_y_px < ws.scroll_y {
+                    ws.scroll_y = caret_y_px;
+                } else if caret_y_px + line_h * self.scale > ws.scroll_y + rect.h * self.scale {
+                    ws.scroll_y =
+                        (caret_y_px + line_h * self.scale - rect.h * self.scale)
+                            .min(max_scroll_px);
+                }
             }
-            ws.scroll_y = ws.scroll_y.clamp(0.0, max_scroll);
+            ws.scroll_y = ws.scroll_y.clamp(0.0, max_scroll_px);
             ws.scroll_y
         };
         // 绘制
@@ -4229,6 +5158,10 @@ impl Ui<'_> {
         let win = self.cur_win;
         let elem = self.seq + 1;
         let border = if focused { style.border_focus } else { style.border };
+        // **Clip 子沙箱**（控件内）：强制裁剪层 = 外层强制 ∩ 输入框矩形。
+        // 光标 / 高亮 / 文本命令自动受其裁剪（滚出视图不画出框）。
+        let saved_clip = self.clip;
+        self.clip = clip_for_view(saved_clip, box_clip, ViewMode::Clip);
         self.push_panel_like(rect, style.bg, border, style.border_w, style.radius, elem);
         // 选择高亮（逐**视觉行**；x = 行内前缀宽度，y = 视觉行序号 × 行高——与显示一致）
         if let Some((lo, hi)) = sel_range(
@@ -4237,8 +5170,10 @@ impl Ui<'_> {
         ) {
             let lo_byte = char_to_byte(value, lo);
             let hi_byte = char_to_byte(value, hi);
-            let lo_li = vline_of_byte(lo_byte);
-            let hi_li = vline_of_byte(hi_byte);
+            // 用**重新排版后**的 vlines（编辑后行区间才与当前文本一致，否则高亮
+            // 错位/消失；见上方重排注释）。
+            let lo_li = vline_of_byte(&vlines, lo_byte);
+            let hi_li = vline_of_byte(&vlines, hi_byte);
             for li in lo_li..=hi_li {
                 let line = &vlines[li];
                 let ls = line.byte_start.min(value.len());
@@ -4254,10 +5189,12 @@ impl Ui<'_> {
                 let x1 = self
                     .text_size(&value[ls..c1b], style.font_size, style.font_family.as_deref())
                     .x;
-                // y 随垂直滚动上移（-scroll）；clip = 内容区（选择高亮受裁剪，不溢出）。
+                // y 随垂直滚动上移（-scroll/scale）；clip = 输入框强制层（选择高亮
+                // 受裁剪，不溢出输入框 / 外层滚动容器）。
+                // 行顶用真实 `VisualLine.top`（与文本行网格一致，长文本不漂移）。
                 let sel_rect = Rect::new(
-                    content_rect.x + x0,
-                    rect.y + li as f32 * line_h - scroll,
+                    content_rect.x + x0 + text_dx,
+                    rect.y + vlines[li].top / self.scale - scroll / self.scale,
                     (x1 - x0).max(0.0),
                     line_h,
                 );
@@ -4269,13 +5206,13 @@ impl Ui<'_> {
                         win,
                         elem,
                         rect: sel_rect,
-                        clip: Some(content_rect),
+                        clip: self.clip,
                         kind: DrawKind::Solid(style.sel_bg),
                     });
                 }
             }
         }
-        // 文本（换行 + 垂直滚动；clip 相对文本块：上缘 = scroll_y，高 = 可视区；
+        // 文本（换行 + 垂直滚动；clip 相对文本块：上缘 = scroll/scale，高 = 可视区；
         // 缓冲控件自持——组合时用显示串缓冲，否则复用 `vbuf`）。
         let seq = self.next_seq();
         self.queue.push(text_cmd(
@@ -4283,7 +5220,12 @@ impl Ui<'_> {
             seq,
             win,
             elem,
-            Rect::new(content_rect.x, content_rect.y - scroll, content_w, rect.h),
+            Rect::new(
+                content_rect.x + text_dx,
+                content_rect.y - scroll / self.scale,
+                content_w,
+                rect.h,
+            ),
             Arc::from(draw_text),
             style.font_size,
             style.fg,
@@ -4291,7 +5233,13 @@ impl Ui<'_> {
             // 多行编辑：**顶对齐**（行盒顶 = 内容区顶），与光标/点击的 TopLeft 定位一致
             TextVAlign::Top,
             style.font_family.clone(),
-            Some(Rect::new(0.0, scroll, content_w, rect.h)),
+            // 内层裁剪相对**移动后**的文本 rect（含水平滚动）：窗口固定在视觉框
+            Some(Rect::new(
+                -style.padding_x - text_dx,
+                scroll / self.scale,
+                rect.w,
+                rect.h,
+            )),
             self.clip,
             Some(draw_buf),
         ));
@@ -4316,8 +5264,9 @@ impl Ui<'_> {
                     .text_size(&disp[ls..x1b], style.font_size, style.font_family.as_deref())
                     .x;
                 let ul = Rect::new(
-                    content_rect.x + x0,
-                    rect.y + li as f32 * line_h + line_h - 3.0 - scroll,
+                    content_rect.x + x0 + text_dx,
+                    rect.y + draw_vlines[li].top / self.scale + line_h - 3.0
+                        - scroll / self.scale,
                     (x1 - x0).max(0.0),
                     2.0,
                 );
@@ -4329,7 +5278,7 @@ impl Ui<'_> {
                         win,
                         elem,
                         rect: ul,
-                        clip: Some(content_rect),
+                        clip: self.clip,
                         kind: DrawKind::Solid(style.preedit),
                     });
                 }
@@ -4337,8 +5286,9 @@ impl Ui<'_> {
         }
         // **IME 候选框定位**：跟随组合光标（窗口客户区物理像素；无组合 = 输入光标）。
         if focused {
-            let ime_x = ((self.abs_base.x + content_rect.x + caret_x) * self.scale) as i32;
-            let ime_y = ((self.abs_base.y + rect.y + caret_y - scroll) * self.scale) as i32;
+            let ime_x = ((self.abs_base.x + content_rect.x + caret_x + text_dx) * self.scale) as i32;
+            let ime_y =
+                ((self.abs_base.y + rect.y) * self.scale + caret_y_px - scroll) as i32;
             let ime_w = (rect.w * self.scale).max(1.0) as u32;
             let ime_h = (line_h * self.scale).max(1.0) as u32;
             let _ = self.window.set_ime_cursor_area(
@@ -4349,8 +5299,8 @@ impl Ui<'_> {
         // 光标（组合时 = 显示串内的组合光标）
         if focused && self.state.caret_blink_on() {
             let caret_rect = Rect::new(
-                content_rect.x + caret_x,
-                rect.y + caret_y - scroll,
+                content_rect.x + caret_x + text_dx,
+                rect.y + caret_y - scroll / self.scale,
                 1.0,
                 line_h,
             );
@@ -4368,6 +5318,25 @@ impl Ui<'_> {
                 },
             });
         }
+        // **垂直滚动条**（内容超出可视区时显示；拖 thumb / 点轨道翻页）——
+        // 复用 `scroll_at` 的滚动条（物理像素偏移；`elem` = 本控件 → 覆盖在文本
+        // 之上）；状态 ID 独立（`{id}::vbar`），拖拽与文本选择互不干扰。
+        if content_h > rect.h + 1.0 && rect.h > 0.0 {
+            let new_px = self.scrollbar(
+                &format!("{id}::vbar"),
+                &Rect::new(rect.x, rect.y, rect.w, rect.h),
+                rect.h,
+                content_h,
+                scroll,
+                max_scroll_px,
+                self.clip,
+                elem,
+            );
+            let ws = self.state.widgets.entry(id.to_owned()).or_default();
+            ws.scroll_y = new_px;
+        }
+        // 退出 Clip 子沙箱（恢复外层强制裁剪层）。
+        self.clip = saved_clip;
     }
 }
 
@@ -4398,6 +5367,7 @@ impl From<TextAlign> for Align {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edit::{remove_at, remove_before};
 
     #[test]
     fn insert_char_at_handles_caret() {
@@ -4697,6 +5667,43 @@ mod tests {
     }
 
     #[test]
+    fn anchor_pos_covers_all_corners_and_clamps() {
+        let vp = Vec2::new(1280.0, 720.0);
+        let size = Vec2::new(200.0, 20.0);
+        let m = Vec2::new(16.0, 16.0);
+        // 四角 + 边距
+        assert_eq!(Ui::anchor_pos_in(vp, Anchor::TopLeft, size, m), Vec2::new(16.0, 16.0));
+        assert_eq!(
+            Ui::anchor_pos_in(vp, Anchor::TopRight, size, m),
+            Vec2::new(1280.0 - 16.0 - 200.0, 16.0)
+        );
+        assert_eq!(
+            Ui::anchor_pos_in(vp, Anchor::BottomLeft, size, m),
+            Vec2::new(16.0, 720.0 - 16.0 - 20.0)
+        );
+        assert_eq!(
+            Ui::anchor_pos_in(vp, Anchor::BottomRight, size, m),
+            Vec2::new(1280.0 - 16.0 - 200.0, 720.0 - 16.0 - 20.0)
+        );
+        // 居中（上下 / 左右边距对称）
+        assert_eq!(
+            Ui::anchor_pos_in(vp, Anchor::Center, size, m),
+            Vec2::new(16.0 + (1280.0 - 32.0 - 200.0) * 0.5, 16.0 + (720.0 - 32.0 - 20.0) * 0.5)
+        );
+        // 底中对齐
+        assert_eq!(
+            Ui::anchor_pos_in(vp, Anchor::BottomCenter, size, m),
+            Vec2::new(16.0 + (1280.0 - 32.0 - 200.0) * 0.5, 720.0 - 16.0 - 20.0)
+        );
+        // 内容超视口（+边距）→ clamp 贴边（左上/左下角，不产生负坐标；
+        // 内容本身比视口宽时无法完全放入，贴边即可）
+        let big = Vec2::new(2000.0, 1000.0);
+        let p = Ui::anchor_pos_in(vp, Anchor::BottomRight, big, m);
+        assert!(p.x >= 0.0 && p.y >= 0.0, "不产生负坐标");
+        assert_eq!(Ui::anchor_pos_in(vp, Anchor::TopLeft, big, m), Vec2::new(16.0, 16.0), "左上角不 clamp");
+    }
+
+    #[test]
     fn topmost_win_never_occluded() {
         use crate::hit::window_occluded;
         // 任意普通窗口叠放时，置顶哨兵 z（浮层）恒不被遮挡 → 浮层始终可交互。
@@ -4771,5 +5778,25 @@ mod tests {
             Vec2::new(3.0, 3.0),
             "脚本对 id 返回 None → 落到用户拖拽状态"
         );
+    }
+
+    #[test]
+    fn safe_line_slice_never_panics_on_stale_byte_ranges() {
+        // 回归：TextArea 粘贴中文后，旧视觉行字节区间落在新文本多字节字符中间
+        // （"start byte index 64 is not a char boundary; inside '尾'" panic）。
+        // safe_line_slice 必须对齐到字符边界且不 panic。
+        // "窗口 A 选项\n尾部文字"：'项' = bytes 12..15（3 字节/字符）
+        let value = "窗口 A 选项\n尾部文字";
+        // 模拟过期 vlines：区间起点/终点落在 '项'（12..15）中间
+        let stale = VisualLine { byte_start: 13, byte_end: 14, top: 0.0, width: 10.0 };
+        let s = safe_line_slice(value, &stale);
+        // 13 → floor 到 '项' 起点 12；14 → floor 到 12 → s == e → 空串（不 panic）
+        assert_eq!(s, "");
+        // 区间越过末尾：byte_end 超 len → clamp 到 len 并取整
+        let over = VisualLine { byte_start: 0, byte_end: 999, top: 0.0, width: 10.0 };
+        assert_eq!(safe_line_slice(value, &over), value);
+        // 正常区间原样返回（0..6 = "窗口"）
+        let ok = VisualLine { byte_start: 0, byte_end: 6, top: 0.0, width: 10.0 };
+        assert_eq!(safe_line_slice(value, &ok), "窗口");
     }
 }

@@ -38,9 +38,18 @@ pub struct WidgetState {
     pub caret: usize,
     /// 文本选择锚点（char 索引；`Some` = 有选择，范围 = [min(anchor,caret), max)）。
     pub sel_anchor: Option<usize>,
-    /// 单行输入框**水平滚动偏移**（逻辑像素）：超长文本时文本左移、光标跟随可见。
+    /// **双击检测**：上次按下帧号（0 = 无历史；与光标闪烁同用 `UiState.frame` 时钟）。
+    pub(crate) last_click_frame: u64,
+    /// **双击检测**：上次按下位置（逻辑像素；位移 < 阈值才算同一点）。
+    pub(crate) last_click_pos: Vec2,
+    /// **词模式选择**：双击后按住拖拽按词边界扩散（`extend_word_caret`）。
+    pub(crate) sel_word: bool,
+    /// 上一帧是否持有键盘焦点（内置 NumberInput 用：**仅首次聚焦时全选**，
+    /// 之后可正常用鼠标部分选择文本）。
+    pub(crate) focused_prev: bool,
+    /// 单行输入框**水平滚动偏移**（**物理像素**）：超长文本时文本左移、光标跟随可见。
     pub text_scroll: f32,
-    /// 多行输入框（TextArea）**垂直滚动偏移**（逻辑像素）。
+    /// 多行输入框（TextArea）**垂直滚动偏移**（**物理像素**）。
     pub scroll_y: f32,
     /// **控件自持的文本排版缓冲**：`(key, Arc<Buffer>)`，key 含文本/字号/字体/换行宽/
     /// 版本。文本频繁变化的输入框在此缓存（**不污染** `UiState::text_buffers` 全局缓存）；
@@ -51,7 +60,10 @@ pub struct WidgetState {
 /// 滚动容器状态（`UiState.scrolls`，跨帧持久）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ScrollState {
-    /// 垂直滚动偏移（内容顶部相对可视区顶部；逻辑像素，已 clamp）。
+    /// 滚动偏移（**物理像素**，已 clamp）。以整物理像素步进（滚轮 / 拖 thumb 均
+    /// 取整），保证非整数 DPI（125%/150%）下内容按 `offset / scale` 逻辑平移后，
+    /// 每个元素绘制取整时**整体刚性移动**——否则相邻元素取整相位不同步，拖动
+    /// 滚动条时内容相对位置逐帧交替（"抖动"，如勾选框的蓝色填充块）。
     pub offset: f32,
     /// 内容总高（逻辑像素；clamp 上限 = max(0, content_h - view_h)）。
     pub content_h: f32,
@@ -148,6 +160,15 @@ pub struct UiState {
     pub(crate) scrolls: HashMap<String, ScrollState>,
     /// **下拉框展开状态**：当前展开的 `combo` 的 id（`None` = 全部收起）。
     pub(crate) combo_open: Option<String>,
+    /// **固定宽窗口的宽度**（`window_at_w` 鼠标缩放：id → 逻辑宽度，跨帧持久）。
+    pub(crate) window_widths: HashMap<String, f32>,
+    /// **用户拖拽缩放的控件尺寸**（[`Ui::resize_handle`]：id → 逻辑尺寸，跨帧持久）。
+    /// 可缩放 widget 的 `size()` 优先读它（首次 = 内容自然尺寸）。
+    pub sizes: HashMap<String, Vec2>,
+    /// **上一帧 rjw_ui 是否设置过系统光标**（`finish` 光标抑制用：本帧无 UI 光标
+    /// 意图且上一帧设过 → 清一次回 Default；从未设过 → 不碰系统光标，保留应用
+    /// 自定义光标，如游戏准星）。
+    pub(crate) cursor_was_set: bool,
     /// **UI 帧性能统计**（`finish` 各阶段耗时；示例/诊断读取）。
     pub stats: UiStats,
 }
@@ -199,6 +220,7 @@ impl UiState {
         self.last_press_window = None;
         self.scrolls.clear();
         self.combo_open = None;
+        self.sizes.clear();
         self.stats = UiStats::default();
     }
 

@@ -223,6 +223,44 @@ impl Camera2D {
     }
 }
 
+/// **视口**（UI 专用）："窗口像素 → 世界"的映射（**identity 相机特例**：
+/// pos=0 / rot=0 / zoom=1，UI 不旋转/缩放，无需相机语义）。
+///
+/// `rjw_ui` 的 [`Ui::finish`](crate::ui::Ui::finish) 用它替代 [`Camera2D`]：
+/// - [`Self::vp_matrix`]：Render2D 的 `set_mvp`（= identity 相机的 View-Projection）；
+/// - [`Self::screen_to_world`]：屏幕固定文本/图形变换的锚点换算。
+///
+/// 数学直接委托恒等 [`Camera2D`]（`new(size)` + `set_vp(size, pos)`），零重复。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    /// 视口左上角（窗口像素）。
+    pub pos: Vec2,
+    /// 视口尺寸（像素）。
+    pub size: Vec2,
+}
+
+impl Viewport {
+    pub const fn new(size: Vec2, pos: Vec2) -> Self {
+        Self { pos, size }
+    }
+
+    /// identity 相机的 View-Projection 矩阵（含 Y flip）——Render2D `set_mvp` 用。
+    #[inline]
+    pub fn vp_matrix(&self) -> Mat4 {
+        let mut c = Camera2D::new(self.size);
+        c.set_vp(self.size, self.pos);
+        c.vp_matrix()
+    }
+
+    /// 窗口像素 → 世界（identity 相机特例，数学同 [`Camera2D::screen_to_world`]）。
+    #[inline]
+    pub fn screen_to_world(&self, screen_px: Vec2) -> Vec2 {
+        let mut c = Camera2D::new(self.size);
+        c.set_vp(self.size, self.pos);
+        c.screen_to_world(screen_px)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +455,41 @@ mod tests {
             assert!(
                 (via_tf - expect).length() < 0.05,
                 "均匀缩放 view_transform({w:?})={via_tf:?} 应等于屏幕偏移 {expect:?}"
+            );
+        }
+    }
+
+    /// Viewport = identity 相机的"窗口像素 → 世界"（1:1 屏幕固定数学）。
+    #[test]
+    fn viewport_screen_to_world_matches_identity_camera() {
+        let vp = Viewport::new(Vec2::new(W, H), Vec2::new(40.0, 30.0));
+        // 与同参恒等 Camera2D 结果一致
+        let mut c = Camera2D::new(Vec2::new(W, H));
+        c.set_vp(Vec2::new(W, H), Vec2::new(40.0, 30.0));
+        for px in [Vec2::ZERO, Vec2::new(640.0, 360.0), Vec2::new(W, H), Vec2::new(123.0, 456.0)] {
+            assert!(
+                (vp.screen_to_world(px) - c.screen_to_world(px)).length() < 1e-4,
+                "screen_to_world({px:?}) 应等于恒等相机"
+            );
+        }
+    }
+
+    /// Viewport 屏幕固定变换：局部点 → 世界 → world_to_screen = 锚点 + 局部（1:1）。
+    #[test]
+    fn viewport_screen_fixed_transform_maps_local_to_screen_1to1() {
+        let vp = Viewport::new(Vec2::new(W, H), Vec2::ZERO);
+        let anchor_px = Vec2::new(40.0, 30.0);
+        let t = crate::Transform2D::IDENTITY.with_pos(vp.screen_to_world(anchor_px));
+        // 用与 Viewport 同参的 Camera2D 做 world_to_screen 往返
+        let mut c = Camera2D::new(Vec2::new(W, H));
+        c.set_vp(Vec2::new(W, H), Vec2::ZERO);
+        for local in [Vec2::ZERO, Vec2::new(50.0, 12.0), Vec2::new(300.0, -40.0), Vec2::new(-20.0, 100.0)] {
+            let world = t.transform_point(local);
+            let screen = c.world_to_screen(world);
+            let expect = anchor_px + local;
+            assert!(
+                (screen - expect).length() < 0.05,
+                "local {local:?} → screen {screen:?} 应等于 {expect:?}"
             );
         }
     }

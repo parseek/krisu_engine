@@ -12,12 +12,37 @@ pub struct Theme {
     pub slider: SliderStyle,
     pub input: InputStyle,
     pub checkbox: CheckboxStyle,
+    /// **分割线样式**（[`Ui::divider_at`](crate::ui::Ui::divider_at) / 容器 `divider()`）。
+    pub divider: DividerStyle,
     /// 调试样式（debug_layout 描边等；DebugDraw 图元的样式 = 每次调用显式传参）。
     pub debug: DebugStyle,
     /// **焦点样式**（键盘导航）：当前焦点控件的描边（`finish` 绘制）。
     pub focus: FocusStyle,
+    /// **模态对话框样式**（[`Ui::modal_at`](crate::ui::Ui::modal_at) 遮罩）。
+    pub modal: ModalStyle,
+    /// **单行控件统一高度**（逻辑像素）：水平行容器（`p.row(...)`）内所有子项强制
+    /// 等高——Label/Button/输入框各自内容垂直居中 → 文字中心线对齐（近似基线）。
+    pub row_h: f32,
     /// pack / grid 默认子项间距（像素）。
     pub gap: f32,
+}
+
+/// 模态对话框样式（`modal_at` 的全屏遮罩）。
+#[derive(Clone, Debug)]
+pub struct ModalStyle {
+    /// 遮罩颜色（默认半透明黑，遮住背后内容）。
+    pub dim: Color,
+    /// 遮罩尺寸（**逻辑像素**；`None` = 全屏）。
+    pub size: Option<glam::Vec2>,
+}
+
+impl Default for ModalStyle {
+    fn default() -> Self {
+        Self {
+            dim: Color::rgba_u8(0, 0, 0, 140),
+            size: None,
+        }
+    }
 }
 
 /// 纯文本标签样式。
@@ -178,12 +203,35 @@ impl Default for InputStyle {
     }
 }
 
+/// 分割线样式（[`Ui::divider_at`](crate::ui::Ui::divider_at) / [`crate::widget::Divider`]）。
+#[derive(Clone, Debug)]
+pub struct DividerStyle {
+    /// 线颜色。
+    pub color: Color,
+    /// 线厚度（逻辑像素）。
+    pub thickness: f32,
+    /// 上下留白（逻辑像素；占光标行高 = thickness + 2 × margin）。
+    pub margin: f32,
+}
+
+impl Default for DividerStyle {
+    fn default() -> Self {
+        Self {
+            color: Color::rgba_u8(150, 150, 150, 255),
+            thickness: 1.0,
+            margin: 4.0,
+        }
+    }
+}
+
 /// 勾选框 / 单选样式。
 #[derive(Clone, Debug)]
 pub struct CheckboxStyle {
     /// 方框边长。
     pub box_size: f32,
     pub box_border: Color,
+    /// 方框边框宽（逻辑像素；中心填充 = 外框 shrink(border_w + [`CHECKBOX_INNER`](crate::ui) 内边距)）。
+    pub border_w: f32,
     pub checked_fill: Color,
     pub fg: Color,
     pub font_size: f32,
@@ -197,6 +245,7 @@ impl Default for CheckboxStyle {
         Self {
             box_size: 16.0,
             box_border: Color::rgba_u8(140, 140, 140, 255),
+            border_w: 1.0,
             checked_fill: Color::rgba_u8(80, 140, 220, 255),
             fg: Color::rgba_u8(30, 30, 30, 255),
             font_size: 14.0,
@@ -253,8 +302,11 @@ impl Theme {
             slider: SliderStyle::default(),
             input: InputStyle::default(),
             checkbox: CheckboxStyle::default(),
+            divider: DividerStyle::default(),
             debug: DebugStyle::default(),
             focus: FocusStyle::default(),
+            modal: ModalStyle::default(),
+            row_h: 26.0,
             gap: 6.0,
         }
     }
@@ -288,5 +340,141 @@ impl Theme {
         // 焦点描边：深色主题下更亮，便于看清焦点位置
         t.focus.color = Color::rgba_u8(96, 200, 255, 255);
         t
+    }
+
+    // ── with 链（责任链语义：链上后设覆盖先设；可级联的全局参数） ──
+
+    /// **全局字体族**：级联到全部文本子样式（`label` / `button` / `checkbox` /
+    /// `input`——滑块无文本、面板无字体）。`None` = 系统默认。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::Theme;
+    /// let theme = Theme::dark().with_font_family("Microsoft YaHei");
+    /// # let _ = theme;
+    /// ```
+    pub fn with_font_family(mut self, family: impl Into<String>) -> Self {
+        let f = Some(family.into());
+        self.label.font_family = f.clone();
+        self.button.font_family = f.clone();
+        self.checkbox.font_family = f.clone();
+        self.input.font_family = f;
+        self
+    }
+
+    /// **全局字号**：级联到全部文本子样式（`label` / `button` / `checkbox` / `input`）。
+    pub fn with_font_size(mut self, size: f32) -> Self {
+        self.label.font_size = size;
+        self.button.font_size = size;
+        self.checkbox.font_size = size;
+        self.input.font_size = size;
+        self
+    }
+
+    /// **圆角半径**：级联到 `panel` / `button` / `input`（逻辑像素；0 = 直角）。
+    pub fn with_radius(mut self, radius: f32) -> Self {
+        self.panel.radius = radius;
+        self.button.radius = radius;
+        self.input.radius = radius;
+        self
+    }
+
+    /// pack / grid 默认子项间距（像素）。
+    pub fn with_gap(mut self, gap: f32) -> Self {
+        self.gap = gap;
+        self
+    }
+
+    /// **单行控件统一高度**（水平行 `row(...)` 内子项强制等高；默认 26）。
+    pub fn with_row_h(mut self, row_h: f32) -> Self {
+        self.row_h = row_h;
+        self
+    }
+
+    /// 整体替换子样式（链上最后一个 `with_xxx` 生效）。
+    pub fn with_label(mut self, s: LabelStyle) -> Self {
+        self.label = s;
+        self
+    }
+    pub fn with_panel(mut self, s: PanelStyle) -> Self {
+        self.panel = s;
+        self
+    }
+    pub fn with_button(mut self, s: ButtonStyle) -> Self {
+        self.button = s;
+        self
+    }
+    pub fn with_slider(mut self, s: SliderStyle) -> Self {
+        self.slider = s;
+        self
+    }
+    pub fn with_input(mut self, s: InputStyle) -> Self {
+        self.input = s;
+        self
+    }
+    pub fn with_checkbox(mut self, s: CheckboxStyle) -> Self {
+        self.checkbox = s;
+        self
+    }
+    pub fn with_divider(mut self, s: DividerStyle) -> Self {
+        self.divider = s;
+        self
+    }
+    pub fn with_focus(mut self, s: FocusStyle) -> Self {
+        self.focus = s;
+        self
+    }
+    pub fn with_debug(mut self, s: DebugStyle) -> Self {
+        self.debug = s;
+        self
+    }
+    pub fn with_modal(mut self, s: ModalStyle) -> Self {
+        self.modal = s;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_chain_cascades_font_family_and_size() {
+        let t = Theme::dark()
+            .with_font_family("Microsoft YaHei")
+            .with_font_size(16.0);
+        // 级联：四个文本子样式全部生效
+        assert_eq!(t.label.font_family.as_deref(), Some("Microsoft YaHei"));
+        assert_eq!(t.button.font_family.as_deref(), Some("Microsoft YaHei"));
+        assert_eq!(t.checkbox.font_family.as_deref(), Some("Microsoft YaHei"));
+        assert_eq!(t.input.font_family.as_deref(), Some("Microsoft YaHei"));
+        assert_eq!(t.label.font_size, 16.0);
+        assert_eq!(t.button.font_size, 16.0);
+        assert_eq!(t.checkbox.font_size, 16.0);
+        assert_eq!(t.input.font_size, 16.0);
+        // 无文本子样式不受影响
+        assert_eq!(t.slider.track, Theme::dark().slider.track);
+    }
+
+    #[test]
+    fn with_chain_last_link_wins() {
+        // 责任链语义：后设覆盖先设
+        let t = Theme::default()
+            .with_radius(6.0)
+            .with_radius(0.0)
+            .with_gap(8.0);
+        assert_eq!(t.panel.radius, 0.0);
+        assert_eq!(t.button.radius, 0.0);
+        assert_eq!(t.input.radius, 0.0);
+        assert_eq!(t.gap, 8.0);
+    }
+
+    #[test]
+    fn with_substyle_replaces_whole_style() {
+        let mut button = Theme::dark().button;
+        button.bg = Color::RED;
+        let t = Theme::dark().with_button(button);
+        assert_eq!(t.button.bg, Color::RED);
+        // 未替换的子样式仍是 dark 预设
+        assert_eq!(t.panel.bg, Theme::dark().panel.bg);
     }
 }

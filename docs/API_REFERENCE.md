@@ -692,14 +692,15 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 
 | 函数 | 签名 / 用法 | 说明 |
 |---|---|---|
-| `Ui::begin` | `Ui::begin(window, &cam, &mouse, &keyboard, &mut text, &mut r2d, &mut state) -> UiInit` | 一帧一次；`window` 用于 IME 候选框定位；借用窗口/相机/输入/文本/渲染器/状态 |
+| `Ui::begin` | `Ui::begin(window, &mut text, &mut state) -> UiInit` | 一帧一次；`window` 用于 IME 候选框定位与光标图标。**输入与绘制解耦**：输入经 `UiInit::capture` 快照、相机/渲染器延迟到 `Ui::finish` 传入 |
+| `UiInit::capture(&MouseInput, &KeyboardInput)` | `.capture(&ctx.mouse, &ctx.keyboard)` | 把键盘/鼠标设备状态**拷贝**为 Ui 自持快照（省略 = 空输入，headless 安全） |
 | `UiInit::theme(Theme)` | `.theme(Theme::dark())` | 主题（默认浅色；`Theme::dark()` 深色） |
 | `UiInit::base_layer(f64)` | `.base_layer(1e7)` | 基层层级（默认 `1e7`） |
 | `UiInit::scale_factor(f64)` | `.scale_factor(ctx.scale_factor().unwrap_or(1.0))` | DPI：控件坐标/字号按逻辑像素，内部换算物理像素（默认 1.0） |
 | `UiInit::debug_layout(bool)` | `.debug_layout(true)` | 调试 UI 布局：给每个控件/容器矩形画描边（颜色/宽度见 [样式小节](#样式theme可-clone-覆盖) 的 `DebugStyle`；默认 false） |
 | `Ui::debug_layout(bool)` | `ui.debug_layout(on)` | 同 `UiInit::debug_layout`，帧内运行时开关 |
 | `UiInit::build()` | → `Ui` | 完成构建（内部 `state.begin_frame()`） |
-| `Ui::finish()` | `ui.finish()` | 排序 `(win, depth, 图形/文字, 录制序)` 并提交绘制；清空帧状态 |
+| `Ui::finish(&Viewport, &mut Render2D)` | `ui.finish(&viewport, r2d)` | 排序 `(win, depth, 图形/文字, 录制序)` 并提交绘制（视口/渲染器在此延迟传入；UI 无需相机，`Viewport{pos,size}` 提供屏幕固定变换）；清空帧状态 |
 | `UiState::new()` | 应用持有 | 跨帧持久状态容器 |
 | `UiState::reset()` / `remove(id)` | 示例"R 重开" | 清空全部 / 移除单个控件状态 |
 | `UiState::capturing_text()` | `if !ui_state.capturing_text() { /* 快捷键 */ }` | 输入框聚焦时屏蔽应用快捷键 |
@@ -864,8 +865,9 @@ use rjw_ui::{PackSide, Theme, Ui, UiState};
 let mut state = UiState::new();
 state.radio_groups.insert("diff".into(), "diff_normal".into()); // 默认选中
 
-// 每帧：
-let mut ui = Ui::begin(&cam, &ctx.mouse, &ctx.keyboard, &mut font, &mut r2d, &mut state)
+// 每帧（window/font 来自主循环；输入设备经 capture 快照；相机/渲染器延迟到 finish）：
+let mut ui = Ui::begin(window, &mut font, &mut state)
+    .capture(&ctx.mouse, &ctx.keyboard)
     .theme(Theme::dark()).build();
 
 ui.pack_at(Vec2::new(16.0, 16.0), PackSide::Top, |p| {
@@ -874,7 +876,7 @@ ui.pack_at(Vec2::new(16.0, 16.0), PackSide::Top, |p| {
     if p.checkbox("fs", "全屏", fs).toggled() { fs = !fs; }
     p.text_input("name", &mut name);
 });
-ui.finish();
+ui.finish(&viewport, r2d);
 ```
 
 > 约定：交互控件 ID 必须稳定；顶层用 `*_at`；控件坐标 = 屏幕**逻辑**像素（`.scale_factor` 设置 DPI，

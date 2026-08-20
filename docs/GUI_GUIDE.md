@@ -13,8 +13,9 @@ use rjw_ui::{PackSide, Theme, Ui, UiState};
 // 应用持有跨帧状态
 let mut ui_state = UiState::new();
 
-// 每帧：begin → 录制控件 → finish
-let mut ui = Ui::begin(window, &cam, &mouse, &keyboard, &mut text, &mut r2d, &mut ui_state)
+// 每帧：begin → 录制控件 → finish（输入经 capture 快照；相机/渲染器延迟到 finish 传入）
+let mut ui = Ui::begin(window, &mut text, &mut ui_state)
+    .capture(&mouse, &keyboard)
     .theme(Theme::dark())
     .base_layer(1e7)                        // UI 层（高于世界层）
     .scale_factor(ctx.scale_factor().unwrap_or(1.0))
@@ -32,8 +33,8 @@ ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {
     let vol = p.slider("vol", 0.0..=1.0, 0.6);
 });
 
-ui.finish();
-// r2d 提交（UI 的 Render2D 必须 set_sorting(false)）
+ui.finish(&viewport, r2d); // 视口/渲染器在此延迟传入（UI 无需相机，仅视口大小+位置）
+// r2d 提交（UI 的 Render2D 必须 set_sorting(false)；set_mvp 用 viewport.vp_matrix()）
 ```
 
 ---

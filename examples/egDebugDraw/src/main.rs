@@ -24,8 +24,8 @@ use rjw_color::Color;
 use rjw_main::*;
 use rjw_render::{wgpu, RenderConfig, RenderContext};
 use rjw_text::Text;
-use rjw_transform::{Camera2D, Rect, Transform2D};
-use rjw_ui::{Theme, Ui, UiState};
+use rjw_transform::{Rect, Transform2D, Viewport};
+use rjw_ui::{Theme, Ui, UiAdd, UiState};
 
 const LAYER_UI: f64 = 10_000_000.0;
 /// DebugDraw 覆盖层的基准层级（世界场景之上、UI 之下）。
@@ -41,7 +41,7 @@ struct DebugApp {
     render2d: Option<Render2D>,
     render2d_ui: Option<Render2D>,
     font: Option<Text>,
-    cam: Camera2D,
+    viewport: Viewport,
     ui_state: UiState,
     // ── 调试面板状态 ──
     debug_visible: bool,
@@ -68,7 +68,7 @@ impl DebugApp {
             render2d: None,
             render2d_ui: None,
             font: None,
-            cam: Camera2D::default(),
+            viewport: Viewport::new(Vec2::new(1280.0, 720.0), Vec2::ZERO),
             ui_state: UiState::new(),
             debug_visible: true,
             show_hitboxes: true,
@@ -106,19 +106,18 @@ impl App for DebugApp {
         render2d_ui.set_sorting(false);
         let font = Text::new(render2d.device(), render2d.queue(), render2d.tex_bind_group_layout());
         let (w, h) = render.size();
-        let mut cam = Camera2D::new(Vec2::new(w as f32, h as f32));
-        cam.set_vp(Vec2::new(w as f32, h as f32), Vec2::ZERO);
+        let viewport = Viewport::new(Vec2::new(w as f32, h as f32), Vec2::ZERO);
         self.render2d = Some(render2d);
         self.render2d_ui = Some(render2d_ui);
         self.font = Some(font);
-        self.cam = cam;
+        self.viewport = viewport;
     }
 
     fn on_resized(&mut self, _ctx: &mut MainContext, width: u32, height: u32) {
         if let Some(r) = &mut self.render {
             r.resize(width, height);
         }
-        self.cam.set_vp(Vec2::new(width as f32, height as f32), Vec2::ZERO);
+        self.viewport = Viewport::new(Vec2::new(width as f32, height as f32), Vec2::ZERO);
         // 视口尺寸变化后世界边界跟随（球在视口内反弹）。
         self.world = Rect::new(
             -(width as f32) * 0.5,
@@ -156,7 +155,7 @@ impl App for DebugApp {
         let Some(r2d) = &mut self.render2d else {
             return;
         };
-        r2d.set_mvp(self.cam.vp_matrix());
+        r2d.set_mvp(self.viewport.vp_matrix());
         let font = self.font.as_mut().unwrap();
 
         // ── 世界层：背景 + 障碍物（实心矩形） ───────────────────
@@ -215,9 +214,10 @@ impl App for DebugApp {
 
         // ── Debug UI 层（rjw_ui 调试窗口；F1 开关） ─────────────
         let r2d_ui = self.render2d_ui.as_mut().unwrap();
-        r2d_ui.set_mvp(self.cam.vp_matrix());
+        r2d_ui.set_mvp(self.viewport.vp_matrix());
         let window = ctx.primary_window().expect("window");
-        let mut ui = Ui::begin(window, &self.cam, &ctx.mouse, &ctx.keyboard, font, r2d_ui, &mut self.ui_state)
+        let mut ui = Ui::begin(window, font, &mut self.ui_state)
+            .capture(&ctx.mouse, &ctx.keyboard)
             .theme(Theme::dark())
             .base_layer(LAYER_UI)
             .scale_factor(ctx.scale_factor().unwrap_or(1.0))
@@ -273,7 +273,7 @@ impl App for DebugApp {
                 ui.debug_rect_outline(Rect::new(24.0, 24.0, 190.0, 240.0), 1.5, Color::MAGENTA);
             }
         }
-        ui.finish();
+        ui.finish(&self.viewport, r2d_ui);
 
         // ── 合并提交：世界（含 DebugDraw）→ UI → 一次 present ──
         let Some((surface_tex, view)) = r2d.begin_frame() else {

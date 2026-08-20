@@ -26,17 +26,18 @@ use rjw_color::Color;
 use rjw_main::*;
 use rjw_render::{wgpu, RenderConfig, RenderContext};
 use rjw_text::Text;
-use rjw_transform::{Camera2D, Transform2D};
-use rjw_ui::{Button, Label, PackSide, Theme, Ui, UiAdd, UiState, UiStats};
+use rjw_transform::{Transform2D, Viewport};
+use rjw_ui::{Anchor, Button, Divider, FontModal, Label, NumberInput, PackSide, Theme, Ui, UiAdd, UiState, UiStats};
 
 const LAYER_UI: f64 = 10_000_000.0;
 
+/// 数字输入 / 字体 Modal 演示状态。
 struct UiApp {
     render: Option<RenderContext>,
     render2d: Option<Render2D>,
     render2d_ui: Option<Render2D>,
     font: Option<Text>,
-    cam: Camera2D,
+    viewport: Viewport,
     ui_state: UiState,
     // 窗口位置（支持命令行参数覆盖，便于 RenderDoc 验证重叠次序）
     win_a_pos: Vec2,
@@ -45,6 +46,26 @@ struct UiApp {
     clicks: u32,
     volume: f32,
     fullscreen: bool,
+    /// 数字输入（数字条）值。
+    hp: f32,
+    /// 数字输入（数字条）文本框内容（持久，打字不丢）。
+    hp_text: String,
+    /// 水平行（row）演示的第二/三个数字条状态。
+    hp2: f32,
+    hp3: f32,
+    hp_text2: String,
+    hp_text3: String,
+    /// checkbox_mut（WidgetId）演示状态。
+    show_hud: bool,
+    opt7: bool,
+    /// 当前应用的字体族（空 = 系统默认；FontModal 确定后写入）。
+    font_name: String,
+    /// 字体 Modal 输入框内容（跨帧持久）。
+    font_input: String,
+    /// 字体 Modal 开关。
+    font_modal_open: bool,
+    /// 多行文本域是否自动换行（false = 不换行 + 水平滚动）。
+    ta_wrap: bool,
     difficulty: String,
     /// combo 选中索引（难度下拉框）。
     diff_idx: Option<u32>,
@@ -75,12 +96,25 @@ impl UiApp {
             render2d: None,
             render2d_ui: None,
             font: None,
-            cam: Camera2D::default(),
+            viewport: Viewport::new(Vec2::new(1280.0, 720.0), Vec2::ZERO),
             ui_state,
             win_a_pos: Vec2::new(560.0, 240.0),
-            win_b_pos: Vec2::new(640.0, 330.0),
+            // win_b 默认避开 win_a 右下角（缩放柄可达；仍与 win_a 右上角重叠演示置顶）
+            win_b_pos: Vec2::new(760.0, 120.0),
             clicks: 0,
             volume: 0.6,
+            hp: 66.0,
+            hp_text: "66".to_owned(),
+            hp2: 40.0,
+            hp3: 60.0,
+            hp_text2: "40".to_owned(),
+            hp_text3: "60".to_owned(),
+            show_hud: true,
+            opt7: false,
+            font_name: String::new(),
+            font_input: String::new(),
+            font_modal_open: false,
+            ta_wrap: true,
             fullscreen: false,
             difficulty: "普通".to_owned(),
             diff_idx: Some(1),
@@ -230,19 +264,18 @@ impl App for UiApp {
         render2d_ui.set_sorting(false);
         let font = Text::new(render2d.device(), render2d.queue(), render2d.tex_bind_group_layout());
         let (w, h) = render.size();
-        let mut cam = Camera2D::new(Vec2::new(w as f32, h as f32));
-        cam.set_vp(Vec2::new(w as f32, h as f32), Vec2::ZERO);
+        let viewport = Viewport::new(Vec2::new(w as f32, h as f32), Vec2::ZERO);
         self.render2d = Some(render2d);
         self.render2d_ui = Some(render2d_ui);
         self.font = Some(font);
-        self.cam = cam;
+        self.viewport = viewport;
     }
 
     fn on_resized(&mut self, _ctx: &mut MainContext, width: u32, height: u32) {
         if let Some(r) = &mut self.render {
             r.resize(width, height);
         }
-        self.cam.set_vp(Vec2::new(width as f32, height as f32), Vec2::ZERO);
+        self.viewport = Viewport::new(Vec2::new(width as f32, height as f32), Vec2::ZERO);
     }
 
     fn about_to_wait(&mut self, ctx: &mut MainContext) {
@@ -272,7 +305,7 @@ impl App for UiApp {
         let Some(r2d) = &mut self.render2d else {
             return;
         };
-        r2d.set_mvp(self.cam.vp_matrix());
+        r2d.set_mvp(self.viewport.vp_matrix());
         let font = self.font.as_mut().unwrap();
 
         // ── 世界层：几个背景方块（在 UI 之下） ─────────────────
@@ -295,7 +328,7 @@ impl App for UiApp {
 
         // ── UI 层：录制到独立 Render2D（关闭排序） ─────────────
         let r2d_ui = self.render2d_ui.as_mut().unwrap();
-        r2d_ui.set_mvp(self.cam.vp_matrix());
+        r2d_ui.set_mvp(self.viewport.vp_matrix());
         let window = ctx.primary_window().expect("window");
         // 窗口诊断（调试机制）：`UiState` 的跨帧诊断数据须在 `Ui::begin` **之前**读取
         // （begin 会借用 ui_state）——上一帧 finish 写入的值本帧显示。
@@ -307,8 +340,15 @@ impl App for UiApp {
         let prev_blocked = self.ui_state.occluded_hits();
         // 渲染增强演示：渐变状态栏背景（圆角样式已弃用——默认 radius=0 方形路径，
         // 不再生成程序化圆角纹理）。
-        let theme = Theme::dark();
-        let mut ui = Ui::begin(window, &self.cam, &ctx.mouse, &ctx.keyboard, font, r2d_ui, &mut self.ui_state)
+        // 主题按所选字体构建（FontModal 确定后写入 font_name；空 = 系统默认）。
+        // with 责任链：全局字体族级联到全部文本子样式。⚠ 不设 radius（圆角纹理有缺陷）。
+        let theme = if self.font_name.is_empty() {
+            Theme::dark()
+        } else {
+            Theme::dark().with_font_family(&self.font_name)
+        };
+        let mut ui = Ui::begin(window, font, &mut self.ui_state)
+            .capture(&ctx.mouse, &ctx.keyboard)
             .theme(theme)
             .base_layer(LAYER_UI)
             // DPI 缩放：控件坐标/字号按逻辑像素，内部换算物理像素
@@ -345,6 +385,14 @@ impl App for UiApp {
         // );
         ui.label_at(Vec2::new(16.0, 12.0), &format!("FPS: {:.0}", ctx.timer.get_fps()));
         ui.label_at(Vec2::new(16.0, 34.0), &format!("点击次数: {}", self.clicks));
+        // ── 字体切换（Modal 窗口：Input + PreviewInput + 确定/取消右对齐）──
+        // "字体…"按钮（**pack 内自动尺寸**：随字体名变长自动变宽）打开 Modal；
+        // 确定后写入 font_name，下一帧主题按它重建。
+        ui.pack_at(Vec2::new(16.0, 56.0), PackSide::Top, |p| {
+            if p.button("font_btn", &format!("字体… {}", self.font_name)).clicked() {
+                self.font_modal_open = true;
+            }
+        });
         ui.drag_panel_at("name_panel", Vec2::new(200.0, 12.0), |p| {
             p.label("玩家名（可拖动）");
             p.text_input("name", &mut self.player_name);
@@ -383,6 +431,18 @@ impl App for UiApp {
             // 滑块：返回更新后的值，写入应用状态
             self.volume = p.slider("vol", 0.0..=1.0, self.volume);
             p.label(&format!("音量: {:.0}%", self.volume * 100.0));
+            // ── 新功能演示：数字条（builtin 组合控件） + WidgetId 数字 ID ──
+            p.label("生命值（数字条：拖动手柄左右调值 / 点击输入）");
+            p.add(
+                NumberInput::new("hp_bar", &mut self.hp_text, &mut self.hp)
+                    .range(0.0, 100.0)
+                    .step(0.25),
+            );
+            p.label(&format!("HP: {:.0}", self.hp));
+            if p.checkbox_mut(Some("cb_hud"), "显示 HUD", &mut self.show_hud).toggled() {
+                // checkbox_mut 点击已直接翻转 `&mut bool`；此处演示返回状态仍可判断
+            }
+            p.checkbox_mut(7u64, "选项 7（数字 ID）", &mut self.opt7); // id = WidgetId::Int(7)
             if p.checkbox("fs", "全屏", self.fullscreen).toggled() {
                 self.fullscreen = !self.fullscreen;
             }
@@ -410,6 +470,28 @@ impl App for UiApp {
                 self.clicks += 1;
             }
             p.label_wrap(180.0, "自动换行标签：pack 内 180 宽自动换行成多行，适合说明文字。");
+            // ── 水平行（row）：{Label} {NumberInput} {NumberInput} {Button} 占一行 ──
+            p.divider();
+            p.label("水平行（row）：数字条 ×2 + 按钮");
+            p.row(|r| {
+                r.label("HP:");
+                r.add(
+                    NumberInput::new("hp_row_a", &mut self.hp_text2, &mut self.hp2)
+                        .range(0.0, 100.0)
+                        .step(0.25),
+                );
+                r.add(
+                    NumberInput::new("hp_row_b", &mut self.hp_text3, &mut self.hp3)
+                        .range(0.0, 100.0)
+                        .step(0.25),
+                );
+                if r.button("hp_row_btn", "同步").clicked() {
+                    self.hp3 = self.hp2;
+                }
+            });
+            // ── 分割线（占光标；宽 = 容器可用宽 / 当前最宽子项） ──
+            p.divider();
+            p.label("分割线下方的段落……");
         });
 
         // ── 可拖拽面板 + grid：右侧背包 ───────────────────────
@@ -428,15 +510,23 @@ impl App for UiApp {
 
         // ── Window 容器：可重叠 + 点击置顶 + 可拖拽 ───────────
         // 两个窗口互相重叠；点击任一窗口即置顶（焦点 z-order）。
-        ui.window_at("win_a", self.win_a_pos, |w| {
+        // 窗口 A 用**固定宽**（右下角缩放柄，鼠标拖动改宽度、高度自动）。
+        // 缩窄窗口 A：Label 自动换行 / `.ellipsis()` 省略 / 按钮文本省略。
+        ui.window_at_w("win_a", self.win_a_pos, 220.0, |w| {
             w.label("窗口 A（点击置顶 · 拖动移动）");
             if w.button("win_a_btn", "A 按钮").clicked() {
                 self.clicks += 1;
             }
-            // 勾选状态由应用持有（跨帧持久），点击切换 ✓
-            if w.checkbox("win_a_cb", "窗口 A 选项", self.win_a_checked).toggled() {
-                self.win_a_checked = !self.win_a_checked;
-            }
+            // 勾选状态由应用持有（跨帧持久）：checkbox_mut 点击**直接翻转** `&mut bool`，
+            // 无需手动 toggled() 维护；ID = None → 以 label 文本为 ID。
+            w.checkbox_mut(None, "窗口 A 选项", &mut self.win_a_checked);
+            // Label 溢出演示（Resizable 窗口缩窄）：
+            // - 默认（无显式 wrap）：在窗口固定宽内**自动换行**；
+            // - `.ellipsis()`：超出宽度以 "…" 省略为单行。
+            w.add(Label::new("自动换行标签：窗口缩窄后自动换行，不再溢出画到窗口外。"));
+            w.add(Label::new("省略标签：窗口缩窄后显示为省略号……").ellipsis());
+            w.add(Divider::new());
+            w.label("分割线下方");
         });
         ui.window_at("win_b", self.win_b_pos, |w| {
             w.label("窗口 B（覆盖在 A 之上）");
@@ -447,9 +537,28 @@ impl App for UiApp {
             }
             // 输入内容写入应用状态（跨帧持久），聚焦后打字生效 ✓
             w.text_input("win_b_input", &mut self.win_b_note);
-            // 多行 TextArea：Enter 换行、自动换行 + 垂直滚动、拖选 + Ctrl+C/V/X
-            w.label("多行备注（Enter 换行 · 拖选复制粘贴）");
-            w.text_area("win_b_note_area", &mut self.win_b_note_area);
+            // 多行 TextArea：Enter 换行、拖选 + Ctrl+C/V/X。两种模式：
+            // 自动换行（按内容区宽换行）/ 不自动换行（行宽不限 + 水平滚动）。
+            w.checkbox_mut(Some("ta_wrap"), "自动换行", &mut self.ta_wrap);
+            w.label("多行备注（Enter 换行 · 双击按词选择 · 拖选复制粘贴）");
+            if self.ta_wrap {
+                w.text_area("win_b_note_area", &mut self.win_b_note_area);
+            } else {
+                w.text_area_nw("win_b_note_area", &mut self.win_b_note_area);
+            }
+        });
+
+        // ── 严格裁剪窗口（window_at_strict）：内容超出窗口被强制裁剪（Clip 沙箱）──
+        // 对照 win_a 的 Expand 语义（内容自动换行/撑高窗口）。
+        ui.window_at_strict("strict_win", Vec2::new(560.0, 460.0), |w| {
+            w.label("严格裁剪窗口（内容超出被裁）");
+            w.add(Label::new(
+                "这一段文字足够长，会超出严格窗口的可视区——超出部分被强制裁剪，\
+                 不再撑大窗口；滚动容器 / 文本编辑框同为 Clip 语义。",
+            ));
+            if w.button("strict_btn", "被裁窗口按钮").clicked() {
+                self.clicks += 1;
+            }
         });
 
         // ── 窗口诊断面板（调试机制：实时告诉你窗口叠放与点击解析）──
@@ -503,13 +612,26 @@ impl App for UiApp {
             }
         });
 
-        // ── place：底部说明 ───────────────────────────────────
-        ui.label_at(
-            Vec2::new(16.0, 690.0),
-            "Tab/方向键 遍历焦点 · 输入框拖选文本 + Ctrl+C/V/X · Enter 换行（多行） · Esc 收起/失焦（再按退出） · R 重置",
-        );
+        // ── place：底部说明（**锚定视口左下角**——不再被窗口遮挡） ──
+        let hint = "Tab/方向键 遍历焦点 · 输入框拖选文本 + Ctrl+C/V/X · 双击按词选择 · Enter 换行（多行） · 滚轮滚动（指针在框内） · Esc 收起/失焦（再按退出） · R 重置";
+        let (hint_fs, hint_ff) = (ui.theme.label.font_size, ui.theme.label.font_family.clone());
+        let hint_size = ui.text_size(hint, hint_fs, hint_ff.as_deref());
+        let hint_pos = ui.anchor_pos(Anchor::BottomLeft, hint_size, Vec2::new(16.0, 16.0));
+        ui.label_at(hint_pos, hint);
 
-        ui.finish();
+        // ── 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制
+        //    才能保证不被本帧后录的窗口盖住——见 modal_at 文档）──
+        if self.font_modal_open {
+            FontModal {
+                input: &mut self.font_input,
+                apply: &mut |name: &str| {
+                    self.font_name = name.to_owned();
+                },
+            }
+            .show(&mut ui, &mut self.font_modal_open);
+        }
+
+        ui.finish(&self.viewport, r2d_ui);
 
         // 重置请求（ui 借用已随 finish 结束，可安全触碰 ui_state）
         if reset_requested {

@@ -111,6 +111,20 @@ impl Rect {
         ];
         Rect::from_point_slice(&pts)
     }
+
+    /// **内缩**（减法语义）：四边各向内收 `by`（`x/y += by`、`w/h −= 2by`），
+    /// 宽高 clamp 到 ≥ 0（内缩超过半宽/半高时退化为空矩形，不产生负尺寸）。
+    /// 用于"外框内缩"式绘制（如勾选框中心填充 = 外框 shrink 边框宽 + 内边距）。
+    #[inline]
+    pub fn shrink(&self, by: f32) -> Rect {
+        let by = by.max(0.0);
+        Rect::new(
+            self.x + by,
+            self.y + by,
+            (self.w - by * 2.0).max(0.0),
+            (self.h - by * 2.0).max(0.0),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -150,5 +164,19 @@ mod tests {
         for c in [Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(0.0, 10.0), Vec2::new(10.0, 10.0)] {
             assert!(r.contains_point(t.transform_point(c)), "包围盒应包含变换后的角点 {c:?}");
         }
+    }
+
+    #[test]
+    fn shrink_uses_subtraction_and_clamps_nonnegative() {
+        // 减法内缩：x/y 增大、w/h 减小
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0).shrink(4.0);
+        assert_eq!(r, Rect::new(14.0, 24.0, 92.0, 42.0));
+        // 内缩超过半宽 → 宽 clamp 到 0（不产生负尺寸）
+        let r2 = Rect::new(0.0, 0.0, 10.0, 10.0).shrink(6.0);
+        assert_eq!(r2, Rect::new(6.0, 6.0, 0.0, 0.0));
+        // 负数 by → 按 0 处理（无变化）
+        assert_eq!(Rect::new(0.0, 0.0, 5.0, 5.0).shrink(-3.0), Rect::new(0.0, 0.0, 5.0, 5.0));
+        // 非方矩形
+        assert_eq!(Rect::new(1.0, 2.0, 20.0, 8.0).shrink(1.5), Rect::new(2.5, 3.5, 17.0, 5.0));
     }
 }

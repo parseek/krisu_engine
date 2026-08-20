@@ -939,8 +939,9 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 ### 18.2 最小用法
 
 ```rust
-// UiState 存在应用结构体里（跨帧持久）
-let mut ui = Ui::begin(window, &cam, &ctx.mouse, &ctx.keyboard, &mut text, &mut r2d, &mut ui_state)
+// UiState 存在应用结构体里（跨帧持久）；输入经 capture 快照、相机/渲染器延迟到 finish
+let mut ui = Ui::begin(window, &mut text, &mut ui_state)
+    .capture(&ctx.mouse, &ctx.keyboard)
     .theme(Theme::dark())
     .base_layer(LAYER_UI)                               // 默认 1e7
     .scale_factor(ctx.scale_factor().unwrap_or(1.0))    // DPI：控件坐标/字号按逻辑像素
@@ -964,7 +965,7 @@ ui.drag_panel_at("inv_panel", Vec2::new(300.0, 90.0), |pp| {  // 可拖拽面板
         g.button("slot_0", "物品 0");
     });
 });
-ui.finish();   // 排序（窗口 z → 深度 → 图形/文字 → 录制序）并提交绘制
+ui.finish(&viewport, r2d);   // 排序（窗口 z → 深度 → 图形/文字 → 录制序）并提交绘制（视口/渲染器延迟传入；UI 无需相机）
 ```
 
 ### 18.3 ⚠️ 易混淆点
@@ -1209,7 +1210,7 @@ clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位�
 ### 18.11 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
-- 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `widget_api!` 宏里加便捷方法（Panel / Pack / Grid 自动获得）。
+- 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。
 - 新增**交互**控件时必须调用 `register_focus(id, rect, FocusKind::X)`（键盘导航 / 焦点描边）；需要 Enter/Space 激活的控件用 `key_click(id, kind)` 合成点击。
 - 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
 - 网格 cell 缓存（`UiState::grid_cells`）保证跨帧布局稳定；无缓存首帧渐进扩展，次帧起稳定。

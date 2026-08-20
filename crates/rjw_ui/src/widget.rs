@@ -4,7 +4,8 @@
 //!
 //! 旧控件 API 由 `widget_api!` 宏统一生成（`p.label` / `p.button` …）——加一个新控件要
 //! 改宏（报错指向宏展开、难以调试），且控件属性（颜色 / 字号 / 字体 / 内边距）只能
-//! 跟随全局 [`Theme`]（`crate::style::Theme`），无法逐控件覆盖。
+//! 跟随全局 [`Theme`]（`crate::style::Theme`），无法逐控件覆盖。该宏现已移除，
+//! 容器便捷方法统一由 [`crate::ui::UiAdd`] trait 提供（默认方法，无需宏展开）。
 //!
 //! 本模块提供：
 //! - [`Widget`] trait：**新控件 = 一个实现该 trait 的 builder 结构体**——普通 Rust，
@@ -13,17 +14,18 @@
 //!   setter，未设置的属性回落到全局 [`Theme`]；
 //! - 统一响应 [`Response`]（hover / pressed / clicked / released / toggled）；
 //! - 放置方式：[`Ui::add`]（容器内占光标）/ [`Ui::add_at`]（绝对定位）；容器包装
-//!   （`Panel` / `Pack` / `Grid` / `Window` / `Scroll` / `FlexCtx`）经 [`UiAdd`] 提供
-//!   同样的 `add` / `add_at`。
+//!   （`Panel` / `Pack` / `Grid` / `Window` / `Scroll` / `FlexCtx`）经
+//!   [`crate::ui::UiAdd`] 提供同样的 `add` / `add_at` 与全部便捷方法。
 //!
 //! # 用法
 //!
 //! ```no_run
-//! # let cam = todo!(); let mouse = todo!(); let keyboard = todo!();
+//! # let viewport = todo!(); let mouse = todo!(); let keyboard = todo!();
 //! # let text = todo!(); let r2d = todo!(); let state = todo!(); let window = todo!();
 //! use rjw_color::Color;
 //! use rjw_ui::{Button, Label, Theme, Ui, UiAdd};
-//! let mut ui = Ui::begin(&window, &cam, &mouse, &keyboard, &mut text, &mut r2d, &mut state)
+//! let mut ui = Ui::begin(&window, &mut text, &mut state)
+//!     .capture(&mouse, &keyboard)
 //!     .theme(Theme::dark())
 //!     .build();
 //! // 容器内：占光标
@@ -35,18 +37,143 @@
 //! });
 //! // 顶层：绝对定位（不占光标）
 //! ui.add_at(glam::Vec2::new(400.0, 40.0), Label::new("HUD"));
-//! ui.finish();
+//! ui.finish(&viewport, &mut r2d);
 //! ```
 //!
 //! # 添加一个新控件
 //!
 //! 1. 定义 builder 结构体（属性 = `Option<T>` 覆盖字段）；
 //! 2. `impl Widget`：`size` 测量内容（可调 `ui.text_size` 等），`ui` 在给定矩形内
-//!    渲染 + 交互（可调 `Ui` 的 `pub(crate)` 原语，或复用现有 `*_at` 方法）；
+//!    渲染 + 交互（用 `Ui` 的**公开原语**，或复用现有 `*_at` 方法）；
 //! 3. 需要复用现有控件时，优先给 `Ui` 增加 `xxx_at_styled(…, &Style)` 变体并让旧方法
 //!    委托它（见 `button_at` / `checkbox_at` 的改造方式）。
 //!
+//! # 跨 crate 自定义控件模板（只用公开 API）
+//!
+//! `Widget` trait、`Ui` 的测量/命中/焦点/绘制原语、`UiState`/`WidgetState` 交互状态
+//! 全部公开——下面两个模板（滑块 + 数字输入，含**拖动调值**）只依赖公开接口，
+//! 可原样放进你自己的 crate：
+//!
+//! ```no_run
+//! use std::ops::RangeInclusive;
+//! use glam::Vec2;
+//! use rjw_transform::Rect;
+//! use rjw_ui::draw::TextVAlign;
+//! use rjw_ui::hit::update_drag;
+//! use rjw_ui::{FocusKind, Response, TextAlign, Ui, Widget};
+//!
+//! /// 滑块（模板）：尺寸取主题，交互/绘制全部委托现有原语 [`Ui::slider_at`]——
+//! /// 与内置控件同一条路径（"现有控件能使用接口就使用接口"）。
+//! pub struct Slider<'a> {
+//!     id: &'a str,
+//!     range: RangeInclusive<f32>,
+//!     value: f32,
+//! }
+//! impl<'a> Slider<'a> {
+//!     pub fn new(id: &'a str, range: RangeInclusive<f32>, value: f32) -> Self {
+//!         Self { id, range, value }
+//!     }
+//! }
+//! impl Widget for Slider<'_> {
+//!     fn size(&self, ui: &mut Ui) -> Vec2 {
+//!         Vec2::new(ui.theme.slider.min_w.max(40.0), ui.theme.slider.height)
+//!     }
+//!     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+//!         let _new = ui.slider_at(self.id, rect, self.range, self.value);
+//!         Response::default()
+//!     }
+//! }
+//!
+//! /// 数字输入（模板）：文本框 + 右侧拖拽手柄（按住上下拖动调值）。
+//! /// 演示公开交互原语：`hit_abs` / `mouse_left` / `register_focus` /
+//! /// `update_drag` + `WidgetState` 拖拽基准 + `push_*` 绘制原语。
+//! pub struct NumberInput<'a> {
+//!     id: &'a str,
+//!     value: f32,
+//! }
+//! impl<'a> NumberInput<'a> {
+//!     pub fn new(id: &'a str, value: f32) -> Self {
+//!         Self { id, value }
+//!     }
+//! }
+//! impl Widget for NumberInput<'_> {
+//!     fn size(&self, ui: &mut Ui) -> Vec2 {
+//!         Vec2::new(ui.theme.input.min_w, ui.theme.input.height)
+//!     }
+//!     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+//!         // 1) 交互基础（公开原语）
+//!         let mouse = ui.mouse_logical();
+//!         let hit = ui.hit_abs(&rect);
+//!         let btn = ui.mouse_left();
+//!         ui.register_focus(self.id, rect, FocusKind::TextInput);
+//!         // 自身有拖拽语义 → 声明按下归属：阻止外层窗口把本次按下当作窗口拖拽基准
+//!         // （窗口内拖手柄不再连窗口一起动）。
+//!         if btn.down_edge() && hit {
+//!             ui.claim_press();
+//!         }
+//!         // 2) 拖拽调值：**向上拖 = 增加**（y 减小 → 值增大）；拖动 1 逻辑像素 = 0.1。
+//!         //    ⚠ 拖拽基准存在**独立的**状态 ID（`{id}::grip`）——与 text_input_at
+//!         //    共用同一 WidgetState 会把 press_mouse 互相覆盖（拖拽失灵）。
+//!         let mut value = self.value;
+//!         let drag_id = format!("{}::grip", self.id);
+//!         {
+//!             let ws = ui.state_mut().widget(&drag_id);
+//!             let dragging = update_drag(ws, hit, btn);
+//!             if btn.down_edge() && hit {
+//!                 ws.press_mouse = Some(mouse);
+//!                 ws.press_panel = Some(Vec2::new(0.0, value));
+//!             }
+//!             if dragging {
+//!                 let pm = ws.press_mouse.unwrap_or(mouse);
+//!                 let base = ws.press_panel.unwrap_or(Vec2::ZERO).y;
+//!                 value = (base - (mouse.y - pm.y) * 0.1).round();
+//!             }
+//!         }
+//!         // 拖动手柄悬停/拖拽 → ↔ 光标（EwResize）；点击文本框输入 → 内置 I 型
+//!         if hit {
+//!             ui.set_cursor(rjw_ui::UiCursor::EwResize);
+//!         }
+//!         // 3) 文本框：`text_input_at` 直接写**持久** `&mut String`（每帧重格式化会
+//!         //    把打字冲掉——"无法输入"）；真实控件还需**屏蔽非数字输入**
+//!         //    （`retain` 只留数字/负号/小数点）并解析回数值。
+//!         let mut buf = format!("{value:.1}");
+//!         ui.text_input_at(self.id, rect, &mut buf);
+//!         // 主题值先拷出（Copy），避免与下方 &mut ui 调用（push_*）的借用冲突
+//!         let (border, fg, font_size) = {
+//!             let st = &ui.theme.input;
+//!             (st.border, st.fg, st.font_size)
+//!         };
+//!         let grip = Rect::new(rect.x + rect.w - 14.0, rect.y, 14.0, rect.h);
+//!         ui.push_panel_like(grip, border, border, 1.0, 0.0, 1);
+//!         ui.push_text_rect(
+//!             grip,
+//!             "≡",
+//!             font_size,
+//!             fg,
+//!             None,
+//!             TextAlign::Center,
+//!             TextVAlign::Center,
+//!             None,
+//!             None,
+//!         );
+//!         Response::default()
+//!     }
+//! }
+//!
+//! // 放置：容器内占光标（add）/ 顶层绝对定位（add_at）
+//! # let mut ui: rjw_ui::Ui = todo!();
+//! ui.add(Slider::new("vol", 0.0..=1.0, 0.5));
+//! ui.add(NumberInput::new("hp", 100.0));
+//! ```
+//!
 //! 详见 `docs/WIDGET_GUIDE.md`。
+
+// 以下需求已实现（见 rjw_ui / examples/eg260818UI）：
+// - 多行文本：自动换行（Ui::text_area_at）与不自动换行 + 水平滚动（Ui::text_area_at_nw）模式
+// - 不同字体：默认、SimHei、Sarasa Mono SC（demo 顶层 combo，Theme::with_font_family 级联）
+// - 数字输入框：拖动手柄整体调值（EwResize 光标，向上拖 = 增加），点击文本框 I 型光标输入
+//   （非数字输入被屏蔽；拖拽基准用独立状态 ID `{id}::grip`）
+// - 窗体：悬停、拖动时保持普通 Arrow（光标由 set_cursor / 内置规则管理）
 
 use glam::Vec2;
 use rjw_color::Color;
@@ -111,6 +238,35 @@ impl From<ButtonState> for Response {
 
 // ─── Widget trait ───────────────────────────────────────────────
 
+/// **控件尺寸约束**（每轴可选；`None` = 该轴不约束）。见 [`Widget::constraints`]。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SizeConstraints {
+    pub min_w: Option<f32>,
+    pub max_w: Option<f32>,
+    pub min_h: Option<f32>,
+    pub max_h: Option<f32>,
+}
+
+/// **控件膨胀模式**（内容尺寸相对父级空间的行为）。见 [`Widget::expansion`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expansion {
+    /// 内容按自身尺寸（clamp min/max），**不撑大父级**——内容可能溢出父级，
+    /// 由控件用 noclip 绘制 / 省略自洽（如装饰性分隔线）。
+    DisableAutoExpansion,
+    /// **限制在父级可用空间内**：取 min(内容, 沙箱可用宽，`Ui::avail_w`)，超出
+    /// 部分由控件自处理（Label 自动换行 / "…"省略、Button 省略、TextArea 滚动）；
+    /// 无可用空间时退化为 [`Expansion::UnlimitedExpansion`]。
+    LimitedInParent,
+    /// 内容自然尺寸（clamp min/max），**撑大父级**（默认，DOM 语义）。
+    UnlimitedExpansion,
+}
+
+impl Default for Expansion {
+    fn default() -> Self {
+        Self::UnlimitedExpansion
+    }
+}
+
 /// **控件 trait**：新控件 = 实现此 trait 的 builder 结构体（普通 Rust，无宏）。
 ///
 /// - [`Widget::size`]：期望尺寸（**逻辑像素**；内容测量可调用 `ui.text_size` /
@@ -118,34 +274,107 @@ impl From<ButtonState> for Response {
 /// - [`Widget::ui`]：在分配好的矩形内渲染 + 交互，返回 [`Response`]。
 ///
 /// 放置：[`Ui::add`]（容器内占光标）/ [`Ui::add_at`]（绝对定位）；容器包装经
-/// [`UiAdd`] 提供同样的 `add` / `add_at`。
+/// [`crate::ui::UiAdd`] 提供同样的 `add` / `add_at` 与全部便捷方法（`p.button` 等）。
 pub trait Widget {
     /// 期望尺寸（逻辑像素；内容测量可经 `&mut Ui` 排版/缓存）。
     fn size(&self, ui: &mut Ui) -> Vec2;
 
     /// 在 `rect`（相对当前容器内容原点，逻辑像素）内渲染 + 交互。
     fn ui(self, ui: &mut Ui, rect: Rect) -> Response;
-}
 
-/// **容器可放置控件**：`add`（占光标）/ `add_at`（绝对定位）。
-///
-/// 由全部容器包装（`Panel` / `Pack` / `Grid` / `Window` / `Scroll` / `FlexCtx`）
-/// 实现——`p.add(…)` / `w.add(…)` 与 `ui.add(…)` 同语义。
-pub trait UiAdd<'a> {
-    /// 容器持有的 `Ui`（包装字段，仅本 crate 内实现）。
-    fn ui_mut(&mut self) -> &mut Ui<'a>;
-
-    /// 在容器内**占光标**放置控件（尺寸 = 控件测量值）。
-    fn add(&mut self, w: impl Widget) -> Response {
-        let size = w.size(self.ui_mut());
-        let rect = self.ui_mut().child_rect(size.x, size.y);
-        w.ui(self.ui_mut(), rect)
+    /// **尺寸约束**（每轴 `Option<f32>`；默认全 `None`，不约束）。
+    /// `Ui::add` 在布局前对 `size()` 结果按此 clamp。
+    fn constraints(&self) -> SizeConstraints {
+        SizeConstraints::default()
     }
 
-    /// **绝对定位**放置控件（`pos` 相对当前容器内容原点；不占光标）。
-    fn add_at(&mut self, pos: Vec2, w: impl Widget) -> Response {
-        let size = w.size(self.ui_mut());
-        w.ui(self.ui_mut(), Rect::new(pos.x, pos.y, size.x, size.y))
+    /// **膨胀模式**（默认 [`Expansion::UnlimitedExpansion`]）：
+    /// 决定内容是否撑大父级 / 是否限制在父级可用空间内（见 [`Expansion`]）。
+    fn expansion(&self) -> Expansion {
+        Expansion::UnlimitedExpansion
+    }
+
+    /// **可选拖拽缩放范围** `(min, max)`（逻辑像素；默认 `None` = 不可缩放）。
+    ///
+    /// 声明后控件应在 `size()` 中优先读持久尺寸（`ui.state().sizes`，首次 = 内容
+    /// 自然尺寸），并在 `ui()` 里调用 [`Ui::resize_handle`] 处理右下角缩放柄并
+    /// 写回 [`UiState::sizes`]。内置 `window_at_w` / `window_at_strict_w` 已演示
+    /// 该模式（宽度缩放）。
+    fn resizable(&self) -> Option<(Vec2, Vec2)> {
+        None
+    }
+}
+
+/// 应用尺寸约束：`natural` 每轴 clamp 到 `min`/`max`（纯函数，可单测）。
+/// 顺序 = 先压 max 再抬 min（**min 恒优先**：`min > max` 时结果为 min）。
+#[inline]
+pub fn apply_constraints(natural: Vec2, c: SizeConstraints) -> Vec2 {
+    let clamp = |v: f32, lo: Option<f32>, hi: Option<f32>| {
+        let v = match hi {
+            Some(hi) => v.min(hi),
+            None => v,
+        };
+        match lo {
+            Some(lo) => v.max(lo),
+            None => v,
+        }
+    };
+    Vec2::new(
+        clamp(natural.x, c.min_w, c.max_w),
+        clamp(natural.y, c.min_h, c.max_h),
+    )
+}
+
+// ─── 控件 ID（Label 派生 / 字符串 / 数字） ──────────────────────
+
+/// 控件 ID（跨帧状态键，如勾选框勾选状态）的三种来源。
+///
+/// - [`WidgetId::Label`]：用 **label 文本本身**作 ID——同容器内标签唯一时最简；
+/// - [`WidgetId::String`]：显式字符串 ID（原 `&str` 参数）；
+/// - [`WidgetId::Int`]：数字 ID（如列表行索引 `i as u64`）。
+///
+/// 便捷转换（[`From`]）：`None` → `Label`；`Some("id")` / `"id"` → `String`；
+/// `42u64` → `Int`。示例见 [`crate::ui::UiAdd::checkbox_mut`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WidgetId<'a> {
+    /// ID = label 文本本身（唯一标签无需显式 ID）。
+    Label,
+    /// 显式字符串 ID。
+    String(&'a str),
+    /// 数字 ID。
+    Int(u64),
+}
+
+impl<'a> From<Option<&'a str>> for WidgetId<'a> {
+    #[inline]
+    fn from(id: Option<&'a str>) -> Self {
+        match id {
+            Some(s) => WidgetId::String(s),
+            None => WidgetId::Label,
+        }
+    }
+}
+impl<'a> From<&'a str> for WidgetId<'a> {
+    #[inline]
+    fn from(s: &'a str) -> Self {
+        WidgetId::String(s)
+    }
+}
+impl From<u64> for WidgetId<'_> {
+    #[inline]
+    fn from(i: u64) -> Self {
+        WidgetId::Int(i)
+    }
+}
+
+impl WidgetId<'_> {
+    /// 解析为实际 ID 字符串（`Label` 用 label 文本；`Int` 转十进制）。
+    pub(crate) fn resolve(&self, label: &str) -> String {
+        match self {
+            WidgetId::Label => label.to_owned(),
+            WidgetId::String(s) => (*s).to_owned(),
+            WidgetId::Int(i) => i.to_string(),
+        }
     }
 }
 
@@ -164,11 +393,13 @@ pub struct Label<'a> {
     font_family: Option<&'a str>,
     /// 自动换行宽度（逻辑像素；`Some(w)` 且 `w > 0` 时按宽度换行）。
     wrap: Option<f32>,
+    /// 省略模式：文本超出可用/分配宽度时以 "…" 截断（单行，内容自洽）。
+    ellipsis: bool,
 }
 
 impl<'a> Label<'a> {
     pub fn new(text: &'a str) -> Self {
-        Self { text, color: None, font_size: None, font_family: None, wrap: None }
+        Self { text, color: None, font_size: None, font_family: None, wrap: None, ellipsis: false }
     }
 
     /// 文本颜色（默认 `Theme::label.color`）。
@@ -194,6 +425,13 @@ impl<'a> Label<'a> {
         self.wrap = Some(max_w);
         self
     }
+
+    /// **省略模式**：文本超出可用宽度（容器固定宽 / 沙箱 `avail_w` / 分配矩形）时
+    /// 以 "…" 截断为单行（内容自洽，配合 Resizable 窗口缩窄）。
+    pub fn ellipsis(mut self) -> Self {
+        self.ellipsis = true;
+        self
+    }
 }
 
 impl Widget for Label<'_> {
@@ -203,9 +441,30 @@ impl Widget for Label<'_> {
             Some(f) => Some(f.to_owned()),
             None => ui.theme.label.font_family.clone(),
         };
-        match self.wrap {
+        // 显式换行宽：直接按它测量。
+        let natural = match self.wrap {
             Some(w) if w > 0.0 => ui.text_size_wrap(self.text, size, family.as_deref(), w),
             _ => ui.text_size(self.text, size, family.as_deref()),
+        };
+        if self.ellipsis {
+            // 省略：宽度 ≤ 可用宽（单行；高度 = 自然行高）。
+            if let Some(avail) = ui.avail_w() {
+                if avail < natural.x {
+                    return Vec2::new(avail, natural.y);
+                }
+            }
+            natural
+        } else if self.wrap.is_none() || self.wrap.is_some_and(|w| w <= 0.0) {
+            // 默认（无显式换行宽）：**LimitedInParent**——在父级可用宽内自动换行
+            // （Resizable 窗口缩窄后 Label 不溢出；无可用宽 = 自然尺寸）。
+            if let Some(avail) = ui.avail_w() {
+                if avail < natural.x {
+                    return ui.text_size_wrap(self.text, size, family.as_deref(), avail);
+                }
+            }
+            natural
+        } else {
+            natural
         }
     }
 
@@ -218,22 +477,48 @@ impl Widget for Label<'_> {
             Some(f) => Some(f.to_owned()),
             None => ui.theme.label.font_family.clone(),
         };
-        // 换行标签：直接传预排版缓冲（wrap 宽度参与缓存键），保证渲染与测量一致。
-        let buf = self
-            .wrap
-            .filter(|&w| w > 0.0)
-            .map(|w| ui.wrap_buffer(self.text, size, family.as_deref(), w));
-        ui.push_text_rect(
-            rect,
-            self.text,
-            size,
-            color,
-            family,
-            TextAlign::from(align),
-            TextVAlign::Center,
-            None,
-            buf,
-        );
+        if self.ellipsis {
+            // 省略模式：文本超出分配宽度 → "…"截断（内容自洽：宽 = rect.w，noclip）。
+            let natural = ui.text_size(self.text, size, family.as_deref());
+            let text: std::borrow::Cow<'_, str> = if natural.x > rect.w {
+                crate::edit::ellipsize(self.text, rect.w, |s| {
+                    ui.text_size(s, size, family.as_deref()).x
+                })
+            } else {
+                std::borrow::Cow::Borrowed(self.text)
+            };
+            ui.push_text_rect_noclip(
+                rect,
+                &text,
+                size,
+                color,
+                family,
+                TextAlign::from(align),
+                TextVAlign::Center,
+                None,
+            );
+        } else {
+            // 换行标签：直接传预排版缓冲（wrap 宽度参与缓存键），保证渲染与测量一致。
+            // 默认自动换行（LimitedInParent）：`size()` 已按可用宽测量换行高度，渲染
+            // **必须用同一宽度的换行缓冲**（rect.w），否则"逻辑换行、渲染仍溢出"。
+            let natural = ui.text_size(self.text, size, family.as_deref());
+            let wrap_w = self
+                .wrap
+                .filter(|&w| w > 0.0)
+                .unwrap_or(if natural.x > rect.w { rect.w } else { 0.0 });
+            let buf =
+                (wrap_w > 0.0).then(|| ui.wrap_buffer(self.text, size, family.as_deref(), wrap_w));
+            ui.push_text_rect_noclip(
+                rect,
+                self.text,
+                size,
+                color,
+                family,
+                TextAlign::from(align),
+                TextVAlign::Center,
+                buf,
+            );
+        }
         Response::default()
     }
 }
@@ -433,6 +718,7 @@ impl<'a> Checkbox<'a> {
         CheckboxStyle {
             box_size: base.box_size,
             box_border: self.box_border.unwrap_or(base.box_border),
+            border_w: base.border_w,
             checked_fill: self.checked_fill.unwrap_or(base.checked_fill),
             fg: self.fg.unwrap_or(base.fg),
             font_size: self.font_size.unwrap_or(base.font_size),
@@ -468,5 +754,110 @@ impl Widget for Checkbox<'_> {
             released: false,
             toggled: s.toggled,
         }
+    }
+}
+
+// ─── Divider ────────────────────────────────────────────────────
+
+/// 分割线控件（占光标）：宽 = 容器可用宽（`avail_w`）/ 当前最宽子项，行高 =
+/// 线厚 + 上下留白。属性可选，未设置回落 [`Theme::divider`](crate::style::Theme::divider)。
+pub struct Divider {
+    color: Option<Color>,
+    thickness: Option<f32>,
+    margin: Option<f32>,
+}
+
+impl Divider {
+    pub fn new() -> Self {
+        Self { color: None, thickness: None, margin: None }
+    }
+    /// 线颜色（默认 `Theme::divider.color`）。
+    pub fn color(mut self, c: Color) -> Self {
+        self.color = Some(c);
+        self
+    }
+    /// 线厚度（逻辑像素；默认 `Theme::divider.thickness`）。
+    pub fn thickness(mut self, t: f32) -> Self {
+        self.thickness = Some(t);
+        self
+    }
+    /// 上下留白（逻辑像素；默认 `Theme::divider.margin`）。
+    pub fn margin(mut self, m: f32) -> Self {
+        self.margin = Some(m);
+        self
+    }
+}
+
+impl Default for Divider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Widget for Divider {
+    fn size(&self, ui: &mut Ui) -> Vec2 {
+        let st = ui.theme.divider.clone();
+        let t = self.thickness.unwrap_or(st.thickness);
+        let m = self.margin.unwrap_or(st.margin);
+        // 宽 = 容器可用宽（固定宽窗口 / 沙箱）；无可用宽 = 默认 120。
+        let w = ui.avail_w().unwrap_or(120.0);
+        Vec2::new(w, t + m * 2.0)
+    }
+
+    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+        let st = ui.theme.divider.clone();
+        let t = self.thickness.unwrap_or(st.thickness);
+        let c = self.color.unwrap_or(st.color);
+        let y = rect.y + (rect.h - t) * 0.5; // 垂直居中（行高被 clamp 时仍居中）
+        ui.push_solid_rect(Rect::new(rect.x, y, rect.w, t), c);
+        Response::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widget_id_resolve() {
+        // Label：以 label 文本为 ID
+        assert_eq!(WidgetId::Label.resolve("窗口 A 选项"), "窗口 A 选项");
+        // String：显式字符串 ID（忽略 label）
+        assert_eq!(WidgetId::String("win_b_cb").resolve("任意"), "win_b_cb");
+        // Int：数字 ID
+        assert_eq!(WidgetId::Int(7).resolve("任意"), "7");
+        // From 转换：None → Label、Some/&str → String、u64 → Int
+        assert_eq!(WidgetId::from(None::<&str>).resolve("label-x"), "label-x");
+        assert_eq!(WidgetId::from(Some("id-y")).resolve("label-x"), "id-y");
+        assert_eq!(WidgetId::from("id-z").resolve("label-x"), "id-z");
+        assert_eq!(WidgetId::from(42u64).resolve("label-x"), "42");
+        // 区分度：同容器内不同 label 的 Label ID 互不相同
+        assert_ne!(
+            WidgetId::Label.resolve("窗口 A"),
+            WidgetId::Label.resolve("窗口 B")
+        );
+    }
+
+    #[test]
+    fn apply_constraints_clamps_each_axis() {
+        // 无约束：原样
+        assert_eq!(apply_constraints(Vec2::new(10.0, 20.0), SizeConstraints::default()), Vec2::new(10.0, 20.0));
+        // min 抬升
+        let c = SizeConstraints { min_w: Some(30.0), min_h: Some(40.0), ..Default::default() };
+        assert_eq!(apply_constraints(Vec2::new(10.0, 20.0), c), Vec2::new(30.0, 40.0));
+        // max 压缩
+        let c = SizeConstraints { max_w: Some(50.0), max_h: Some(60.0), ..Default::default() };
+        assert_eq!(apply_constraints(Vec2::new(100.0, 200.0), c), Vec2::new(50.0, 60.0));
+        // 单轴独立
+        let c = SizeConstraints { max_w: Some(50.0), ..Default::default() };
+        assert_eq!(apply_constraints(Vec2::new(100.0, 20.0), c), Vec2::new(50.0, 20.0));
+        // min > max 时 min 优先（clamp 顺序）
+        let c = SizeConstraints { min_w: Some(80.0), max_w: Some(50.0), ..Default::default() };
+        assert_eq!(apply_constraints(Vec2::new(10.0, 0.0), c), Vec2::new(80.0, 0.0));
+    }
+
+    #[test]
+    fn expansion_default_is_unlimited() {
+        assert_eq!(Expansion::default(), Expansion::UnlimitedExpansion);
     }
 }

@@ -47,8 +47,14 @@ pub(crate) struct Frame {
     /// **下一子项的强制高度**（flex 权重分配；`None` = 自然测量）。
     /// 一次性：`child_rect` 消耗（[`Self::force_next_h`] 设置）。
     next_fixed_h: Option<f32>,
+    /// **本 frame 全部子项的强制高度**（水平行 `row` 等高；`None` = 自然测量）。
+    /// 持续作用于本 frame 所有子项（区别于一次性 `next_fixed_h`）。
+    force_h_all: Option<f32>,
     /// **容器固定高度**（flex_at 等；覆盖 `settle_size` 的自然高度）。
     fixed_h: Option<f32>,
+    /// **容器固定宽度**（`window_at_w` 等；覆盖 `settle_size` 的自然宽度，
+    /// 子项宽度 clamp 到该值——内容按固定宽排布、高度自然，如同 egui）。
+    fixed_w: Option<f32>,
 }
 
 impl Frame {
@@ -63,7 +69,9 @@ impl Frame {
             next_min: Vec2::ZERO,
             next_max: Vec2::ZERO,
             next_fixed_h: None,
+            force_h_all: None,
             fixed_h: None,
+            fixed_w: None,
         }
     }
 
@@ -78,7 +86,9 @@ impl Frame {
             next_min: Vec2::ZERO,
             next_max: Vec2::ZERO,
             next_fixed_h: None,
+            force_h_all: None,
             fixed_h: None,
+            fixed_w: None,
         }
     }
 
@@ -102,35 +112,109 @@ impl Frame {
         self.next_fixed_h = Some(h.max(0.0));
     }
 
+    /// **强制本 frame 全部子项等高**（水平行 `row` 用）：`child_rect` 时高度 =
+    /// `force_h_all`（覆盖自然高 / 一次性 next_fixed_h），持续到 frame 结束。
+    pub fn set_force_h_all(&mut self, h: f32) {
+        self.force_h_all = Some(h.max(0.0));
+    }
+
     /// 固定容器结算高度（`settle_size` 覆盖自然高度）。
     pub fn set_fixed_h(&mut self, h: f32) {
         self.fixed_h = Some(h.max(0.0));
     }
 
+    /// 固定容器结算宽度（`settle_size` 覆盖自然宽度；子项宽度 clamp 到该值）。
+    pub fn set_fixed_w(&mut self, w: f32) {
+        self.fixed_w = Some(w.max(0.0));
+    }
+
+    /// 固定宽容器（`fixed_w`）扣除内边距后的**内容可用宽度**（`None` = 未设固定宽）。
+    /// 供 `Ui::avail_w`（沙箱可用宽度）兜底。
+    pub(crate) fn fixed_avail_w(&self) -> Option<f32> {
+        match self.fixed_w {
+            Some(w) if w > 0.0 => Some((w - self.pad_total * 2.0).max(0.0)),
+            _ => None,
+        }
+    }
+
+    /// 下一子项的 max **宽度**约束（`0` = 不约束）。
+    pub(crate) fn next_max_w(&self) -> f32 {
+        self.next_max.x
+    }
+
+    /// 已放置子项的最大宽度（`0` = 尚无子项）。分割线"取当前容器宽度"用。
+    pub(crate) fn max_child_w(&self) -> f32 {
+        self.max_child.x
+    }
+
     /// 为尺寸 `(w, h)` 的子项分配一个局部矩形，并推进光标 / 更新统计。
     ///
-    /// 应用顺序：**min/max 约束** → **flex 强制高度**（覆盖测量值）。
+    /// 应用顺序：**min/max 约束** → **容器固定宽**（`fixed_w` clamp）→ **flex 强制高度**
+    /// （覆盖测量值）。
     pub fn child_rect(&mut self, w: f32, h: f32) -> Rect {
+        self.child_rect_inner(w, h, true)
+    }
+
+    /// 同 [`Self::child_rect`]，但 `expands = false` 时该子项**不撑大父级**
+    /// （`max_child` 不更新、grid 不扩格）——`DisableAutoExpansion` 控件语义：
+    /// 内容按自身尺寸放置，溢出由控件自身自洽（noclip / 省略）。
+    pub fn child_rect_exp(&mut self, w: f32, h: f32, expands: bool) -> Rect {
+        self.child_rect_inner(w, h, expands)
+    }
+
+    /// **外部放置**（嵌套容器结算后补记）：按 Stack 语义推进光标 + 更新 `max_child`
+    /// + 计数——供"占光标"式嵌套容器（如 [`crate::ui::UiAdd::row`]）使用：
+    /// 子容器已按自身 Frame 放置内容，结算尺寸 `size` 后由父 Frame 补记占位。
+    pub(crate) fn place_external(&mut self, size: Vec2) {
+        match &mut self.kind {
+            FrameKind::Stack { side, gap } => {
+                match side {
+                    PackSide::Top => self.cursor.y += size.y + *gap,
+                    PackSide::Left => self.cursor.x += size.x + *gap,
+                }
+                self.max_child.x = self.max_child.x.max(size.x);
+                self.max_child.y = self.max_child.y.max(size.y);
+                self.count += 1;
+            }
+            FrameKind::Grid { .. } => {
+                // grid 单元格尺寸由 grid 内部管理（外部放置不适用）。
+            }
+        }
+    }
+
+    /// `child_rect` 公共实现（`track_max`：是否更新 `max_child` / 扩展 grid 单元格）。
+    fn child_rect_inner(&mut self, w: f32, h: f32, track_max: bool) -> Rect {
         let w = w.max(0.0);
         let h = h.max(0.0);
         let w = if self.next_max.x > 0.0 { w.min(self.next_max.x).max(self.next_min.x) } else { w.max(self.next_min.x) };
         let h = if self.next_max.y > 0.0 { h.min(self.next_max.y).max(self.next_min.y) } else { h.max(self.next_min.y) };
         let h = self.next_fixed_h.take().unwrap_or(h);
+        // 行等高（row）：覆盖一切高度（含一次性 flex 高度），持续作用于本 frame 全部子项。
+        let h = self.force_h_all.unwrap_or(h);
         self.next_min = Vec2::ZERO;
         self.next_max = Vec2::ZERO;
+        // 容器固定宽：子项宽度 clamp（内容按固定宽排布，高度自然）
+        let w = match self.fixed_w {
+            Some(fw) if fw > 0.0 => w.min(fw),
+            _ => w,
+        };
         match &mut self.kind {
             FrameKind::Stack { side, gap } => {
                 let local = self.cursor;
                 match side {
                     PackSide::Top => {
                         self.cursor.y += h + *gap;
-                        self.max_child.x = self.max_child.x.max(w);
-                        self.max_child.y = self.max_child.y.max(h);
+                        if track_max {
+                            self.max_child.x = self.max_child.x.max(w);
+                            self.max_child.y = self.max_child.y.max(h);
+                        }
                     }
                     PackSide::Left => {
                         self.cursor.x += w + *gap;
-                        self.max_child.x = self.max_child.x.max(w);
-                        self.max_child.y = self.max_child.y.max(h);
+                        if track_max {
+                            self.max_child.x = self.max_child.x.max(w);
+                            self.max_child.y = self.max_child.y.max(h);
+                        }
                     }
                 }
                 self.count += 1;
@@ -138,17 +222,21 @@ impl Frame {
             }
             FrameKind::Grid { cols, cell } => {
                 // 渐进扩展 cell：容纳当前子项（缓存值不足时本帧就地扩大，位置即时一致）。
-                if w > cell.x {
-                    cell.x = w;
-                }
-                if h > cell.y {
-                    cell.y = h;
+                if track_max {
+                    if w > cell.x {
+                        cell.x = w;
+                    }
+                    if h > cell.y {
+                        cell.y = h;
+                    }
                 }
                 let col = self.count % *cols;
                 let row = self.count / *cols;
                 self.count += 1;
-                self.max_child.x = self.max_child.x.max(w);
-                self.max_child.y = self.max_child.y.max(h);
+                if track_max {
+                    self.max_child.x = self.max_child.x.max(w);
+                    self.max_child.y = self.max_child.y.max(h);
+                }
                 Rect::new(
                     self.pad_total + col as f32 * cell.x,
                     self.pad_total + row as f32 * cell.y,
@@ -169,7 +257,10 @@ impl Frame {
                 }
                 match side {
                     PackSide::Top => {
-                        let w = self.max_child.x + self.pad_total * 2.0;
+                        let w = match self.fixed_w {
+                            Some(fw) if fw > 0.0 => fw + self.pad_total * 2.0,
+                            _ => self.max_child.x + self.pad_total * 2.0,
+                        };
                         let h = self.fixed_h.unwrap_or((self.cursor.y - gap).max(0.0) + self.pad_total);
                         Vec2::new(w, h)
                     }
@@ -295,11 +386,43 @@ mod tests {
     }
 
     #[test]
+    fn force_h_all_makes_every_child_equal_height() {
+        // 水平行等高（row）：全部子项高度 = row_h（持续作用于本 frame）
+        let mut f = Frame::new_stack(PackSide::Left, 6.0, 0.0);
+        f.set_force_h_all(26.0);
+        assert_eq!(f.child_rect(30.0, 16.0), Rect::new(0.0, 0.0, 30.0, 26.0), "Label 被抬高到 row_h");
+        assert_eq!(f.child_rect(60.0, 26.0), Rect::new(36.0, 0.0, 60.0, 26.0), "Input 保持 row_h");
+        assert_eq!(f.child_rect(40.0, 20.0), Rect::new(102.0, 0.0, 40.0, 26.0), "继续等高");
+        // 结算：高 = row_h（max_child.y），宽 = 子项宽和 + 间距（30+6+60+6+40 = 142）
+        assert_eq!(f.settle_size(), Vec2::new(142.0, 26.0));
+        // force_h_all 与一次性 force_next_h 并存：force_h_all 覆盖（row 语义）
+        let mut g = Frame::new_stack(PackSide::Left, 6.0, 0.0);
+        g.set_force_h_all(26.0);
+        g.force_next_h(60.0);
+        assert_eq!(g.child_rect(30.0, 16.0).h, 26.0, "行等高优先于一次性 flex 高");
+    }
+
+    #[test]
     fn fixed_h_overrides_settle_height() {
         let mut f = Frame::new_stack(PackSide::Top, 6.0, 0.0);
         f.child_rect(50.0, 20.0);
         f.child_rect(40.0, 10.0);
         f.set_fixed_h(200.0);
         assert_eq!(f.settle_size(), Vec2::new(50.0, 200.0), "固定高覆盖自然结算");
+    }
+
+    #[test]
+    fn fixed_w_clamps_children_and_settles_width() {
+        // 窗口固定宽：子项宽度 clamp 到 fixed_w，高度自然（egui 风格）
+        let mut f = Frame::new_stack(PackSide::Top, 6.0, 4.0);
+        f.set_fixed_w(120.0);
+        assert_eq!(f.child_rect(300.0, 20.0), Rect::new(4.0, 4.0, 120.0, 20.0), "宽被 clamp 到 120");
+        assert_eq!(f.child_rect(50.0, 10.0), Rect::new(4.0, 30.0, 50.0, 10.0), "窄子项保持自然");
+        // 结算：宽 = fixed_w + 2*pad；高 = 内容自然高
+        assert_eq!(f.settle_size(), Vec2::new(120.0 + 8.0, 4.0 + 20.0 + 6.0 + 10.0 + 4.0));
+        // 未设 fixed_w 行为不变
+        let mut g = Frame::new_stack(PackSide::Top, 6.0, 4.0);
+        g.child_rect(300.0, 20.0);
+        assert_eq!(g.settle_size(), Vec2::new(308.0, 28.0));
     }
 }

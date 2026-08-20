@@ -1,25 +1,25 @@
 //! 绘制原语：屏幕固定变换 + 实心矩形 / 边框（记录式，实际提交在 `Ui::finish`）。
 //!
-//! 屏幕固定变换数学（与 `rjw_transform::Camera2D` 单元测试
-//! `screen_fixed_transform_maps_local_to_screen_1to1` 一致）：
-//! `{ pos: cam.screen_to_world(anchor_px), rotation: +cam.rotation, scale: 1/zoom }`
-//! —— 局部像素点经该变换到世界、再 `world_to_screen`，恒等于 `anchor_px + local`（1:1，
-//! 不随相机旋转/缩放而变形）。注意旋转符号为 **`+cam.rotation`**（用 `-` 会双重旋转）。
+//! 屏幕固定变换数学（与 `rjw_transform` 单元测试
+//! `viewport_screen_fixed_transform_maps_local_to_screen_1to1` 一致）：
+//! `{ pos: viewport.screen_to_world(anchor_px), rotation: 0, scale: 1 }`
+//! —— 局部像素点经该变换到世界、再 `world_to_screen`，恒等于 `anchor_px + local`
+//! （1:1，不随相机旋转/缩放而变形）。UI 相机恒为 identity（rot=0/zoom=1/pos=0），
+//! 仅需视口（[`rjw_transform::Viewport`]：大小 + 位置）做屏幕像素 ↔ 世界换算。
 
 use glam::Vec2;
 use rjw_2d_render::SpriteRect;
 use rjw_color::Color;
 use rjw_text::Buffer;
-use rjw_transform::{Camera2D, Rect, Transform2D};
+use rjw_transform::{Rect, Transform2D, Viewport};
 use std::sync::Arc;
 
-/// 屏幕固定变换：把屏幕像素锚点映射为世界中的 `Transform2D`。
+/// 屏幕固定变换：把屏幕像素锚点映射为世界中的 `Transform2D`（UI 恒等特例）。
 #[inline]
-pub fn screen_fixed_tf(cam: &Camera2D, anchor_px: Vec2) -> Transform2D {
-    Transform2D::IDENTITY
-        .with_pos(cam.screen_to_world(anchor_px))
-        .with_rot(cam.rotation)
-        .with_scale(Vec2::new(1.0 / cam.zoom.x, 1.0 / cam.zoom.y))
+pub fn screen_fixed_tf(viewport: &Viewport, anchor_px: Vec2) -> Transform2D {
+    // UI 相机恒为 identity（rot=0 / zoom=1 / pos=0）：变换 = 平移到
+    // viewport.screen_to_world(anchor_px)（屏幕固定 1:1，不旋转/缩放）。
+    Transform2D::IDENTITY.with_pos(viewport.screen_to_world(anchor_px))
 }
 
 /// 屏幕矩形 → 精灵矩形（mesh 局部坐标从 (0,0) 起，尺寸 = 矩形宽高）。
@@ -38,6 +38,36 @@ pub fn snap_rect(r: &Rect) -> Rect {
     let x1 = (r.x + r.w).round();
     let y1 = (r.y + r.h).round();
     Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+}
+
+/// **物理 / 逻辑单位包装**（DPI 边界类型）。
+///
+/// 内部计算一律使用**物理像素**（渲染取整 / 命中 / 滚动都在物理侧），逻辑单位只在
+/// 公开 API 边界换算一次。对外参数若允许用户二选一，用本类型接收：
+///
+/// ```no_run
+/// # use rjw_ui::draw::Metric;
+/// let m: Metric<f32> = Metric::Logical(40.0);
+/// let px = m.to_physical(1.5); // 60.0 物理像素
+/// # let _ = px;
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Metric<T> {
+    /// 已按 DPI 换算的物理像素值。
+    Physical(T),
+    /// 逻辑像素值（内部 × scale 换算为物理）。
+    Logical(T),
+}
+
+impl Metric<f32> {
+    /// 换算为**物理像素**（`Logical` 值 × `scale`；`Physical` 原样）。
+    #[inline]
+    pub fn to_physical(self, scale: f32) -> f32 {
+        match self {
+            Metric::Physical(v) => v,
+            Metric::Logical(v) => v * scale,
+        }
+    }
 }
 
 /// 屏幕像素点取整（锚点 / 文本位置用）。
@@ -288,7 +318,9 @@ pub struct UiDraw {
     pub elem: u32,
     pub rect: Rect,
     /// **裁剪区**（**绝对逻辑屏幕坐标**；滚动容器等设置，`None` = 不裁剪）。
-    /// 与 `rect` 一样随容器弹出平移（`translate`）。收集期与内容求交，越界部分剔除。
+    /// 与 `rect` 不同：**不随容器弹出平移**（`translate` 只移动 `rect`）——因为
+    /// `rect` 是相对当前容器 origin 的局部坐标（逐层平移成绝对），而 `clip` 记录时
+    /// 已是绝对坐标，再平移会双重偏移（滚动容器内容被错误裁掉）。
     pub clip: Option<Rect>,
     pub kind: DrawKind,
 }
@@ -298,10 +330,9 @@ impl UiDraw {
     pub fn translate(&mut self, by: Vec2) {
         self.rect.x += by.x;
         self.rect.y += by.y;
-        if let Some(c) = &mut self.clip {
-            c.x += by.x;
-            c.y += by.y;
-        }
+        // 只平移 rect：clip 已是绝对坐标（见字段文档），平移会造成双重偏移——
+        // 滚动容器（scroll_at）里录制的命令 clip = 可视区绝对矩形，若再加一次
+        // pos 偏移会被裁到屏幕外（list_at 内容"不显示"的根因）。
     }
 }
 
@@ -506,5 +537,25 @@ mod tests {
         let top = text_block_offset(TextAlign::Left, TextVAlign::Top, Vec2::new(100.0, 60.0), -7.0);
         let ctr = text_block_offset(TextAlign::Left, TextVAlign::Center, Vec2::new(100.0, 60.0), -7.0);
         assert_eq!(ctr.y - top.y, -30.0, "Center 比 Top 上移半个内容高");
+    }
+
+    #[test]
+    fn translate_moves_rect_but_not_absolute_clip() {
+        // 回归：滚动容器内容被错误裁掉（list_at 不显示）的根因——
+        // `clip` 是绝对逻辑坐标，`translate` 只应平移局部坐标的 `rect`。
+        let mut d = UiDraw {
+            depth: 1,
+            seq: 0,
+            win: 0,
+            elem: 1,
+            rect: Rect::new(0.0, 0.0, 20.0, 10.0),
+            clip: Some(Rect::new(880.0, 130.0, 240.0, 300.0)),
+            kind: DrawKind::Solid(Color::WHITE),
+        };
+        d.translate(Vec2::new(880.0, 120.0));
+        // rect：局部 → 绝对（随容器平移）
+        assert_eq!(d.rect, Rect::new(880.0, 120.0, 20.0, 10.0));
+        // clip：绝对坐标，**不得**再加一次偏移
+        assert_eq!(d.clip, Some(Rect::new(880.0, 130.0, 240.0, 300.0)));
     }
 }
