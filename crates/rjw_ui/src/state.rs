@@ -8,6 +8,7 @@ use rjw_2d_render::VertexP3U2C4;
 use rjw_text::Buffer;
 use rjw_transform::Rect;
 
+use crate::id::IdAbsolute;
 use crate::proc::ProcTextures;
 
 /// 控件文本 `Arc<Buffer>` 缓存容量上限：超出时按"本帧未使用"驱逐（帧级近似 LRU），
@@ -38,9 +39,10 @@ pub struct WidgetState {
     pub caret: usize,
     /// 文本选择锚点（char 索引；`Some` = 有选择，范围 = [min(anchor,caret), max)）。
     pub sel_anchor: Option<usize>,
-    /// **双击检测**：上次按下帧号（0 = 无历史；与光标闪烁同用 `UiState.frame` 时钟）。
-    pub(crate) last_click_frame: u64,
-    /// **双击检测**：上次按下位置（逻辑像素；位移 < 阈值才算同一点）。
+    /// **双击检测**：上次按下时间（`None` = 无历史；两次按下间隔 ≤ [`crate::ui::DOUBLE_CLICK_TIME`]，
+    /// 用 `Instant` 而非帧数——高帧率下帧窗口不缩水）。
+    pub(crate) last_click_time: Option<std::time::Instant>,
+    /// **双击检测**：上次按下位置（物理像素；位移 < 阈值才算同一点）。
     pub(crate) last_click_pos: Vec2,
     /// **词模式选择**：双击后按住拖拽按词边界扩散（`extend_word_caret`）。
     pub(crate) sel_word: bool,
@@ -55,6 +57,12 @@ pub struct WidgetState {
     /// 版本。文本频繁变化的输入框在此缓存（**不污染** `UiState::text_buffers` 全局缓存）；
     /// 静态标签仍走全局缓存（`CachePolicy::User`）。
     pub(crate) text_buf: Option<(String, Arc<Buffer>)>,
+    /// **数字输入框内部持久编辑文本**（`NumberInput` 内部管理、无需调用方持有
+    /// `String`）：聚焦时编辑缓冲、失焦清空（显示由 `value` 派生）；`None` = 未聚焦。
+    pub(crate) input_text: Option<String>,
+    /// **拖拽灵敏度记录**（`NumberInput` / `Slider` 用）：本控件上次拖拽的每像素速度
+    /// 倍率；**变化时（按住 Shift/Ctrl 切换）重设拖拽基准**——从当前值继续、不跳变。
+    pub(crate) drag_sens: f32,
 }
 
 /// 滚动容器状态（`UiState.scrolls`，跨帧持久）。
@@ -101,17 +109,17 @@ pub struct UiStats {
 /// UI 全局持久状态（由应用持有，跨帧复用；一个 `UiState` 可对应多个 `Ui`）。
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
-    /// 控件 ID → 持久状态。
-    pub widgets: HashMap<String, WidgetState>,
-    /// 当前持有焦点的控件 ID（文本输入框等）。
-    pub focused: Option<String>,
-    /// 单选组：组名 → 当前选中的控件 ID。
-    pub radio_groups: HashMap<String, String>,
-    /// 可拖拽面板 / 窗口：ID → 左上角位置（屏幕逻辑像素，跨帧持久）。
-    pub panel_pos: HashMap<String, Vec2>,
-    /// **窗口 z-order**：窗口 ID → z 值（越大越靠上；点击窗口置顶 = z+1）。
+    /// 控件 **绝对 ID** → 持久状态。
+    pub widgets: HashMap<IdAbsolute<'static>, WidgetState>,
+    /// 当前持有焦点的控件 **绝对 ID**（文本输入框等）。
+    pub focused: Option<IdAbsolute<'static>>,
+    /// 单选组：组名 → 当前选中的控件 **绝对 ID**。
+    pub radio_groups: HashMap<String, IdAbsolute<'static>>,
+    /// 可拖拽面板 / 窗口：**绝对 ID** → 左上角位置（屏幕逻辑像素，跨帧持久）。
+    pub panel_pos: HashMap<IdAbsolute<'static>, Vec2>,
+    /// **窗口 z-order**：窗口 **绝对 ID** → z 值（越大越靠上；点击窗口置顶 = z+1）。
     /// 窗口命令按 z 升序绘制（焦点窗口最后画 → 最上层）。
-    pub window_z: HashMap<String, u32>,
+    pub window_z: HashMap<IdAbsolute<'static>, u32>,
     /// **窗口矩形缓存**：窗口 z → 屏幕矩形（**逻辑像素**），跨帧保留。
     ///
     /// 用途：窗口**遮挡判定**（[`crate::hit::window_occluded`]）——控件命中测试时
@@ -119,8 +127,8 @@ pub struct UiState {
     /// 区域不响应）。录制窗口时更新（[`Ui::window_at`]），`finish` 末尾只保留
     /// **本帧录制过**的窗口（销毁/停用窗口自动清除，z 变化时旧条目随帧清理）。
     pub(crate) window_rects: HashMap<u32, Rect>,
-    /// grid 容器：ID → 结算后的单元格尺寸（跨帧缓存，保证布局稳定）。
-    pub grid_cells: HashMap<String, Vec2>,
+    /// grid 容器：**绝对 ID** → 结算后的单元格尺寸（跨帧缓存，保证布局稳定）。
+    pub grid_cells: HashMap<IdAbsolute<'static>, Vec2>,
     /// 控件文本排版缓存：`(文本, 字号位模式, 字体族, 换行宽度位模式, 版本)` →
     /// `(共享 `Arc<Buffer>`, 最后使用帧号)`。
     ///
@@ -139,7 +147,7 @@ pub struct UiState {
     /// 若只看当前帧候选会误判为"非组合"而执行本地退格（误删已有文本）。
     /// 组合中或刚结束的帧，退格/删除/方向键一律交给 IME 系统处理。
     pub(crate) ime_composing: bool,
-    /// **窗口四边形缓存**：窗口 id → (内容签名, 按 **(元素序, 组, 纹理)** 分组的**局部顶点**)。
+    /// **窗口四边形缓存**：窗口 **绝对 ID** → (内容签名, 按 **(元素序, 组, 纹理)** 分组的**局部顶点**)。
     /// 组：`0` = 图形（白纹理 / 圆角 / 渐变 / 边框）、`1` = 文字（字形图集）。
     /// 窗口内容不变时复用（`finish` 按**全量签名**命中），**移动窗口只改变换、顶点不重建**；
     /// 任何内容变化（hover 变色、点击按下、文字编辑、滚动等）都会使签名变化而自动重建。
@@ -147,28 +155,35 @@ pub struct UiState {
     /// ⚠ 签名必须是**逐命令全量哈希**（含颜色 / 边框宽 / 圆角 / 对齐 / 光标 / 选择）——
     /// 轻量摘要曾漏掉颜色位，hover/click 变色被误判"内容未变" → 复用陈旧顶点，
     /// 窗口内交互效果不刷新（下拉框 / 背包 / 窗口按钮失效）。
-    pub(crate) window_quads: HashMap<String, (u64, Vec<(u32, u8, u64, Vec<VertexP3U2C4>)>)>,
+    pub(crate) window_quads: HashMap<IdAbsolute<'static>, (u64, Vec<(u32, u8, u64, Vec<VertexP3U2C4>)>)>,
     /// **诊断**：本帧**命中但被更高窗口遮挡而未响应**的控件次数
     /// （点击穿透拦截计数；`Ui::hit_abs` 累加，`begin_frame` 清零）。
     pub(crate) occluded_hits: u32,
     /// **诊断**：最近一次按下由哪个窗口接收（`finish::resolve_win_press` 写入；
     /// 即重叠点击时被置顶/可拖拽的**最上层**窗口）。跨帧保留直至下一次按下。
-    pub(crate) last_press_window: Option<(String, u32)>,
+    pub(crate) last_press_window: Option<(IdAbsolute<'static>, u32)>,
     /// **程序化纹理缓存**（圆角矩形 / 渐变 / WHITE）：塞进动态 Atlas，跨帧复用。
     pub(crate) proc: ProcTextures,
-    /// **滚动容器状态**：`scroll_at` 的 id → (偏移, 内容高)，跨帧持久。
-    pub(crate) scrolls: HashMap<String, ScrollState>,
-    /// **下拉框展开状态**：当前展开的 `combo` 的 id（`None` = 全部收起）。
-    pub(crate) combo_open: Option<String>,
-    /// **固定宽窗口的宽度**（`window_at_w` 鼠标缩放：id → 逻辑宽度，跨帧持久）。
-    pub(crate) window_widths: HashMap<String, f32>,
-    /// **用户拖拽缩放的控件尺寸**（[`Ui::resize_handle`]：id → 逻辑尺寸，跨帧持久）。
+    /// **滚动容器状态**：`scroll_at` 的 **绝对 ID** → (偏移, 内容高)，跨帧持久。
+    pub(crate) scrolls: HashMap<IdAbsolute<'static>, ScrollState>,
+    /// **下拉框展开状态**：当前展开的 `combo` 的 **绝对 ID**（`None` = 全部收起）。
+    pub(crate) combo_open: Option<IdAbsolute<'static>>,
+    /// **固定宽窗口的宽度**（`window_at_w` 鼠标缩放：**绝对 ID** → 逻辑宽度，跨帧持久）。
+    pub(crate) window_widths: HashMap<IdAbsolute<'static>, f32>,
+    /// **用户拖拽缩放的控件尺寸**（[`Ui::resize_handle`]：**绝对 ID** → 逻辑尺寸，跨帧持久）。
     /// 可缩放 widget 的 `size()` 优先读它（首次 = 内容自然尺寸）。
-    pub sizes: HashMap<String, Vec2>,
+    pub sizes: HashMap<IdAbsolute<'static>, Vec2>,
+    /// **窗口整窗口特效**（[`Ui::window_fx`](crate::ui::Ui::window_fx)：**绝对 ID** → tint +
+    /// transform override，跨帧持久；默认无 fx）。不进窗口顶点缓存，提交时应用。
+    pub(crate) window_fx: HashMap<IdAbsolute<'static>, crate::ui::WindowFx>,
     /// **上一帧 rjw_ui 是否设置过系统光标**（`finish` 光标抑制用：本帧无 UI 光标
     /// 意图且上一帧设过 → 清一次回 Default；从未设过 → 不碰系统光标，保留应用
     /// 自定义光标，如游戏准星）。
     pub(crate) cursor_was_set: bool,
+
+    #[allow(unused)]
+    /// 提供部分控件需要的字符串上下文，如数字输入（**绝对 ID** 键）。
+    pub(crate) widget_strs: HashMap<IdAbsolute<'static>, String>,
     /// **UI 帧性能统计**（`finish` 各阶段耗时；示例/诊断读取）。
     pub stats: UiStats,
 }
@@ -185,20 +200,20 @@ impl UiState {
         self.occluded_hits = 0;
     }
 
-    /// 取（或创建）某控件的持久状态。
-    pub fn widget(&mut self, id: &str) -> &mut WidgetState {
-        self.widgets.entry(id.to_owned()).or_default()
+    /// 取（或创建）某控件的持久状态。`id` 为**绝对 ID**（控件内 `ui.id_for(..)` 所得）。
+    pub fn widget(&mut self, id: &IdAbsolute<'_>) -> &mut WidgetState {
+        self.widgets.entry(id.to_static()).or_default()
     }
 
-    /// 移除某个控件状态（控件消失/复用 ID 时）。
-    pub fn remove(&mut self, id: &str) {
-        self.widgets.remove(id);
-        if self.focused.as_deref() == Some(id) {
+    /// 移除某个控件状态（控件消失/复用 ID 时）。`id` 为**绝对 ID**。
+    pub fn remove(&mut self, id: &IdAbsolute<'_>) {
+        self.widgets.remove(id.as_str());
+        if self.focused.as_ref().is_some_and(|f| f.as_str() == id.as_str()) {
             self.focused = None;
         }
         for group in self.radio_groups.values_mut() {
-            if group == id {
-                *group = String::new();
+            if group.as_str() == id.as_str() {
+                *group = IdAbsolute::owned(String::new());
             }
         }
     }
@@ -221,6 +236,7 @@ impl UiState {
         self.scrolls.clear();
         self.combo_open = None;
         self.sizes.clear();
+        self.window_fx.clear();
         self.stats = UiStats::default();
     }
 

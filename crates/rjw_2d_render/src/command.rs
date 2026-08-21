@@ -31,6 +31,17 @@ pub(crate) enum DrawCommand {
         /// 经 model 变换到世界（`None` = 顶点即世界坐标，原语义）。
         mat_idx: Option<usize>,
     },
+    /// **已提前合批的四边形段**（QuadVerticesCommand）：一整段 QuadVertices +
+    /// 单一变换矩阵 + 单一**混合颜色**（实例 color，shader 里 顶点色×实例色）。
+    /// 语义 = 自成一整段一次 `draw_indexed`，**不参与**通用 Mesh 的跨段合批比较
+    /// （避免 color 参与分组）。供 UI 窗口整段提交（整窗口动画/特效）。
+    MeshStyled {
+        vert: Range<usize>,
+        tri_index: Range<usize>,
+        mat_idx: Option<usize>,
+        /// 整段混合色（实例 color；`[1,1,1,1]` = 不染色）。
+        color: [f32; 4],
+    },
     /// 静态网格（注册表）：`mesh_id` → `MESHES` 中的 `Arc<MeshData>`，实例化合并绘制。
     /// 顶点自带 UV，通过 `States.texture_uid` 采样纹理。
     StaticMesh {

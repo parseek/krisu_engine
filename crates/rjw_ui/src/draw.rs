@@ -70,6 +70,118 @@ impl Metric<f32> {
     }
 }
 
+// ─── Size / Position：公开 API 的带单位参数（逻辑 / 物理） ────────
+
+/// **带单位的尺寸**（公开 API 参数）：`Size<f32>` 标量（宽 / 高 / 半径 / 字号…）、
+/// `Size<Vec2>` 向量（尺寸对）。默认 `From` 为 [`Size::Logical`]——现有调用
+/// `width(220.0)` / `view_size(vec2(…))` 源码兼容；需物理像素时显式 `Size::Physical(..)`。
+///
+/// 换算在 **API 边界**进行一次（[`Size::to_physical`]），Ui 内部以物理像素为单位
+/// （布局 / 命中 / 绘制零 scale 换算）。`Logical` 换算会**取整**（`(v×scale).round()`，
+/// 保布局整数不变量）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Size<T> {
+    /// 逻辑像素（× scale 换算为物理，取整）。
+    Logical(T),
+    /// 物理像素（原样）。
+    Physical(T),
+}
+
+impl Size<f32> {
+    #[inline]
+    pub fn to_physical(self, scale: f32) -> f32 {
+        match self {
+            Size::Physical(v) => v,
+            Size::Logical(v) => (v * scale).round(),
+        }
+    }
+}
+
+impl Size<Vec2> {
+    #[inline]
+    pub fn to_physical(self, scale: f32) -> Vec2 {
+        match self {
+            Size::Physical(v) => v,
+            Size::Logical(v) => (v * scale).round(),
+        }
+    }
+}
+
+impl Default for Size<f32> {
+    fn default() -> Self {
+        Size::Logical(0.0)
+    }
+}
+
+impl Default for Size<Vec2> {
+    fn default() -> Self {
+        Size::Logical(Vec2::ZERO)
+    }
+}
+
+impl From<f32> for Size<f32> {
+    #[inline]
+    fn from(v: f32) -> Self {
+        Size::Logical(v)
+    }
+}
+
+impl From<Vec2> for Size<Vec2> {
+    #[inline]
+    fn from(v: Vec2) -> Self {
+        Size::Logical(v)
+    }
+}
+
+/// **带单位的位置**（公开 API 参数，默认 `Vec2`）：`Position` / `Position<Vec2>`。
+/// 语义与换算同 [`Size`]（[`Position::to_physical`]）；`From<Vec2>` 默认 [`Position::Logical`]。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Position<T = Vec2> {
+    Logical(T),
+    Physical(T),
+}
+
+impl Position<Vec2> {
+    #[inline]
+    pub fn to_physical(self, scale: f32) -> Vec2 {
+        match self {
+            Position::Physical(v) => v,
+            Position::Logical(v) => (v * scale).round(),
+        }
+    }
+}
+
+impl Position<f32> {
+    #[inline]
+    pub fn to_physical(self, scale: f32) -> f32 {
+        match self {
+            Position::Physical(v) => v,
+            Position::Logical(v) => (v * scale).round(),
+        }
+    }
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Position::Logical(Vec2::ZERO)
+    }
+}
+
+impl From<Vec2> for Position {
+    #[inline]
+    fn from(v: Vec2) -> Self {
+        Position::Logical(v)
+    }
+}
+
+impl From<f32> for Position<f32> {
+    #[inline]
+    fn from(v: f32) -> Self {
+        Position::Logical(v)
+    }
+}
+
+
 /// 屏幕像素点取整（锚点 / 文本位置用）。
 #[inline]
 pub fn snap_point(p: Vec2) -> Vec2 {
@@ -139,16 +251,16 @@ pub fn border_rects(rect: &Rect, width: f32) -> [Rect; 4] {
     ]
 }
 
-/// 调试形状（逻辑像素）→ 物理像素线段列表：每条 = `([起点, 终点], 线宽)`。
+/// 调试形状（物理像素）→ 物理像素线段列表：每条 = `([起点, 终点], 线宽)`。
 ///
-/// 纯几何（可单测）：`scale` 为 DPI 物理/逻辑换算；线段随后由 `QuadCollector`
-/// 经 `thick_line_quad` 生成带厚度四边形。Grid 每方向最多 512 条（防病态输入）。
-pub(crate) fn debug_shape_segments(shape: &DebugShape, scale: f32) -> Vec<([Vec2; 2], f32)> {
+/// 纯几何（可单测）；线段随后由 `QuadCollector` 经 `thick_line_quad` 生成带厚度
+/// 四边形。Grid 每方向最多 512 条（防病态输入）。
+pub(crate) fn debug_shape_segments(shape: &DebugShape) -> Vec<([Vec2; 2], f32)> {
     use std::f32::consts::TAU;
     let mut segs: Vec<([Vec2; 2], f32)> = Vec::new();
     match shape {
         DebugShape::Line { a, b, width } => {
-            segs.push(([*a * scale, *b * scale], width * scale));
+            segs.push(([*a, *b], *width));
         }
         DebugShape::RectOutline { rect, width } => {
             let tl = Vec2::new(rect.x, rect.y);
@@ -156,7 +268,7 @@ pub(crate) fn debug_shape_segments(shape: &DebugShape, scale: f32) -> Vec<([Vec2
             let br = Vec2::new(rect.x + rect.w, rect.y + rect.h);
             let bl = Vec2::new(rect.x, rect.y + rect.h);
             for (a, b) in [(tl, tr), (tr, br), (br, bl), (bl, tl)] {
-                segs.push(([a * scale, b * scale], width * scale));
+                segs.push(([a, b], *width));
             }
         }
         DebugShape::CircleOutline {
@@ -166,29 +278,29 @@ pub(crate) fn debug_shape_segments(shape: &DebugShape, scale: f32) -> Vec<([Vec2
             width,
         } => {
             let seg = (*segments).max(3);
-            let c = *center * scale;
-            let r = *radius * scale;
+            let c = *center;
+            let r = *radius;
             for i in 0..seg {
                 let a0 = i as f32 / seg as f32 * TAU;
                 let a1 = (i + 1) as f32 / seg as f32 * TAU;
                 let p0 = c + Vec2::new(a0.cos(), a0.sin()) * r;
                 let p1 = c + Vec2::new(a1.cos(), a1.sin()) * r;
-                segs.push(([p0, p1], width * scale));
+                segs.push(([p0, p1], *width));
             }
         }
         DebugShape::Cross { center, half, width } => {
-            let c = *center * scale;
-            let h = *half * scale;
-            segs.push(([c - Vec2::new(h, 0.0), c + Vec2::new(h, 0.0)], width * scale));
-            segs.push(([c - Vec2::new(0.0, h), c + Vec2::new(0.0, h)], width * scale));
+            let c = *center;
+            let h = *half;
+            segs.push(([c - Vec2::new(h, 0.0), c + Vec2::new(h, 0.0)], *width));
+            segs.push(([c - Vec2::new(0.0, h), c + Vec2::new(0.0, h)], *width));
         }
         DebugShape::Grid { rect, spacing, width } => {
-            let w = width * scale;
-            let sp = (*spacing).max(f32::EPSILON) * scale;
-            let x0 = rect.x * scale;
-            let y0 = rect.y * scale;
-            let x1 = (rect.x + rect.w) * scale;
-            let y1 = (rect.y + rect.h) * scale;
+            let w = *width;
+            let sp = (*spacing).max(f32::EPSILON);
+            let x0 = rect.x;
+            let y0 = rect.y;
+            let x1 = rect.x + rect.w;
+            let y1 = rect.y + rect.h;
             let mut x = x0;
             let mut n = 0;
             while x <= x1 && n < 512 {
@@ -426,57 +538,88 @@ mod tests {
     }
 
     #[test]
+    fn size_and_position_units_convert() {
+        // From 默认 Logical（现有 f32/Vec2 调用兼容）。
+        let s: Size<f32> = 220.0.into();
+        assert_eq!(s, Size::Logical(220.0));
+        let p: Position = Vec2::new(10.0, 20.0).into();
+        assert_eq!(p, Position::Logical(Vec2::new(10.0, 20.0)));
+        let v: Size<Vec2> = Vec2::new(1.0, 2.0).into();
+        assert_eq!(v, Size::Logical(Vec2::new(1.0, 2.0)));
+        // Logical → Physical：× scale 并**取整**（布局整数不变量）。
+        assert_eq!(Size::Logical(220.0).to_physical(1.25), 275.0);
+        assert_eq!(Size::Logical(6.0).to_physical(1.25), 8.0, "6×1.25=7.5 → round 8");
+        assert_eq!(
+            Position::Logical(Vec2::new(155.0, 32.0)).to_physical(1.25),
+            Vec2::new(194.0, 40.0)
+        );
+        // Physical 原样（不取整）。
+        assert_eq!(Size::Physical(220.0).to_physical(1.25), 220.0);
+        assert_eq!(Position::Physical(Vec2::new(7.5, 8.5)).to_physical(2.0), Vec2::new(7.5, 8.5));
+        // Default。
+        assert_eq!(Size::<f32>::default(), Size::Logical(0.0));
+        assert_eq!(Position::default(), Position::Logical(Vec2::ZERO));
+    }
+
+    #[test]
     fn snap_point_rounds() {
         assert_eq!(snap_point(Vec2::new(1.2, -3.6)), Vec2::new(1.0, -4.0));
     }
 
     #[test]
-    fn debug_shape_segments_scale_and_count() {
-        // 线段：1 条，端点与线宽按 scale 缩放
-        let segs = debug_shape_segments(
-            &DebugShape::Line { a: Vec2::new(10.0, 20.0), b: Vec2::new(30.0, 40.0), width: 2.0 },
-            1.5,
-        );
+    fn debug_shape_segments_counts_and_geometry() {
+        // 线段：1 条（坐标 / 线宽为物理像素，原样输出）
+        let segs = debug_shape_segments(&DebugShape::Line {
+            a: Vec2::new(10.0, 20.0),
+            b: Vec2::new(30.0, 40.0),
+            width: 2.0,
+        });
         assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].0, [Vec2::new(15.0, 30.0), Vec2::new(45.0, 60.0)]);
-        assert_eq!(segs[0].1, 3.0);
-        // 矩形框：4 条边，角点落在缩放后的矩形角上
-        let segs = debug_shape_segments(
-            &DebugShape::RectOutline { rect: Rect::new(0.0, 0.0, 100.0, 50.0), width: 1.0 },
-            2.0,
-        );
+        assert_eq!(segs[0].0, [Vec2::new(10.0, 20.0), Vec2::new(30.0, 40.0)]);
+        assert_eq!(segs[0].1, 2.0);
+        // 矩形框：4 条边，角点落在矩形角上
+        let segs = debug_shape_segments(&DebugShape::RectOutline {
+            rect: Rect::new(0.0, 0.0, 100.0, 50.0),
+            width: 1.0,
+        });
         assert_eq!(segs.len(), 4);
         let corners: Vec<Vec2> = segs.iter().flat_map(|([a, b], _)| [*a, *b]).collect();
-        for c in [Vec2::new(0.0, 0.0), Vec2::new(200.0, 0.0), Vec2::new(200.0, 100.0), Vec2::new(0.0, 100.0)] {
+        for c in [Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0), Vec2::new(100.0, 50.0), Vec2::new(0.0, 50.0)] {
             assert!(corners.contains(&c), "角点 {c:?} 应出现在矩形框线段中");
         }
-        // 圆环：segments 条线段，半径缩放
-        let segs = debug_shape_segments(
-            &DebugShape::CircleOutline { center: Vec2::ZERO, radius: 10.0, segments: 32, width: 1.0 },
-            1.0,
-        );
+        // 圆环：segments 条线段，半径不缩放
+        let segs = debug_shape_segments(&DebugShape::CircleOutline {
+            center: Vec2::ZERO,
+            radius: 10.0,
+            segments: 32,
+            width: 1.0,
+        });
         assert_eq!(segs.len(), 32);
         for ([a, b], w) in &segs {
             assert!((a.length() - 10.0).abs() < 0.2 && (b.length() - 10.0).abs() < 0.2, "环上点半径≈10");
             assert_eq!(*w, 1.0);
         }
         // 十字：2 条线段（横 + 竖）
-        let segs = debug_shape_segments(
-            &DebugShape::Cross { center: Vec2::new(5.0, 5.0), half: 8.0, width: 2.0 },
-            1.0,
-        );
+        let segs = debug_shape_segments(&DebugShape::Cross {
+            center: Vec2::new(5.0, 5.0),
+            half: 8.0,
+            width: 2.0,
+        });
         assert_eq!(segs.len(), 2);
         // 网格：40×20 每 10px → 竖线 0,10,20,30,40 = 5 条；横线 0,10,20 = 3 条
-        let segs = debug_shape_segments(
-            &DebugShape::Grid { rect: Rect::new(0.0, 0.0, 40.0, 20.0), spacing: 10.0, width: 1.0 },
-            1.0,
-        );
+        let segs = debug_shape_segments(&DebugShape::Grid {
+            rect: Rect::new(0.0, 0.0, 40.0, 20.0),
+            spacing: 10.0,
+            width: 1.0,
+        });
         assert_eq!(segs.len(), 5 + 3, "40px 宽每 10px 一条（含两端）→ 5 条；20px 高 → 3 条");
         // segments 下限：segments=0 → 按 3 处理
-        let segs = debug_shape_segments(
-            &DebugShape::CircleOutline { center: Vec2::ZERO, radius: 5.0, segments: 0, width: 1.0 },
-            1.0,
-        );
+        let segs = debug_shape_segments(&DebugShape::CircleOutline {
+            center: Vec2::ZERO,
+            radius: 5.0,
+            segments: 0,
+            width: 1.0,
+        });
         assert_eq!(segs.len(), 3);
     }
 

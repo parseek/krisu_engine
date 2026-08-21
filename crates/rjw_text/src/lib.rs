@@ -308,10 +308,21 @@ fn swash_render_image(
     .render(&mut scaler, cache_key.glyph_id)
 }
 
+/// **字形图集键**：字形（cosmic CacheKey）或**用户自定义纹理**（如 UI 圆角矩形）。
+/// 让自定义纹理与字形共享同一图集页 → 同纹理合批。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AtlasKey {
+    /// 字形（cosmic-text 缓存键）。
+    Glyph(cosmic_text::CacheKey),
+    /// 用户自定义纹理（如 UI 圆角）；`u64` 为**定长 ID**（调用方编码，如圆角半径——
+    /// 无 String 分配、可哈希）。
+    Custom(u64),
+}
+
 pub struct Text {
     font_system: FontSystem,
     scale_context: ScaleContext,
-    glyph_cache: DynamicAtlas<cosmic_text::CacheKey>,
+    glyph_cache: DynamicAtlas<AtlasKey>,
     locations: HashMap<cosmic_text::CacheKey, GlyphLocation>,
     /// 无法产生像素的字形（空格 / 缺字体 / swash 渲染失败）：避免每帧重复光栅化。
     no_image: std::collections::HashSet<cosmic_text::CacheKey>,
@@ -355,6 +366,23 @@ impl Text {
         Some(self.glyph_cache.insert_white())
     }
 
+    /// 往**字形图集**插入用户自定义纹理（如 UI 圆角矩形 9-patch）——与字形 / WHITE
+    /// 纹理**同页同纹理**，UI 绘制时可合批（省去图形↔文字的纹理状态切换）。
+    ///
+    /// `id` 为**定长去重键**（调用方编码，如圆角半径整数；同 `id` 复用同一 region）。
+    /// `clamp_margin` 防采样透色（UI 图形边缘用）。**永久保留**（不参与 LRU 逐出）。
+    /// 返回 `None` 仅当图集满页。
+    pub fn insert_user_texture(
+        &mut self,
+        id: u64,
+        rgba: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Option<AtlasRegion> {
+        self.glyph_cache
+            .insert_permanent(AtlasKey::Custom(id), rgba, w, h, (0, 0), true)
+    }
+
     /// 若字形图集发生过“去碎片重排”（[`rjw_atlas::DynamicAtlas::generation`] 变化），
     /// 从图集重新拉取所有已缓存字形的 `AtlasRegion`，避免旧区域指向已搬动的像素。
     ///
@@ -367,7 +395,7 @@ impl Text {
         self.atlas_generation = generation;
         let keys: Vec<cosmic_text::CacheKey> = self.locations.keys().copied().collect();
         for key in keys {
-            if let Some(region) = self.glyph_cache.get(&key) {
+            if let Some(region) = self.glyph_cache.get(&AtlasKey::Glyph(key)) {
                 if let Some(loc) = self.locations.get_mut(&key) {
                     loc.region = *region;
                 }
@@ -576,7 +604,7 @@ impl Text {
 
         // 写入 DynamicAtlas（使用 insert_no_clamp 避免边界 padding 二次挤压）
         if let Some(region) = self.glyph_cache.insert(
-            cache_key, &rgba, w, h, (0, 0), false
+            AtlasKey::Glyph(cache_key), &rgba, w, h, (0, 0), false
         ) {
             self.locations.insert(cache_key, GlyphLocation {
                 region,
@@ -748,7 +776,7 @@ impl Text {
         Vec2::ZERO
     }
 
-    pub fn glyph_cache(&self) -> &DynamicAtlas<cosmic_text::CacheKey> { &self.glyph_cache }
+    pub fn glyph_cache(&self) -> &DynamicAtlas<AtlasKey> { &self.glyph_cache }
     pub fn page_size(&self) -> u32 { self.glyph_cache.page_size() }
 }
 

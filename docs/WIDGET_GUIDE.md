@@ -159,8 +159,8 @@ if ui.add(TagButton::new("t1", "标签").bg(Color::ORANGE)).clicked() { … }
 | 布局 | `child_rect` | 自写"占光标"容器时分配子矩形 |
 | 命中 | `hit_abs(&Rect)` / `mouse_left()` / `mouse_logical()` | 点中判定 / 左键状态 / 拖拽基准 |
 | 按下归属 | `claim_press()` | **自身有拖拽语义的控件**在按下时调用——阻止外层窗口把本次按下当窗口拖拽基准 |
-| 焦点 | `register_focus(id, rect, FocusKind)` / `key_click(id, kind)` | 键盘导航（Tab/Enter/方向键）接入 |
-| 状态 | `state_mut().widget(id)` → `WidgetState` + `hit::update_drag` / `update_interact` | 跨帧交互状态机（hover/按下/拖拽基准） |
+| 焦点 | `register_focus(&id_for, rect, FocusKind)` / `key_click(&id_for, kind)`（`id_for = ui.id_for(id)` 为**绝对 ID**） | 键盘导航（Tab/Enter/方向键）接入 |
+| 状态 | `state_mut().widget(&id_for)` → `WidgetState` + `hit::update_drag` / `update_interact` | 跨帧交互状态机（hover/按下/拖拽基准）；**收绝对 ID** |
 | 绘制 | `push_panel_like` / `push_text_rect` / `push_solid_rect` / `push_border_rect` | 背景边框 / 文本 / 实心 / 描边（逻辑坐标） |
 | 复用 | `button_at_styled` / `checkbox_at_styled` / `slider_at` / `text_input_at` / `text_area_at` / `radio_at` / `combo_at` | 委托现有控件（**内置控件同路径**） |
 
@@ -196,9 +196,18 @@ if ui.add(TagButton::new("t1", "标签").bg(Color::ORANGE)).clicked() { … }
    // let mut theme = Theme::dark();
    // theme.button.bg = …;
    ```
-2. **逐控件属性**（builder setter）：只覆盖你设置的字段，其余回落主题：
+   **子样式也全是责任链**：每个子样式结构都有 `with_*` setter（只改链上字段，其余回落
+   默认）——逐容器覆盖主题样式无需 clone 整份 Theme：
+   ```rust
+   let panel = PanelStyle::default().with_radius(8.0).with_bg(Color::rgba_u8(40, 44, 62, 255));
+   let btn = ButtonStyle::default().with_bg(c).with_radius(6.0);
+   let slider = SliderStyle::default().with_track(c).with_fill(c);
+   ```
+2. **逐控件属性**（builder setter）：只覆盖你设置的字段，其余回落主题；数值字段接收
+   [`Size`](crate::draw::Size)（默认 `Logical`，× scale 换算取整；`Size::Physical` 原样）：
    ```rust
    ui.add(Button::new("b", "红底白字").bg(Color::RED).color(Color::WHITE));
+   ui.add(Label::new("16px").font_size(Size::Physical(16.0))); // 显式物理字号
    ```
 3. **新控件内部**：`Theme` 子样式 + builder `Option` 合并（见 `resolve()` 示例）——
    需要主题新增样式字段时，直接在 `style.rs` 的子样式结构体加字段并给默认值。
@@ -226,7 +235,10 @@ if ui.add(TagButton::new("t1", "标签").bg(Color::ORANGE)).clicked() { … }
 
 ## 6. 待办（后续可加）
 
-- `Slider` / `TextInput` / `TextArea` / `Combo` 的 builder 化（同样走 `*_at_styled`）；
+- ~~`Slider` / `NumberInput` 的 builder 化~~（已完成：`widget::Slider` 支持 `drag_sensitivity`
+  / `shift_speed` / `ctrl_speed`；`NumberInput::new(id, &mut value)` 内部管理显示文本，
+  支持 `.step()` / `.shift_speed()` / `.ctrl_speed()`）；
+- `TextInput` / `TextArea` / `Combo` 的 builder 化（同样走 `*_at_styled`）；
 - `Response` 扩展（如滑块新值 `Option<f32>`、`drag_delta`）；
 - widget 级 `disabled` / `tooltip` 等通用属性。
 

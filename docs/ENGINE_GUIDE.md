@@ -947,21 +947,21 @@ let mut ui = Ui::begin(window, &mut text, &mut ui_state)
     .scale_factor(ctx.scale_factor().unwrap_or(1.0))    // DPI：控件坐标/字号按逻辑像素
     .build();
 
-ui.label_at(Vec2::new(16.0, 12.0), "FPS: 60");          // place：绝对定位 + 内容自然尺寸
-ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {  // pack：垂直堆叠
+ui.label_at(vec2(16.0, 12.0), "FPS: 60");          // place：绝对定位 + 内容自然尺寸
+ui.pack_at(vec2(16.0, 90.0), PackSide::Top, |p| {  // pack：垂直堆叠
     if p.button("btn_start", "开始游戏").clicked() { /* ... */ }
     volume = p.slider("vol", 0.0..=1.0, volume);         // 返回新值
     if p.checkbox("fs", "全屏", fs).toggled() { fs = !fs; }
     if p.radio("diff_hard", "diff", "困难").checked() { /* 单选组互斥 */ }
     p.text_input("name", &mut player_name);              // 点击聚焦、打字（IME 已支持）、Enter/Esc 失焦
 });
-ui.window_at("win_a", Vec2::new(560.0, 240.0), |w| {    // 可重叠窗口：点击置顶 + 可拖拽
+ui.window_at("win_a", vec2(560.0, 240.0), |w| {    // 可重叠窗口：点击置顶 + 可拖拽
     w.label("窗口 A");
     w.button("win_a_btn", "A 按钮");
 });
-ui.drag_panel_at("inv_panel", Vec2::new(300.0, 90.0), |pp| {  // 可拖拽面板（位置持久）
+ui.drag_panel_at("inv_panel", vec2(300.0, 90.0), |pp| {  // 可拖拽面板（位置持久）
     pp.label("背包");
-    pp.grid_at(Vec2::new(0.0, 28.0), 3, "inv", |g| {    // 3 列网格（cell 跨帧缓存）
+    pp.grid_at(vec2(0.0, 28.0), 3, "inv", |g| {    // 3 列网格（cell 跨帧缓存）
         g.button("slot_0", "物品 0");
     });
 });
@@ -973,8 +973,9 @@ ui.finish(&viewport, r2d);   // 排序（窗口 z → 深度 → 图形/文字 �
 - **坐标一律屏幕逻辑像素**（左上角原点、Y+ 向下）：调用 `.scale_factor(ctx.scale_factor().unwrap_or(1.0))` 后，所有控件坐标 / 字号按逻辑像素使用，内部自动换算物理像素绘制与命中；不设置则 scale = 1.0（与物理像素一致）。与引擎世界坐标（中心原点）不同；内部经相机屏幕固定变换绘制，旋转/缩放相机下依然 1:1。
 - **顶层用 `*_at(pos, ...)`**（含 `label_at` / `panel_at` / `pack_at` / `grid_at`）；容器内才可用无位置形式（`p.button(...)` 占光标）。容器内嵌套容器用 `*_at(offset)`（相对当前容器内容原点），**不占光标**——v1 不支持容器内"光标嵌套"。
 - **交互控件必须有稳定 ID 字符串**（按钮 / 滑块 / 勾选 / 单选 / 输入框）；ID 变化 = 状态丢失。`UiState::reset()` 清空全部状态。
+- **ID 命名空间**（[`IdRelative`] / [`IdAbsolute`] / [`Ui::id_for`]）：窗口 / 滚动容器 / grid / 可拖拽面板 / 下拉框是**命名空间边界**——进入自动压栈、退出自动弹栈（`with_id` 闭包作用域保证配对），其内控件的**绝对 ID** 自动带容器前缀（如 `"chishi/btn"`）。控件公开 API 仍传**相对名字**（`&str`），内部自动解析；状态键 / 焦点 / 单选组值 / 窗口 id 一律用**绝对 ID**。`ui.id_for(id_relative)` 从名字生成绝对 ID（顶层零拷贝）。类型层面杜绝双重前缀与相对/绝对混用（详见 `crate::id`）。
 - **闭包内不可借用已被 `ui` 借用的字段**（如 `self.ui_state`）；需要重置等操作时用局部标记，`ui.finish()` 后统一处理（见示例）。
-- **单选**的选中状态完全存于 `UiState.radio_groups`（`group → id`），应用只读 `checked()`；初始选中用 `state.radio_groups.insert("组名", "id")`。
+- **单选**的选中状态完全存于 `UiState.radio_groups`（`group → 控件绝对 ID`），应用只读 `checked()`；初始选中用 `state.radio_groups.insert("组名", IdAbsolute::from("id"))`（顶层无前缀 = 原样；窗口内单选值自动带窗口前缀，与应用无关）。
 - **文本输入**：普通字符走 `rjw_keyboard::get_chars()`（含 Shift 组合，控制字符已过滤）；**中文输入法（IME）已支持**——`rjw_main` 建窗时自动 `set_ime_allowed(true)`，`rjw_keyboard` 收集上屏文本（`get_ime_commits`）与组合候选（`get_ime_preedit`，输入框以灰色绘制在光标后），Enter 确认上屏。
 - **可拖拽面板 / 窗口**：`drag_panel_at(id, pos, |p| ...)` 按住面板拖动；`window_at(id, pos, |w| ...)` 是**可重叠窗口**——点击即**置顶**（焦点 z-order，`UiState.window_z`），位置持久于 `UiState.panel_pos`；拖动期间**抑制内部子控件交互**。拖拽位置按**物理像素粒度**跟随（1px 跟手，不受 DPI 逻辑量化影响）。
 - **窗口重叠点击裁决**：重叠区域点击**只让最上层窗口**获得拖拽与置顶（`Ui::finish` 内部 `resolve_win_press`）——不会同时拖动两个窗口。
@@ -1039,13 +1040,18 @@ theme.debug.layout_outline_width = 2.0;        // 2 物理像素宽
 **样式如何设置**：`Theme` 子样式的 `radius` 字段（面板 / 窗口 / 按钮 / 输入框，逻辑像素，
 默认 0 = 直角）；绘制原语 `ui.rounded_rect_at(pos, size, radius, color)` 与
 `ui.gradient_rect_at(pos, size, axis, stops)`（绝对定位，`elem = 0` 装饰层）。
+子样式与主题都是**责任链**（`with_*` setter 返回 `Self`，只改链上字段）：
 
 ```rust
-let mut theme = Theme::dark();
-theme.panel.radius = 8.0;    // 面板/窗口圆角
-theme.button.radius = 6.0;   // 按钮圆角（三态背景同样生效）
-theme.input.radius = 4.0;    // 输入框圆角
-// Ui::begin(..).theme(theme).build()
+// 全局主题：with_radius 级联 panel/button/input（圆角生成器已修复，高 DPI 无缺口）
+let theme = Theme::dark().with_radius(8.0);
+// 逐容器样式覆盖（容器责任链）：只改这个窗口的圆角/背景，其余回落全局主题
+ui.window("win")
+    .pos(Vec2::new(560.0, 240.0))
+    .width(220.0)
+    .style(PanelStyle::default().with_radius(8.0).with_bg(Color::rgba_u8(40, 44, 62, 255)))
+    .show(|w| { w.label("窗口"); });
+// 等价旧写法（仍可用）：let mut theme = Theme::dark(); theme.panel.radius = 8.0; …
 
 ui.gradient_rect_at(Vec2::new(0.0, 0.0), Vec2::new(1280.0, 56.0),
     GradientAxis::Horizontal,
@@ -1058,10 +1064,12 @@ ui.gradient_rect_at(Vec2::new(0.0, 0.0), Vec2::new(1280.0, 56.0),
 `TEXTURES`、`clamp_margin` 防采样透色）。要点：
 
 - **圆角纹理只存白色 + alpha**：同半径一张纹理，绘制时用**顶点色 tint** 得到任意颜色
-  （图集不随颜色膨胀）；key 仅含半径；
+  （图集不随颜色膨胀）；key 仅含半径（`r.to_bits()` 位模式，非整数半径不串味）；
 - **9-patch 绘制**（`proc::rounded_9patch`）：四角原样采样、四边/中心拉伸——任意
   矩形尺寸圆弧不畸变；`radius > 0` 的边框 ≈ 外圈 border 色圆角 + 内圈 bg 色圆角
   （`Ui::push_panel_like`）；
+- **生成器按像素半区选圆心**（`proc::rounded_rect_rgba`）：非整数物理半径（高 DPI：
+  radius × scale，如 6 × 1.25 = 7.5）不再因 `r as i32` 截断导致角区整列透明；
 - 渐变矩形直接拉伸采样（主轴 64 级已平滑）；渐变纹理存**真实颜色**（key 含停靠点，
   改变停靠即换纹理）；
 - **提交分组升级为 `(win, 图形/文字组, 纹理 uid)`**（`GROUP_GRAPHIC=0` / `GROUP_TEXT=1`）：
@@ -1093,7 +1101,7 @@ ui.scroll_at(Vec2::new(880.0, 130.0), Vec2::new(240.0, 300.0), "scroll_demo", |s
 ### 18.8 键盘导航（焦点遍历）
 
 交互控件（按钮 / 勾选 / 单选 / 滑块 / 输入框 / 下拉框）录制时调用 `Ui::register_focus`
-登记进**本帧焦点链**（`focus.rs` 的 `FocusEntry`：id / 窗口 z / 类型 / **绝对逻辑矩形** /
+登记进**本帧焦点链**（`focus.rs` 的 `FocusEntry`：**绝对 ID** / 窗口 z / 类型 / **绝对逻辑矩形** /
 裁剪）。`finish` 末尾 `handle_focus_keys`：
 
 1. 链按 `(win, 注册序)` 稳定排序（非窗口 0 在前，窗口按 z 从下到上）；
@@ -1105,7 +1113,7 @@ ui.scroll_at(Vec2::new(880.0, 130.0), Vec2::new(240.0, 300.0), "scroll_demo", |s
 
 **激活与调值**（控件录制时即时处理，无跨帧延迟）：
 
-- **Enter / Space**：`Ui::key_click(id, kind)`（焦点匹配 + 非 IME 组合中）→ 按钮 /
+- **Enter / Space**：`Ui::key_click(&id_for, kind)`（`id_for = ui.id_for(id)` 绝对 ID；焦点匹配 + 非 IME 组合中）→ 按钮 /
   勾选 / 单选 / 下拉框合成一次 clicked（`key_click` 排除 TextInput / Slider）；
 - **← / →**：焦点为滑块时步进调值（`span × 5%`）；焦点为输入框时移动光标（原有）；
 - **↑ / ↓**：下拉框展开且焦点在按钮上时循环切换选项（选中即收起）；
@@ -1211,6 +1219,6 @@ clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位�
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。
-- 新增**交互**控件时必须调用 `register_focus(id, rect, FocusKind::X)`（键盘导航 / 焦点描边）；需要 Enter/Space 激活的控件用 `key_click(id, kind)` 合成点击。
+- 新增**交互**控件时必须调用 `register_focus(&id_for, rect, FocusKind::X)`（键盘导航 / 焦点描边；`id_for = ui.id_for(id)` 为**绝对 ID**）；需要 Enter/Space 激活的控件用 `key_click(&id_for, kind)` 合成点击。持久状态一律经 `state_mut().widget(&id_for)` 读写（绝对 ID）。
 - 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
 - 网格 cell 缓存（`UiState::grid_cells`）保证跨帧布局稳定；无缓存首帧渐进扩展，次帧起稳定。

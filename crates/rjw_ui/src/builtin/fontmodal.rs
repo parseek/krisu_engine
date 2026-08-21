@@ -31,12 +31,11 @@ impl FontModal<'_> {
             return;
         }
         // 主题/测量值先拷出（Copy / owned），闭包内不再借用 `ui`
-        let (font_size, fg, pad, gap) = {
+        let (font_size, fg, gap) = {
             let t = &ui.theme;
-            (t.input.font_size, t.input.fg, t.panel.padding, t.gap)
+            (t.input.font_size, t.input.fg, t.gap)
         };
         let width = 340.0_f32;
-        let content_w = (width - pad * 2.0).max(0.0);
         let bsz = |ui: &mut Ui, s: &str| -> f32 {
             let t = ui.theme.button.clone();
             ui.text_size(s, t.font_size, t.font_family.as_deref()).x + t.padding.x * 2.0
@@ -46,6 +45,12 @@ impl FontModal<'_> {
         let mut ok = false;
         let mut cancel = false;
         ui.modal_at_w("font_modal", Vec2::new(460.0, 220.0), width, |m| {
+            // 内容区宽 = 窗口**内容可用宽**——`avail_w()` 已扣除窗口内边距
+            // （`Frame::fixed_avail_w = w − pad_total×2`，`pad_total = padding + border_w`），
+            // **不要再减 padding**（旧实现重复扣减导致预览框/按钮右缘比内容区窄 2×padding，
+            // 窗口缩窄时 `content_w − btn_w` 提前为负 → spacer 0 → 按钮溢出窗口）。
+            // 窗口缩放柄改宽后 `avail_w()` 返回持久值，预览换行框与按钮右对齐随之跟随。
+            let content_w = m.ui_mut().avail_w().unwrap_or(width);
             m.label("字体切换：输入字体名预览，确定生效（空 = 默认）");
             // Input：输入字体名
             m.text_input("font_modal_input", self.input);
@@ -84,18 +89,25 @@ impl FontModal<'_> {
                     Some(buf),
                 );
             }
-            // 确定 / 取消：水平排列、右对齐（spacer 用 min_size 撑满剩余宽）
+            // 确定 / 取消：水平排列、右对齐（spacer 用 min_size 撑满剩余宽）。
+            // ⚠ `row_y` 是窗口内容光标（**物理**），`pack_at` 收带单位 Position——
+            // 必须显式 `Position::Physical`，否则默认 Logical 会被 ×scale 二次换算
+            // （scale≠1 时按钮行跑到窗口外面）。
             let row_y = m.ui_mut().cursor_pos().y;
-            let row = m.pack_at(Vec2::new(0.0, row_y), PackSide::Left, |row| {
-                row.min_size((content_w - btn_w).max(0.0), 0.0);
-                row.label("");
-                if row.button("font_modal_ok", "确定").clicked() {
-                    ok = true;
-                }
-                if row.button("font_modal_cancel", "取消").clicked() {
-                    cancel = true;
-                }
-            });
+            let row = m.pack_at(
+                crate::draw::Position::Physical(Vec2::new(0.0, row_y)),
+                PackSide::Left,
+                |row| {
+                    row.min_size((content_w - btn_w).max(0.0), 0.0);
+                    row.label("");
+                    if row.button("font_modal_ok", "确定").clicked() {
+                        ok = true;
+                    }
+                    if row.button("font_modal_cancel", "取消").clicked() {
+                        cancel = true;
+                    }
+                },
+            );
             // pack_at 不占父光标：占一个与行同高的子项，窗口高度自然结算
             m.ui_mut().child_rect(0.0, row.y);
         });

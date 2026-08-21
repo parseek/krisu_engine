@@ -30,6 +30,11 @@
 //!   [`Ui::gradient_rect_at`]——程序化纹理（圆角 9-patch / 渐变 / WHITE）**塞进动态
 //!   Atlas**（[`ProcTextures`] → `UiState` 持有），圆角纹理只存白色 + alpha（颜色顶点色
 //!   tint），提交分组升级为 `(win, 图形/文字组, 纹理)` 保证"先图形后文字"。
+//! - **窗口级合批 + 窗口级 FX**：`finish` 提交按窗口聚合（每窗口每纹理合并成整段、
+//!   一次 `draw_indexed`，命中 Render2D 的 QuadVertices 合批；不同纹理/状态/超顶点上限
+//!   自动切段，**尽力而为**）。[`Ui::window_fx`]（[`WindowFx`]：tint + transform override）
+//!   给每个窗口整窗混合色与叠加变换——顶点缓存不变、仅提交时应用，支撑整窗口动画
+//!   （淡入淡出 / 整体位移缩放旋转 / 整窗染色）。
 //! - **控件 trait（非宏）**：[`widget::Widget`] + 属性化 builder（[`widget::Label`] /
 //!   [`widget::Button`] / [`widget::Checkbox`] / [`widget::Divider`]）——新控件 = 普通
 //!   Rust 结构体实现 trait，无 `macro_rules!` 展开（报错定位精确、可单测）；逐控件覆盖
@@ -103,6 +108,7 @@
 //! # 模块
 //!
 //! - [`ui`]：`Ui` 主体 / `Panel` / `Pack` / `Grid` / `UiAdd` 容器控件 API
+//! - [`id`]：ID 命名空间（[`IdRelative`] 原始名字 / [`IdAbsolute`] 完整状态键 / [`IdStack`]）
 //! - [`layout`]：容器布局（Frame / PackSide）
 //! - [`style`]：`Theme` 样式系统
 //! - [`state`]：`UiState` 持久状态 + `ButtonState` / `CheckboxState`
@@ -117,6 +123,7 @@ pub mod builtin;
 pub mod draw;
 pub mod edit;
 pub mod focus;
+pub mod id;
 pub mod hit;
 pub mod input;
 pub mod layout;
@@ -128,14 +135,15 @@ pub mod view;
 pub mod widget;
 
 pub use builtin::{FontModal, NumberInput};
-pub use draw::{GradientAxis, Metric, TextAlign};
+pub use draw::{GradientAxis, Metric, Position, Size, TextAlign};
 pub use focus::FocusKind;
+pub use id::{IdAbsolute, IdRelative, IdStack};
 pub use proc::ProcTextures;
 pub use hit::{hit_test, InteractEvents};
 pub use layout::PackSide;
 pub use state::{ButtonState, CheckboxState, UiState, UiStats, WidgetState};
-pub use style::{ButtonStyle, CheckboxStyle, DividerStyle, InputStyle, LabelStyle, ModalStyle, PanelStyle, SliderStyle, Theme};
+pub use style::{ButtonStyle, CheckboxStyle, ComboStyle, DividerStyle, InputStyle, LabelStyle, ModalStyle, PanelStyle, SliderStyle, Theme};
 pub use input::{KeyboardSnapshot, MouseSnapshot};
-pub use ui::{Anchor, Grid, Pack, Panel, Ui, UiAdd, UiCursor, UiInit, Window};
+pub use ui::{Anchor, Grid, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Ui, UiAdd, UiCursor, UiInit, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
 pub use view::{ViewCtx, ViewMode};
-pub use widget::{Button, Checkbox, Divider, Label, Response, Widget, WidgetId};
+pub use widget::{Button, Checkbox, Divider, Label, Response, Slider, Widget, WidgetId};

@@ -12,6 +12,8 @@
 
 use rjw_transform::Rect;
 
+use crate::id::IdAbsolute;
+
 /// 可聚焦控件类型（键盘行为差异：Enter/Space 激活、方向键调值等）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusKind {
@@ -32,7 +34,8 @@ pub enum FocusKind {
 /// 本帧注册的可聚焦控件（焦点链条目）。
 #[derive(Clone, Debug)]
 pub struct FocusEntry {
-    pub id: String,
+    /// 控件**绝对 ID**（焦点 id / 状态键一致）。
+    pub id: IdAbsolute<'static>,
     /// 所在窗口 z（非窗口内容 = 0；焦点链按 (win, 注册序) 排序）。
     pub win: u32,
     pub kind: FocusKind,
@@ -54,14 +57,14 @@ pub struct FocusEntry {
 /// - 链空返回 `None`。
 pub fn focus_step<'a>(
     chain: &[&'a FocusEntry],
-    current: Option<&str>,
+    current: Option<&IdAbsolute<'static>>,
     dir: i32,
-) -> Option<String> {
+) -> Option<IdAbsolute<'static>> {
     if chain.is_empty() {
         return None;
     }
     let n = chain.len();
-    match current.and_then(|id| chain.iter().position(|e| e.id == id)) {
+    match current.and_then(|id| chain.iter().position(|e| e.id == *id)) {
         Some(i) => {
             let ni = ((i as i64 + dir as i64).rem_euclid(n as i64)) as usize;
             Some(chain[ni].id.clone())
@@ -79,7 +82,7 @@ mod tests {
 
     fn entry(id: &str, win: u32) -> FocusEntry {
         FocusEntry {
-            id: id.to_owned(),
+            id: IdAbsolute::owned(id.to_owned()),
             win,
             kind: FocusKind::Button,
             depth: 0,
@@ -96,25 +99,25 @@ mod tests {
     fn focus_step_forward_wraps() {
         let chain = [entry("a", 0), entry("b", 0), entry("c", 0)];
         let c = refs(&chain);
-        assert_eq!(focus_step(&c, Some("a"), 1).as_deref(), Some("b"));
-        assert_eq!(focus_step(&c, Some("b"), 1).as_deref(), Some("c"));
-        assert_eq!(focus_step(&c, Some("c"), 1).as_deref(), Some("a"), "末尾环绕到链首");
+        assert_eq!(focus_step(&c, Some(&IdAbsolute::from("a")), 1), Some(IdAbsolute::from("b")));
+        assert_eq!(focus_step(&c, Some(&IdAbsolute::from("b")), 1), Some(IdAbsolute::from("c")));
+        assert_eq!(focus_step(&c, Some(&IdAbsolute::from("c")), 1), Some(IdAbsolute::from("a")), "末尾环绕到链首");
     }
 
     #[test]
     fn focus_step_backward_wraps() {
         let chain = [entry("a", 0), entry("b", 0), entry("c", 0)];
         let c = refs(&chain);
-        assert_eq!(focus_step(&c, Some("c"), -1).as_deref(), Some("b"));
-        assert_eq!(focus_step(&c, Some("a"), -1).as_deref(), Some("c"), "链首反向环绕到链尾");
+        assert_eq!(focus_step(&c, Some(&IdAbsolute::from("c")), -1), Some(IdAbsolute::from("b")));
+        assert_eq!(focus_step(&c, Some(&IdAbsolute::from("a")), -1), Some(IdAbsolute::from("c")), "链首反向环绕到链尾");
     }
 
     #[test]
     fn focus_step_no_current_starts_at_ends() {
         let chain = [entry("a", 0), entry("b", 0)];
         let c = refs(&chain);
-        assert_eq!(focus_step(&c, None, 1).as_deref(), Some("a"), "无焦点向前从链首开始");
-        assert_eq!(focus_step(&c, None, -1).as_deref(), Some("b"), "无焦点向后从链尾开始");
+        assert_eq!(focus_step(&c, None, 1), Some(IdAbsolute::from("a")), "无焦点向前从链首开始");
+        assert_eq!(focus_step(&c, None, -1), Some(IdAbsolute::from("b")), "无焦点向后从链尾开始");
     }
 
     #[test]
@@ -122,8 +125,8 @@ mod tests {
         let chain = [entry("a", 0), entry("b", 0)];
         let c = refs(&chain);
         // 焦点控件本帧未录制（如所在窗口关闭）→ 重新开始
-        assert_eq!(focus_step(&c, Some("gone"), 1).as_deref(), Some("a"));
-        assert_eq!(focus_step(&c, Some("gone"), -1).as_deref(), Some("b"));
+        assert_eq!(focus_step(&c, Some(&IdAbsolute::from("gone")), 1), Some(IdAbsolute::from("a")));
+        assert_eq!(focus_step(&c, Some(&IdAbsolute::from("gone")), -1), Some(IdAbsolute::from("b")));
     }
 
     #[test]
@@ -131,7 +134,7 @@ mod tests {
         let chain: [FocusEntry; 0] = [];
         let c = refs(&chain);
         assert_eq!(focus_step(&c, None, 1), None);
-        assert_eq!(focus_step(&c, Some("x"), 1), None);
+        assert_eq!(focus_step(&c, Some(&IdAbsolute::from("x")), 1), None);
     }
 
     #[test]

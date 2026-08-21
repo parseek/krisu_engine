@@ -50,6 +50,9 @@ ui.finish(&viewport, r2d); // 视口/渲染器在此延迟传入（UI 无需相�
 | `list_at` | 选择列表（scroll + 逐项回调） | `ui.list_at(pos, view, id, n, sel, \|s,i,sel\| …)` |
 | `panel_at` / `drag_panel_at` | 面板（背景+边框，可拖拽） | `ui.panel_at(pos, \|p\| …)` |
 | `window_at` | 可重叠窗口（z-order + 点击置顶 + 可拖拽） | `ui.window_at(id, pos, \|w\| …)` |
+| `window` builder | 窗口统一入口（`.width` 固定宽 / `.strict` 裁剪 / `.style` 逐窗样式） | `ui.window(id).pos(..).width(..).strict().style(..).show(\|w\| …)` |
+| `panel` builder | 面板统一入口（`.drag(id)` 可拖拽 / `.style` 覆盖） | `ui.panel().pos(..).drag(id).show(\|p\| …)` |
+| `modal` builder | 模态对话框统一入口（`.width` 固定宽） | `ui.modal(id).pos(..).width(..).show(\|m\| …)` |
 
 - 容器内子项**占光标**堆叠；`*_at` 形式**绝对定位**（相对当前容器内容原点，不占光标）。
 - 尺寸约束：`p.min_size(w, h)` / `p.max_size(w, h)` 作用于下一子项。
@@ -95,6 +98,9 @@ ui.add_at(Vec2::new(400.0, 40.0), Label::new("HUD"));
 
 ## 4. 窗口系统
 
+- **容器责任链 builder**：`ui.window(id).pos(..).width(..).strict().style(..).show(..)` /
+  `ui.panel().pos(..).drag(id).show(..)` / `ui.modal(id).pos(..).width(..).show(..)`——
+  统一旧 `window_at*` / `panel_at` / `modal_at*` 的选项组合（后者保留，薄委托）；
 - **z-order**：点击窗口置顶（z+1）；重叠区域只有**最上层**窗口可交互（点击穿透已修复）；
 - **拖拽**：按住窗口/面板移动 ≥ 3 物理像素进入拖拽（纯点击不拖拽，子控件正常响应）；
 - **位置责任链**（`Ui::pos_handler`）：脚本/动画提供者（优先级降序）→ 用户拖拽状态

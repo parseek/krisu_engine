@@ -126,7 +126,25 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 
 命令排序键 `(win, depth, elem, 图形/文字组, seq)`：窗口 z 升序 → 元素录制序 → 元素内
 "背景/图形先于文字"。实心填充 / 光标用**字形图集页白纹理**（与字形同页同纹理 → 合批）。
-圆角 / 渐变经程序化纹理进动态 Atlas。
+圆角矩形（9-patch）纹理也**塞进字形图集**（[`rjw_text::Text::insert_user_texture`]，
+白色 + alpha、顶点色 tint）——圆角图形与文字/白填充同页同纹理 → 窗口内合并一次 draw；
+线性渐变仍在独立程序化 Atlas 页。
+
+**窗口级合批（尽力而为）**：`finish` 提交按窗口聚合——同一窗口内**连续的同纹理同状态
+内容**顶点合并成整段，一次 `add_quads_styled` → Render2D 一次 `draw_indexed`（命中其
+QuadVertices 合批）。窗口内出现不同纹理（白纹理 / 圆角渐变程序化页）或不同混合状态、
+或超顶点上限（`MAX_UI_SEG_VERTS`）时自动**切段**（层级保序）。
+
+**窗口级 FX**（[`Ui::window_fx`] / `WindowFx`）：每个窗口可设 `tint`（整窗混合色，
+shader 里 `顶点色 × 实例色`）、`transform` override（叠加在窗口原点上）与 **`anchor`
+归一化变换锚点**（`(0.5,0.5)` = 窗口中心，变换绕该锚点旋转/缩放/位移）——**顶点缓存
+不变、仅提交时应用到窗口段实例**，支撑整窗口动画（淡入淡出 / 整体位移缩放旋转 / 整窗
+染色），移动窗口/改 FX 只更新实例矩阵/颜色而不重建顶点。**无论锚点何值，`transform =
+IDENTITY` 时窗口位置恒为原位置**。
+
+**窗口位置约束**（[`WindowBuilder::clamp`](crate::ui::WindowBuilder::clamp) /
+[`WindowClamp`](crate::ui::WindowClamp)）：默认 `Screen` 限位（窗口整体不跑出屏幕）、
+`Free` 自由拖出、`Locked` 锁定位置不可拖（脚本仍可定位）。
 
 ### 10. 焦点与键盘导航（`focus.rs`）
 
@@ -143,7 +161,7 @@ use rjw_ui::{Button, Label, NumberInput, PackSide, Theme, Ui, UiAdd, Viewport};
 // 每帧：
 let mut ui = Ui::begin(&window, &mut text, &mut state)
     .capture(&mouse, &keyboard)
-    .theme(Theme::dark())                       // with_font_family / with_font_size / ...
+    .theme(Theme::dark().with_radius(8.0))      // with_font_family / with_font_size / with_radius / ...
     .scale_factor(ctx.scale_factor().unwrap_or(1.0))
     .build();
 
@@ -156,16 +174,20 @@ ui.pack_at(Vec2::new(16.0, 56.0), PackSide::Top, |p| {
     p.divider();                                // 分割线
     p.row(|r| {                                 // 水平等高行
         r.label("HP:");
-        r.add(NumberInput::new("hp", &mut self.hp_text, &mut self.hp).range(0.0, 100.0));
+        r.add(NumberInput::new("hp", &mut self.hp).range(0.0, 100.0));
         if r.button("hp_btn", "应用").clicked() { /* ... */ }
     });
 });
 
-// 窗口 + Label 溢出处理
-ui.window_at_w("win", Vec2::new(560.0, 240.0), 220.0, |w| {
-    w.label("标题（缩窄窗口自动换行）");
-    w.add(Label::new("省略标签……").ellipsis());
-});
+// 窗口 + Label 溢出处理（容器责任链 builder：`ui.window(id).pos(..).width(..)`
+// 等价旧 `window_at_w`；`.strict()` = 强制裁剪；`.style(..)` = 逐窗口样式覆盖）
+ui.window("win")
+    .pos(Vec2::new(560.0, 240.0))
+    .width(220.0)
+    .show(|w| {
+        w.label("标题（缩窄窗口自动换行）");
+        w.add(Label::new("省略标签……").ellipsis());
+    });
 
 // 提交
 let viewport = Viewport::new(render2d.size(), Vec2::ZERO);
@@ -177,7 +199,7 @@ ui.finish(&viewport, r2d_ui);
 
 | 分类 | 方法 / 控件 |
 |---|---|
-| 容器 | `pack_at` / `grid_at` / `panel_at` / `drag_panel_at` / `window_at(_w/_strict)` / `modal_at` / `flex_at` / `scroll_at` / `list_at` / `row` / `view_at` |
+| 容器 | `ui.window(id)`/`ui.panel()`/`ui.modal(id)` builder（选项链 + `.show(..)`，统一 `window_at*` / `panel_at` / `modal_at*`）/ `pack_at` / `grid_at` / `flex_at` / `scroll_at` / `list_at` / `row` / `view_at` |
 | 占光标便捷 | `p.label` / `p.button` / `p.checkbox(_mut)` / `p.radio` / `p.slider` / `p.text_input` / `p.text_area(_nw)` / `p.combo` / `p.divider` / `p.row` |
 | Widget builder | `Label`（`wrap` / `ellipsis`）/ `Button` / `Checkbox` / `Divider`（`p.add(...)` 放置） |
 | 组合控件 | `NumberInput`（拖动调值 + 输入）/ `FontModal`（字体切换） |
@@ -208,7 +230,8 @@ impl Widget for MyButton<'_> {
         Vec2::new(t.x + style.padding.x * 2.0, t.y + style.padding.y * 2.0)
     }
     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-        // 复用现有控件 / 原语；交互用 ui.hit_abs / ui.mouse_left / ui.state_mut().widget(id)
+        // 复用现有控件 / 原语；交互用 ui.hit_abs / ui.mouse_left / ui.state_mut().widget(&id_for)
+        // （状态键 / 焦点用**绝对 ID**：let id_for = ui.id_for(self.id);）
         let st = ui.button_at(self.id, rect, self.label);
         st.into()   // ButtonState → Response
     }
@@ -216,7 +239,8 @@ impl Widget for MyButton<'_> {
 ```
 
 公开原语：`text_size(_wrap)`（测量）、`hit_abs` / `mouse_left` / `mouse_logical`（命中）、
-`claim_press` / `register_focus` / `key_click`（焦点）、`state_mut().widget(id)`（持久状态 +
+`claim_press` / `register_focus` / `key_click`（焦点；**收绝对 ID** `&ui.id_for(id_relative)`）、
+`state_mut().widget(&id_for)`（持久状态 +
 `hit::update_drag/update_interact`）、`push_solid_rect` / `push_border_rect` /
 `push_text_rect(_noclip)` / `push_panel_like` / `resize_handle`（绘制）。
 

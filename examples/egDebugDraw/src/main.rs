@@ -257,17 +257,16 @@ impl App for DebugApp {
             ),
         );
 
-        // ── rjw_ui 的 DebugDraw（屏幕空间；绝对逻辑像素，覆盖在 UI 之上） ──
+        // ── rjw_ui 的 DebugDraw（屏幕空间；物理像素，覆盖在 UI 之上） ──
         if self.ui_debug_shapes {
-            let scale = ctx.scale_factor().unwrap_or(1.0) as f32;
             let (mx, my) = ctx.mouse.get_mouse_position();
-            let mouse_logical = Vec2::new(mx as f32, my as f32) / scale;
+            let mouse = Vec2::new(mx as f32, my as f32);
             // 鼠标十字 + 跟随圆圈
-            ui.debug_cross(mouse_logical, 10.0, 1.5, Color::ORANGE);
-            ui.debug_circle_outline(mouse_logical, 24.0, 40, 1.5, Color::ORANGE);
+            ui.debug_cross(mouse, 10.0, 1.5, Color::ORANGE);
+            ui.debug_circle_outline(mouse, 24.0, 40, 1.5, Color::ORANGE);
             // 屏幕中心 → 鼠标 连线
             let center = Vec2::new(640.0, 360.0);
-            ui.debug_line(center, mouse_logical, 1.0, Color::rgba_u8(255, 200, 100, 200));
+            ui.debug_line(center, mouse, 1.0, Color::rgba_u8(255, 200, 100, 200));
             // 调试面板矩形框（若面板可见）
             if self.debug_visible {
                 ui.debug_rect_outline(Rect::new(24.0, 24.0, 190.0, 240.0), 1.5, Color::MAGENTA);

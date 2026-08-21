@@ -20,11 +20,336 @@ pub struct Theme {
     pub focus: FocusStyle,
     /// **模态对话框样式**（[`Ui::modal_at`](crate::ui::Ui::modal_at) 遮罩）。
     pub modal: ModalStyle,
+    /// **下拉框（combo）样式**：触发按钮用 [`ButtonStyle`]；选项浮层 = 现代右键菜单外观。
+    pub combo: ComboStyle,
     /// **单行控件统一高度**（逻辑像素）：水平行容器（`p.row(...)`）内所有子项强制
     /// 等高——Label/Button/输入框各自内容垂直居中 → 文字中心线对齐（近似基线）。
     pub row_h: f32,
     /// pack / grid 默认子项间距（像素）。
     pub gap: f32,
+}
+
+/// **下拉框（combo）样式**：触发按钮用 [`ButtonStyle`]；选项浮层 = **现代右键菜单
+/// 外观**——扁平列表项（无边框）、hover / 选中整行高亮、✓ 选中标记、浮层面板细边框
+/// 小圆角。
+#[derive(Clone, Debug)]
+pub struct ComboStyle {
+    /// 浮层面板背景（浅色主题 = 白 / 浅灰；dark = 深灰）。
+    pub menu_bg: Color,
+    /// 浮层面板边框。
+    pub menu_border: Color,
+    /// 浮层圆角（小圆角，如 6）。
+    pub menu_radius: f32,
+    /// 浮层上下留白（让菜单"飘"起来）。
+    pub menu_pad_v: f32,
+    /// 菜单项 hover 整行高亮（浅蓝）。
+    pub item_hover: Color,
+    /// 选中项高亮（略深 / 同 hover）。
+    pub item_selected: Color,
+    /// 菜单项左右内边距。
+    pub item_pad_x: f32,
+    /// 菜单项最小宽。
+    pub item_min_w: f32,
+    /// 菜单项文本色。
+    pub fg: Color,
+    /// ✓ 选中标记色。
+    pub fg_mark: Color,
+    pub font_size: f32,
+    pub font_family: Option<String>,
+}
+
+impl Default for ComboStyle {
+    fn default() -> Self {
+        Self {
+            menu_bg: Color::rgba_u8(250, 250, 252, 255),
+            menu_border: Color::rgba_u8(180, 185, 195, 255),
+            menu_radius: 6.0,
+            menu_pad_v: 4.0,
+            item_hover: Color::rgba_u8(230, 242, 255, 255),
+            item_selected: Color::rgba_u8(208, 228, 255, 255),
+            item_pad_x: 12.0,
+            item_min_w: 140.0,
+            fg: Color::rgba_u8(40, 40, 40, 255),
+            fg_mark: Color::rgba_u8(30, 108, 198, 255),
+            font_size: 14.0,
+            font_family: None,
+        }
+    }
+}
+
+// ─── 子样式 DPI 预乘：每个子样式都有 `scaled(s)`（尺寸 / 字号字段 × s 取整；
+// 颜色 / 字体族不变）。`Theme::scaled` 逐一调用——单一职责、便于各样式独立复用。 ───
+
+impl LabelStyle {
+    /// 预乘 DPI scale：字号 × s 取整。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        self.font_size = (self.font_size * s).round();
+        self
+    }
+}
+
+impl PanelStyle {
+    /// 预乘 DPI scale：边框宽 / 内边距 / 圆角 × s 取整。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.border_w = m(self.border_w);
+        self.padding = m(self.padding);
+        self.radius = m(self.radius);
+        self
+    }
+}
+
+impl ButtonStyle {
+    /// 预乘 DPI scale：边框宽 / 圆角 / 内边距 / 字号 × s 取整。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.border_w = m(self.border_w);
+        self.radius = m(self.radius);
+        self.padding.x = m(self.padding.x);
+        self.padding.y = m(self.padding.y);
+        self.font_size = m(self.font_size);
+        self
+    }
+}
+
+impl SliderStyle {
+    /// 预乘 DPI scale：轨道高 / 手柄宽 / 控件高 / 最小宽 × s 取整。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.track_h = m(self.track_h);
+        self.handle_w = m(self.handle_w);
+        self.height = m(self.height);
+        self.min_w = m(self.min_w);
+        self
+    }
+}
+
+impl InputStyle {
+    /// 预乘 DPI scale：边框宽 / 内边距 / 圆角 / 高 / 最小宽 / 字号 × s 取整。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.border_w = m(self.border_w);
+        self.padding_x = m(self.padding_x);
+        self.radius = m(self.radius);
+        self.height = m(self.height);
+        self.min_w = m(self.min_w);
+        self.font_size = m(self.font_size);
+        self
+    }
+}
+
+impl CheckboxStyle {
+    /// 预乘 DPI scale：方框 / 边框宽 / 字号 / 间距 × s 取整。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.box_size = m(self.box_size);
+        self.border_w = m(self.border_w);
+        self.font_size = m(self.font_size);
+        self.gap = m(self.gap);
+        self
+    }
+}
+
+impl DividerStyle {
+    /// 预乘 DPI scale：线厚 / 留白 × s 取整。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.thickness = m(self.thickness);
+        self.margin = m(self.margin);
+        self
+    }
+}
+
+impl DebugStyle {
+    /// 预乘 DPI scale：布局描边宽度 × s 取整（颜色不变）。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        self.layout_outline_width = (self.layout_outline_width * s).round();
+        self
+    }
+}
+
+impl FocusStyle {
+    /// 预乘 DPI scale：焦点描边宽度 × s 取整。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        self.width = (self.width * s).round();
+        self
+    }
+}
+
+impl ModalStyle {
+    /// 预乘 DPI scale：遮罩尺寸 × s 取整（`size = None` 全屏不变）。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        if let Some(sz) = &mut self.size {
+            sz.x = (sz.x * s).round();
+            sz.y = (sz.y * s).round();
+        }
+        self
+    }
+}
+
+impl ComboStyle {
+    /// 预乘 DPI scale：浮层圆角 / 上下留白 / 项内边距 / 项最小宽 / 字号 × s 取整。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.menu_radius = m(self.menu_radius);
+        self.menu_pad_v = m(self.menu_pad_v);
+        self.item_pad_x = m(self.item_pad_x);
+        self.item_min_w = m(self.item_min_w);
+        self.font_size = m(self.font_size);
+        self
+    }
+}
+
+// ─── 子样式深色预设：每个子样式都有 `dark()`（深色配色，尺寸同 [`Default`]）。
+// `Theme::dark()` 逐一组装——与 `scaled` 同样的单一职责。 ───
+
+impl LabelStyle {
+    /// 深色主题预设：浅色文字。
+    pub fn dark() -> Self {
+        Self { color: Color::rgba_u8(225, 225, 225, 255), ..Self::default() }
+    }
+}
+
+impl PanelStyle {
+    /// 深色主题预设：深灰面板 + 边框。
+    pub fn dark() -> Self {
+        Self {
+            bg: Color::rgba_u8(38, 42, 52, 255),
+            border: Color::rgba_u8(70, 78, 96, 255),
+            ..Self::default()
+        }
+    }
+}
+
+impl ButtonStyle {
+    /// 深色主题预设：深色三态背景。
+    pub fn dark() -> Self {
+        Self {
+            bg: Color::rgba_u8(52, 58, 70, 255),
+            bg_hover: Color::rgba_u8(66, 76, 96, 255),
+            bg_pressed: Color::rgba_u8(90, 110, 150, 255),
+            fg: Color::rgba_u8(230, 230, 230, 255),
+            border: Color::rgba_u8(90, 98, 118, 255),
+            ..Self::default()
+        }
+    }
+}
+
+impl SliderStyle {
+    /// 深色主题预设：深色轨道 + 亮填充 / 手柄。
+    pub fn dark() -> Self {
+        Self {
+            track: Color::rgba_u8(58, 64, 78, 255),
+            fill: Color::rgba_u8(96, 150, 220, 255),
+            handle: Color::rgba_u8(200, 210, 225, 255),
+            handle_border: Color::rgba_u8(120, 132, 150, 255),
+            ..Self::default()
+        }
+    }
+}
+
+impl InputStyle {
+    /// 深色主题预设：深色输入框 + 亮边框 / 光标 / 选择。
+    pub fn dark() -> Self {
+        Self {
+            bg: Color::rgba_u8(28, 32, 40, 255),
+            border: Color::rgba_u8(80, 88, 104, 255),
+            border_focus: Color::rgba_u8(110, 160, 230, 255),
+            fg: Color::rgba_u8(230, 230, 230, 255),
+            caret: Color::rgba_u8(230, 230, 230, 255),
+            preedit: Color::rgba_u8(150, 158, 176, 255),
+            sel_bg: Color::rgba_u8(70, 120, 190, 255),
+            ..Self::default()
+        }
+    }
+}
+
+impl CheckboxStyle {
+    /// 深色主题预设：深色方框 + 亮填充 / 文字。
+    pub fn dark() -> Self {
+        Self {
+            box_border: Color::rgba_u8(150, 158, 176, 255),
+            checked_fill: Color::rgba_u8(96, 150, 220, 255),
+            fg: Color::rgba_u8(225, 225, 225, 255),
+            ..Self::default()
+        }
+    }
+}
+
+impl DividerStyle {
+    /// 深色主题预设：深灰分割线（深色背景上可见）。
+    pub fn dark() -> Self {
+        Self { color: Color::rgba_u8(70, 78, 96, 255), ..Self::default() }
+    }
+}
+
+impl DebugStyle {
+    /// 深色主题预设：亮青布局描边。
+    pub fn dark() -> Self {
+        Self { layout_outline: Color::rgba_u8(96, 200, 255, 255), ..Self::default() }
+    }
+}
+
+impl FocusStyle {
+    /// 深色主题预设：亮蓝焦点描边（深色下更易辨认）。
+    pub fn dark() -> Self {
+        Self { color: Color::rgba_u8(96, 200, 255, 255), ..Self::default() }
+    }
+}
+
+impl ModalStyle {
+    /// 深色主题预设：更深遮罩。
+    pub fn dark() -> Self {
+        Self { dim: Color::rgba_u8(0, 0, 0, 180), ..Self::default() }
+    }
+}
+
+impl ComboStyle {
+    /// 深色主题预设：深色浮层 + 深蓝菜单项高亮。
+    pub fn dark() -> Self {
+        Self {
+            menu_bg: Color::rgba_u8(40, 45, 55, 255),
+            menu_border: Color::rgba_u8(72, 80, 96, 255),
+            item_hover: Color::rgba_u8(52, 82, 122, 255),
+            item_selected: Color::rgba_u8(45, 72, 108, 255),
+            fg: Color::rgba_u8(228, 228, 228, 255),
+            fg_mark: Color::rgba_u8(110, 180, 255, 255),
+            ..Self::default()
+        }
+    }
 }
 
 /// 模态对话框样式（`modal_at` 的全屏遮罩）。
@@ -292,6 +617,307 @@ impl Default for FocusStyle {
     }
 }
 
+impl LabelStyle {
+    /// 字体族（`None` = 系统默认）。
+    pub fn with_font_family(mut self, f: impl Into<String>) -> Self {
+        self.font_family = Some(f.into());
+        self
+    }
+    pub fn with_font_size(mut self, s: f32) -> Self {
+        self.font_size = s;
+        self
+    }
+    pub fn with_color(mut self, c: Color) -> Self {
+        self.color = c;
+        self
+    }
+    /// 水平对齐（垂直恒居中）。
+    pub fn with_align(mut self, a: Align) -> Self {
+        self.align = a;
+        self
+    }
+}
+
+impl PanelStyle {
+    pub fn with_bg(mut self, c: Color) -> Self {
+        self.bg = c;
+        self
+    }
+    pub fn with_border(mut self, c: Color) -> Self {
+        self.border = c;
+        self
+    }
+    pub fn with_border_w(mut self, w: f32) -> Self {
+        self.border_w = w;
+        self
+    }
+    /// 内容区内边距（像素）。
+    pub fn with_padding(mut self, p: f32) -> Self {
+        self.padding = p;
+        self
+    }
+    /// 圆角半径（**逻辑像素**；0 = 直角）。
+    pub fn with_radius(mut self, r: f32) -> Self {
+        self.radius = r;
+        self
+    }
+}
+
+impl ButtonStyle {
+    /// 常态背景。
+    pub fn with_bg(mut self, c: Color) -> Self {
+        self.bg = c;
+        self
+    }
+    /// 悬停背景。
+    pub fn with_bg_hover(mut self, c: Color) -> Self {
+        self.bg_hover = c;
+        self
+    }
+    /// 按下背景。
+    pub fn with_bg_pressed(mut self, c: Color) -> Self {
+        self.bg_pressed = c;
+        self
+    }
+    /// 文本前景色。
+    pub fn with_fg(mut self, c: Color) -> Self {
+        self.fg = c;
+        self
+    }
+    pub fn with_border(mut self, c: Color) -> Self {
+        self.border = c;
+        self
+    }
+    pub fn with_border_w(mut self, w: f32) -> Self {
+        self.border_w = w;
+        self
+    }
+    /// 圆角半径（**逻辑像素**；0 = 直角）。
+    pub fn with_radius(mut self, r: f32) -> Self {
+        self.radius = r;
+        self
+    }
+    /// 内边距（x = 水平，y = 垂直）。
+    pub fn with_padding(mut self, p: glam::Vec2) -> Self {
+        self.padding = p;
+        self
+    }
+    pub fn with_font_size(mut self, s: f32) -> Self {
+        self.font_size = s;
+        self
+    }
+    pub fn with_font_family(mut self, f: impl Into<String>) -> Self {
+        self.font_family = Some(f.into());
+        self
+    }
+}
+
+impl SliderStyle {
+    /// 轨道颜色。
+    pub fn with_track(mut self, c: Color) -> Self {
+        self.track = c;
+        self
+    }
+    /// 已填充部分颜色。
+    pub fn with_fill(mut self, c: Color) -> Self {
+        self.fill = c;
+        self
+    }
+    /// 手柄颜色。
+    pub fn with_handle(mut self, c: Color) -> Self {
+        self.handle = c;
+        self
+    }
+    /// 手柄边框颜色。
+    pub fn with_handle_border(mut self, c: Color) -> Self {
+        self.handle_border = c;
+        self
+    }
+    /// 轨道高度（像素）。
+    pub fn with_track_h(mut self, h: f32) -> Self {
+        self.track_h = h;
+        self
+    }
+    /// 手柄宽度（像素）。
+    pub fn with_handle_w(mut self, w: f32) -> Self {
+        self.handle_w = w;
+        self
+    }
+    /// 控件总高（含点击区）。
+    pub fn with_height(mut self, h: f32) -> Self {
+        self.height = h;
+        self
+    }
+    /// 控件最小宽（pack 内自动尺寸用）。
+    pub fn with_min_w(mut self, w: f32) -> Self {
+        self.min_w = w;
+        self
+    }
+}
+
+impl InputStyle {
+    pub fn with_bg(mut self, c: Color) -> Self {
+        self.bg = c;
+        self
+    }
+    pub fn with_border(mut self, c: Color) -> Self {
+        self.border = c;
+        self
+    }
+    /// 聚焦时的边框颜色。
+    pub fn with_border_focus(mut self, c: Color) -> Self {
+        self.border_focus = c;
+        self
+    }
+    pub fn with_fg(mut self, c: Color) -> Self {
+        self.fg = c;
+        self
+    }
+    pub fn with_caret(mut self, c: Color) -> Self {
+        self.caret = c;
+        self
+    }
+    /// IME 组合候选串颜色。
+    pub fn with_preedit(mut self, c: Color) -> Self {
+        self.preedit = c;
+        self
+    }
+    /// 文本选择高亮背景色。
+    pub fn with_sel_bg(mut self, c: Color) -> Self {
+        self.sel_bg = c;
+        self
+    }
+    pub fn with_border_w(mut self, w: f32) -> Self {
+        self.border_w = w;
+        self
+    }
+    /// 内容水平内边距。
+    pub fn with_padding_x(mut self, p: f32) -> Self {
+        self.padding_x = p;
+        self
+    }
+    /// 圆角半径（**逻辑像素**；0 = 直角）。
+    pub fn with_radius(mut self, r: f32) -> Self {
+        self.radius = r;
+        self
+    }
+    /// 控件总高。
+    pub fn with_height(mut self, h: f32) -> Self {
+        self.height = h;
+        self
+    }
+    /// 控件最小宽。
+    pub fn with_min_w(mut self, w: f32) -> Self {
+        self.min_w = w;
+        self
+    }
+    pub fn with_font_size(mut self, s: f32) -> Self {
+        self.font_size = s;
+        self
+    }
+    pub fn with_font_family(mut self, f: impl Into<String>) -> Self {
+        self.font_family = Some(f.into());
+        self
+    }
+}
+
+impl DividerStyle {
+    pub fn with_color(mut self, c: Color) -> Self {
+        self.color = c;
+        self
+    }
+    /// 线厚度（逻辑像素）。
+    pub fn with_thickness(mut self, t: f32) -> Self {
+        self.thickness = t;
+        self
+    }
+    /// 上下留白（逻辑像素）。
+    pub fn with_margin(mut self, m: f32) -> Self {
+        self.margin = m;
+        self
+    }
+}
+
+impl CheckboxStyle {
+    /// 方框边长。
+    pub fn with_box_size(mut self, s: f32) -> Self {
+        self.box_size = s;
+        self
+    }
+    pub fn with_box_border(mut self, c: Color) -> Self {
+        self.box_border = c;
+        self
+    }
+    pub fn with_border_w(mut self, w: f32) -> Self {
+        self.border_w = w;
+        self
+    }
+    pub fn with_checked_fill(mut self, c: Color) -> Self {
+        self.checked_fill = c;
+        self
+    }
+    pub fn with_fg(mut self, c: Color) -> Self {
+        self.fg = c;
+        self
+    }
+    pub fn with_font_size(mut self, s: f32) -> Self {
+        self.font_size = s;
+        self
+    }
+    pub fn with_font_family(mut self, f: impl Into<String>) -> Self {
+        self.font_family = Some(f.into());
+        self
+    }
+    /// 文本与方框间距。
+    pub fn with_gap(mut self, g: f32) -> Self {
+        self.gap = g;
+        self
+    }
+}
+
+impl DebugStyle {
+    /// `debug_layout` 布局描边颜色。
+    pub fn with_layout_outline(mut self, c: Color) -> Self {
+        self.layout_outline = c;
+        self
+    }
+    /// `debug_layout` 布局描边宽度（**物理像素**）。
+    pub fn with_layout_outline_width(mut self, w: f32) -> Self {
+        self.layout_outline_width = w;
+        self
+    }
+}
+
+impl FocusStyle {
+    pub fn with_color(mut self, c: Color) -> Self {
+        self.color = c;
+        self
+    }
+    /// 焦点描边宽度（逻辑像素）。
+    pub fn with_width(mut self, w: f32) -> Self {
+        self.width = w;
+        self
+    }
+}
+
+impl ModalStyle {
+    /// 遮罩颜色（默认半透明黑）。
+    pub fn with_dim(mut self, c: Color) -> Self {
+        self.dim = c;
+        self
+    }
+    /// 遮罩尺寸（**逻辑像素**）。
+    pub fn with_size(mut self, s: glam::Vec2) -> Self {
+        self.size = Some(s);
+        self
+    }
+    /// 全屏遮罩（默认）。
+    pub fn with_fullscreen(mut self) -> Self {
+        self.size = None;
+        self
+    }
+}
+
 impl Theme {
     /// 浅色主题（默认）。
     pub fn default() -> Self {
@@ -306,40 +932,30 @@ impl Theme {
             debug: DebugStyle::default(),
             focus: FocusStyle::default(),
             modal: ModalStyle::default(),
+            combo: ComboStyle::default(),
             row_h: 26.0,
             gap: 6.0,
         }
     }
 
-    /// 深色主题。
+    /// 深色主题：逐一组装每个子样式的 [`dark()`](LabelStyle::dark) 预设
+    /// （深色配色、尺寸同 `Default`）+ 主题级 `row_h` / `gap`。
     pub fn dark() -> Self {
-        let mut t = Self::default();
-        t.label.color = Color::rgba_u8(225, 225, 225, 255);
-        t.label.font_size = 14.0;
-        t.panel.bg = Color::rgba_u8(38, 42, 52, 255);
-        t.panel.border = Color::rgba_u8(70, 78, 96, 255);
-        t.button.bg = Color::rgba_u8(52, 58, 70, 255);
-        t.button.bg_hover = Color::rgba_u8(66, 76, 96, 255);
-        t.button.bg_pressed = Color::rgba_u8(90, 110, 150, 255);
-        t.button.fg = Color::rgba_u8(230, 230, 230, 255);
-        t.button.border = Color::rgba_u8(90, 98, 118, 255);
-        t.slider.track = Color::rgba_u8(58, 64, 78, 255);
-        t.slider.fill = Color::rgba_u8(96, 150, 220, 255);
-        t.slider.handle = Color::rgba_u8(200, 210, 225, 255);
-        t.slider.handle_border = Color::rgba_u8(120, 132, 150, 255);
-        t.input.bg = Color::rgba_u8(28, 32, 40, 255);
-        t.input.border = Color::rgba_u8(80, 88, 104, 255);
-        t.input.border_focus = Color::rgba_u8(110, 160, 230, 255);
-        t.input.fg = Color::rgba_u8(230, 230, 230, 255);
-        t.input.caret = Color::rgba_u8(230, 230, 230, 255);
-        t.input.preedit = Color::rgba_u8(150, 158, 176, 255);
-        t.input.sel_bg = Color::rgba_u8(70, 120, 190, 255);
-        t.checkbox.box_border = Color::rgba_u8(150, 158, 176, 255);
-        t.checkbox.checked_fill = Color::rgba_u8(96, 150, 220, 255);
-        t.checkbox.fg = Color::rgba_u8(225, 225, 225, 255);
-        // 焦点描边：深色主题下更亮，便于看清焦点位置
-        t.focus.color = Color::rgba_u8(96, 200, 255, 255);
-        t
+        Self {
+            label: LabelStyle::dark(),
+            panel: PanelStyle::dark(),
+            button: ButtonStyle::dark(),
+            slider: SliderStyle::dark(),
+            input: InputStyle::dark(),
+            checkbox: CheckboxStyle::dark(),
+            divider: DividerStyle::dark(),
+            debug: DebugStyle::dark(),
+            focus: FocusStyle::dark(),
+            modal: ModalStyle::dark(),
+            combo: ComboStyle::dark(),
+            row_h: 26.0,
+            gap: 6.0,
+        }
     }
 
     // ── with 链（责任链语义：链上后设覆盖先设；可级联的全局参数） ──
@@ -357,16 +973,19 @@ impl Theme {
         self.label.font_family = f.clone();
         self.button.font_family = f.clone();
         self.checkbox.font_family = f.clone();
-        self.input.font_family = f;
+        self.input.font_family = f.clone();
+        self.combo.font_family = f;
         self
     }
 
-    /// **全局字号**：级联到全部文本子样式（`label` / `button` / `checkbox` / `input`）。
+    /// **全局字号**：级联到全部文本子样式（`label` / `button` / `checkbox` / `input` /
+    /// `combo`）。
     pub fn with_font_size(mut self, size: f32) -> Self {
         self.label.font_size = size;
         self.button.font_size = size;
         self.checkbox.font_size = size;
         self.input.font_size = size;
+        self.combo.font_size = size;
         self
     }
 
@@ -431,6 +1050,38 @@ impl Theme {
         self.modal = s;
         self
     }
+    pub fn with_combo(mut self, s: ComboStyle) -> Self {
+        self.combo = s;
+        self
+    }
+
+    /// **预乘 DPI scale**：逐一调用每个子样式的 [`scaled`](LabelStyle::scaled)（尺寸 /
+    /// 字号字段 × `s` 取整，保布局整数不变量）+ 主题级 `gap` / `row_h`。
+    ///
+    /// 由 `Ui::begin(..).scale_factor(s).build()` 内部调用——此后 Ui 内部以
+    /// **物理像素**为单位（布局 / 命中 / 绘制零 scale 换算）。颜色 / 字体族不变；
+    /// `s <= 0` 视为 1（不缩放）。**顺序无关**：无论先 `with_*` 还是先 `scale_factor`，
+    /// 最终 `build()` 统一预乘一次。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.label = self.label.scaled(s);
+        self.panel = self.panel.scaled(s);
+        self.button = self.button.scaled(s);
+        self.slider = self.slider.scaled(s);
+        self.input = self.input.scaled(s);
+        self.checkbox = self.checkbox.scaled(s);
+        self.divider = self.divider.scaled(s);
+        self.debug = self.debug.scaled(s);
+        self.focus = self.focus.scaled(s);
+        self.modal = self.modal.scaled(s);
+        self.combo = self.combo.scaled(s);
+        self.gap = m(self.gap);
+        self.row_h = m(self.row_h);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -476,5 +1127,86 @@ mod tests {
         assert_eq!(t.button.bg, Color::RED);
         // 未替换的子样式仍是 dark 预设
         assert_eq!(t.panel.bg, Theme::dark().panel.bg);
+    }
+
+    #[test]
+    fn substyle_builders_chain_apply() {
+        // 面板/按钮/滑块等子样式的 with_* 责任链：只改链上字段，其余回落默认。
+        let p = PanelStyle::default()
+            .with_bg(Color::RED)
+            .with_radius(8.0)
+            .with_padding(10.0);
+        assert_eq!(p.bg, Color::RED);
+        assert_eq!(p.radius, 8.0);
+        assert_eq!(p.padding, 10.0);
+        assert_eq!(p.border, PanelStyle::default().border, "未设字段回落默认");
+
+        let b = ButtonStyle::default()
+            .with_bg(Color::RED)
+            .with_bg_hover(Color::BLUE)
+            .with_radius(6.0)
+            .with_font_family("Microsoft YaHei");
+        assert_eq!(b.bg, Color::RED);
+        assert_eq!(b.bg_hover, Color::BLUE);
+        assert_eq!(b.radius, 6.0);
+        assert_eq!(b.font_family.as_deref(), Some("Microsoft YaHei"));
+        assert_eq!(b.bg_pressed, ButtonStyle::default().bg_pressed);
+
+        let s = SliderStyle::default()
+            .with_track(Color::BLACK)
+            .with_fill(Color::WHITE)
+            .with_handle_border(Color::RED)
+            .with_min_w(200.0);
+        assert_eq!(s.track, Color::BLACK);
+        assert_eq!(s.fill, Color::WHITE);
+        assert_eq!(s.handle_border, Color::RED);
+        assert_eq!(s.min_w, 200.0);
+        assert_eq!(s.height, SliderStyle::default().height, "未设字段回落默认");
+
+        let i = InputStyle::default().with_radius(4.0).with_sel_bg(Color::RED);
+        assert_eq!(i.radius, 4.0);
+        assert_eq!(i.sel_bg, Color::RED);
+        assert_eq!(i.height, InputStyle::default().height);
+
+        let l = LabelStyle::default().with_font_size(16.0).with_color(Color::RED);
+        assert_eq!(l.font_size, 16.0);
+        assert_eq!(l.color, Color::RED);
+
+        let m = ModalStyle::default()
+            .with_dim(Color::BLACK)
+            .with_size(glam::Vec2::new(100.0, 80.0));
+        assert_eq!(m.dim, Color::BLACK);
+        assert_eq!(m.size, Some(glam::Vec2::new(100.0, 80.0)));
+        // with_fullscreen 恢复全屏遮罩。
+        assert_eq!(ModalStyle::default().with_fullscreen().size, None);
+    }
+
+    #[test]
+    fn substyle_builder_last_link_wins() {
+        // 责任链语义：后设覆盖先设。
+        let b = ButtonStyle::default().with_radius(6.0).with_radius(0.0);
+        assert_eq!(b.radius, 0.0);
+        let p = PanelStyle::default().with_bg(Color::RED).with_bg(Color::BLUE);
+        assert_eq!(p.bg, Color::BLUE);
+    }
+
+    #[test]
+    fn theme_scaled_premultiplies_dimensions() {
+        // 全部尺寸 / 字号字段 × scale 并取整（布局整数不变量）；颜色 / 字体族不变。
+        let t = Theme::default().scaled(1.5);
+        assert_eq!(t.label.font_size, (14.0_f32 * 1.5).round());
+        assert_eq!(t.button.padding.x, (12.0_f32 * 1.5).round());
+        assert_eq!(t.button.font_size, (14.0_f32 * 1.5).round());
+        assert_eq!(t.input.height, (26.0_f32 * 1.5).round());
+        assert_eq!(t.gap, (6.0_f32 * 1.5).round());
+        assert_eq!(t.panel.bg, Theme::default().panel.bg, "颜色不受预乘影响");
+        assert_eq!(t.label.font_family, Theme::default().label.font_family, "字体族不受预乘影响");
+        // 先 with_* 再预乘：覆盖值 ×scale（`scale_factor` 只存值、`build` 统一预乘，
+        // 故"先 with_*、后 scale_factor"的顺序无关）。
+        let a = Theme::default().with_radius(6.0).scaled(1.5);
+        assert_eq!(a.panel.radius, 9.0);
+        assert_eq!(a.button.radius, 9.0);
+        // s <= 0 → 不缩放。
+        assert_eq!(Theme::default().scaled(0.0).label.font_size, Theme::default().label.font_size);
     }
 }

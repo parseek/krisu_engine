@@ -2,10 +2,10 @@
 //!
 //! - **纯生成函数**（无 GPU，可单测）：[`rounded_rect_rgba`]（抗锯齿圆角填充）、
 //!   [`gradient_rgba`]（水平 / 垂直线性渐变）、[`WHITE_RGBA`]；
-//! - **`ProcTextures`**：把这些程序化纹理**塞进动态 Atlas**（[`rjw_atlas::DynamicAtlas`]，
-//!   与字形图集同机制：Guillotine 打包、页纹理自动注册进 `rjw_render::TEXTURES`、
-//!   `insert_permanent` 永久保留、`clamp_margin` 防采样透色），
-//!   惰性初始化（首次取纹理时用 `Ui` 传入的 device/queue/layout）。
+//! - **`ProcTextures`**：程序化纹理缓存。**圆角已迁入字形图集**
+//!   （[`crate::Text::insert_user_texture`]——与字形 / WHITE 同页同纹理 → 窗口内
+//!   圆角图形与文字合批）；本模块保留生成函数（`rounded_rect_rgba` 供插入用）与
+//!   **渐变**（[`ProcTextures::gradient`]，仍用独立 `rjw_atlas::DynamicAtlas`）。
 //!
 //! 圆角矩形用 **9-patch** 绘制（见 [`rounded_9patch`]）：四角原样、四边/中心拉伸，
 //! 任意矩形尺寸下圆弧不畸变。渐变矩形直接拉伸采样（主轴 64 级已足够平滑）。
@@ -42,12 +42,15 @@ fn rgba8(c: Color) -> [u8; 4] {
 /// 抗锯齿圆角矩形填充纹理（`size × size` RGBA；四角按 `radius` 挖圆，边缘 1px 平滑）。
 ///
 /// 纯函数（可单测）：`radius` 会 clamp 到 `size/2 - 1`；`size = 0` 返回空。
+/// 角部圆心按像素所在的**半区**选择（与半径是否整数无关）——非整数物理半径
+/// （高 DPI：`radius × scale`）也能生成无缺口的圆角。
 pub fn rounded_rect_rgba(size: u32, radius: f32, color: Color) -> Vec<u8> {
     if size == 0 {
         return Vec::new();
     }
     let n = size as i32;
     let r = radius.clamp(0.0, n as f32 * 0.5 - 1.0).max(0.0);
+    let r = r.round();
     let [cr, cg, cb, ca] = rgba8(color);
     let mut out = vec![0u8; (n * n * 4) as usize];
     for y in 0..n {
@@ -60,8 +63,13 @@ pub fn rounded_rect_rgba(size: u32, radius: f32, color: Color) -> Vec<u8> {
             let alpha = if dx >= r || dy >= r {
                 1.0
             } else {
-                let ccx = if x < r as i32 { r } else { (n - 1) as f32 - r };
-                let ccy = if y < r as i32 { r } else { (n - 1) as f32 - r };
+                // 圆心选择：按像素落在左/右（上/下）**半区**判定——与半径是否整数无关。
+                // 旧实现用 `x < r as i32`（半径截断）：非整数物理半径（高 DPI 下
+                // radius × scale 几乎必为非整数）时，靠近圆心的整列像素被误判到
+                // 另一侧圆心 → dist > r → alpha = 0 → 圆角处整条透明缝 / 圆弧破损。
+                let mid = (n - 1) as f32 * 0.5;
+                let ccx = if (x as f32) <= mid { r } else { (n - 1) as f32 - r };
+                let ccy = if (y as f32) <= mid { r } else { (n - 1) as f32 - r };
                 let dist = ((x as f32 - ccx).powi(2) + (y as f32 - ccy).powi(2)).sqrt();
                 (r - dist + 0.5).clamp(0.0, 1.0)
             };
@@ -69,7 +77,7 @@ pub fn rounded_rect_rgba(size: u32, radius: f32, color: Color) -> Vec<u8> {
             out[i] = cr;
             out[i + 1] = cg;
             out[i + 2] = cb;
-            out[i + 3] = (ca as f32 * alpha) as u8;
+            out[i + 3] = (ca as f32 * alpha).round().clamp(0.0, 255.0) as u8;
         }
     }
     out
@@ -146,6 +154,8 @@ pub(crate) fn gradient_key(vertical: bool, stops: &[(f32, Color)]) -> String {
 /// 纹理半径 = `tex_radius`）。四角原样采样、四边/中心拉伸，任意尺寸圆弧不畸变。
 ///
 /// 纯函数（可单测）：`radius` 会按 `rect` 尺寸 clamp；`rect` 过小（< 2r）时半径收缩。
+/// 调用方应传入**取整后的物理半径**（如 `(radius_logical × scale).round()`）——非整数
+/// 半径会让 9 块边界落在半像素，光栅化时共享边界像素归属漂移（填充偏右下 / 1px 缝隙）。
 pub fn rounded_9patch(
     rect: Rect,
     radius: f32,
@@ -271,7 +281,8 @@ impl ProcTextures {
         radius: f32,
     ) -> Option<(u64, AtlasRegion)> {
         let r = radius.clamp(0.0, ROUNDED_TEX_SIZE as f32 * 0.5 - 1.0).max(0.0);
-        let key = format!("rounded_r{}", r as u32);
+        // 半径量化 key 用位模式（`r as u32` 会截断：非整数半径共享同一 key → 纹理串味）。
+        let key = format!("rounded_r{:x}", r.to_bits());
         let a = self.atlas(device, queue, layout);
         let region = a
             .insert_permanent(
@@ -393,5 +404,60 @@ mod tests {
         // 半径过大 clamp：rect 高 60 → r ≤ 30。
         let clamped = rounded_9patch(rect, 999.0, 32, 8.0);
         assert!(clamped[0].0.w <= 30.0, "半径应 clamp 到 min(w,h)/2");
+    }
+
+    #[test]
+    fn rounded_rect_rgba_non_integer_radius_no_gap() {
+        // 回归：非整数物理半径（高 DPI：radius × scale）下，圆心选择曾用 `r as i32`
+        // 截断半径——靠近圆心的整列像素被误判到另一侧圆心 → dist > r → alpha = 0，
+        // 圆角处出现整条透明缝 / 圆弧破损。修复后按像素半区选圆心，与半径整数性无关。
+        let size = 32;
+        let rgba = rounded_rect_rgba(size, 7.5, Color::WHITE);
+        let a = |x: usize, y: usize| rgba[((y * size as usize + x) * 4 + 3) as usize];
+        // 四角外角点仍透明。
+        assert_eq!(a(0, 0), 0, "圆角外角点应透明");
+        // 中心像素不透明。
+        assert_eq!(a(16, 16), 255, "中心应不透明");
+        // 角部内侧（靠近圆心 (7.5, 7.5)、dist < r - 0.5）完全不透明。
+        assert_eq!(a(6, 6), 255, "左上角内侧应不透明");
+        // 角区整列（x = 0..8）所有像素 alpha > 0——旧实现在 x = 7 整列 alpha = 0。
+        for y in 0..8 {
+            assert!(a(7, y) > 0, "角区 (7,{y}) alpha 应 > 0（旧实现在该列全透明）");
+        }
+        // 四角镜像对称：左上 (x,y) 与右上 (31-x,y)、左下 (x,31-y)、右下 (31-x,31-y) 一致。
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(a(x, y), a(size as usize - 1 - x, y), "左右镜像应一致");
+                assert_eq!(a(x, y), a(x, size as usize - 1 - y), "上下镜像应一致");
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_9patch_integer_radius_yields_integer_partitions() {
+        // 回归：9-patch 的 9 块边界必须落在整数像素（物理半径取整后）——非整数边界
+        // （如 scale=1.25 时 radius×scale=7.5）会让光栅化共享边界像素归属漂移 →
+        // 填充偏右下 / 1px 缝隙。绘制侧 `r = (radius*scale).round()` 保证此不变量。
+        let rect = Rect::new(0.0, 0.0, 125.0, 75.0);
+        for r in [0.0_f32, 1.0, 2.0, 7.0, 8.0, 15.0] {
+            let parts = rounded_9patch(rect, r, 32, r);
+            for (i, (m, _, _)) in parts.iter().enumerate() {
+                assert!(
+                    m.x.fract().abs() < 1e-4
+                        && m.y.fract().abs() < 1e-4
+                        && m.w.fract().abs() < 1e-4
+                        && m.h.fract().abs() < 1e-4,
+                    "整数物理半径 {r} 时第 {i} 块边界应为整数像素：{m:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_rect_rgba_alpha_255_rounds_exact() {
+        // alpha = 1.0 且 color alpha = 255 时输出应精确 255（旧 `as u8` 截断可能丢 1）。
+        let rgba = rounded_rect_rgba(32, 8.0, Color::WHITE);
+        let i = ((16 * 32 + 16) * 4 + 3) as usize;
+        assert_eq!(rgba[i], 255, "完全不透明像素 alpha 应精确 255");
     }
 }

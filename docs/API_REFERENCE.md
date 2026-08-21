@@ -707,13 +707,35 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 
 ### 容器（布局）
 
+**容器责任链 builder**（推荐）：统一 `window_at*` / `panel_at` / `modal_at*` 的选项组合，
+选项链式设置、`.show(f)` 终结（旧 `*_at` 入口保留，薄委托）：
+
+**单位（[`Size`](crate::draw::Size) / [`Position`](crate::draw::Position)）**：坐标 / 尺寸参数
+（`pos`、`width`、builder 的 `.pos/.width` 等）接受带单位包装——`Size::Logical` /
+`Position::Logical`（默认，`From<f32/Vec2>`，× scale 换算并取整）或 `Size::Physical` /
+`Position::Physical`（原样）。换算仅在 **API 边界**一次完成，Ui 内部布局 / 命中 / 绘制
+一律**物理像素**（`Ui::scale()` 只供边界换算；`scale_factor` 在 `build()` 时把 Theme
+**预乘**——全部样式尺寸 / 字号 × scale 取整，见 [`Theme::scaled`](crate::style::Theme::scaled)）。
+
+| 入口 | 链 | 语义 |
+|---|---|---|
+| `ui.window(id)` | `.pos(..)` `.width(w)` `.strict()` `.topmost(bool)` `.style(PanelStyle)` `.clamp(WindowClamp)` `.show(\|w\| ..)` | 窗口 = `window_at` + `window_at_w` + `window_at_strict` 统一入口；`.width` = 固定宽（右下角可缩放）；`.strict` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖） |
+| `ui.panel()` | `.pos(..)` `.drag(id)` `.style(..)` `.show(\|pp\| ..)` | 面板 = `panel_at` + `drag_panel_at` 统一入口 |
+| `ui.modal(id)` | `.pos(..)` `.width(w)` `.show(\|m\| ..)` | 模态对话框 = `modal_at` + `modal_at_w` 统一入口 |
+
+选项载体 `WindowOptions` / `PanelOptions`（公开，可独立构造/复用）。容器闭包内经
+`UiAdd::window(id)` / `UiAdd::panel()` 同样可用。
+
 | 函数 | 签名 | 语义 |
 |---|---|---|
 | `label_at` | `ui.label_at(pos, text) -> Vec2` | place：绝对定位 + 内容自然尺寸 |
 | `pack_at` | `ui.pack_at(pos, side, \|p\| ...) -> Vec2` | pack：按 `PackSide::Top/Left` 堆叠，宽/高 = 最大子项 |
-| `panel_at` | `ui.panel_at(pos, \|pp\| ...) -> Vec2` | 背景 + 边框 + 内容垂直堆叠，尺寸自动包裹 |
-| `drag_panel_at` | `ui.drag_panel_at(id, pos, \|pp\| ...) -> Vec2` | 同 panel_at，且按住面板任意处可**拖动**（位置持久于 `UiState.panel_pos`；拖动期间子控件不响应） |
-| `window_at` | `ui.window_at(id, pos, \|w\| ...) -> Vec2` | **可重叠窗口**：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽；窗口内同一 layer 按"背景/图形→文字"绘制，不做元素重叠处理 |
+| `panel_at` | `ui.panel_at(pos, \|pp\| ...) -> Vec2` | 背景 + 边框 + 内容垂直堆叠，尺寸自动包裹（等价 `ui.panel().pos(pos).show(..)`） |
+| `drag_panel_at` | `ui.drag_panel_at(id, pos, \|pp\| ...) -> Vec2` | 同 panel_at，且按住面板任意处可**拖动**（位置持久于 `UiState.panel_pos`；拖动期间子控件不响应；等价 `ui.panel().pos(pos).drag(id).show(..)`） |
+| `window_at` | `ui.window_at(id, pos, \|w\| ...) -> Vec2` | **可重叠窗口**：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽；窗口内同一 layer 按"背景/图形→文字"绘制，不做元素重叠处理（等价 `ui.window(id).pos(pos).show(..)`） |
+| `window_at_w` | `ui.window_at_w(id, pos, width, \|w\| ...) -> Vec2` | 同 `window_at`，固定宽 + 右下角可鼠标缩放（等价 `ui.window(id).pos(pos).width(width).show(..)`） |
+| `window_at_strict` | `ui.window_at_strict(id, pos, \|w\| ...) -> Vec2` | 同 `window_at`，内容强制裁剪到窗口矩形（等价 `ui.window(id).pos(pos).strict().show(..)`） |
+| `window_at_strict_w` | `ui.window_at_strict_w(id, pos, width, \|w\| ...) -> Vec2` | 固定宽 + 严格裁剪（等价 `.width(w).strict()`） |
 | `scroll_at` | `ui.scroll_at(pos, view_size, id, \|s\| ...) -> Vec2` | **滚动容器**：内容在可视区内垂直堆叠（pack Top），滚轮 / 滚动条（拖 thumb、点轨道翻页）滚动；可视区外**裁剪**；偏移持久于 `UiState.scrolls` |
 | `grid_at` | `ui.grid_at(pos, cols, id, \|g\| ...) -> Vec2` | 均匀网格；`id` 缓存单元格尺寸（跨帧稳定） |
 | `flex_at` | `ui.flex_at(pos, total_h, &[w1,w2,..], \|f, i\| ...) -> Vec2` | **flex 容器**：固定总高 `total_h` 按 `weights` **权重等分**子项高度（扣 gap；回调按索引布局，同帧精确）；内容超高溢出可见（需滚动时内嵌 `scroll_at`） |
@@ -743,16 +765,34 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 
 ### 样式（`Theme`，可 clone 覆盖）
 
-`Theme { label, panel, button, slider, input, checkbox, debug, focus, gap }`，子样式见 `crates/rjw_ui/src/style.rs`：
+`Theme { label, panel, button, slider, input, checkbox, divider, debug, focus, modal, combo, gap, row_h }`，子样式见 `crates/rjw_ui/src/style.rs`：
 `LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**）、`ButtonStyle`（三态 bg + padding + **radius**）、
 `SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius**）、
-`CheckboxStyle`（box_size/checked_fill/gap）、`DebugStyle`（layout_outline / layout_outline_width）、
-`FocusStyle`（color / width，键盘导航焦点描边）。
+`CheckboxStyle`（box_size/checked_fill/gap）、`DividerStyle`、`DebugStyle`（layout_outline / layout_outline_width）、
+`FocusStyle`（color / width，键盘导航焦点描边）、`ModalStyle`（dim / size）、
+`ComboStyle`（下拉浮层现代菜单：menu_bg/border/radius/pad_v + item_hover/selected/pad_x/min_w + fg/fg_mark）。
 `Theme::default()` 浅色，`Theme::dark()` 深色。
 
+**子样式责任链**：每个子样式都有 `with_*` builder setter（返回 `Self`，只改链上字段，
+其余回落默认）——`PanelStyle::default().with_radius(8.0)` / `ButtonStyle::default().
+with_bg(c).with_radius(6.0)` / `SliderStyle::default().with_track(c).with_fill(c)` 等，
+与 `Theme::with_*` 同风格；`font_family` setter 接受 `impl Into<String>`（可直接传 `&str`）。
+样式可整体替换进主题（`Theme::with_panel(..)`），也用于容器 builder 的逐容器覆盖
+（`ui.window(..).style(panel_style)`）。
+
+**DPI 预乘**：`Ui::begin(..).scale_factor(s).build()` 在 `build()` 时对最终 Theme 调用
+[`Theme::scaled`](crate::style::Theme::scaled)（全尺寸 / 字号字段 × s 取整，颜色 / 字体族
+不变）——与 `with_*` 调用顺序无关。之后 Ui 内部以物理像素为单位；公开坐标 / 尺寸参数
+用 [`Size`](crate::draw::Size) / [`Position`](crate::draw::Position)（默认 Logical，
+× scale 换算；`Size::Physical` 原样）。widget builder 的数值覆盖（`Label::font_size` /
+`Button::radius/padding/font_size` / `Divider::thickness/margin` 等）同样接收 `Size`。
+
 > **圆角半径**（`radius`，逻辑像素，默认 0 = 直角）：面板 / 窗口 / 按钮 / 输入框的
-> 背景与边框走 **9-patch 圆角矩形**（程序化纹理进动态 Atlas，颜色顶点色 tint）——
+> 背景与边框走 **9-patch 圆角矩形**（程序化纹理进字形图集，颜色顶点色 tint）——
 > 任意尺寸圆弧不畸变；`radius > 0` 时边框 ≈ 外圈 border 色圆角 + 内圈 bg 色圆角。
+> 纹理生成按像素半区选圆心，**非整数物理半径（高 DPI：radius × scale）无缺口**；
+> 绘制侧物理半径**取整**（`(radius × scale).round()`），9-patch 9 块边界恒落在
+> 整数像素——高 DPI 下圆角填充不偏右下、无 1px 缝隙。
 
 #### 调试样式（`DebugStyle`）
 
@@ -860,10 +900,12 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 ### 快速上手
 
 ```rust
-use rjw_ui::{PackSide, Theme, Ui, UiState};
+use rjw_ui::{IdAbsolute, PackSide, Theme, Ui, UiState};
 
 let mut state = UiState::new();
-state.radio_groups.insert("diff".into(), "diff_normal".into()); // 默认选中
+state
+    .radio_groups
+    .insert("diff".into(), IdAbsolute::from("diff_normal")); // 默认选中
 
 // 每帧（window/font 来自主循环；输入设备经 capture 快照；相机/渲染器延迟到 finish）：
 let mut ui = Ui::begin(window, &mut font, &mut state)

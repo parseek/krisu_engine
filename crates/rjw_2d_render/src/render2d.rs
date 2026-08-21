@@ -351,11 +351,19 @@ pub struct MeshBuilder<'a> {
     rstates: RStates,
     texture_uid: Option<u64>,
     has_rstates: bool,
+    /// 整段混合色（`Some` = 生成 `MeshStyled`，实例带 color；`None` = 通用 `Mesh`）。
+    color: Option<[f32; 4]>,
 }
 
 impl<'a> MeshBuilder<'a> {
     pub fn set_texture(mut self, texture: &ArcTextureWrapped) -> Self {
         self.texture_uid = Some(texture.uid);
+        self
+    }
+    /// 整段混合色（实例 color；`[1,1,1,1]` = 不染色）。设置后该段按
+    /// **已提前合批**的 QuadVerticesCommand 提交（自成一整段一次 draw，不参与跨段合批）。
+    pub fn color(mut self, c: Color) -> Self {
+        self.color = Some(c.into());
         self
     }
     pub fn blend(mut self, mode: BlendMode) -> Self {
@@ -478,6 +486,13 @@ impl Drop for MeshBuilder<'_> {
             None
         };
         if let Some(cmd) = self.cmd.take() {
+            let cmd = match (cmd, self.color) {
+                // 设置了整段混合色 → 转为"已提前合批"的 QuadVerticesCommand（实例带 color）。
+                (DrawCommand::Mesh { vert, tri_index, mat_idx }, Some(color)) => {
+                    DrawCommand::MeshStyled { vert, tri_index, mat_idx, color }
+                }
+                (other, _) => other,
+            };
             self.queue.push(
                 cmd,
                 self.layer,
@@ -1278,6 +1293,7 @@ impl Render2D {
             rstates: RStates::default(),
             texture_uid: None,
             has_rstates: false,
+            color: None,
         }
     }
 
@@ -1346,7 +1362,28 @@ impl Render2D {
             rstates: RStates::default(),
             texture_uid: Some(texture.uid),
             has_rstates: false,
+            color: None,
         }
+    }
+
+    /// **已提前合批的 QuadVerticesCommand**：一整段 QuadVertices + 单一变换矩阵 +
+    /// 单一**混合颜色**（`tint`）→ 一次 `draw_indexed`（实例 model + 整段 color，
+    /// shader 里 `顶点色 × 实例色`）。**自成一整段、不参与跨段合批比较**。
+    ///
+    /// 供"调用方已提前 concat 好的整段"使用（如 rjw_ui 的**窗口段**——窗口内同纹理
+    /// 同状态内容 concat 成一段，带窗口 transform 与窗口 tint → 整窗口动画/特效）。
+    /// 顶点为**局部坐标**，经 `transform` 映射到世界（同 [`Self::add_quads`]）。
+    pub fn add_quads_styled(
+        &mut self,
+        vertices: &[VertexP3U2C4],
+        transform: Transform2D,
+        tint: Color,
+        layer: impl Into<Layer>,
+        texture: &ArcTextureWrapped,
+    ) -> MeshBuilder<'_> {
+        let mut b = self.add_quads(vertices, transform, layer, texture);
+        b.color = Some(tint.into());
+        b
     }
 
     /// `add_mesh` 的带变换版本：顶点为**局部坐标**，经 `transform` 映射到世界
@@ -1405,6 +1442,7 @@ impl Render2D {
             rstates: RStates::default(),
             texture_uid: None,
             has_rstates: false,
+            color: None,
         }
     }
 
@@ -1460,6 +1498,7 @@ impl Render2D {
             rstates: RStates::default(),
             texture_uid: None,
             has_rstates: false,
+            color: None,
         }
     }
 
@@ -1490,6 +1529,7 @@ impl Render2D {
             rstates: RStates::default(),
             texture_uid: None,
             has_rstates: false,
+            color: None,
         }
     }
 
@@ -1792,6 +1832,7 @@ impl Render2D {
         let mut dyn_seg_rr: u64 = 0;
         let mut dyn_seg_tu: Option<u64> = None;
         let mut dyn_seg_mat: Option<usize> = None;
+        let mut dyn_seg_color: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
         let mut dyn_seg_layer: Layer = Layer::default();
         let mut dyn_seq_counter = 0u32;
 
@@ -1813,7 +1854,7 @@ impl Render2D {
                             instance: match dyn_seg_mat {
                                 Some(mi) => {
                                     let m = self.command_queue.matrices[mi];
-                                    InstanceData::from_model(m)
+                                    InstanceData::from_model_tinted(m, dyn_seg_color)
                                 }
                                 None => InstanceData::identity(),
                             },
@@ -2015,6 +2056,7 @@ impl Render2D {
                         dyn_seg_rr = rr;
                         dyn_seg_tu = tu;
                         dyn_seg_mat = *mat_idx;
+                        dyn_seg_color = [1.0, 1.0, 1.0, 1.0];
                         dyn_seg_layer = layer;
                     }
                     if vn != 0 {
@@ -2033,6 +2075,36 @@ impl Render2D {
                     }
                     dyn_accum_verts += vn;
                     dyn_accum_tris += tn;
+                }
+                DrawCommand::MeshStyled { vert, tri_index, mat_idx, color } => {
+                    // **已提前合批**：自成一整段一次 draw（前后 flush），实例带 model +
+                    // 整段混合色（shader 里 顶点色×实例色）。不参与跨段合批比较。
+                    flush_dyn!();
+                    dyn_seg_tri_start = Some(dyn_accum_tris);
+                    dyn_seg_rr = rr;
+                    dyn_seg_tu = tu;
+                    dyn_seg_mat = *mat_idx;
+                    dyn_seg_color = *color;
+                    dyn_seg_layer = layer;
+                    let vn = vert.end - vert.start;
+                    let tn = tri_index.end - tri_index.start;
+                    if vn != 0 {
+                        self.buf_all_verts
+                            .extend_from_slice(&self.mesh_storage.vertices[vert.clone()]);
+                    }
+                    if vn != 0 && tn != 0 {
+                        let rb = (dyn_accum_verts as i64) - (vert.start as i64);
+                        for t in &self.mesh_storage.tri_indices[tri_index.clone()] {
+                            self.buf_all_tris.push(TriIndicies(
+                                Index((t.0.0 as i64 + rb) as u16),
+                                Index((t.1.0 as i64 + rb) as u16),
+                                Index((t.2.0 as i64 + rb) as u16),
+                            ));
+                        }
+                    }
+                    dyn_accum_verts += vn;
+                    dyn_accum_tris += tn;
+                    flush_dyn!();
                 }
                 DrawCommand::Custom { idx } => {
                     // Custom 是合批屏障：关闭动态段、冲刷已收集 items。

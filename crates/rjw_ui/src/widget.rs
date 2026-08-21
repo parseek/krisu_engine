@@ -60,7 +60,7 @@
 //! use rjw_transform::Rect;
 //! use rjw_ui::draw::TextVAlign;
 //! use rjw_ui::hit::update_drag;
-//! use rjw_ui::{FocusKind, Response, TextAlign, Ui, Widget};
+//! use rjw_ui::{FocusKind, IdAbsolute, Response, TextAlign, Ui, Widget};
 //!
 //! /// 滑块（模板）：尺寸取主题，交互/绘制全部委托现有原语 [`Ui::slider_at`]——
 //! /// 与内置控件同一条路径（"现有控件能使用接口就使用接口"）。
@@ -101,11 +101,13 @@
 //!         Vec2::new(ui.theme.input.min_w, ui.theme.input.height)
 //!     }
 //!     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-//!         // 1) 交互基础（公开原语）
+//!         // 1) 交互基础（公开原语）；状态键 / 焦点用**绝对 ID**（`ui.id_for(..)` 解析，
+//!         //    容器内自动带前缀——详见 [`crate::id`] 模块）。
+//!         let id_for = ui.id_for(self.id);
 //!         let mouse = ui.mouse_logical();
 //!         let hit = ui.hit_abs(&rect);
 //!         let btn = ui.mouse_left();
-//!         ui.register_focus(self.id, rect, FocusKind::TextInput);
+//!         ui.register_focus(&id_for, rect, FocusKind::TextInput);
 //!         // 自身有拖拽语义 → 声明按下归属：阻止外层窗口把本次按下当作窗口拖拽基准
 //!         // （窗口内拖手柄不再连窗口一起动）。
 //!         if btn.down_edge() && hit {
@@ -115,7 +117,7 @@
 //!         //    ⚠ 拖拽基准存在**独立的**状态 ID（`{id}::grip`）——与 text_input_at
 //!         //    共用同一 WidgetState 会把 press_mouse 互相覆盖（拖拽失灵）。
 //!         let mut value = self.value;
-//!         let drag_id = format!("{}::grip", self.id);
+//!         let drag_id = IdAbsolute::owned(format!("{}::grip", id_for.as_str()));
 //!         {
 //!             let ws = ui.state_mut().widget(&drag_id);
 //!             let dragging = update_drag(ws, hit, btn);
@@ -179,7 +181,7 @@ use glam::Vec2;
 use rjw_color::Color;
 use rjw_transform::Rect;
 
-use crate::draw::{TextAlign, TextVAlign};
+use crate::draw::{Size, TextAlign, TextVAlign};
 use crate::state::ButtonState;
 use crate::style::{ButtonStyle, CheckboxStyle, Theme};
 use crate::ui::Ui;
@@ -389,10 +391,10 @@ impl WidgetId<'_> {
 pub struct Label<'a> {
     text: &'a str,
     color: Option<Color>,
-    font_size: Option<f32>,
+    font_size: Option<Size<f32>>,
     font_family: Option<&'a str>,
-    /// 自动换行宽度（逻辑像素；`Some(w)` 且 `w > 0` 时按宽度换行）。
-    wrap: Option<f32>,
+    /// 自动换行宽度（[`Size<f32>`]：逻辑（默认）或物理；`Some(w)` 且 `w > 0` 时换行）。
+    wrap: Option<Size<f32>>,
     /// 省略模式：文本超出可用/分配宽度时以 "…" 截断（单行，内容自洽）。
     ellipsis: bool,
 }
@@ -408,9 +410,10 @@ impl<'a> Label<'a> {
         self
     }
 
-    /// 字号（默认 `Theme::label.font_size`）。
-    pub fn font_size(mut self, s: f32) -> Self {
-        self.font_size = Some(s);
+    /// 字号（[`Size<f32>`]：`Logical`（默认，× scale）/ `Physical` 原样；
+    /// 默认 `Theme::label.font_size`）。
+    pub fn font_size(mut self, s: impl Into<Size<f32>>) -> Self {
+        self.font_size = Some(s.into());
         self
     }
 
@@ -420,9 +423,9 @@ impl<'a> Label<'a> {
         self
     }
 
-    /// 按宽度自动换行（`max_w` 逻辑像素；`<= 0` = 不换行，同默认）。
-    pub fn wrap(mut self, max_w: f32) -> Self {
-        self.wrap = Some(max_w);
+    /// 按宽度自动换行（[`Size<f32>`]：逻辑（默认）或物理；`<= 0` = 不换行，同默认）。
+    pub fn wrap(mut self, max_w: impl Into<Size<f32>>) -> Self {
+        self.wrap = Some(max_w.into());
         self
     }
 
@@ -436,13 +439,17 @@ impl<'a> Label<'a> {
 
 impl Widget for Label<'_> {
     fn size(&self, ui: &mut Ui) -> Vec2 {
-        let size = self.font_size.unwrap_or(ui.theme.label.font_size);
+        let size = self
+            .font_size
+            .map(|s| s.to_physical(ui.scale()))
+            .unwrap_or(ui.theme.label.font_size);
         let family = match self.font_family {
             Some(f) => Some(f.to_owned()),
             None => ui.theme.label.font_family.clone(),
         };
+        let wrap = self.wrap.map(|w| w.to_physical(ui.scale()));
         // 显式换行宽：直接按它测量。
-        let natural = match self.wrap {
+        let natural = match wrap {
             Some(w) if w > 0.0 => ui.text_size_wrap(self.text, size, family.as_deref(), w),
             _ => ui.text_size(self.text, size, family.as_deref()),
         };
@@ -454,7 +461,7 @@ impl Widget for Label<'_> {
                 }
             }
             natural
-        } else if self.wrap.is_none() || self.wrap.is_some_and(|w| w <= 0.0) {
+        } else if wrap.is_none() || wrap.is_some_and(|w| w <= 0.0) {
             // 默认（无显式换行宽）：**LimitedInParent**——在父级可用宽内自动换行
             // （Resizable 窗口缩窄后 Label 不溢出；无可用宽 = 自然尺寸）。
             if let Some(avail) = ui.avail_w() {
@@ -471,7 +478,10 @@ impl Widget for Label<'_> {
     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
         // 先把主题值拷出（Copy / owned），避免主题借用与下方 &mut ui 调用冲突
         let color = self.color.unwrap_or(ui.theme.label.color);
-        let size = self.font_size.unwrap_or(ui.theme.label.font_size);
+        let size = self
+            .font_size
+            .map(|s| s.to_physical(ui.scale()))
+            .unwrap_or(ui.theme.label.font_size);
         let align = ui.theme.label.align;
         let family = match self.font_family {
             Some(f) => Some(f.to_owned()),
@@ -504,6 +514,7 @@ impl Widget for Label<'_> {
             let natural = ui.text_size(self.text, size, family.as_deref());
             let wrap_w = self
                 .wrap
+                .map(|w| w.to_physical(ui.scale()))
                 .filter(|&w| w > 0.0)
                 .unwrap_or(if natural.x > rect.w { rect.w } else { 0.0 });
             let buf =
@@ -535,12 +546,12 @@ pub struct Button<'a> {
     bg_hover: Option<Color>,
     bg_pressed: Option<Color>,
     border: Option<Color>,
-    border_w: Option<f32>,
-    /// 圆角半径（逻辑像素；0 = 直角）。
-    radius: Option<f32>,
-    /// 内边距（x = 水平，y = 垂直）。
-    padding: Option<Vec2>,
-    font_size: Option<f32>,
+    border_w: Option<Size<f32>>,
+    /// 圆角半径（[`Size<f32>`]：逻辑（默认）或物理；0 = 直角）。
+    radius: Option<Size<f32>>,
+    /// 内边距（x = 水平，y = 垂直；[`Size<Vec2>`]：逻辑（默认）或物理）。
+    padding: Option<Size<Vec2>>,
+    font_size: Option<Size<f32>>,
     font_family: Option<&'a str>,
 }
 
@@ -587,24 +598,24 @@ impl<'a> Button<'a> {
         self.border = Some(c);
         self
     }
-    /// 边框宽度（默认 `ButtonStyle::border_w`）。
-    pub fn border_w(mut self, w: f32) -> Self {
-        self.border_w = Some(w);
+    /// 边框宽度（[`Size<f32>`]：逻辑（默认）或物理；默认 `ButtonStyle::border_w`）。
+    pub fn border_w(mut self, w: impl Into<Size<f32>>) -> Self {
+        self.border_w = Some(w.into());
         self
     }
-    /// 圆角半径（逻辑像素；默认 `ButtonStyle::radius`）。
-    pub fn radius(mut self, r: f32) -> Self {
-        self.radius = Some(r);
+    /// 圆角半径（[`Size<f32>`]：逻辑（默认）或物理；默认 `ButtonStyle::radius`）。
+    pub fn radius(mut self, r: impl Into<Size<f32>>) -> Self {
+        self.radius = Some(r.into());
         self
     }
-    /// 内边距（x = 水平，y = 垂直；默认 `ButtonStyle::padding`）。
-    pub fn padding(mut self, p: Vec2) -> Self {
-        self.padding = Some(p);
+    /// 内边距（[`Size<Vec2>`]：逻辑（默认）或物理；默认 `ButtonStyle::padding`）。
+    pub fn padding(mut self, p: impl Into<Size<Vec2>>) -> Self {
+        self.padding = Some(p.into());
         self
     }
-    /// 字号（默认 `ButtonStyle::font_size`）。
-    pub fn font_size(mut self, s: f32) -> Self {
-        self.font_size = Some(s);
+    /// 字号（[`Size<f32>`]：逻辑（默认）或物理；默认 `ButtonStyle::font_size`）。
+    pub fn font_size(mut self, s: impl Into<Size<f32>>) -> Self {
+        self.font_size = Some(s.into());
         self
     }
     /// 字体族（默认 `ButtonStyle::font_family`）。
@@ -613,8 +624,8 @@ impl<'a> Button<'a> {
         self
     }
 
-    /// 主题样式 + 本控件覆盖 → 最终样式。
-    fn resolve(&self, theme: &Theme) -> ButtonStyle {
+    /// 主题样式 + 本控件覆盖 → 最终样式（`scale`：API 边界 Size 换算用）。
+    fn resolve(&self, theme: &Theme, scale: f32) -> ButtonStyle {
         let base = &theme.button;
         ButtonStyle {
             bg: self.bg.unwrap_or(base.bg),
@@ -622,10 +633,10 @@ impl<'a> Button<'a> {
             bg_pressed: self.bg_pressed.unwrap_or(base.bg_pressed),
             fg: self.color.unwrap_or(base.fg),
             border: self.border.unwrap_or(base.border),
-            border_w: self.border_w.unwrap_or(base.border_w),
-            radius: self.radius.unwrap_or(base.radius),
-            padding: self.padding.unwrap_or(base.padding),
-            font_size: self.font_size.unwrap_or(base.font_size),
+            border_w: self.border_w.map(|w| w.to_physical(scale)).unwrap_or(base.border_w),
+            radius: self.radius.map(|r| r.to_physical(scale)).unwrap_or(base.radius),
+            padding: self.padding.map(|p| p.to_physical(scale)).unwrap_or(base.padding),
+            font_size: self.font_size.map(|s| s.to_physical(scale)).unwrap_or(base.font_size),
             font_family: self
                 .font_family
                 .map(|f| f.to_owned())
@@ -636,18 +647,24 @@ impl<'a> Button<'a> {
 
 impl Widget for Button<'_> {
     fn size(&self, ui: &mut Ui) -> Vec2 {
-        let size = self.font_size.unwrap_or(ui.theme.button.font_size);
+        let size = self
+            .font_size
+            .map(|s| s.to_physical(ui.scale()))
+            .unwrap_or(ui.theme.button.font_size);
         let family = match self.font_family {
             Some(f) => Some(f.to_owned()),
             None => ui.theme.button.font_family.clone(),
         };
         let tsize = ui.text_size(self.label, size, family.as_deref());
-        let pad = self.padding.unwrap_or(ui.theme.button.padding);
+        let pad = self
+            .padding
+            .map(|p| p.to_physical(ui.scale()))
+            .unwrap_or(ui.theme.button.padding);
         Vec2::new(tsize.x + pad.x * 2.0, tsize.y + pad.y * 2.0)
     }
 
     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-        let style = self.resolve(&ui.theme);
+        let style = self.resolve(&ui.theme, ui.scale());
         let s = ui.button_at_styled(self.id, rect, self.label, &style);
         Response {
             hovered: s.hovered,
@@ -669,7 +686,7 @@ pub struct Checkbox<'a> {
     fg: Option<Color>,
     box_border: Option<Color>,
     checked_fill: Option<Color>,
-    font_size: Option<f32>,
+    font_size: Option<Size<f32>>,
     font_family: Option<&'a str>,
 }
 
@@ -702,9 +719,9 @@ impl<'a> Checkbox<'a> {
         self.checked_fill = Some(c);
         self
     }
-    /// 字号（默认 `CheckboxStyle::font_size`）。
-    pub fn font_size(mut self, s: f32) -> Self {
-        self.font_size = Some(s);
+    /// 字号（[`Size<f32>`]：逻辑（默认）或物理；默认 `CheckboxStyle::font_size`）。
+    pub fn font_size(mut self, s: impl Into<Size<f32>>) -> Self {
+        self.font_size = Some(s.into());
         self
     }
     /// 字体族（默认 `CheckboxStyle::font_family`）。
@@ -713,7 +730,7 @@ impl<'a> Checkbox<'a> {
         self
     }
 
-    fn resolve(&self, theme: &Theme) -> CheckboxStyle {
+    fn resolve(&self, theme: &Theme, scale: f32) -> CheckboxStyle {
         let base = &theme.checkbox;
         CheckboxStyle {
             box_size: base.box_size,
@@ -721,7 +738,7 @@ impl<'a> Checkbox<'a> {
             border_w: base.border_w,
             checked_fill: self.checked_fill.unwrap_or(base.checked_fill),
             fg: self.fg.unwrap_or(base.fg),
-            font_size: self.font_size.unwrap_or(base.font_size),
+            font_size: self.font_size.map(|s| s.to_physical(scale)).unwrap_or(base.font_size),
             font_family: self
                 .font_family
                 .map(|f| f.to_owned())
@@ -735,7 +752,10 @@ impl Widget for Checkbox<'_> {
     fn size(&self, ui: &mut Ui) -> Vec2 {
         let box_size = ui.theme.checkbox.box_size;
         let gap = ui.theme.checkbox.gap;
-        let size = self.font_size.unwrap_or(ui.theme.checkbox.font_size);
+        let size = self
+            .font_size
+            .map(|s| s.to_physical(ui.scale()))
+            .unwrap_or(ui.theme.checkbox.font_size);
         let family = match self.font_family {
             Some(f) => Some(f.to_owned()),
             None => ui.theme.checkbox.font_family.clone(),
@@ -745,7 +765,7 @@ impl Widget for Checkbox<'_> {
     }
 
     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-        let style = self.resolve(&ui.theme);
+        let style = self.resolve(&ui.theme, ui.scale());
         let s = ui.checkbox_at_styled(self.id, rect, self.label, self.checked, &style);
         Response {
             hovered: s.hovered,
@@ -763,8 +783,8 @@ impl Widget for Checkbox<'_> {
 /// 线厚 + 上下留白。属性可选，未设置回落 [`Theme::divider`](crate::style::Theme::divider)。
 pub struct Divider {
     color: Option<Color>,
-    thickness: Option<f32>,
-    margin: Option<f32>,
+    thickness: Option<Size<f32>>,
+    margin: Option<Size<f32>>,
 }
 
 impl Divider {
@@ -776,14 +796,14 @@ impl Divider {
         self.color = Some(c);
         self
     }
-    /// 线厚度（逻辑像素；默认 `Theme::divider.thickness`）。
-    pub fn thickness(mut self, t: f32) -> Self {
-        self.thickness = Some(t);
+    /// 线厚度（[`Size<f32>`]：逻辑（默认）或物理；默认 `Theme::divider.thickness`）。
+    pub fn thickness(mut self, t: impl Into<Size<f32>>) -> Self {
+        self.thickness = Some(t.into());
         self
     }
-    /// 上下留白（逻辑像素；默认 `Theme::divider.margin`）。
-    pub fn margin(mut self, m: f32) -> Self {
-        self.margin = Some(m);
+    /// 上下留白（[`Size<f32>`]：逻辑（默认）或物理；默认 `Theme::divider.margin`）。
+    pub fn margin(mut self, m: impl Into<Size<f32>>) -> Self {
+        self.margin = Some(m.into());
         self
     }
 }
@@ -797,8 +817,8 @@ impl Default for Divider {
 impl Widget for Divider {
     fn size(&self, ui: &mut Ui) -> Vec2 {
         let st = ui.theme.divider.clone();
-        let t = self.thickness.unwrap_or(st.thickness);
-        let m = self.margin.unwrap_or(st.margin);
+        let t = self.thickness.map(|x| x.to_physical(ui.scale())).unwrap_or(st.thickness);
+        let m = self.margin.map(|x| x.to_physical(ui.scale())).unwrap_or(st.margin);
         // 宽 = 容器可用宽（固定宽窗口 / 沙箱）；无可用宽 = 默认 120。
         let w = ui.avail_w().unwrap_or(120.0);
         Vec2::new(w, t + m * 2.0)
@@ -806,10 +826,87 @@ impl Widget for Divider {
 
     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
         let st = ui.theme.divider.clone();
-        let t = self.thickness.unwrap_or(st.thickness);
+        let t = self.thickness.map(|x| x.to_physical(ui.scale())).unwrap_or(st.thickness);
         let c = self.color.unwrap_or(st.color);
         let y = rect.y + (rect.h - t) * 0.5; // 垂直居中（行高被 clamp 时仍居中）
         ui.push_solid_rect(Rect::new(rect.x, y, rect.w, t), c);
+        Response::default()
+    }
+}
+
+/// **滑块 builder**（链式：拖拽精度 / Shift·Ctrl 速度）。放置：`ui.add(Slider::new(..))`
+/// 或 `p.add(..)`（占光标）。交互与绘制委托 [`Ui::slider_at_drag`]（增量拖拽，
+/// 点击轨道即定位）。
+///
+/// ```no_run
+/// # use rjw_ui::{Slider, Ui};
+/// # let mut ui: rjw_ui::Ui = todo!();
+/// # let mut vol: f32 = 0.5;
+/// ui.add(
+///     Slider::new("vol", 0.0..=1.0, &mut vol)
+///         .drag_sensitivity(2.0)   // 每像素 2× 全值/宽（更快）
+///         .shift_speed(10.0)       // 按住 Shift 拖拽 ×10
+///         .ctrl_speed(0.1),        // 按住 Ctrl 拖拽 ×0.1
+/// );
+/// ```
+pub struct Slider<'a> {
+    id: &'a str,
+    range: std::ops::RangeInclusive<f32>,
+    value: &'a mut f32,
+    /// 拖拽精度（每像素数值倍率；默认 1 = 值随鼠标 1:1）。
+    drag_sensitivity: f32,
+    /// 按住 Shift 拖拽速度倍率（默认 10）。
+    shift_speed: f32,
+    /// 按住 Ctrl 拖拽速度倍率（默认 0.1）。
+    ctrl_speed: f32,
+}
+
+impl<'a> Slider<'a> {
+    pub fn new(id: &'a str, range: std::ops::RangeInclusive<f32>, value: &'a mut f32) -> Self {
+        Self { id, range, value, drag_sensitivity: 1.0, shift_speed: 10.0, ctrl_speed: 0.1 }
+    }
+    /// 拖拽**精度**：每像素数值倍率（默认 1 = 值随鼠标 1:1；`> 1` 更快、`< 1` 更慢）。
+    pub fn drag_sensitivity(mut self, s: f32) -> Self {
+        self.drag_sensitivity = s;
+        self
+    }
+    /// 按住 **Shift** 拖拽速度倍率（默认 10）。
+    pub fn shift_speed(mut self, s: f32) -> Self {
+        self.shift_speed = s;
+        self
+    }
+    /// 按住 **Ctrl** 拖拽速度倍率（默认 0.1）。
+    pub fn ctrl_speed(mut self, s: f32) -> Self {
+        self.ctrl_speed = s;
+        self
+    }
+}
+
+impl Widget for Slider<'_> {
+    fn size(&self, ui: &mut Ui) -> Vec2 {
+        Vec2::new(ui.theme.slider.min_w.max(40.0), ui.theme.slider.height)
+    }
+
+    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+        // 速度倍率：Shift = ×shift_speed（默认 10），Ctrl = ×ctrl_speed（默认 0.1）。
+        let shift = ui.key_down(winit::keyboard::KeyCode::ShiftLeft)
+            || ui.key_down(winit::keyboard::KeyCode::ShiftRight);
+        let ctrl = ui.key_down(winit::keyboard::KeyCode::ControlLeft)
+            || ui.key_down(winit::keyboard::KeyCode::ControlRight);
+        let speed = if shift {
+            self.shift_speed
+        } else if ctrl {
+            self.ctrl_speed
+        } else {
+            1.0
+        };
+        *self.value = ui.slider_at_drag(
+            self.id,
+            rect,
+            self.range,
+            *self.value,
+            self.drag_sensitivity * speed,
+        );
         Response::default()
     }
 }

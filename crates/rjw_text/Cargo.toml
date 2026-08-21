@@ -1,6 +1,6 @@
 [package]
 name = "rjw_text"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["KrisuRJW <Cmd1loica99@163.com>"]
 description = "Text rendering via cosmic-text layout, swash glyph rasterization and a DynamicAtlas glyph cache."

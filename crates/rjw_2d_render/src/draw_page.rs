@@ -77,6 +77,15 @@ impl InstanceData {
         id
     }
 
+    /// 带 model 变换 + **整段混合色**的实例（QuadVerticesCommand 用）：
+    /// shader 中 `顶点色 × 实例色` → 整段染色（窗口淡入淡出 / 特效）。
+    #[inline]
+    pub(crate) fn from_model_tinted(model: glam::Mat4, color: [f32; 4]) -> Self {
+        let mut id = Self::from_model(model);
+        id.color = color;
+        id
+    }
+
     pub(crate) fn from_sprite(rect: &SpriteRect, color: Color, transform: Transform2D) -> Self {
         let (sin, cos) = transform.rotation.sin_cos();
         let model = glam::Mat4::from_cols_array_2d(&[

@@ -20,14 +20,14 @@
 
 use std::time::Instant;
 
-use glam::Vec2;
+use glam::{Vec2, vec2};
 use rjw_2d_render::{ClearConfig, Render2D, SpriteRect};
 use rjw_color::Color;
 use rjw_main::*;
 use rjw_render::{wgpu, RenderConfig, RenderContext};
 use rjw_text::Text;
 use rjw_transform::{Transform2D, Viewport};
-use rjw_ui::{Anchor, Button, Divider, FontModal, Label, NumberInput, PackSide, Theme, Ui, UiAdd, UiState, UiStats};
+use rjw_ui::{Anchor, Button, Divider, FontModal, IdAbsolute, Label, NumberInput, PackSide, PanelStyle, Slider, Theme, Ui, UiAdd, UiState, UiStats, WindowClamp, WindowFx};
 
 const LAYER_UI: f64 = 10_000_000.0;
 
@@ -48,13 +48,9 @@ struct UiApp {
     fullscreen: bool,
     /// 数字输入（数字条）值。
     hp: f32,
-    /// 数字输入（数字条）文本框内容（持久，打字不丢）。
-    hp_text: String,
     /// 水平行（row）演示的第二/三个数字条状态。
     hp2: f32,
     hp3: f32,
-    hp_text2: String,
-    hp_text3: String,
     /// checkbox_mut（WidgetId）演示状态。
     show_hud: bool,
     opt7: bool,
@@ -77,6 +73,8 @@ struct UiApp {
     /// 多行备注（TextArea 演示）。
     win_b_note_area: String,
     inventory: [bool; 9],
+    // chishi（旋转 + RGBA 染色窗口；显示文本由 NumberInput 内部管理）
+    cshi_num: f32,
     // —— 性能测量（--auto-drag：自动拖动 win_b 并每帧改内容，模拟"拖动中内容逐帧变化"的最坏路径） ——
     perf: PerfAgg,
     auto_drag: bool,
@@ -89,8 +87,10 @@ struct UiApp {
 impl UiApp {
     fn new() -> Self {
         let mut ui_state = UiState::new();
-        // 默认选中"普通"难度
-        ui_state.radio_groups.insert("diff".to_owned(), "diff_normal".to_owned());
+        // 默认选中"普通"难度（单选组值 = 控件**绝对 ID**；顶层无前缀 = 原样）
+        ui_state
+            .radio_groups
+            .insert("diff".to_owned(), IdAbsolute::from("diff_normal"));
         Self {
             render: None,
             render2d: None,
@@ -104,11 +104,8 @@ impl UiApp {
             clicks: 0,
             volume: 0.6,
             hp: 66.0,
-            hp_text: "66".to_owned(),
             hp2: 40.0,
             hp3: 60.0,
-            hp_text2: "40".to_owned(),
-            hp_text3: "60".to_owned(),
             show_hud: true,
             opt7: false,
             font_name: String::new(),
@@ -129,6 +126,7 @@ impl UiApp {
             script_pos: false,
             drag_t0: Instant::now(),
             auto_tick: 0,
+            cshi_num: 0.,
         }
     }
 }
@@ -338,15 +336,16 @@ impl App for UiApp {
             .map(|(id, z)| format!("{id} (z{z})"))
             .unwrap_or_else(|| "无".to_owned());
         let prev_blocked = self.ui_state.occluded_hits();
-        // 渲染增强演示：渐变状态栏背景（圆角样式已弃用——默认 radius=0 方形路径，
-        // 不再生成程序化圆角纹理）。
+        // 渲染增强演示：圆角已修复（见 proc::rounded_rect_rgba 非整数半径回归测试）——
+        // 主题责任链 `with_radius` 级联到 panel / button / input，高 DPI 下也不再破损。
         // 主题按所选字体构建（FontModal 确定后写入 font_name；空 = 系统默认）。
-        // with 责任链：全局字体族级联到全部文本子样式。⚠ 不设 radius（圆角纹理有缺陷）。
+        // with 责任链：全局字体族级联到全部文本子样式 + 全局圆角。
         let theme = if self.font_name.is_empty() {
             Theme::dark()
         } else {
             Theme::dark().with_font_family(&self.font_name)
-        };
+        }
+        .with_radius(8.0);
         let mut ui = Ui::begin(window, font, &mut self.ui_state)
             .capture(&ctx.mouse, &ctx.keyboard)
             .theme(theme)
@@ -428,17 +427,19 @@ impl App for UiApp {
             if p.button("btn_reset", "重置 UI 状态 (R)").clicked() {
                 reset_requested = true;
             }
-            // 滑块：返回更新后的值，写入应用状态
-            self.volume = p.slider("vol", 0.0..=1.0, self.volume);
+            // 滑块 builder（链式拖拽精度 + Shift/Ctrl 速度；占光标 add）：
+            // 拖拽精度 = 每像素数值倍率；Shift 按住 ×10、Ctrl 按住 ×0.1。
+            p.add(
+                Slider::new("vol", 0.0..=1.0, &mut self.volume)
+                    .drag_sensitivity(1.0)
+                    .shift_speed(10.0)
+                    .ctrl_speed(0.1),
+            );
             p.label(&format!("音量: {:.0}%", self.volume * 100.0));
             // ── 新功能演示：数字条（builtin 组合控件） + WidgetId 数字 ID ──
             p.label("生命值（数字条：拖动手柄左右调值 / 点击输入）");
-            p.add(
-                NumberInput::new("hp_bar", &mut self.hp_text, &mut self.hp)
-                    .range(0.0, 100.0)
-                    .step(0.25),
-            );
-            p.label(&format!("HP: {:.0}", self.hp));
+            p.add(NumberInput::new("hp_bar", &mut self.hp).range(0.0, 100.0).step(0.25));
+            p.label(&format!("HP: {:.2}", self.hp));
             if p.checkbox_mut(Some("cb_hud"), "显示 HUD", &mut self.show_hud).toggled() {
                 // checkbox_mut 点击已直接翻转 `&mut bool`；此处演示返回状态仍可判断
             }
@@ -475,17 +476,11 @@ impl App for UiApp {
             p.label("水平行（row）：数字条 ×2 + 按钮");
             p.row(|r| {
                 r.label("HP:");
-                r.add(
-                    NumberInput::new("hp_row_a", &mut self.hp_text2, &mut self.hp2)
-                        .range(0.0, 100.0)
-                        .step(0.25),
-                );
-                r.add(
-                    NumberInput::new("hp_row_b", &mut self.hp_text3, &mut self.hp3)
-                        .range(0.0, 100.0)
-                        .step(0.25),
-                );
+                // NumberInput 新 API：只需数值引用（显示文本内部跨帧持久管理）。
+                r.add(NumberInput::new("hp_row_a", &mut self.hp2).range(0.0, 100.0).step(0.25));
+                r.add(NumberInput::new("hp_row_b", &mut self.hp3).range(0.0, 100.0).step(0.25));
                 if r.button("hp_row_btn", "同步").clicked() {
+                    // 同步只写值即可——NumberInput 失焦显示由 value 派生，自动跟随。
                     self.hp3 = self.hp2;
                 }
             });
@@ -495,39 +490,55 @@ impl App for UiApp {
         });
 
         // ── 可拖拽面板 + grid：右侧背包 ───────────────────────
-        ui.window_at("inv_panel", Vec2::new(300.0, 90.0), |p| {
-            p.label("背包（按住拖动 · 点击切换物品）");
-            p.grid_at(Vec2::new(0.0, 28.0), 3, "inv", |g| {
-                for i in 0..9 {
-                    let owned = self.inventory[i];
-                    let label = if owned { format!("物品 {i} ★") } else { format!("物品 {i}") };
-                    if g.button(&format!("slot_{i}"), &label).clicked() {
-                        self.inventory[i] = !self.inventory[i];
+        // 容器责任链 builder：`ui.window(id)` → 选项链 → `.show(f)`（等价旧 window_at）。
+        ui.window("inv_panel")
+            .pos(Vec2::new(300.0, 90.0))
+            .show(|p| {
+                p.label("背包（按住拖动 · 点击切换物品）");
+                p.grid_at(Vec2::new(0.0, 28.0), 3, "inv", |g| {
+                    for i in 0..9 {
+                        let owned = self.inventory[i];
+                        let label = if owned { format!("物品 {i} ★") } else { format!("物品 {i}") };
+                        if g.button(&format!("slot_{i}"), &label).clicked() {
+                            self.inventory[i] = !self.inventory[i];
+                        }
                     }
-                }
+                });
             });
-        });
 
         // ── Window 容器：可重叠 + 点击置顶 + 可拖拽 ───────────
         // 两个窗口互相重叠；点击任一窗口即置顶（焦点 z-order）。
-        // 窗口 A 用**固定宽**（右下角缩放柄，鼠标拖动改宽度、高度自动）。
+        // 窗口 A 用**固定宽**（builder `.width()`，等价旧 `window_at_w`：右下角缩放柄，
+        // 鼠标拖动改宽度、高度自动）+ **逐窗口样式**（`.style()`：圆角深色面板，
+        // 默认回落全局 `Theme::panel`）。
         // 缩窄窗口 A：Label 自动换行 / `.ellipsis()` 省略 / 按钮文本省略。
-        ui.window_at_w("win_a", self.win_a_pos, 220.0, |w| {
-            w.label("窗口 A（点击置顶 · 拖动移动）");
-            if w.button("win_a_btn", "A 按钮").clicked() {
-                self.clicks += 1;
-            }
-            // 勾选状态由应用持有（跨帧持久）：checkbox_mut 点击**直接翻转** `&mut bool`，
-            // 无需手动 toggled() 维护；ID = None → 以 label 文本为 ID。
-            w.checkbox_mut(None, "窗口 A 选项", &mut self.win_a_checked);
-            // Label 溢出演示（Resizable 窗口缩窄）：
-            // - 默认（无显式 wrap）：在窗口固定宽内**自动换行**；
-            // - `.ellipsis()`：超出宽度以 "…" 省略为单行。
-            w.add(Label::new("自动换行标签：窗口缩窄后自动换行，不再溢出画到窗口外。"));
-            w.add(Label::new("省略标签：窗口缩窄后显示为省略号……").ellipsis());
-            w.add(Divider::new());
-            w.label("分割线下方");
-        });
+        ui.window("win_a")
+            .pos(self.win_a_pos)
+            .width(220.0)
+            .style(
+                PanelStyle::default()
+                    .with_bg(Color::rgba_u8(40, 44, 62, 255))
+                    .with_radius(8.0),
+            )
+            // 位置约束责任链：默认 Screen = 窗口整体不跑出屏幕；Free = 可拖出；
+            // Locked = 位置固定（拖不动，脚本/传入位置仍生效）。
+            .clamp(WindowClamp::Screen)
+            .show(|w| {
+                w.label("窗口 A（点击置顶 · 拖动移动）");
+                if w.button("win_a_btn", "A 按钮").clicked() {
+                    self.clicks += 1;
+                }
+                // 勾选状态由应用持有（跨帧持久）：checkbox_mut 点击**直接翻转** `&mut bool`，
+                // 无需手动 toggled() 维护；ID = None → 以 label 文本为 ID。
+                w.checkbox_mut(None, "窗口 A 选项", &mut self.win_a_checked);
+                // Label 溢出演示（Resizable 窗口缩窄）：
+                // - 默认（无显式 wrap）：在窗口固定宽内**自动换行**；
+                // - `.ellipsis()`：超出宽度以 "…" 省略为单行。
+                w.add(Label::new("自动换行标签：窗口缩窄后自动换行，不再溢出画到窗口外。"));
+                w.add(Label::new("省略标签：窗口缩窄后显示为省略号……").ellipsis());
+                w.add(Divider::new());
+                w.label("分割线下方");
+            });
         ui.window_at("win_b", self.win_b_pos, |w| {
             w.label("窗口 B（覆盖在 A 之上）");
             // 性能测量：auto_drag 时每帧变化的标签（强制窗口内容每帧变化 → 重建路径）
@@ -560,6 +571,48 @@ impl App for UiApp {
                 self.clicks += 1;
             }
         });
+        
+        let mut r = 1.0;
+        let mut g = 1.0;
+        let mut b = 1.0;
+        let mut a = 1.0;
+        ui.window_at("chishi", vec2(155., 32.), |w| {
+            w.label("赤石");
+            w.add(NumberInput::new("chisN1", &mut self.cshi_num).step(0.1));
+            self.cshi_num = w.slider("sb", 0.0..=360., self.cshi_num);
+            w.row(|w| {
+                w.label("HP:");
+                r = w.slider("CSHI_r", 0.0..=1.0, r);
+                g = w.slider("CSHI_g", 0.0..=1.0, g);
+                b = w.slider("CSHI_b", 0.0..=1.0, b);
+                a = w.slider("CSHI_a", 0.0..=1.0, a);
+            });
+        } );
+        // 赤石窗口：整窗旋转（角度 = cshi_num）+ RGBA 染色（4 个 slider 调）
+        // —— window_fx 演示：顶点缓存不变，仅提交时应用 tint/transform。
+        // `anchor = (0.5, 0.5)`：旋转/缩放绕**窗口中心**（transform = IDENTITY 时
+        // 无论锚点何值，位置恒为窗口原位置）。
+        ui.window_fx("chishi", WindowFx {
+            tint: Color::rgba(r, g, b, a),
+            transform: Some(Transform2D::IDENTITY.with_rot(self.cshi_num.to_radians())),
+            anchor: Vec2::new(0.5, 0.5),
+        });
+
+        // ── 窗口级 FX（window_fx）：win_b 整窗淡入淡出 + 轻微上浮动画 ──
+        // tint（混合色，顶点色×实例色）与 transform override（叠加在窗口原点上）——
+        // 顶点缓存不变，仅提交时应用，支撑整窗口动画/特效。
+        let fx_t = self.drag_t0.elapsed().as_secs_f64();
+        let fx_alpha = 0.75 + 0.25 * (fx_t * 1.5).sin() as f32;
+        ui.window_fx(
+            "win_b",
+            WindowFx {
+                tint: Color::rgba_u8(255, 255, 255, (fx_alpha * 255.0) as u8),
+                transform: Some(
+                    Transform2D::IDENTITY.with_pos(Vec2::new(0.0, 5.0 * (fx_t * 1.2).sin() as f32)).with_rot(1.0),
+                ),
+                anchor: Vec2::new(0.5, 0.5), // 旋转/缩放绕窗口中心
+            },
+        );
 
         // ── 窗口诊断面板（调试机制：实时告诉你窗口叠放与点击解析）──
         // 把窗口 A/B/背包叠在同一处点击：面板会显示鼠标下**最上层**窗口是哪个、
@@ -713,5 +766,5 @@ fn reset_ui_state(state: &mut UiState) {
     state.reset();
     state
         .radio_groups
-        .insert("diff".to_owned(), "diff_normal".to_owned());
+        .insert("diff".to_owned(), IdAbsolute::from("diff_normal"));
 }
