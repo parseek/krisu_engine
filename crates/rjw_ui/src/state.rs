@@ -175,6 +175,10 @@ pub struct UiState {
     pub(crate) combo_open: Option<IdAbsolute<'static>>,
     /// **固定宽窗口的宽度**（`window_at_w` 鼠标缩放：**绝对 ID** → 逻辑宽度，跨帧持久）。
     pub(crate) window_widths: HashMap<IdAbsolute<'static>, f32>,
+    /// **窗口结算尺寸**（**绝对 ID** → 物理尺寸，跨帧持久）。clamp（`WindowClamp`）
+    /// 用——按 **id** 而非窗口 z 索引：**点击置顶 z+1 后尺寸不丢** → clamp 边界稳定
+    /// （消除"按下即跳变"）；`window_rects[z]` 仅作兜底。
+    pub(crate) window_sizes: HashMap<IdAbsolute<'static>, Vec2>,
     /// **用户拖拽缩放的控件尺寸**（[`Ui::resize_handle`]：**绝对 ID** → 逻辑尺寸，跨帧持久）。
     /// 可缩放 widget 的 `size()` 优先读它（首次 = 内容自然尺寸）。
     pub sizes: HashMap<IdAbsolute<'static>, Vec2>,

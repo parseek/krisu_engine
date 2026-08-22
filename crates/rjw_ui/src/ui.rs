@@ -2082,24 +2082,32 @@ impl<'a> Ui<'a> {
             .unwrap_or_else(|| self.theme.panel.clone());
         let (pad_total, gap) = (style.padding + style.border_w, self.theme.gap);
         let saved_base = self.abs_base;
-        // **限位与命中基准一致**：主窗口（OS 窗口）缩小 / 内容尺寸变化后，屏幕
-        // 边界变小，窗口位置会被 clamp 回屏幕内；若命中（abs_base / panel_rect）
-        // 仍用未 clamp 的 `origin`、绘制用 clamp 后位置 → "窗口看得见却点不到、
-        // 拖不动"。统一用 **上帧窗口尺寸**（`window_rects` 跨帧缓存）clamp：
-        // 命中基准 = 显示基准 = `base_pos`（尺寸变化帧 clamp 边界延迟一帧生效，
-        // 换取命中 / 绘制永不错位）。首帧无记录按尺寸 0（等价原"贴边界"）。
         let (sw, sh) = (
             self.window.inner_size().width as f32,
             self.window.inner_size().height as f32,
         );
+        // 窗口尺寸（clamp 用）：**按 id 跨帧持久**（`window_sizes`）——点击置顶
+        // z+1 后尺寸不丢 → clamp 边界稳定（消除"按下即跳变"）；`window_rects[z]`
+        // 仅兜底；首帧（均无记录）= `None`。
         let prev_size = self
             .state
-            .window_rects
-            .get(&z)
-            .map(|r| Vec2::new(r.w, r.h))
-            .unwrap_or(Vec2::ZERO);
+            .window_sizes
+            .get(id_for.as_str())
+            .copied()
+            .or_else(|| {
+                self.state
+                    .window_rects
+                    .get(&z)
+                    .map(|r| Vec2::new(r.w, r.h))
+            });
+        // 命中 / 内容基准 = 显示基准：非首帧用持久尺寸 clamp（主窗口缩小 / 内容
+        // 变化后窗口被拉回屏幕内 → 照常可点可拖）；**首帧（尺寸未知）不 clamp**——
+        // 窗口出现在应用指定位置，当帧显示已 clamp，次帧收敛一致（消除首帧跳变）。
         let base_pos = if clamp == WindowClamp::Screen {
-            clamp_window_pos(saved_base + origin, prev_size, sw, sh) - saved_base
+            match prev_size {
+                Some(ps) => clamp_window_pos(saved_base + origin, ps, sw, sh) - saved_base,
+                None => origin,
+            }
         } else {
             origin
         };
@@ -2122,6 +2130,8 @@ impl<'a> Ui<'a> {
         let size = frame.settle_size();
         self.depth -= 1;
         self.abs_base = saved_base;
+        // 记录窗口尺寸（按 id 持久；点击置顶 z 变化后下帧 prev_size 仍可取）。
+        self.state.window_sizes.insert(id_for.to_static(), size);
         // 拖拽 + 按下裁决（物理像素粒度拖动基准，同 panel_impl）：
         // 重叠区域点击按下时，记录"本帧按下命中的**最上层**窗口"（win_press_top），
         // `finish::resolve_win_press` 只保留它的拖拽与置顶——避免同时拖动多个窗口。
@@ -2133,7 +2143,8 @@ impl<'a> Ui<'a> {
         if let Some(w) = width {
             let hw = 14.0_f32;
             // handle 为**外层容器局部坐标**（此处 abs_base 已恢复为外层原点）。
-            let handle = Rect::new(origin.x + size.x - hw, origin.y + size.y - hw, hw, hw);
+            // 用 clamp 后位置 `base_pos`（而非 origin）——与显示一致，贴边窗口缩放柄可命中。
+            let handle = Rect::new(base_pos.x + size.x - hw, base_pos.y + size.y - hw, hw, hw);
             let h_id = format!("{id}::resize");
             if let Some(new_size) = self.resize_handle(
                 &h_id,
@@ -2197,17 +2208,19 @@ impl<'a> Ui<'a> {
                 origin
             };
             // 拖拽中 clamp 边界 = 按下帧尺寸（固定）→ 位置纯跟手、不因内容尺寸
-            // 变化被推回（消除"拖动单帧跳变"）；非拖拽帧用上帧尺寸（命中基准一致）。
-            let clamp_size = if active { ws.press_size.unwrap_or(prev_size) } else { prev_size };
+            // 变化被推回（消除"拖动单帧跳变"）；非拖拽帧用持久尺寸（命中基准一致）。
+            let clamp_size = if active { ws.press_size.or(prev_size) } else { prev_size };
             (active, np, clamp_size)
         };
         // **Screen 限位**：窗口 clamp 到画面（窗口客户区）内——拖拽 / 脚本定位后
         // 的位置都被限制（绝对坐标 clamp 后回容器局部）；`Free` / `Locked` 不 clamp
         // （Locked 本身位置固定）。**clamp 尺寸**：拖拽中 = 按下帧尺寸（固定，
-        // 边界稳定 → 无单帧跳变）；非拖拽 = 上帧尺寸（与命中基准 base_pos 一致，
-        // 主窗口缩小 / 窗口比画面大也不会"看得见拖不动"）。
+        // 边界稳定 → 无单帧跳变）；非拖拽 = 持久尺寸（与命中基准 base_pos 一致，
+        // 主窗口缩小 / 窗口比画面大也不会"看得见拖不动"）；首帧无记录 = 本帧结算
+        // 尺寸（窗口首次显示在 clamp 后位置，次帧命中基准收敛一致）。
         let display_pos = if clamp == WindowClamp::Screen {
-            clamp_window_pos(saved_base + new_pos, drag_clamp_size, sw, sh) - saved_base
+            let cs = drag_clamp_size.unwrap_or(size);
+            clamp_window_pos(saved_base + new_pos, cs, sw, sh) - saved_base
         } else {
             new_pos
         };
@@ -6328,6 +6341,46 @@ mod tests {
             );
             last = disp.x;
         }
+    }
+
+    #[test]
+    fn window_first_frame_position_converges() {
+        // 首帧（prev_size 未知）：命中基准 = origin（不 clamp）；显示 = clamp(origin, size)。
+        // 次帧：prev_size = size → base_pos = clamp(origin, size) = **首帧显示位置**
+        // → 命中/显示收敛、位置无跳（消除"窗口刚出现就按下 → 按下瞬间跳变"）。
+        let origin = Vec2::new(700.0, 300.0); // 窗口内容大，origin 超出真实 clamp 边界
+        let size = Vec2::new(300.0, 100.0);
+        let sw = 800.0;
+        let sh = 600.0;
+        let first_display = clamp_window_pos(origin, size, sw, sh);
+        assert_eq!(first_display.x, 500.0, "首帧显示 clamp 到 [0, sw-size]=500");
+        // 次帧命中基准 = clamp(origin, size)（首帧显示位置）→ 一致。
+        let second_base = clamp_window_pos(origin, size, sw, sh);
+        assert_eq!(second_base, first_display, "次帧命中基准 = 首帧显示位置（无跳变）");
+        // 次帧后 origin 已持久化为 clamp 后位置 → 再 clamp 不变。
+        let origin2 = first_display;
+        assert_eq!(
+            clamp_window_pos(origin2, size, sw, sh),
+            origin2,
+            "已 clamp 位置再 clamp 不变"
+        );
+    }
+
+    #[test]
+    fn window_size_persists_across_z_change() {
+        // 点击置顶 z+1 只影响 `window_rects[z]` 索引；尺寸按 **id** 持久
+        // （`window_sizes`）→ 下帧 prev_size 不回落 ZERO，clamp 边界稳定。
+        let id = "win_a";
+        let mut sizes = std::collections::HashMap::<String, Vec2>::new();
+        sizes.insert(id.into(), Vec2::new(200.0, 100.0));
+        // 置顶后（window_rects 无新 z 记录）：
+        let prev_size = sizes.get(id).copied(); // window_sizes 优先
+        assert_eq!(prev_size, Some(Vec2::new(200.0, 100.0)), "置顶后尺寸仍可取（不回落 ZERO）");
+        // 用持久尺寸 clamp：贴右缘窗口位置稳定（若回落 ZERO 会贴到 sw=800）。
+        let p = clamp_window_pos(Vec2::new(650.0, 300.0), prev_size.unwrap(), 800.0, 600.0);
+        assert_eq!(p.x, 600.0, "clamp 边界 = sw-size = 600（稳定）");
+        let p_zero = clamp_window_pos(Vec2::new(650.0, 300.0), Vec2::ZERO, 800.0, 600.0);
+        assert_eq!(p_zero.x, 650.0, "ZERO 尺寸 clamp 区间 [0,sw]（不生效，跳变源对比）");
     }
 
     #[test]
