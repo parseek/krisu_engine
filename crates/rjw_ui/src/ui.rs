@@ -2164,21 +2164,24 @@ impl<'a> Ui<'a> {
                 self.win_press_top = Some((id_for.to_static(), self.cur_win));
             }
         }
-        let (active, new_pos) = if clamp == WindowClamp::Locked {
+        let (active, new_pos, drag_clamp_size) = if clamp == WindowClamp::Locked {
             // 锁定：位置固定（不建立拖拽基准、不激活拖拽；点击置顶 / 子控件仍有效）。
-            (false, origin)
+            (false, origin, prev_size)
         } else {
             let ws = self.state.widgets.entry(id_for.to_static()).or_default();
             let dragging = update_drag(ws, hit, btn);
             if drag_here {
                 ws.press_panel = Some(panel_rect.min());
                 ws.press_mouse = Some(self.mouse_screen.round());
+                // 按下帧窗口尺寸：拖拽中 clamp 边界**固定**——内容尺寸变化不推窗。
+                ws.press_size = Some(size);
             } else if press_here {
                 // 文本框等子控件按下（选择拖拽优先）：**清除旧拖拽基准**——
                 // 否则 `update_drag` 已置 dragging=true，残留的 press_mouse 会被
                 // drag_moved 当作基准，算出巨大位移 → 窗口"瞬移"。
                 ws.press_panel = None;
                 ws.press_mouse = None;
+                ws.press_size = None;
             }
             // 拖拽需实际位移（≥ DRAG_ACTIVATE_PX）且**有本帧基准**才激活：纯点击不拖拽，
             // 窗口内子控件（按钮/勾选/输入框）正常响应（见 hit_abs 抑制条件）。
@@ -2193,14 +2196,18 @@ impl<'a> Ui<'a> {
             } else {
                 origin
             };
-            (active, np)
+            // 拖拽中 clamp 边界 = 按下帧尺寸（固定）→ 位置纯跟手、不因内容尺寸
+            // 变化被推回（消除"拖动单帧跳变"）；非拖拽帧用上帧尺寸（命中基准一致）。
+            let clamp_size = if active { ws.press_size.unwrap_or(prev_size) } else { prev_size };
+            (active, np, clamp_size)
         };
         // **Screen 限位**：窗口 clamp 到画面（窗口客户区）内——拖拽 / 脚本定位后
         // 的位置都被限制（绝对坐标 clamp 后回容器局部）；`Free` / `Locked` 不 clamp
-        // （Locked 本身位置固定）。**与命中基准 base_pos 用同一尺寸（prev_size）**
-        // clamp → 命中与绘制恒一致（主窗口缩小 / 窗口比画面大也不会"看得见拖不动"）。
+        // （Locked 本身位置固定）。**clamp 尺寸**：拖拽中 = 按下帧尺寸（固定，
+        // 边界稳定 → 无单帧跳变）；非拖拽 = 上帧尺寸（与命中基准 base_pos 一致，
+        // 主窗口缩小 / 窗口比画面大也不会"看得见拖不动"）。
         let display_pos = if clamp == WindowClamp::Screen {
-            clamp_window_pos(saved_base + new_pos, prev_size, sw, sh) - saved_base
+            clamp_window_pos(saved_base + new_pos, drag_clamp_size, sw, sh) - saved_base
         } else {
             new_pos
         };
@@ -6290,6 +6297,37 @@ mod tests {
         assert_eq!(p, Vec2::new(-100.0, -100.0), "超大窗口可拖到负区间（sw-size）");
         let p = clamp_window_pos(Vec2::new(-50.0, -50.0), Vec2::new(900.0, 700.0), 800.0, 600.0);
         assert_eq!(p, Vec2::new(-50.0, -50.0), "超大窗口在负区间内原样保留");
+    }
+
+    #[test]
+    fn window_drag_clamp_size_fixed_during_drag() {
+        // 拖拽中窗口内容尺寸变化（变宽）时，clamp 边界**固定为按下帧尺寸**：
+        // 贴右缘的窗口不被推回（纯跟手、无单帧跳变）；非拖拽帧才按最新尺寸复位。
+        let sw = 800.0;
+        let sh = 600.0;
+        let press_size = Vec2::new(200.0, 100.0); // 按下帧窗口尺寸
+        let now_size = Vec2::new(260.0, 100.0); // 拖拽中内容变宽后的尺寸
+        // 同一目标位置（拖到屏幕右缘外）：
+        let target = Vec2::new(720.0, 300.0);
+        let with_press = clamp_window_pos(target, press_size, sw, sh);
+        let with_now = clamp_window_pos(target, now_size, sw, sh);
+        assert_eq!(with_press.x, 600.0, "按下帧尺寸 clamp：窗口贴右缘 600（拖拽中稳定）");
+        assert_eq!(with_now.x, 540.0, "当前尺寸 clamp：窗口被推左 60px（拖拽中跳变源）");
+        // 拖拽中窗口位置 = clamp(press_panel + d, press_size)：随鼠标位移连续。
+        let press_panel = Vec2::new(600.0, 300.0);
+        let press_mouse = Vec2::new(700.0, 350.0);
+        let mut last = press_panel.x;
+        for i in 1..=6 {
+            // 鼠标位移 -30, -20, -10, 0, +10, +20（先回拖离开右缘、再拖回贴边）。
+            let d = Vec2::new(10.0 * (i as f32 - 4.0), 0.0);
+            let disp = clamp_window_pos(press_panel + d, press_size, sw, sh);
+            assert!(
+                (disp.x - last).abs() <= 30.0 + 0.001,
+                "帧 {i}: 拖拽中位置应随鼠标平滑（每帧 ≤ 鼠标步进 30px），实际 {last} → {}",
+                disp.x
+            );
+            last = disp.x;
+        }
     }
 
     #[test]

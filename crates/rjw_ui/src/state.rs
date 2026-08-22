@@ -35,6 +35,11 @@ pub struct WidgetState {
     pub press_panel: Option<Vec2>,
     /// 面板拖拽基准：按下时鼠标物理坐标（取整），见 [`Self::press_panel`]。
     pub press_mouse: Option<Vec2>,
+    /// **窗口拖拽基准**：按下帧窗口**结算尺寸**（`WindowClamp::Screen` 拖拽中
+    /// clamp 边界固定用）。窗口内容尺寸在拖拽中变化时（换行 / 滚动条 / 动态文本），
+    /// clamp 边界不随之每帧变 → 窗口位置**纯跟手**，不会在贴边时被推回产生
+    /// "单帧跳变"。`None` = 无按下基准（非拖拽帧用上帧尺寸 clamp）。
+    pub(crate) press_size: Option<Vec2>,
     /// 文本输入框光标位置（char 索引）。
     pub caret: usize,
     /// 文本选择锚点（char 索引；`Some` = 有选择，范围 = [min(anchor,caret), max)）。
