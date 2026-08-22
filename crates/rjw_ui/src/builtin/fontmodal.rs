@@ -82,7 +82,7 @@ impl FontModal<'_> {
                     &example,
                     psize,
                     fg,
-                    (!name.is_empty()).then(|| name.clone()),
+                    (!name.is_empty()).then(|| name.clone().into()),
                     crate::TextAlign::Left,
                     crate::draw::TextVAlign::Top,
                     None,

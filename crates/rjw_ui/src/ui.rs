@@ -253,7 +253,7 @@ impl<'a> UiInit<'a> {
         let (mx, my) = mouse.get_mouse_position();
         let mouse_screen = Vec2::new(mx as f32, my as f32);
         let mouse_in_window = mouse.in_window();
-        Ui {
+        let mut ui = Ui {
             window,
             text,
             state,
@@ -293,7 +293,17 @@ impl<'a> UiInit<'a> {
             cursor_window_drag: false,
             cursor_custom: None,
             ids: IdStack::new(),
-        }
+        };
+        // 根容器（顶层流式布局）：pack 控件（`label` / `button` / `slider` …）在
+        // `finish` 前**任何位置**可调用——顶层直接自顶向下堆叠（原 `child_rect` 在
+        // 无容器时 panic）；固定宽 = 视口物理宽 → 顶层 `avail_w()` = 视口宽
+        // （`LimitedInParent` 控件自动换行自洽）。容器 / 窗口各自 push 自己的帧，
+        // root 只作栈底，`finish` 不读 frames，无副作用。
+        let vw = ui.window_physical_size().0 as f32;
+        let mut root = Frame::new_stack(PackSide::Top, ui.theme.gap, 0.0);
+        root.set_fixed_w(vw);
+        ui.frames.push(root);
+        ui
     }
 }
 
@@ -1113,7 +1123,7 @@ impl<'a> Ui<'a> {
         text: &str,
         size: f32,
         color: Color,
-        family: Option<String>,
+        family: Option<Arc<str>>,
         align: TextAlign,
         valign: TextVAlign,
         clip: Option<Rect>,
@@ -1153,7 +1163,7 @@ impl<'a> Ui<'a> {
         text: &str,
         size: f32,
         color: Color,
-        family: Option<String>,
+        family: Option<Arc<str>>,
         align: TextAlign,
         valign: TextVAlign,
         buf: Option<Arc<Buffer>>,
@@ -1251,12 +1261,13 @@ impl<'a> Ui<'a> {
         best
     }
 
-    /// 当前容器为子项分配局部矩形（顶层无容器时 panic，顶层请用 `*_at`）。
-    /// 控件作者做"占光标"式自定义容器时用（相对当前容器内容原点）。
+    /// 当前容器为子项分配局部矩形（`finish` 前任何位置可用：顶层由**根容器**
+    /// （[`Ui::begin`] 内建，可用宽 = 视口物理宽）流式堆叠，容器 / 窗口内
+    /// 用各自的帧）。控件作者做"占光标"式自定义容器时用（相对当前容器内容原点）。
     pub fn child_rect(&mut self, w: f32, h: f32) -> Rect {
         self.frames
             .last_mut()
-            .expect("顶层控件请用 *_at(pos, ...) 定位（容器内才可用无 pos 形式）")
+            .expect("root frame")
             .child_rect(w, h)
     }
 
@@ -1265,7 +1276,7 @@ impl<'a> Ui<'a> {
     pub fn child_rect_exp(&mut self, w: f32, h: f32, expands: bool) -> Rect {
         self.frames
             .last_mut()
-            .expect("顶层控件请用 *_at(pos, ...) 定位（容器内才可用无 pos 形式）")
+            .expect("root frame")
             .child_rect_exp(w, h, expands)
     }
 
@@ -2534,12 +2545,13 @@ impl<'a> Ui<'a> {
         self.resolve_win_press();
         // 键盘导航：Tab / Shift+Tab / 方向键遍历焦点链、Esc 关浮层/失焦、焦点描边。
         self.handle_focus_keys();
-        // 排序（窗口 z → 深度 → 元素序 → 元素内图形/文字 → 命令序）：
-        // 元素间按录制顺序（后录元素覆盖先录元素，重叠层级正确），
-        // 元素内"背景/图形 → 文字"（DrawKind::group）——文字不被自身图形覆盖。
+        // 提交序 = (窗口 z → 深度 → 元素序 → 元素内图形/文字 → 命令序)。**免全量排序**：
+        // 命令按录制序（seq）生成，同深度内 `(elem, group, seq)` 天然有序（元素随录制
+        // 递增、同元素"背景/图形"先于文字录制）；唯一乱序维度是 `depth`（容器嵌套
+        // 进出）与 `win`（跨帧 z 缓存使录制序 ≠ z 序）→ 按 win 分桶 + 桶内 depth
+        // 分桶、桶内保持录制序，与 `sort_by_key((win, depth, elem, group, seq))`
+        // **完全等价**（O(n + 桶数)，免每帧 O(n log n)）。
         let t_sort = Instant::now();
-        self.queue
-            .sort_by_key(|d| (d.win, d.depth, d.elem, d.kind.group(), d.seq));
         let cmd_count = self.queue.len() as u32;
         let queue = std::mem::take(&mut self.queue);
         // **WHITE 基础纹理优先取字形图集页**（`Text::white_region`，1×1 clamp_margin）：
@@ -2561,13 +2573,9 @@ impl<'a> Ui<'a> {
                 (uid, Vec2::ZERO, Vec2::ONE)
             }
         };
-        // 按窗口分组：非窗口（win=0）每帧重建；窗口按**内容签名**缓存局部顶点，
-        // 内容不变时复用（移动窗口只改变换，顶点不重建）。
-        let mut groups: std::collections::HashMap<u32, Vec<UiDraw>> =
-            std::collections::HashMap::new();
-        for d in queue {
-            groups.entry(d.win).or_default().push(d);
-        }
+        // 按窗口分组 + 组内 depth 分桶（桶内保持录制序）：非窗口（win=0）每帧重建；
+        // 窗口按**内容签名**缓存局部顶点，内容不变时复用（移动窗口只改变换，顶点不重建）。
+        let mut groups = bucket_cmds(queue);
         let mut wins: Vec<u32> = groups.keys().copied().collect();
         wins.sort_unstable();
         let sort_us = t_sort.elapsed().as_secs_f64() * 1e6;
@@ -2605,7 +2613,7 @@ impl<'a> Ui<'a> {
             let sig = {
                 use std::hash::Hasher;
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for d in &cmds {
+                for d in cmds.iter().flatten() {
                     self.cmd_sig(&mut h, d);
                 }
                 h.finish()
@@ -2767,7 +2775,7 @@ impl<'a> Ui<'a> {
             dwins.sort_unstable();
             for win in dwins {
                 let cmds = debug_groups.remove(&win).expect("group exists");
-                self.collect_cmds(&mut quads, win, &cmds, viewport, r2d);
+                self.collect_cmds(&mut quads, win, &[cmds], viewport, r2d);
             }
         }
         let mut dwins: Vec<u32> = quads.debug.keys().copied().collect();
@@ -2865,7 +2873,7 @@ impl<'a> Ui<'a> {
         &mut self,
         quads: &mut QuadCollector,
         win: u32,
-        cmds: &[UiDraw],
+        cmds: &[Vec<UiDraw>],
         viewport: &Viewport,
         r2d: &Render2D,
     ) {
@@ -2881,7 +2889,8 @@ impl<'a> Ui<'a> {
         } else {
             None
         };
-        for d in cmds {
+        // depth 桶展平（桶序 = depth 升序，桶内录制序）：免排序下仍满足提交序。
+        for d in cmds.iter().flatten() {
             // 当前元素序：push 方法按其分组（控件级提交顺序——见 QuadCollector）。
             quads.cur_elem = d.elem;
             // 裁剪区（绝对物理；内容已随容器平移成绝对逻辑坐标）。
@@ -3897,7 +3906,8 @@ pub trait UiAdd<'a> {
             tsize.y + style.padding.y * 2.0,
         );
         let rect = ui.child_rect(size.x, size.y);
-        ui.button_at(id, rect, label)
+        // 直接走 styled 变体：避免 button_at 内再 clone 一次样式。
+        ui.button_at_styled(id, rect, label, &style)
     }
 
     /// 显式尺寸按钮（逃生舱）。
@@ -6021,6 +6031,23 @@ impl From<TextAlign> for Align {
 
 // ─── 单元测试（无 GPU） ─────────────────────────────────────────
 
+/// 把绘制命令按 `win` 分组、组内按 `depth` 分桶（桶内保持**录制序**）。
+/// 免全量排序的提交序基础：与 `sort_by_key((win, depth, elem, group, seq))`
+/// **完全等价**（命令同深度内 `(elem, group, seq)` 天然有序——元素随录制递增、
+/// 同元素"背景/图形"先于文字录制；唯一乱序维度是 depth 与 win）。
+fn bucket_cmds(queue: Vec<UiDraw>) -> std::collections::HashMap<u32, Vec<Vec<UiDraw>>> {
+    let mut groups: std::collections::HashMap<u32, Vec<Vec<UiDraw>>> =
+        std::collections::HashMap::new();
+    for d in queue {
+        let buckets = groups.entry(d.win).or_default();
+        while buckets.len() as u32 <= d.depth {
+            buckets.push(Vec::new());
+        }
+        buckets[d.depth as usize].push(d);
+    }
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6153,6 +6180,68 @@ mod tests {
         // 期望：win0 图形(elem1) → win0 文字(elem1) → win1 图形(elem2) → win1 文字(elem2)
         let order: Vec<u32> = cmds.iter().map(|d| d.seq).collect();
         assert_eq!(order, vec![1, 2, 3, 4], "窗口 z 升序；元素内图形先、文字后");
+    }
+
+    #[test]
+    fn bucket_cmds_equals_full_sort() {
+        // P2 回归：depth 分桶提交序必须与全量稳定排序 (win, depth, elem, group, seq) 等价。
+        // 模拟"录制序"：seq 单调递增，但 depth（容器嵌套进出）与 win（跨帧 z 缓存）
+        // 乱序——正是免排序分桶要处理的场景。
+        let mut rng = 42u64;
+        let mut rand = move |m: u64| -> u64 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) % m
+        };
+        let n = 300;
+        let mut seq = 0u32;
+        let cmds: Vec<UiDraw> = (0..n)
+            .map(|_| {
+                let depth = (rand(5)) as u32; // depth ∈ [0,5)
+                let win = (rand(3)) as u32; // win ∈ {0,1,2}
+                let graphic = rand(2) == 0;
+                seq += 1;
+                let kind = if graphic {
+                    DrawKind::Solid(Color::WHITE)
+                } else {
+                    DrawKind::Text {
+                        text: Arc::from("x"),
+                        size: 14.0,
+                        color: Color::WHITE,
+                        align: TextAlign::Left,
+                        valign: TextVAlign::Center,
+                        family: None,
+                        clip: None,
+                        buf: None,
+                    }
+                };
+                UiDraw {
+                    depth,
+                    seq,
+                    win,
+                    elem: seq,
+                    rect: Rect::ZERO,
+                    clip: None,
+                    kind,
+                }
+            })
+            .collect();
+        let mut sorted = cmds.clone();
+        sorted.sort_by_key(|d| (d.win, d.depth, d.elem, d.kind.group(), d.seq));
+        let groups = bucket_cmds(cmds);
+        let mut wins: Vec<u32> = groups.keys().copied().collect();
+        wins.sort_unstable();
+        let key = |d: &UiDraw| (d.win, d.depth, d.elem, d.kind.group(), d.seq);
+        let mut got: Vec<(u32, u32, u32, u8, u32)> = Vec::with_capacity(n);
+        for win in wins {
+            let buckets = &groups[&win];
+            for bucket in buckets {
+                for d in bucket {
+                    got.push(key(d));
+                }
+            }
+        }
+        let want: Vec<(u32, u32, u32, u8, u32)> = sorted.iter().map(key).collect();
+        assert_eq!(got, want, "depth 分桶提交序必须与全量排序完全等价");
     }
 
     #[test]

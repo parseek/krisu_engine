@@ -700,7 +700,7 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 | `UiInit::debug_layout(bool)` | `.debug_layout(true)` | 调试 UI 布局：给每个控件/容器矩形画描边（颜色/宽度见 [样式小节](#样式theme可-clone-覆盖) 的 `DebugStyle`；默认 false） |
 | `Ui::debug_layout(bool)` | `ui.debug_layout(on)` | 同 `UiInit::debug_layout`，帧内运行时开关 |
 | `UiInit::build()` | → `Ui` | 完成构建（内部 `state.begin_frame()`） |
-| `Ui::finish(&Viewport, &mut Render2D)` | `ui.finish(&viewport, r2d)` | 排序 `(win, depth, 图形/文字, 录制序)` 并提交绘制（视口/渲染器在此延迟传入；UI 无需相机，`Viewport{pos,size}` 提供屏幕固定变换）；清空帧状态 |
+| `Ui::finish(&Viewport, &mut Render2D)` | `ui.finish(&viewport, r2d)` | 按 `(win, depth, 图形/文字, 录制序)` 序**免全量排序**提交（win + depth 分桶、桶内保持录制序，语义与排序完全等价）并提交绘制（视口/渲染器在此延迟传入；UI 无需相机，`Viewport{pos,size}` 提供屏幕固定变换）；清空帧状态 |
 | `UiState::new()` | 应用持有 | 跨帧持久状态容器 |
 | `UiState::reset()` / `remove(id)` | 示例"R 重开" | 清空全部 / 移除单个控件状态 |
 | `UiState::capturing_text()` | `if !ui_state.capturing_text() { /* 快捷键 */ }` | 输入框聚焦时屏蔽应用快捷键 |
@@ -779,7 +779,8 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 **子样式责任链**：每个子样式都有 `with_*` builder setter（返回 `Self`，只改链上字段，
 其余回落默认）——`PanelStyle::default().with_radius(8.0)` / `ButtonStyle::default().
 with_bg(c).with_radius(6.0)` / `SliderStyle::default().with_track(c).with_fill(c)` 等，
-与 `Theme::with_*` 同风格；`font_family` setter 接受 `impl Into<String>`（可直接传 `&str`）。
+与 `Theme::with_*` 同风格；`font_family` setter 接受 `impl AsRef<str>`（可直接传 `&str` /
+`&String` / `String`），内部统一存 `Arc<str>`（跨样式 / 跨命令共享，克隆零字符串复制）。
 样式可整体替换进主题（`Theme::with_panel(..)`），也用于容器 builder 的逐容器覆盖
 （`ui.window(..).style(panel_style)`）。
 
@@ -924,12 +925,15 @@ ui.pack_at(Vec2::new(16.0, 16.0), PackSide::Top, |p| {
 ui.finish(&viewport, r2d);
 ```
 
-> 约定：交互控件 ID 必须稳定；顶层用 `*_at`；控件坐标 = 屏幕**逻辑**像素（`.scale_factor` 设置 DPI，
-> 不设置则等于物理像素）；文本输入支持中文 IME（`rjw_keyboard::get_ime_commits` / `get_ime_preedit`，
-> 候选框跟随光标）；输入框聚焦时用 `UiState::capturing_text()` 屏蔽应用快捷键；
+> 约定：交互控件 ID 必须稳定；顶层 pack 控件（`label`/`button`/…）经**根容器**（`build()`
+> 内建，可用宽 = 视口宽）直接流式堆叠，绝对定位用 `*_at`；控件坐标 = 屏幕**逻辑**像素
+> （`.scale_factor` 设置 DPI，不设置则等于物理像素）；文本输入支持中文 IME
+> （`rjw_keyboard::get_ime_commits` / `get_ime_preedit`，候选框跟随光标）；输入框聚焦时用
+> `UiState::capturing_text()` 屏蔽应用快捷键；
 > 控件文本排版缓冲自持于 `UiState.text_buffers`（`CachePolicy::User`，不推入 `rjw_text` LRU）；
 > **独立 UI 渲染**：UI 录到单独 Render2D（`Render2D::set_sorting(false)` 关闭排序），与世界
-> `render_command_buffer` 合并提交（一次 present）；`finish` 按 `(win, depth, 图形/文字, 录制序)` 排序。
+> `render_command_buffer` 合并提交（一次 present）；`finish` 按 `(win, depth, 图形/文字, 录制序)`
+> 免排序（win + depth 分桶）提交。
 
 ---
 

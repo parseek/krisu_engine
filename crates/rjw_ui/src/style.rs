@@ -1,5 +1,7 @@
 //! 主题样式：`Theme` + 各控件子样式（默认 / dark 两套预设，可 clone 覆盖）。
 
+use std::sync::Arc;
+
 use rjw_color::Color;
 use rjw_text::Align;
 
@@ -55,7 +57,7 @@ pub struct ComboStyle {
     /// ✓ 选中标记色。
     pub fg_mark: Color,
     pub font_size: f32,
-    pub font_family: Option<String>,
+    pub font_family: Option<Arc<str>>,
 }
 
 impl Default for ComboStyle {
@@ -374,7 +376,7 @@ impl Default for ModalStyle {
 #[derive(Clone, Debug)]
 pub struct LabelStyle {
     /// 字体族（`None` = 系统默认；空串同默认）。
-    pub font_family: Option<String>,
+    pub font_family: Option<Arc<str>>,
     pub font_size: f32,
     pub color: Color,
     /// 水平对齐（垂直恒居中）。
@@ -430,7 +432,7 @@ pub struct ButtonStyle {
     /// 内边距（x = 水平，y = 垂直）。
     pub padding: glam::Vec2,
     pub font_size: f32,
-    pub font_family: Option<String>,
+    pub font_family: Option<Arc<str>>,
 }
 
 impl Default for ButtonStyle {
@@ -504,7 +506,7 @@ pub struct InputStyle {
     /// 控件最小宽。
     pub min_w: f32,
     pub font_size: f32,
-    pub font_family: Option<String>,
+    pub font_family: Option<Arc<str>>,
 }
 
 impl Default for InputStyle {
@@ -560,7 +562,7 @@ pub struct CheckboxStyle {
     pub checked_fill: Color,
     pub fg: Color,
     pub font_size: f32,
-    pub font_family: Option<String>,
+    pub font_family: Option<Arc<str>>,
     /// 文本与方框间距。
     pub gap: f32,
 }
@@ -619,8 +621,8 @@ impl Default for FocusStyle {
 
 impl LabelStyle {
     /// 字体族（`None` = 系统默认）。
-    pub fn with_font_family(mut self, f: impl Into<String>) -> Self {
-        self.font_family = Some(f.into());
+    pub fn with_font_family(mut self, f: impl AsRef<str>) -> Self {
+        self.font_family = Some(f.as_ref().into());
         self
     }
     pub fn with_font_size(mut self, s: f32) -> Self {
@@ -706,8 +708,8 @@ impl ButtonStyle {
         self.font_size = s;
         self
     }
-    pub fn with_font_family(mut self, f: impl Into<String>) -> Self {
-        self.font_family = Some(f.into());
+    pub fn with_font_family(mut self, f: impl AsRef<str>) -> Self {
+        self.font_family = Some(f.as_ref().into());
         self
     }
 }
@@ -815,8 +817,8 @@ impl InputStyle {
         self.font_size = s;
         self
     }
-    pub fn with_font_family(mut self, f: impl Into<String>) -> Self {
-        self.font_family = Some(f.into());
+    pub fn with_font_family(mut self, f: impl AsRef<str>) -> Self {
+        self.font_family = Some(f.as_ref().into());
         self
     }
 }
@@ -864,8 +866,8 @@ impl CheckboxStyle {
         self.font_size = s;
         self
     }
-    pub fn with_font_family(mut self, f: impl Into<String>) -> Self {
-        self.font_family = Some(f.into());
+    pub fn with_font_family(mut self, f: impl AsRef<str>) -> Self {
+        self.font_family = Some(f.as_ref().into());
         self
     }
     /// 文本与方框间距。
@@ -968,8 +970,8 @@ impl Theme {
     /// let theme = Theme::dark().with_font_family("Microsoft YaHei");
     /// # let _ = theme;
     /// ```
-    pub fn with_font_family(mut self, family: impl Into<String>) -> Self {
-        let f = Some(family.into());
+    pub fn with_font_family(mut self, family: impl AsRef<str>) -> Self {
+        let f = Some(Arc::from(family.as_ref()));
         self.label.font_family = f.clone();
         self.button.font_family = f.clone();
         self.checkbox.font_family = f.clone();

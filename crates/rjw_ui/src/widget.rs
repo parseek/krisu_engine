@@ -177,6 +177,8 @@
 //   （非数字输入被屏蔽；拖拽基准用独立状态 ID `{id}::grip`）
 // - 窗体：悬停、拖动时保持普通 Arrow（光标由 set_cursor / 内置规则管理）
 
+use std::sync::Arc;
+
 use glam::Vec2;
 use rjw_color::Color;
 use rjw_transform::Rect;
@@ -444,7 +446,7 @@ impl Widget for Label<'_> {
             .map(|s| s.to_physical(ui.scale()))
             .unwrap_or(ui.theme.label.font_size);
         let family = match self.font_family {
-            Some(f) => Some(f.to_owned()),
+            Some(f) => Some(Arc::from(f)),
             None => ui.theme.label.font_family.clone(),
         };
         let wrap = self.wrap.map(|w| w.to_physical(ui.scale()));
@@ -484,7 +486,7 @@ impl Widget for Label<'_> {
             .unwrap_or(ui.theme.label.font_size);
         let align = ui.theme.label.align;
         let family = match self.font_family {
-            Some(f) => Some(f.to_owned()),
+            Some(f) => Some(Arc::from(f)),
             None => ui.theme.label.font_family.clone(),
         };
         if self.ellipsis {
@@ -639,7 +641,7 @@ impl<'a> Button<'a> {
             font_size: self.font_size.map(|s| s.to_physical(scale)).unwrap_or(base.font_size),
             font_family: self
                 .font_family
-                .map(|f| f.to_owned())
+                .map(|f| Arc::from(f))
                 .or_else(|| base.font_family.clone()),
         }
     }
@@ -652,7 +654,7 @@ impl Widget for Button<'_> {
             .map(|s| s.to_physical(ui.scale()))
             .unwrap_or(ui.theme.button.font_size);
         let family = match self.font_family {
-            Some(f) => Some(f.to_owned()),
+            Some(f) => Some(Arc::from(f)),
             None => ui.theme.button.font_family.clone(),
         };
         let tsize = ui.text_size(self.label, size, family.as_deref());
@@ -741,7 +743,7 @@ impl<'a> Checkbox<'a> {
             font_size: self.font_size.map(|s| s.to_physical(scale)).unwrap_or(base.font_size),
             font_family: self
                 .font_family
-                .map(|f| f.to_owned())
+                .map(|f| Arc::from(f))
                 .or_else(|| base.font_family.clone()),
             gap: base.gap,
         }
@@ -757,7 +759,7 @@ impl Widget for Checkbox<'_> {
             .map(|s| s.to_physical(ui.scale()))
             .unwrap_or(ui.theme.checkbox.font_size);
         let family = match self.font_family {
-            Some(f) => Some(f.to_owned()),
+            Some(f) => Some(Arc::from(f)),
             None => ui.theme.checkbox.font_family.clone(),
         };
         let tsize = ui.text_size(self.label, size, family.as_deref());

@@ -367,7 +367,7 @@ pub enum DrawKind {
         color: Color,
         align: TextAlign,
         valign: TextVAlign,
-        family: Option<String>,
+        family: Option<Arc<str>>,
         /// 文本局部裁剪（相对内容起点；`None` = 不裁剪）。
         clip: Option<Rect>,
         /// **预排版缓冲**（控件自持，输入框/TextArea 用；`None` = 绘制期按需缓存）。
@@ -461,7 +461,7 @@ pub fn text_cmd(
     color: Color,
     align: TextAlign,
     valign: TextVAlign,
-    family: Option<String>,
+    family: Option<Arc<str>>,
     clip: Option<Rect>,
     clip_outer: Option<Rect>,
     buf: Option<Arc<Buffer>>,
