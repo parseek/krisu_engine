@@ -741,9 +741,18 @@ impl<'a> Ui<'a> {
         });
     }
 
-    /// **圆角矩形**（背景填充原语；绝对定位，`radius` 逻辑像素，9-patch 绘制——
+    /// **圆角矩形**（背景填充原语；绝对定位，`radius` 带单位，9-patch 绘制——
     /// 程序化纹理进动态 Atlas，颜色顶点色 tint）。
-    pub fn rounded_rect_at(&mut self, pos: Vec2, size: Vec2, radius: f32, color: Color) {
+    pub fn rounded_rect_at(
+        &mut self,
+        pos: impl Into<Position>,
+        size: impl Into<Size<Vec2>>,
+        radius: impl Into<Size<f32>>,
+        color: Color,
+    ) {
+        let pos = pos.into().to_physical(self.scale);
+        let size = size.into().to_physical(self.scale);
+        let radius = radius.into().to_physical(self.scale);
         self.push_draw(
             DrawKind::RoundedRect { color, radius },
             Rect::new(pos.x, pos.y, size.x, size.y),
@@ -754,11 +763,13 @@ impl<'a> Ui<'a> {
     /// 程序化渐变纹理进动态 Atlas，按主轴拉伸采样）。
     pub fn gradient_rect_at(
         &mut self,
-        pos: Vec2,
-        size: Vec2,
+        pos: impl Into<Position>,
+        size: impl Into<Size<Vec2>>,
         axis: GradientAxis,
         stops: Vec<(f32, Color)>,
     ) {
+        let pos = pos.into().to_physical(self.scale);
+        let size = size.into().to_physical(self.scale);
         self.push_draw(
             DrawKind::Gradient { axis, stops },
             Rect::new(pos.x, pos.y, size.x, size.y),
@@ -1339,11 +1350,13 @@ impl<'a> Ui<'a> {
     /// 文本编辑框）与严格窗口（[`Self::window_at_strict`]）的公共底座。
     pub fn view_at(
         &mut self,
-        pos: Vec2,
-        size: Vec2,
+        pos: impl Into<Position>,
+        size: impl Into<Size<Vec2>>,
         mode: ViewMode,
         f: impl FnOnce(&mut ViewCtx<'_, '_>),
     ) -> Vec2 {
+        let pos = pos.into().to_physical(self.scale);
+        let size = size.into().to_physical(self.scale);
         let saved_clip = self.clip;
         let saved_base = self.abs_base;
         let view_rel = Rect::new(pos.x, pos.y, size.x.max(0.0), size.y.max(0.0));
@@ -1396,7 +1409,9 @@ impl<'a> Ui<'a> {
     /// **分割线**（绝对定位水平线）：`pos` 相对当前容器内容原点，宽 `w`（逻辑像素）。
     /// 线画在 `pos.y + margin`（上下留白由调用方行高体现）。样式取
     /// [`Theme::divider`](crate::style::Theme::divider)。
-    pub fn divider_at(&mut self, pos: Vec2, w: f32) {
+    pub fn divider_at(&mut self, pos: impl Into<Position>, w: impl Into<Size<f32>>) {
+        let pos = pos.into().to_physical(self.scale);
+        let w = w.into().to_physical(self.scale);
         let st = self.theme.divider.clone();
         if w > 0.0 && st.thickness > 0.0 {
             self.push_solid_rect(Rect::new(pos.x, pos.y + st.margin, w, st.thickness), st.color);
@@ -1419,11 +1434,13 @@ impl<'a> Ui<'a> {
     /// **整体刚性移动**，非整数 DPI（125%/150%）下相邻元素取整相位不抖。
     pub fn scroll_at(
         &mut self,
-        pos: Vec2,
-        view_size: Vec2,
+        pos: impl Into<Position>,
+        view_size: impl Into<Size<Vec2>>,
         id: &str,
         f: impl FnOnce(&mut Scroll<'_, '_>),
     ) -> Vec2 {
+        let pos = pos.into().to_physical(self.scale);
+        let view_size = view_size.into().to_physical(self.scale);
         // 滚动容器自身也是命名空间边界：内部子控件 ID 自动带 `id` 前缀。
         let abs = self.id_for(id);
         let saved_clip = self.clip;
@@ -1512,8 +1529,8 @@ impl<'a> Ui<'a> {
     /// 返回本帧被点击的索引（`None` = 无）。
     pub fn list_at<F>(
         &mut self,
-        pos: Vec2,
-        view_size: Vec2,
+        pos: impl Into<Position>,
+        view_size: impl Into<Size<Vec2>>,
         id: &str,
         count: usize,
         selected: Option<u32>,
@@ -1522,8 +1539,11 @@ impl<'a> Ui<'a> {
     where
         F: FnMut(&mut Scroll<'_, '_>, u32, bool) -> bool,
     {
+        let pos = pos.into().to_physical(self.scale);
+        let view_size = view_size.into().to_physical(self.scale);
         let mut clicked = None;
-        self.scroll_at(pos, view_size, id, |s| {
+        // 内部已是物理：显式 `Physical`（避免默认 Logical 二次换算）。
+        self.scroll_at(Position::Physical(pos), Size::Physical(view_size), id, |s| {
             for i in 0..count as u32 {
                 if item(s, i, selected == Some(i)) && clicked.is_none() {
                     clicked = Some(i);
@@ -1683,7 +1703,9 @@ impl<'a> Ui<'a> {
     /// （宽 = min(自然宽, max_w)，高 = 行数 × 行高）。`max_w <= 0` = 不换行（同 [`Self::label_at`]）。
     ///
     /// 换行宽度参与排版缓存键（不同宽度各自缓存）；多行文本垂直居中于矩形。
-    pub fn label_wrap_at(&mut self, pos: Vec2, max_w: f32, text: &str) -> Vec2 {
+    pub fn label_wrap_at(&mut self, pos: impl Into<Position>, max_w: impl Into<Size<f32>>, text: &str) -> Vec2 {
+        let pos = pos.into().to_physical(self.scale);
+        let max_w = max_w.into().to_physical(self.scale);
         let elem = self.seq + 1;
         let seq = self.next_seq();
         let style = self.theme.label.clone();
@@ -2402,14 +2424,16 @@ impl<'a> Ui<'a> {
     /// `pos` 相对当前容器内容原点（顶层即屏幕原点），不占父容器光标。
     pub fn flex_at<F>(
         &mut self,
-        pos: Vec2,
-        total_h: f32,
+        pos: impl Into<Position>,
+        total_h: impl Into<Size<f32>>,
         weights: &[u32],
         mut f: F,
     ) -> Vec2
     where
         F: FnMut(&mut FlexCtx<'_, '_>, usize),
     {
+        let pos = pos.into().to_physical(self.scale);
+        let total_h = total_h.into().to_physical(self.scale);
         let gap = self.theme.gap;
         let start = self.queue.len();
         let saved_base = self.abs_base;
@@ -2442,11 +2466,12 @@ impl<'a> Ui<'a> {
     /// grid 容器：`cols` 列均匀网格，单元格尺寸跨帧缓存（`id` 须稳定）。
     pub fn grid_at(
         &mut self,
-        pos: Vec2,
+        pos: impl Into<Position>,
         cols: usize,
         id: &str,
         f: impl FnOnce(&mut Grid<'_, '_>),
     ) -> Vec2 {
+        let pos = pos.into().to_physical(self.scale);
         assert!(cols > 0, "grid cols must be > 0");
         // grid 容器是命名空间边界：内部子控件（如背包格子按钮）ID 自动带前缀。
         let abs = self.id_for(id);
@@ -4049,7 +4074,7 @@ pub trait UiAdd<'a> {
     /// 嵌套 grid（`pos` 相对当前容器内容原点；不占光标）。
     fn grid_at(
         &mut self,
-        pos: Vec2,
+        pos: impl Into<Position>,
         cols: usize,
         id: &str,
         f: impl FnOnce(&mut Grid<'_, '_>),

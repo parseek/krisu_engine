@@ -608,7 +608,7 @@ impl App for UiApp {
             WindowFx {
                 tint: Color::rgba_u8(255, 255, 255, (fx_alpha * 255.0) as u8),
                 transform: Some(
-                    Transform2D::IDENTITY.with_pos(Vec2::new(0.0, 5.0 * (fx_t * 1.2).sin() as f32)).with_rot(1.0),
+                    Transform2D::IDENTITY.with_pos(Vec2::new(0.0, 5.0 * (fx_t * 1.2).sin() as f32)),
                 ),
                 anchor: Vec2::new(0.5, 0.5), // 旋转/缩放绕窗口中心
             },
@@ -657,7 +657,7 @@ impl App for UiApp {
         }
 
         // ── 布局增强演示：flex 权重（固定高 150，[1:2:1] 等分） ──
-        ui.flex_at(Vec2::new(880.0, 450.0), 150.0, &[1, 2, 1], |f, i| {
+        ui.flex_at(vec2(880.0, 450.0), 150.0, &[1, 2, 1], |f, i| {
             if f.button(&format!("flex_row_{i}"), &format!("行 {i} · 权重 {}", [1, 2, 1][i]))
                 .clicked()
             {

@@ -716,6 +716,9 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 `Position::Physical`（原样）。换算仅在 **API 边界**一次完成，Ui 内部布局 / 命中 / 绘制
 一律**物理像素**（`Ui::scale()` 只供边界换算；`scale_factor` 在 `build()` 时把 Theme
 **预乘**——全部样式尺寸 / 字号 × scale 取整，见 [`Theme::scaled`](crate::style::Theme::scaled)）。
+`label_wrap_at` / `view_at` / `scroll_at` / `list_at` / `flex_at` / `grid_at` / `divider_at` /
+`rounded_rect_at` / `gradient_rect_at` 同样带单位（`pos` → `Position`，`max_w` / `size` /
+`view_size` / `total_h` / `w` / `radius` → `Size`）。
 
 | 入口 | 链 | 语义 |
 |---|---|---|
