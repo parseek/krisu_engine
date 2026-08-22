@@ -1,6 +1,6 @@
 [package]
 name = "rjw_ui"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 authors = ["KrisuRJW <Cmd1loica99@163.com>"]
 description = "Immediate-mode style UI with persistent state, DOM-like auto layout (pack/grid/place) for the krusie engine."

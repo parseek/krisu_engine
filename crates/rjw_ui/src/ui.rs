@@ -117,7 +117,8 @@ pub enum Anchor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowClamp {
     /// **限制在画面内**（默认）：窗口**整体**不跑出屏幕——拖拽 / 脚本定位后的位置被
-    /// clamp 到窗口客户区内（窗口比画面大时贴左上角）。
+    /// clamp 到窗口客户区内；窗口比画面大时仍可拖动（左上角允许到 `负 = 屏幕-尺寸`，
+    /// 窗口始终覆盖画面，不会钉死）。
     Screen,
     /// **完全自由**：窗口可拖出屏幕（不做限位）。
     Free,
@@ -2081,7 +2082,28 @@ impl<'a> Ui<'a> {
             .unwrap_or_else(|| self.theme.panel.clone());
         let (pad_total, gap) = (style.padding + style.border_w, self.theme.gap);
         let saved_base = self.abs_base;
-        self.abs_base = saved_base + origin;
+        // **限位与命中基准一致**：主窗口（OS 窗口）缩小 / 内容尺寸变化后，屏幕
+        // 边界变小，窗口位置会被 clamp 回屏幕内；若命中（abs_base / panel_rect）
+        // 仍用未 clamp 的 `origin`、绘制用 clamp 后位置 → "窗口看得见却点不到、
+        // 拖不动"。统一用 **上帧窗口尺寸**（`window_rects` 跨帧缓存）clamp：
+        // 命中基准 = 显示基准 = `base_pos`（尺寸变化帧 clamp 边界延迟一帧生效，
+        // 换取命中 / 绘制永不错位）。首帧无记录按尺寸 0（等价原"贴边界"）。
+        let (sw, sh) = (
+            self.window.inner_size().width as f32,
+            self.window.inner_size().height as f32,
+        );
+        let prev_size = self
+            .state
+            .window_rects
+            .get(&z)
+            .map(|r| Vec2::new(r.w, r.h))
+            .unwrap_or(Vec2::ZERO);
+        let base_pos = if clamp == WindowClamp::Screen {
+            clamp_window_pos(saved_base + origin, prev_size, sw, sh) - saved_base
+        } else {
+            origin
+        };
+        self.abs_base = saved_base + base_pos;
         let mut frame = Frame::new_stack(PackSide::Top, gap, pad_total);
         if let Some(w) = width {
             frame.set_fixed_w(w);
@@ -2103,7 +2125,8 @@ impl<'a> Ui<'a> {
         // 拖拽 + 按下裁决（物理像素粒度拖动基准，同 panel_impl）：
         // 重叠区域点击按下时，记录"本帧按下命中的**最上层**窗口"（win_press_top），
         // `finish::resolve_win_press` 只保留它的拖拽与置顶——避免同时拖动多个窗口。
-        let panel_rect = Rect::new(origin.x, origin.y, size.x, size.y);
+        // 命中 / 拖拽基准用 clamp 后位置（`base_pos`）——与显示一致。
+        let panel_rect = Rect::new(base_pos.x, base_pos.y, size.x, size.y);
         // 固定宽窗口：右下角**缩放柄**（鼠标拖动改宽度，高度自动；跨帧持久于
         // `UiState::window_widths`）。⚠ 交互须在窗口拖拽判定**之前**（claim_press
         // 阻止按下缩放柄时同时建立窗口拖拽基准）。基于通用 [`Self::resize_handle`]。
@@ -2172,18 +2195,12 @@ impl<'a> Ui<'a> {
             };
             (active, np)
         };
-        // **Screen 限位**：窗口**整体** clamp 到画面（窗口客户区）内——拖拽 / 脚本
-        // 定位后的位置都被限制（绝对坐标 clamp 后回容器局部）；`Free` / `Locked`
-        // 不 clamp（Locked 本身位置固定）。窗口比画面大时贴左上角。
+        // **Screen 限位**：窗口 clamp 到画面（窗口客户区）内——拖拽 / 脚本定位后
+        // 的位置都被限制（绝对坐标 clamp 后回容器局部）；`Free` / `Locked` 不 clamp
+        // （Locked 本身位置固定）。**与命中基准 base_pos 用同一尺寸（prev_size）**
+        // clamp → 命中与绘制恒一致（主窗口缩小 / 窗口比画面大也不会"看得见拖不动"）。
         let display_pos = if clamp == WindowClamp::Screen {
-            let (sw, sh) = (
-                self.window.inner_size().width as f32,
-                self.window.inner_size().height as f32,
-            );
-            let abs = saved_base + new_pos;
-            let max_x = (sw - size.x).max(0.0);
-            let max_y = (sh - size.y).max(0.0);
-            Vec2::new(abs.x.clamp(0.0, max_x), abs.y.clamp(0.0, max_y)) - saved_base
+            clamp_window_pos(saved_base + new_pos, prev_size, sw, sh) - saved_base
         } else {
             new_pos
         };
@@ -6048,6 +6065,18 @@ fn bucket_cmds(queue: Vec<UiDraw>) -> std::collections::HashMap<u32, Vec<Vec<UiD
     groups
 }
 
+/// 窗口限位（`WindowClamp::Screen` 模式）：把绝对位置 clamp 到窗口客户区内。
+/// - 窗口 ≤ 屏幕：整体在屏幕内，左上角 ∈ `[0, sw-size]`（贴边）；
+/// - 窗口 > 屏幕：允许左上角 ∈ `[sw-size, 0]`（窗口**仍覆盖屏幕**，可拖动）——
+///   否则窗口比画面大时被钉死在左上角、永远拖不走。
+fn clamp_window_pos(abs: Vec2, size: Vec2, sw: f32, sh: f32) -> Vec2 {
+    let min_x = (sw - size.x).min(0.0);
+    let max_x = (sw - size.x).max(0.0);
+    let min_y = (sh - size.y).min(0.0);
+    let max_y = (sh - size.y).max(0.0);
+    Vec2::new(abs.x.clamp(min_x, max_x), abs.y.clamp(min_y, max_y))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6242,6 +6271,25 @@ mod tests {
         }
         let want: Vec<(u32, u32, u32, u8, u32)> = sorted.iter().map(key).collect();
         assert_eq!(got, want, "depth 分桶提交序必须与全量排序完全等价");
+    }
+
+    #[test]
+    fn clamp_window_pos_screen_mode() {
+        // 窗口 ≤ 屏幕：整体在屏幕内，贴边 clamp。
+        let p = clamp_window_pos(Vec2::new(-50.0, 200.0), Vec2::new(100.0, 60.0), 800.0, 600.0);
+        assert_eq!(p, Vec2::new(0.0, 200.0), "左/上超界贴 0");
+        let p = clamp_window_pos(Vec2::new(900.0, 580.0), Vec2::new(100.0, 60.0), 800.0, 600.0);
+        assert_eq!(p, Vec2::new(700.0, 540.0), "右/下超界贴 sw-size");
+        // 窗口 ≤ 屏幕：区间内位置原样保留。
+        let p = clamp_window_pos(Vec2::new(100.0, 50.0), Vec2::new(100.0, 60.0), 800.0, 600.0);
+        assert_eq!(p, Vec2::new(100.0, 50.0));
+        // 窗口 > 屏幕：左上角允许 ∈ [sw-size, 0]（仍覆盖屏幕、**可拖动**，不钉死 0）。
+        let p = clamp_window_pos(Vec2::new(300.0, 200.0), Vec2::new(900.0, 700.0), 800.0, 600.0);
+        assert_eq!(p, Vec2::new(0.0, 0.0), "超大窗口贴左上角（覆盖全屏）");
+        let p = clamp_window_pos(Vec2::new(-300.0, -200.0), Vec2::new(900.0, 700.0), 800.0, 600.0);
+        assert_eq!(p, Vec2::new(-100.0, -100.0), "超大窗口可拖到负区间（sw-size）");
+        let p = clamp_window_pos(Vec2::new(-50.0, -50.0), Vec2::new(900.0, 700.0), 800.0, 600.0);
+        assert_eq!(p, Vec2::new(-50.0, -50.0), "超大窗口在负区间内原样保留");
     }
 
     #[test]

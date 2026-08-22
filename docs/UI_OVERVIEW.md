@@ -143,8 +143,11 @@ shader 里 `顶点色 × 实例色`）、`transform` override（叠加在窗口�
 IDENTITY` 时窗口位置恒为原位置**。
 
 **窗口位置约束**（[`WindowBuilder::clamp`](crate::ui::WindowBuilder::clamp) /
-[`WindowClamp`](crate::ui::WindowClamp)）：默认 `Screen` 限位（窗口整体不跑出屏幕）、
+[`WindowClamp`](crate::ui::WindowClamp)）：默认 `Screen` 限位（窗口整体不跑出屏幕；
+窗口比画面大时仍可拖动——左上角允许到 `屏幕-尺寸`，窗口覆盖画面不钉死）、
 `Free` 自由拖出、`Locked` 锁定位置不可拖（脚本仍可定位）。
+限位与命中共享同一基准（上帧窗口尺寸 clamp）：OS 窗口突然缩小 / 窗口内容变大后，
+窗口被拉回屏幕内时**照常可点可拖**（不会"看得见却拖不动"）。
 
 ### 10. 焦点与键盘导航（`focus.rs`）
 

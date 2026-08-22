@@ -722,7 +722,7 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.window(id)` | `.pos(..)` `.width(w)` `.strict()` `.topmost(bool)` `.style(PanelStyle)` `.clamp(WindowClamp)` `.show(\|w\| ..)` | 窗口 = `window_at` + `window_at_w` + `window_at_strict` 统一入口；`.width` = 固定宽（右下角可缩放）；`.strict` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖） |
+| `ui.window(id)` | `.pos(..)` `.width(w)` `.strict()` `.topmost(bool)` `.style(PanelStyle)` `.clamp(WindowClamp)` `.show(\|w\| ..)` | 窗口 = `window_at` + `window_at_w` + `window_at_strict` 统一入口；`.width` = 固定宽（右下角可缩放）；`.strict` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认；窗口比画面大时仍可拖动）/ `Free` 自由 / `Locked` 锁定位置不可拖） |
 | `ui.panel()` | `.pos(..)` `.drag(id)` `.style(..)` `.show(\|pp\| ..)` | 面板 = `panel_at` + `drag_panel_at` 统一入口 |
 | `ui.modal(id)` | `.pos(..)` `.width(w)` `.show(\|m\| ..)` | 模态对话框 = `modal_at` + `modal_at_w` 统一入口 |
 
