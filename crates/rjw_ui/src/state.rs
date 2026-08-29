@@ -161,6 +161,12 @@ pub struct UiState {
     /// 轻量摘要曾漏掉颜色位，hover/click 变色被误判"内容未变" → 复用陈旧顶点，
     /// 窗口内交互效果不刷新（下拉框 / 背包 / 窗口按钮失效）。
     pub(crate) window_quads: HashMap<IdAbsolute<'static>, (u64, Vec<(u32, u8, u64, Vec<VertexP3U2C4>)>)>,
+    /// **非窗口（win=0）内容的按放置子槽顶点缓存**：放置子槽组号 → (内容签名, 局部顶点)。
+    /// 分组与缓存机制同 `window_quads`（**全量签名** → 命中复用 / 未命中重建），但针对
+    /// **顶层非窗口放置**（pack / flex / scroll / list / drag_panel / container 等，
+    /// 分组见 [`crate::ui::Ui::z0_ranges`]）。值/交互变化只重建对应子槽，其余 win=0
+    /// 放置仍命中复用（缓解"任何 win=0 变化 → 整区重建"）。
+    pub(crate) z0_quads: HashMap<u32, (u64, Vec<(u32, u8, u64, Vec<VertexP3U2C4>)>)>,
     /// **诊断**：本帧**命中但被更高窗口遮挡而未响应**的控件次数
     /// （点击穿透拦截计数；`Ui::hit_abs` 累加，`begin_frame` 清零）。
     pub(crate) occluded_hits: u32,

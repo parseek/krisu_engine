@@ -11,28 +11,47 @@
 //!
 //! 快照的方法名与设备类型对齐，`Ui` 内部调用点无需改动。
 
-use std::collections::HashMap;
-
-use rjw_keystate::KeyState;
+use rjw_keystate::{KeyState, KEY_STATE_RELEASED};
+use rjw_keyboard::key_code::key_code_index;
 use rjw_keyboard::KeyboardInput;
 use rjw_mouse::{MouseButton, MouseInput};
 use winit::keyboard::KeyCode;
 
 /// 键盘快照（`Ui` 自持；方法名对齐 [`KeyboardInput`]）。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct KeyboardSnapshot {
-    keys: HashMap<KeyCode, KeyState>,
+    /// 按键状态表：下标 = `KeyCode` 判别值（与 `rjw_keyboard` 的按键表一致），O(1) 读写。
+    /// 仅槽位 0..`KEY_CODE_COUNT` 对应真实按键；未记录的键恒为 `KEY_STATE_RELEASED`。
+    keys: [KeyState; 256],
     chars: Vec<char>,
     ime_commits: Vec<String>,
     ime_preedit: Option<String>,
     ime_preedit_caret: Option<usize>,
 }
 
+// `[KeyState; 256]` 无 `Default` 实现（数组的 `Default` 仅到长度 32），故手动实现。
+impl Default for KeyboardSnapshot {
+    /// 全表初始化为 `KEY_STATE_RELEASED`（所有键未按下）。
+    fn default() -> Self {
+        Self {
+            keys: [KEY_STATE_RELEASED; 256],
+            chars: Vec::new(),
+            ime_commits: Vec::new(),
+            ime_preedit: None,
+            ime_preedit_caret: None,
+        }
+    }
+}
+
 impl KeyboardSnapshot {
     /// 从设备拷贝本帧状态（含 IME 组合 / 上屏 / 输入字符）。
     pub fn capture(kb: &KeyboardInput) -> Self {
+        let mut keys = [KEY_STATE_RELEASED; 256];
+        for (k, s) in kb.get_keys_iter() {
+            keys[key_code_index(k)] = s;
+        }
         Self {
-            keys: kb.get_keys_iter().map(|(k, s)| (k, s)).collect(),
+            keys,
             chars: kb.get_chars().to_vec(),
             ime_commits: kb.get_ime_commits().to_vec(),
             ime_preedit: kb.get_ime_preedit().map(|s| s.to_owned()),
@@ -43,7 +62,7 @@ impl KeyboardSnapshot {
     /// 按键状态（未按下的键 = [`KeyState::default`]：全 false）。
     #[inline]
     pub fn get(&self, key_code: KeyCode) -> KeyState {
-        self.keys.get(&key_code).copied().unwrap_or_default()
+        self.keys[key_code_index(key_code)]
     }
 
     /// 本帧输入的字符（非 IME 路径，如英文/数字直接输入）。
@@ -130,7 +149,7 @@ impl MouseSnapshot {
 impl KeyboardSnapshot {
     /// 设置一个按键状态（其余字段默认）。
     pub(crate) fn with_key(mut self, key: KeyCode, s: KeyState) -> Self {
-        self.keys.insert(key, s);
+        self.keys[key_code_index(key)] = s;
         self
     }
     /// 设置本帧输入字符。

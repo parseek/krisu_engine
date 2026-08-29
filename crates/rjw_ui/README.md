@@ -44,9 +44,13 @@ ui.finish();
 
 ## 布局
 
+> 布局模型的完整说明见 [`LAYOUT.md`](./LAYOUT.md)（含 pack 逐步推演、grid / flex / place / window / scroll / row）。
+
 - `*_at(pos)`：绝对定位 + 内容自然尺寸（place）
-- `pack_at(pos, |p| ...)`：按 `side`（默认 Top）堆叠，宽度 = 最大子控件自然宽
+- `pack_at(pos, side, |p| ...)`：按 `side`（`Top`/`Left`/`Bottom`/`Right`）堆叠，宽度 = 最大子控件自然宽；`Bottom`/`Right` 的 `pos` 锚定下/右边缘（页脚 / 右栏）
 - `grid_at(pos, cols, |g| ...)`：均匀单元格网格，尺寸 = 最大子控件自然尺寸
+- `flex_at(pos, total_h, weights, |f, i| ...)`：固定总高按权重等分
+- `row(|r| ...)`：水平等高管线，占一行
 
 ## 依赖
 

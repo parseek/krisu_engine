@@ -35,15 +35,15 @@
 //!   自动切段，**尽力而为**）。[`Ui::window_fx`]（[`WindowFx`]：tint + transform override）
 //!   给每个窗口整窗混合色与叠加变换——顶点缓存不变、仅提交时应用，支撑整窗口动画
 //!   （淡入淡出 / 整体位移缩放旋转 / 整窗染色）。
-//! - **控件 trait（非宏）**：[`widget::Widget`] + 属性化 builder（[`widget::Label`] /
-//!   [`widget::Button`] / [`widget::Checkbox`] / [`widget::Divider`]）——新控件 = 普通
+//! - **控件 trait（非宏）**：[`widgets::Widget`] + 属性化 builder（[`widgets::Label`] /
+//!   [`widgets::Button`] / [`widgets::Checkbox`] / [`widgets::Divider`]）——新控件 = 普通
 //!   Rust 结构体实现 trait，无 `macro_rules!` 展开（报错定位精确、可单测）；逐控件覆盖
 //!   颜色 / 字号 / 字体 / 内边距等属性（未设置回落全局 [`Theme`]），统一
-//!   [`widget::Response`] 响应，经 [`Ui::add`] / [`Ui::add_at`]（容器包装见
+//!   [`widgets::Response`] 响应，经 [`Ui::add`] / [`Ui::add_at`]（容器包装见
 //!   [`ui::UiAdd`]）放置。
-//! - **Widget 尺寸契约**：[`widget::SizeConstraints`]（`min_w/max_w/min_h/max_h` 四字段
-//!   全 `Option<f32>`）+ [`widget::Expansion`]（`DisableAutoExpansion` /
-//!   `LimitedInParent` / `UnlimitedExpansion`）+ [`widget::Widget::resizable`]
+//! - **Widget 尺寸契约**：[`widgets::SizeConstraints`]（`min_w/max_w/min_h/max_h` 四字段
+//!   全 `Option<f32>`）+ [`widgets::Expansion`]（`DisableAutoExpansion` /
+//!   `LimitedInParent` / `UnlimitedExpansion`）+ [`widgets::Widget::resizable`]
 //!   （可选拖拽缩放，[`Ui::resize_handle`] 通用原语 + [`UiState::sizes`] 持久尺寸）——
 //!   `Ui::add` 统一 clamp / 膨胀调整。
 //! - **View 沙箱**（[`view`]）：闭包作用域 [`Ui::view_at`]，`ViewMode::{Expand, Clip}`——
@@ -62,7 +62,7 @@
 //! - **布局增强**：[`Ui::label_wrap_at`]（宽度内自动**换行**的标签，含容器内
 //!   `p.label_wrap`）、**min/max 尺寸约束**（`p.min_size` / `p.max_size`，作用于下一
 //!   子项）、**flex 权重**（[`Ui::flex_at`]：固定总高按权重等分子项，同帧精确分配）、
-//!   **分割线**（`p.divider()` / [`Ui::divider_at`] / [`widget::Divider`]，
+//!   **分割线**（`p.divider()` / [`Ui::divider_at`] / [`widgets::Divider`]，
 //!   `Theme.divider`）、**水平行**（`p.row(...)`：`{Label} {Input} {Button}` 占一行的
 //!   水平排列，宽 = 子项结算、撑大父级）。
 //! - **文本输入增强**：单行输入框**超长滚动跟随光标**（滚轮自由滚动不被光标拉回；
@@ -71,7 +71,7 @@
 //!   `extend_word_caret`）、**多行 TextArea**（[`Ui::text_area_at`]：Enter 换行 /
 //!   ↑↓ 跨行 / 自动换行 + 垂直滚动 + **滚动条**）、**IME 组合候选浮动提示框**（preedit
 //!   画在输入框下方浮动小框，不再占行内）；**Label 溢出**：默认在父级可用宽内自动
-//!   换行，[`widget::Label::ellipsis`] 显式"…"省略，Button/勾选/下拉文本自动省略
+//!   换行，[`widgets::Label::ellipsis`] 显式"…"省略，Button/勾选/下拉文本自动省略
 //!   （绘制 noclip 变体 [`Ui::push_text_rect_noclip`]：内容自洽，仍服从 ScrollView
 //!   强制层）。
 //!
@@ -117,9 +117,8 @@
 //! - [`draw`]：屏幕固定变换与绘制命令 + [`Metric`]（物理/逻辑单位包装）
 //! - [`edit`]：文本编辑纯逻辑（编辑状态机 / 词边界 / 省略号 / 剪贴板）
 //! - [`view`]：**View 沙箱**（裁剪分层 / 可用宽度 / 命中过滤；`ViewMode`）
-//! - [`widget`]：`Widget` trait + 尺寸契约 + 属性化 builder（非宏添加控件）
+//! - [`widgets`]：`Widget` trait + 尺寸契约 + 属性化 builder（非宏添加控件）
 
-pub mod builtin;
 pub mod draw;
 pub mod edit;
 pub mod focus;
@@ -132,9 +131,8 @@ pub mod state;
 pub mod style;
 pub mod ui;
 pub mod view;
-pub mod widget;
+pub mod widgets;
 
-pub use builtin::{FontModal, NumberInput};
 pub use draw::{GradientAxis, Metric, Position, Size, TextAlign};
 pub use focus::FocusKind;
 pub use id::{IdAbsolute, IdRelative, IdStack};
@@ -146,4 +144,4 @@ pub use style::{ButtonStyle, CheckboxStyle, ComboStyle, DividerStyle, InputStyle
 pub use input::{KeyboardSnapshot, MouseSnapshot};
 pub use ui::{Anchor, Grid, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Ui, UiAdd, UiCursor, UiInit, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
 pub use view::{ViewCtx, ViewMode};
-pub use widget::{Button, Checkbox, Divider, Label, Response, Slider, Widget, WidgetId};
+pub use widgets::{Button, Checkbox, Divider, FontModal, Label, NumberInput, Response, Slider, Widget, WidgetId};

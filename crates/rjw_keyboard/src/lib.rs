@@ -7,10 +7,13 @@ use rjw_keystate::*;
 /// 重导出键码类型（供下游 crate 使用 `KeyCode::Backspace` 等常量，无需直接依赖 winit）。
 pub use winit::keyboard::KeyCode;
 
-#[derive(Default)]
+pub mod key_code;
+use key_code::{key_code_from_index, key_code_index, KEY_CODE_COUNT};
+
 pub struct KeyboardInput {
-    // Use raw key codes.
-    key_map: std::collections::HashMap<winit::keyboard::KeyCode, KeyState>,
+    // 按键状态表：下标 = `KeyCode` 判别值（见 [`key_code`] 模块），O(1) 读写。
+    // 仅槽位 0..KEY_CODE_COUNT 对应真实按键；其余恒为 `KEY_STATE_RELEASED`。
+    key_map: [KeyState; 256],
     /// 本帧收到的**字符输入**（来自 winit `KeyEvent.text`，已含 Shift 等组合；
     /// 多字节字符逐 `char` 收集）。`end_frame` 清空；帧内多次读取返回同一批字符。
     chars: Vec<char>,
@@ -24,14 +27,35 @@ pub struct KeyboardInput {
     ime_preedit_caret: Option<usize>,
 }
 
+// `[KeyState; 256]` 无 `Default` 实现（数组的 `Default` 仅到长度 32），故手动实现。
+impl Default for KeyboardInput {
+    /// 全表初始化为 `KEY_STATE_RELEASED`（所有键未按下）。
+    fn default() -> Self {
+        Self {
+            key_map: [KEY_STATE_RELEASED; 256],
+            chars: Vec::new(),
+            ime_commits: Vec::new(),
+            ime_preedit: None,
+            ime_preedit_caret: None,
+        }
+    }
+}
+
 impl KeyboardInput {
     #[allow(unused)]
     pub fn get(&self, key_code: winit::keyboard::KeyCode) -> KeyState {
-        *self.key_map.get(&key_code).unwrap_or(&KEY_STATE_RELEASED)
+        self.key_map[key_code_index(key_code)]
     }
     #[allow(unused)]
     pub fn get_keys_iter(&self) -> impl Iterator<Item = (winit::keyboard::KeyCode, KeyState)> + '_ {
-        self.key_map.iter().map(|(k, v)| (*k, *v))
+        // 遍历按键表的前 `KEY_CODE_COUNT` 个有效槽位，仅产出当前有状态的键
+        // （状态非 `KEY_STATE_RELEASED`；边沿位也算"有状态"，不会漏掉释放边沿）。
+        self.key_map
+            .iter()
+            .take(KEY_CODE_COUNT)
+            .enumerate()
+            .filter(|(_, s)| **s != KEY_STATE_RELEASED)
+            .map(|(i, s)| (key_code_from_index(i), *s))
     }
 
     /// 本帧的字符输入（`TextInput` 等文本编辑用）。
@@ -70,7 +94,8 @@ impl KeyboardInput {
 
     /// 内部：更新单个物理键的状态机（原逻辑，拆出以便无 GPU/无窗口单元测试）。
     fn process_key(&mut self, key_code: winit::keyboard::KeyCode, state: ElementState) {
-        let key_state = self.key_map.entry(key_code).or_insert(KEY_STATE_RELEASED);
+        // 按键表 O(1) 寻址；"按键常驻"语义天然成立（槽位永久存在，仅状态变化）。
+        let key_state = &mut self.key_map[key_code_index(key_code)];
         let new_key_state = match state {
             ElementState::Pressed => {
                 if key_state.pressed() {
@@ -136,7 +161,7 @@ impl KeyboardInput {
     }
 
     pub fn end_frame(&mut self) {
-        for key_state in self.key_map.values_mut() {
+        for key_state in self.key_map.iter_mut() {
             // turn off the edge bit, but keep the pressed bit.
             *key_state = key_state.off_edge();
             if key_state.sudden_up() {
@@ -195,6 +220,43 @@ mod tests {
         kb.process_key(KeyCode::KeyA, ElementState::Pressed);
         let s = kb.get(KeyCode::KeyA);
         assert!(s.pressed() && s.down_true_edge(), "再次按下应 down_true_edge: {s}");
+    }
+
+    #[test]
+    fn key_table_tracks_multiple_keys_and_keeps_released() {
+        // 按键表存储：多键各自独立跟踪，且释放后槽位保留（与旧 HashMap 语义一致）。
+        let mut kb = KeyboardInput::default();
+        assert_eq!(kb.key_map.len(), 256, "按键表长度应为 256");
+        assert_eq!(kb.get(KeyCode::KeyA), KEY_STATE_RELEASED, "未按过 = released");
+        kb.process_key(KeyCode::KeyA, ElementState::Pressed);
+        kb.process_key(KeyCode::KeyB, ElementState::Pressed);
+        // 两键都在表中（状态非 RELEASED）
+        assert_eq!(kb.get_keys_iter().count(), 2, "两个键都应有状态");
+        assert!(kb.get(KeyCode::KeyA).down_true_edge());
+        assert!(kb.get(KeyCode::KeyB).down_true_edge());
+        // 遍历产出的 (KeyCode, KeyState) 与 `get` 一致
+        for (k, s) in kb.get_keys_iter() {
+            assert_eq!(s, kb.get(k), "迭代器与 get 应一致");
+        }
+        // 未触碰的键恒为 RELEASED
+        assert_eq!(kb.get(KeyCode::Space), KEY_STATE_RELEASED, "未触碰键 = released");
+        // 释放后槽位不删除，仅状态变化（帧内立即释放 → sudden_up 标记，仍算 pressed）
+        kb.process_key(KeyCode::KeyA, ElementState::Released);
+        assert_eq!(kb.get_keys_iter().count(), 2, "释放后（边沿未清）仍应产出");
+        assert!(
+            kb.get(KeyCode::KeyA).sudden_up() && kb.get(KeyCode::KeyA).pressed(),
+            "帧内按下-释放应打 sudden_up 标记"
+        );
+        // end_frame 把 sudden_up 转换为真正的释放边沿
+        kb.end_frame();
+        assert!(kb.get(KeyCode::KeyA).up_edge(), "end_frame 后 sudden_up 转为释放");
+        // 释放后再次按下 → 再次 down_true_edge（非重复边沿）
+        kb.process_key(KeyCode::KeyA, ElementState::Pressed);
+        assert!(kb.get(KeyCode::KeyA).down_true_edge());
+        // end_frame 对表中所有键统一清边沿
+        kb.end_frame();
+        assert!(kb.get(KeyCode::KeyA).pressed() && !kb.get(KeyCode::KeyA).down_edge());
+        assert!(kb.get(KeyCode::KeyB).pressed() && !kb.get(KeyCode::KeyB).down_edge());
     }
 
     #[test]

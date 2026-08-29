@@ -496,6 +496,8 @@ pub struct InputStyle {
     pub preedit: Color,
     /// **文本选择高亮**（背景色；选中文本拖拽区域）。
     pub sel_bg: Color,
+    /// **缩放柄 / 拖动框颜色**（可调整大小/宽度的文本输入框右下角缩放手柄标记）。
+    pub resize_handle: Color,
     pub border_w: f32,
     /// 内容水平内边距。
     pub padding_x: f32,
@@ -519,6 +521,7 @@ impl Default for InputStyle {
             caret: Color::rgba_u8(30, 30, 30, 255),
             preedit: Color::rgba_u8(120, 120, 120, 255),
             sel_bg: Color::rgba_u8(140, 190, 245, 255),
+            resize_handle: Color::rgba_u8(120, 130, 150, 255),
             border_w: 1.0,
             padding_x: 6.0,
             radius: 0.0,
@@ -530,7 +533,7 @@ impl Default for InputStyle {
     }
 }
 
-/// 分割线样式（[`Ui::divider_at`](crate::ui::Ui::divider_at) / [`crate::widget::Divider`]）。
+/// 分割线样式（[`Ui::divider_at`](crate::ui::Ui::divider_at) / [`crate::widgets::Divider`]）。
 #[derive(Clone, Debug)]
 pub struct DividerStyle {
     /// 线颜色。
@@ -787,6 +790,11 @@ impl InputStyle {
     /// 文本选择高亮背景色。
     pub fn with_sel_bg(mut self, c: Color) -> Self {
         self.sel_bg = c;
+        self
+    }
+    /// 缩放柄 / 拖动框颜色（可调整大小/宽度的文本输入框）。
+    pub fn with_resize_handle(mut self, c: Color) -> Self {
+        self.resize_handle = c;
         self
     }
     pub fn with_border_w(mut self, w: f32) -> Self {
@@ -1212,3 +1220,4 @@ mod tests {
         assert_eq!(Theme::default().scaled(0.0).label.font_size, Theme::default().label.font_size);
     }
 }
+

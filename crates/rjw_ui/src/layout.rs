@@ -17,6 +17,12 @@ pub enum PackSide {
     Top,
     /// 水平堆叠（自左而右），子项顶对齐；高度 = 最大子项高。
     Left,
+    /// 垂直堆叠（**自下而上**，内容向上生长），子项左对齐；宽度 = 最大子项宽。
+    /// `pack_at` 的 `pos` 对准 pack **下边缘**（如页脚：`pos.y` = 底部，向上长）。
+    Bottom,
+    /// 水平堆叠（**自右而左**，内容向左生长），子项顶对齐；高度 = 最大子项高。
+    /// `pack_at` 的 `pos` 对准 pack **右边缘**（如右对齐菜单栏：`pos.x` = 右侧，向左长）。
+    Right,
 }
 
 /// 容器布局种类。
@@ -171,6 +177,8 @@ impl Frame {
                 match side {
                     PackSide::Top => self.cursor.y += size.y + *gap,
                     PackSide::Left => self.cursor.x += size.x + *gap,
+                    PackSide::Bottom => self.cursor.y -= size.y + *gap,
+                    PackSide::Right => self.cursor.x -= size.x + *gap,
                 }
                 self.max_child.x = self.max_child.x.max(size.x);
                 self.max_child.y = self.max_child.y.max(size.y);
@@ -211,6 +219,22 @@ impl Frame {
                     }
                     PackSide::Left => {
                         self.cursor.x += w + *gap;
+                        if track_max {
+                            self.max_child.x = self.max_child.x.max(w);
+                            self.max_child.y = self.max_child.y.max(h);
+                        }
+                    }
+                    // Bottom/Right：**负向推进**——子项落在 y/x ≤ 0 的负区，
+                    // 故 pack 的 0 边（`pos` 锚定边）即下/右边；首个子项贴该边。
+                    PackSide::Bottom => {
+                        self.cursor.y -= h + *gap;
+                        if track_max {
+                            self.max_child.x = self.max_child.x.max(w);
+                            self.max_child.y = self.max_child.y.max(h);
+                        }
+                    }
+                    PackSide::Right => {
+                        self.cursor.x -= w + *gap;
                         if track_max {
                             self.max_child.x = self.max_child.x.max(w);
                             self.max_child.y = self.max_child.y.max(h);
@@ -268,6 +292,19 @@ impl Frame {
                         (self.cursor.x - gap).max(0.0) + self.pad_total,
                         self.max_child.y + self.pad_total * 2.0,
                     ),
+                    // Bottom/Right：光标为负，取绝对值结算（0 边 = pos 锚定边）。
+                    PackSide::Bottom => {
+                        let w = match self.fixed_w {
+                            Some(fw) if fw > 0.0 => fw + self.pad_total * 2.0,
+                            _ => self.max_child.x + self.pad_total * 2.0,
+                        };
+                        let h = self.fixed_h.unwrap_or((-self.cursor.y - gap).max(0.0) + self.pad_total);
+                        Vec2::new(w, h)
+                    }
+                    PackSide::Right => Vec2::new(
+                        (-self.cursor.x - gap).max(0.0) + self.pad_total,
+                        self.max_child.y + self.pad_total * 2.0,
+                    ),
                 }
             }
             FrameKind::Grid { cols, cell } => {
@@ -313,6 +350,41 @@ mod tests {
         let b = f.child_rect(40.0, 60.0);
         assert_eq!(b, Rect::new(34.0, 0.0, 40.0, 60.0), "x 应 +30+gap4");
         assert_eq!(f.settle_size(), Vec2::new(74.0, 60.0), "宽=34+40，高=max(50,60)");
+    }
+
+    #[test]
+    fn stack_bottom_advances_y_negative_and_settles() {
+        // Bottom：首个子项在锚定边（下边 y=0），后续向上（负 y），0 边即 pos 锚定边。
+        let mut f = Frame::new_stack(PackSide::Bottom, 6.0, 0.0);
+        let a = f.child_rect(100.0, 20.0);
+        assert_eq!(a, Rect::new(0.0, 0.0, 100.0, 20.0), "首个子项在底部（y=0）");
+        let b = f.child_rect(80.0, 30.0);
+        assert_eq!(b, Rect::new(0.0, -26.0, 80.0, 30.0), "第二个在第一个上方（-20-gap6）");
+        assert_eq!(f.settle_size(), Vec2::new(100.0, 56.0), "宽=max(100,80)，高=20+6+30");
+    }
+
+    #[test]
+    fn stack_right_advances_x_negative_and_settles() {
+        // Right：首个子项在锚定边（右边 x=0），后续向左（负 x），0 边即 pos 锚定边。
+        let mut f = Frame::new_stack(PackSide::Right, 4.0, 0.0);
+        let a = f.child_rect(30.0, 50.0);
+        assert_eq!(a, Rect::new(0.0, 0.0, 30.0, 50.0), "首个子项在右侧（x=0）");
+        let b = f.child_rect(40.0, 60.0);
+        assert_eq!(b, Rect::new(-34.0, 0.0, 40.0, 60.0), "第二个在第一个左侧（-30-gap4）");
+        assert_eq!(f.settle_size(), Vec2::new(74.0, 60.0), "宽=30+4+40，高=max(50,60)");
+    }
+
+    #[test]
+    fn stack_bottom_min_max_and_fixed_h() {
+        // Bottom 与 min/max 约束、fixed_h 叠加（负向推进下 clamp 行为不变）。
+        let mut f = Frame::new_stack(PackSide::Bottom, 6.0, 0.0);
+        f.set_next_min(Vec2::new(100.0, 0.0));
+        assert_eq!(f.child_rect(40.0, 20.0), Rect::new(0.0, 0.0, 100.0, 20.0), "min 抬宽");
+        f.set_next_max(Vec2::new(80.0, 0.0));
+        assert_eq!(f.child_rect(120.0, 10.0), Rect::new(0.0, -26.0, 80.0, 10.0), "max 压宽");
+        assert_eq!(f.settle_size().y, 36.0, "高=20+6+10");
+        f.set_fixed_h(200.0);
+        assert_eq!(f.settle_size().y, 200.0, "fixed_h 覆盖结算高");
     }
 
     #[test]
