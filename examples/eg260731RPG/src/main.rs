@@ -11,14 +11,8 @@
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
-use glam::{Vec2, vec2};
-use rjw_2d_render::{BlendMode, ClearConfig, Layer, MeshData, Render2D, SpriteRect, VertexP3U2C4};
-use rjw_atlas::{AtlasConfig, AtlasRegion, DynamicAtlas};
-use rjw_color::Color;
-use rjw_main::*;
-use rjw_render::{wgpu, RenderConfig, RenderContext, TEXTURES};
-use rjw_text::{Align, LineSpace, Text};
-use rjw_transform::{Camera2D, Transform2D};
+use rjw_krusie::prelude::*;
+use rjw_krusie::render2d::VertexP3U2C4;
 
 // ── 常量 ─────────────────────────────────────────────────────────
 const TILE: f32 = 32.0;
@@ -386,7 +380,7 @@ fn update(game: &mut Game, cam: &Camera2D, ctx: &MainContext, dt: f32) {
             p.facing_angle = aim.y.atan2(aim.x);
         }
     }
-    let want_attack = k.get(KeyCode::Space).down_edge() || ctx.mouse.get_mouse_button_state(rjw_main::winit::event::MouseButton::Left).down_edge();
+    let want_attack = k.get(KeyCode::Space).down_edge() || ctx.mouse.get_mouse_button_state(MouseButton::Left).down_edge();
     if want_attack && p.attack_cooldown <= 0.0 {
         p.attack_timer = SLASH_DURATION;
         p.attack_cooldown = 0.45;
@@ -467,7 +461,7 @@ fn draw_circle(r2d: &mut Render2D, center: Vec2, radius: f32, color: Color, laye
         let a = i as f32 / SEGS as f32 * TAU;
         verts.push(center + Vec2::new(a.cos(), a.sin()) * radius);
     }
-    r2d.add_polygon_fan(&verts, color, layer);
+    r2d.polygon(&verts).color(color).layer(layer);
 }
 fn draw_attack_slash(r2d: &mut Render2D, center: Vec2, angle: f32, opacity: f32) {
     let mut verts = Vec::with_capacity(14);
@@ -477,7 +471,9 @@ fn draw_attack_slash(r2d: &mut Render2D, center: Vec2, angle: f32, opacity: f32)
         let a = angle - SLASH_HALF_ANGLE + 2.0 * SLASH_HALF_ANGLE * i as f32 / segs as f32;
         verts.push(center + Vec2::new(a.cos(), a.sin()) * SLASH_RANGE);
     }
-    r2d.add_polygon_fan(&verts, Color::rgba_one(1.0 * opacity), LAYER_UI - 10.0)
+    r2d.polygon(&verts)
+        .color(Color::rgba_one(1.0 * opacity))
+        .layer(LAYER_UI - 10.0)
         .blend(BlendMode::Inverse);
 }
 
@@ -485,7 +481,7 @@ fn draw_attack_slash(r2d: &mut Render2D, center: Vec2, angle: f32, opacity: f32)
 //
 // 设计说明（后续改动请保留注释）：
 // - `unit_circle_mesh` 是半径为 1 的单位圆扇面网格，注册到 MESHES 后**所有**圆图形用
-//   `add_static_mesh` 共享它，实例变换 = Translate(pos) * Scale(radius)。同 mesh_id + 同
+//   `static_mesh` 共享它，实例变换 = Translate(pos) * Scale(radius)。同 mesh_id + 同
 //   纹理（white） + 同 RStates → 整张地图的石头/花全部合批为极少数 DrawCall。
 // - 树**不能**放入静态地形：树的遮挡层是 `y_layer(foot_y)`，会插入玩家/史莱姆的实体
 //   Y 排序，必须保持动态绘制；石头/花使用固定 `LAYER_TERRAIN`，不参与实体排序，安全静态化。
@@ -596,7 +592,10 @@ impl StaticTerrain {
         let submit = |r2d: &mut Render2D, insts: &[StaticInst]| {
             for inst in insts {
                 let tf = Transform2D::default().with_pos(inst.pos).with_scale(Vec2::splat(inst.r));
-                r2d.add_static_mesh(self.circle_mesh_id, inst.color, tf, inst.layer, &white);
+                r2d.static_mesh(self.circle_mesh_id, &white)
+                    .color(inst.color)
+                    .transform(tf)
+                    .layer(inst.layer);
             }
         };
         submit(r2d, &self.stone_insts);
@@ -800,7 +799,7 @@ fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, font: &mut Text, game:
             Transform2D::default(),
             LAYER_GAMEOVER,
         );
-        font.draw_label_ex(r2d, "❤GAME OVER — 按\n R 重开❤", Color::rgba(1.0, 0.3, 0.3, 1.0), 22.0, 28.0, cam.position, "SimHei", rjw_text::Align::Center, LAYER_GAMEOVER + 1.0, Vec2::new(0.5, 0.5));
+        font.draw_label_ex(r2d, "❤GAME OVER — 按\n R 重开❤", Color::rgba(1.0, 0.3, 0.3, 1.0), 22.0, 28.0, cam.position, "SimHei", Align::Center, LAYER_GAMEOVER + 1.0, Vec2::new(0.5, 0.5));
     }
 }
 
@@ -1014,18 +1013,19 @@ impl Tex {
         color: Color,
         transform: Transform2D,
         layer: impl Into<Layer> + 'a,
-    ) -> rjw_2d_render::Sprite2DBuilder<'a> {
-        let ps = self.atlas.page_size() as f32;
-        let inv = Vec2::new(1.0 / ps, 1.0 / ps);
-        let spr = SpriteRect::from_texture_px(
+    ) -> rjw_krusie::render2d::SpriteBuilder<'a> {
+        let tex_ref = TEXTURES.get(region.page_uid).unwrap();
+        let spr = SpriteRect::with_uv_tex(
             world_tl,
             world_wh,
             Vec2::new(region.tl_px.0 as f32, region.tl_px.1 as f32),
             Vec2::new(region.wh_px.0 as f32, region.wh_px.1 as f32),
-            inv,
+            &tex_ref,
         );
-        let tex_ref = TEXTURES.get(region.page_uid).unwrap();
-        r2d.add_sprite2d(spr, color, transform, layer, &tex_ref)
+        r2d.sprite(spr, &tex_ref)
+            .color(color)
+            .transform(transform)
+            .layer(layer)
     }
 }
 
@@ -1065,8 +1065,8 @@ impl App for RpgApp {
         self.render = Some(RenderContext::new(window, &RenderConfig::default()));
         let render = self.render.as_ref().unwrap();
         let render2d = Render2D::new(render);
-        let tex = Tex::create(render2d.device(), render2d.queue(), render2d.tex_bind_group_layout());
-        let font = Text::new(render2d.device(), render2d.queue(), render2d.tex_bind_group_layout());
+        let tex = Tex::create(render2d.device(), render2d.queue(), render2d.texture_layout());
+        let font = Text::new(render2d.device(), render2d.queue(), render2d.texture_layout());
         let (w, h) = render.size();
         let mut cam = Camera2D::new(Vec2::new(w as f32, h as f32));
         cam.set_vp(Vec2::new(w as f32, h as f32), Vec2::ZERO);
@@ -1106,7 +1106,7 @@ impl App for RpgApp {
         }
         render2d
             .set_mvp(self.cam.vp_matrix())
-//          .default_samp_min_mag(rjw_2d_render::FilterMode::Nearest)
+//          .set_states(RStates::new().samp_min_mag(FilterMode::Nearest))
         ;
         // 石头 / 花静态地形：地图版本变化时重建一次（单位圆网格 + 实例列表常驻），
         // 每帧只提交实例数据，全部合批。树保持动态（Y 排序插入实体，绝不入此地）。
@@ -1127,5 +1127,5 @@ impl App for RpgApp {
 }
 fn main() -> Result<(), EventLoopError> {
     env_logger::init();
-    rjw_main::run_app(RpgApp::new())
+    run_app(RpgApp::new())
 }

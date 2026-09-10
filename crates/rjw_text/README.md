@@ -6,6 +6,9 @@
 English：
 `rjw_text` renders text using `cosmic-text` layout, `swash` glyph rasterization and a `DynamicAtlas` glyph cache.
 
+> 整套库入口：`use rjw_krusie::prelude::*;` 已含 `Text` / `Align` / `TextStyle` / `TextBuffer` / `TextLayout` / `TextRender`；
+> 低层（`GlyphData` / `GradientAxis` / `cosmic_text`…）走 `rjw_krusie::text::*`。
+
 ---
 
 ## 功能特性 / Features

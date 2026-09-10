@@ -6,7 +6,7 @@
 //! - **物件化**：`TileMap` 整体 `transform`（位移/旋转/缩放整个地图）；tile 矩形保持轴对齐（仅位移缩放）；
 //! - **Chunk 预生成顶点数据**：每个 chunk 按（页, 层）预生成 GPU 静态 mesh（`MeshData`），
 //!   结构/变换变更或图集重排（`generation` 变化）时按脏标记重建；每帧绘制 = 可见 chunk 的
-//!   `add_static_mesh`（draw call ≈ 可见 chunk 数），**每帧零收集 / 零分组 / 零 resolve / 零堆分配**；
+//!   `static_mesh`（draw call ≈ 可见 chunk 数），**每帧零收集 / 零分组 / 零 resolve / 零堆分配**；
 //! - **剔除为闭包形式**：[`TileMap::draw`] 接收 `Option<&dyn Fn(&Rect) -> bool>`
 //!   （世界 AABB → 可见；`None` = 不剔除；如 `|aabb| aabb.intersects(&cam.view_aabb())`），
 //!   在世界空间按 chunk AABB 粗剔——3D 视锥体判定同样直接以闭包传入。
@@ -51,19 +51,61 @@ pub struct Tile {
 }
 
 impl Tile {
-    /// 从整张 `region` 贴片：`src_tl = (0,0)`、`src_wh = region.wh_px`。
+    /// **最常用**：一个贴片（整张精灵）。位置/尺寸接受 `Vec2` 或 `(x, y)`。
+    ///
+    /// ```ignore
+    /// Tile::new(src, (x * 64.0, y * 64.0), (64.0, 64.0))
+    /// Tile::new(src, pos, (64.0, 64.0)).solid(true).color(Color::rgba(1.0, 1.0, 1.0, 0.8))
+    /// ```
     #[inline]
-    pub fn whole_region(region: AtlasRegion, src: RegionRef, mesh_tl: Vec2, mesh_wh: Vec2) -> Self {
+    pub fn new(src: RegionRef, mesh_tl: impl Into<Vec2>, mesh_wh: impl Into<Vec2>) -> Self {
         Self {
             src,
             src_tl: Vec2::ZERO,
-            src_wh: Vec2::new(region.wh_px.0 as f32, region.wh_px.1 as f32),
-            mesh_tl,
-            mesh_wh,
+            // (0,0) = 整张精灵（渲染时按 `AtlasRegion` 全尺寸解析）。
+            src_wh: Vec2::ZERO,
+            mesh_tl: mesh_tl.into(),
+            mesh_wh: mesh_wh.into(),
             color: Color::WHITE,
             layer: 0.0,
             solid: false,
         }
+    }
+
+    /// 源内裁剪（像素，相对 `AtlasRegion.tl_px`；可负 = 翻转；`(0,0)` 表示整张精灵）。
+    #[inline]
+    pub fn uv(mut self, src_tl: impl Into<Vec2>, src_wh: impl Into<Vec2>) -> Self {
+        self.src_tl = src_tl.into();
+        self.src_wh = src_wh.into();
+        self
+    }
+
+    /// 着色（烘焙进顶点颜色）。
+    #[inline]
+    pub fn color(mut self, color: Color) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// 相对基础层的层级偏移（按 (页, 层) 分 mesh）。
+    #[inline]
+    pub fn layer(mut self, layer: f32) -> Self {
+        self.layer = layer;
+        self
+    }
+
+    /// 是否参与碰撞（[`TileMap::solid_rects`] 收集）。
+    #[inline]
+    pub fn solid(mut self, solid: bool) -> Self {
+        self.solid = solid;
+        self
+    }
+
+    /// 从整张 `region` 贴片：`src_tl = (0,0)`、`src_wh = region.wh_px`。
+    #[inline]
+    pub fn whole_region(region: AtlasRegion, src: RegionRef, mesh_tl: impl Into<Vec2>, mesh_wh: impl Into<Vec2>) -> Self {
+        Self::new(src, mesh_tl, mesh_wh)
+            .uv(Vec2::ZERO, Vec2::new(region.wh_px.0 as f32, region.wh_px.1 as f32))
     }
 
     /// 局部 AABB（负尺寸归一化）。
@@ -249,7 +291,7 @@ impl TileMap {
     /// 剔除在**世界空间**按 chunk AABB 判定（chunk 粒度粗剔）。
     ///
     /// 顶点数据在**首次绘制 / 结构或变换变更 / 图集重排**时按脏标记预生成（静态 mesh），
-    /// 每帧仅做：chunk AABB 剔除 + `add_static_mesh` 提交（draw call ≈ 可见 chunk 数）。
+    /// 每帧仅做：chunk AABB 剔除 + `static_mesh` 提交（draw call ≈ 可见 chunk 数）。
     pub fn draw<K: Hash + Eq + Clone>(
         &mut self,
         r2d: &mut Render2D,
@@ -276,13 +318,10 @@ impl TileMap {
             }
             for m in &chunk.meshes {
                 let Some(tex) = TEXTURES.get(m.page_uid) else { continue };
-                r2d.add_static_mesh(
-                    m.mesh_id,
-                    Color::WHITE,
-                    map_t,
-                    Layer::from(base + m.layer as f64),
-                    &tex,
-                );
+                r2d.static_mesh(m.mesh_id, &tex)
+                    .color(Color::WHITE)
+                    .transform(map_t)
+                    .layer(Layer::from(base + m.layer as f64));
             }
         }
     }
@@ -319,8 +358,11 @@ impl TileMap {
                     let Some(region) = tile.src.resolve(atlas) else { continue };
                     let u0 = (region.tl_px.0 as f32 + tile.src_tl.x) / pw;
                     let v0 = (region.tl_px.1 as f32 + tile.src_tl.y) / ph;
-                    let uw = tile.src_wh.x / pw;
-                    let vh = tile.src_wh.y / ph;
+                    // `src_wh` 为 `(0,0)` 时 = 整张精灵（按 `AtlasRegion` 全尺寸解析）。
+                    let sw = if tile.src_wh.x == 0.0 { region.wh_px.0 as f32 } else { tile.src_wh.x };
+                    let sh = if tile.src_wh.y == 0.0 { region.wh_px.1 as f32 } else { tile.src_wh.y };
+                    let uw = sw / pw;
+                    let vh = sh / ph;
                     let tl = tile.mesh_tl;
                     let wh = tile.mesh_wh;
                     let c: [f32; 4] = tile.color.into();
@@ -360,6 +402,31 @@ mod tests {
             layer: 0.0,
             solid: false,
         }
+    }
+
+    #[test]
+    fn tile_new_defaults_to_whole_sprite() {
+        // `Tile::new` = 整张精灵（`src_wh = (0,0)` 由渲染侧解析为 `AtlasRegion` 全尺寸）+
+        // 位置/尺寸接受 `Vec2` 或 `(x, y)`；链式覆盖其余字段。
+        let t = Tile::new(RegionRef::from_parts(1, 2), (10.0, 20.0), (64.0, 64.0));
+        assert_eq!(t.src_tl, Vec2::ZERO);
+        assert_eq!(t.src_wh, Vec2::ZERO, "(0,0) = 整张精灵");
+        assert_eq!(t.mesh_tl, Vec2::new(10.0, 20.0));
+        assert_eq!(t.mesh_wh, Vec2::splat(64.0));
+        assert_eq!(t.color, Color::WHITE);
+        assert_eq!(t.layer, 0.0);
+        assert!(!t.solid);
+
+        let t = t
+            .uv((4.0, 8.0), (16.0, 16.0))
+            .solid(true)
+            .layer(2.0)
+            .color(Color::RED);
+        assert_eq!(t.src_tl, Vec2::new(4.0, 8.0));
+        assert_eq!(t.src_wh, Vec2::new(16.0, 16.0));
+        assert!(t.solid);
+        assert_eq!(t.layer, 2.0);
+        assert_eq!(t.color, Color::RED);
     }
 
     #[test]

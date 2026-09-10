@@ -20,9 +20,10 @@ impl Rect {
         Self { x, y, w, h }
     }
 
-    /// 由两个点构造（自动归一化为左上角 + 正宽高）。
+    /// 由两个点构造（自动归一化为左上角 + 正宽高；接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn from_points(a: Vec2, b: Vec2) -> Self {
+    pub fn from_points(a: impl Into<Vec2>, b: impl Into<Vec2>) -> Self {
+        let (a, b) = (a.into(), b.into());
         let min = a.min(b);
         let max = a.max(b);
         Self { x: min.x, y: min.y, w: max.x - min.x, h: max.y - min.y }
@@ -67,7 +68,8 @@ impl Rect {
     }
 
     #[inline]
-    pub fn contains_point(&self, p: Vec2) -> bool {
+    pub fn contains_point(&self, p: impl Into<Vec2>) -> bool {
+        let p = p.into();
         let r = self.normalized();
         p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h
     }

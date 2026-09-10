@@ -5,27 +5,17 @@
 //!   容器的**布局矩形与命中区域**画青色描边（覆盖在 UI 内容之上）；面板勾选实时切换。
 //! - **rjw_ui 的 DebugDraw**（屏幕空间）：[`Ui::debug_line`] / [`Ui::debug_circle_outline`] /
 //!   [`Ui::debug_cross`] —— 鼠标十字 + 跟随圆圈（绝对逻辑屏幕像素，覆盖在 UI 之上）。
-//! - **世界 DebugDraw**（[`rjw_2d_render::debug_draw`]）：网格（`draw_grid`）、碰撞盒
+//! - **世界 DebugDraw**（[`rjw_krusie::render2d::debug_draw`]）：网格（`draw_grid`）、碰撞盒
 //!   （`draw_rect_outline`）、圆形轮廓与实心圆、点标记（`draw_cross`）、速度矢量
 //!   （`draw_line`）——世界坐标，用于游戏场景调试。
 //! - 独立 UI 渲染器 + 合并提交（与 `eg260818UI` 相同的世界 → UI 一次 present）。
 //!
 //! 操作：`F1` 开关调试面板 · 拖动调试窗口 · `Esc` 退出。
 
-use glam::Vec2;
-use rjw_2d_render::{
-    debug_draw::{
-        draw_circle_filled, draw_circle_outline, draw_cross, draw_grid, draw_line,
-        draw_rect_outline,
-    },
-    ClearConfig, Render2D, SpriteRect,
+use rjw_krusie::prelude::*;
+use rjw_krusie::render2d::debug_draw::{
+    draw_circle_filled, draw_circle_outline, draw_cross, draw_grid, draw_line, draw_rect_outline,
 };
-use rjw_color::Color;
-use rjw_main::*;
-use rjw_render::{wgpu, RenderConfig, RenderContext};
-use rjw_text::Text;
-use rjw_transform::{Rect, Transform2D, Viewport};
-use rjw_ui::{Theme, Ui, UiAdd, UiState};
 
 const LAYER_UI: f64 = 10_000_000.0;
 /// DebugDraw 覆盖层的基准层级（世界场景之上、UI 之下）。
@@ -103,8 +93,8 @@ impl App for DebugApp {
         let render2d = Render2D::new(render);
         // 独立 UI 渲染器：关闭 Render2D 排序（UI 自行管理绘制顺序）。
         let mut render2d_ui = Render2D::new(render);
-        render2d_ui.set_sorting(false);
-        let font = Text::new(render2d.device(), render2d.queue(), render2d.tex_bind_group_layout());
+        render2d_ui.set_sort_mode(SortMode::None);
+        let font = Text::new(render2d.device(), render2d.queue(), render2d.texture_layout());
         let (w, h) = render.size();
         let viewport = Viewport::new(Vec2::new(w as f32, h as f32), Vec2::ZERO);
         self.render2d = Some(render2d);
@@ -160,22 +150,18 @@ impl App for DebugApp {
 
         // ── 世界层：背景 + 障碍物（实心矩形） ───────────────────
         let world_tf = Transform2D::default();
-        r2d.add_sprite2d_solid(
-            SpriteRect::from_texture(
-                Vec2::new(-self.world.w * 0.5, -self.world.h * 0.5),
-                Vec2::new(self.world.w, self.world.h),
-            ),
-            Color::rgba_u8(22, 26, 36, 255),
-            world_tf,
-            0.0,
-        );
+        r2d.solid(SpriteRect::new(
+            (-self.world.w * 0.5, -self.world.h * 0.5),
+            (self.world.w, self.world.h),
+        ))
+        .color(Color::rgba_u8(22, 26, 36, 255))
+        .transform(world_tf)
+        .layer(0.0);
         for (i, o) in self.obstacles.iter().enumerate() {
-            r2d.add_sprite2d_solid(
-                SpriteRect::from_texture(Vec2::new(o.rect.x, o.rect.y), Vec2::new(o.rect.w, o.rect.h)),
-                Color::rgba_u8(44 + i as u8 * 16, 58, 92, 255),
-                world_tf,
-                1.0,
-            );
+            r2d.solid(SpriteRect::new((o.rect.x, o.rect.y), (o.rect.w, o.rect.h)))
+            .color(Color::rgba_u8(44 + i as u8 * 16, 58, 92, 255))
+            .transform(world_tf)
+            .layer(1.0);
         }
         // 球本体（实心圆 = 三角扇）。
         draw_circle_filled(
@@ -275,10 +261,10 @@ impl App for DebugApp {
         ui.finish(&self.viewport, r2d_ui);
 
         // ── 合并提交：世界（含 DebugDraw）→ UI → 一次 present ──
-        let Some((surface_tex, view)) = r2d.begin_frame() else {
+        let Some((surface_tex, view)) = r2d.acquire_frame() else {
             return;
         };
-        let cb_world = r2d.render_command_buffer(
+        let cb_world = r2d.encode(
             &ClearConfig {
                 color: Some(wgpu::Color { r: 0.08, g: 0.09, b: 0.12, a: 1.0 }),
                 depth: None,
@@ -287,7 +273,7 @@ impl App for DebugApp {
             &view,
             None,
         );
-        let cb_ui = r2d_ui.render_command_buffer(
+        let cb_ui = r2d_ui.encode(
             &ClearConfig { color: None, depth: None, stencil: None },
             &view,
             None,

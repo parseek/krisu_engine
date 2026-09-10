@@ -6,7 +6,7 @@
 //!
 //! - 坐标一律为**世界坐标**（经相机变换到屏幕）；屏幕固定的调试叠加可先用相机把
 //!   屏幕点转世界，或直接走 `rjw_ui`。
-//! - 实现：全部经 `Render2D` 动态 mesh 路径（[`Render2D::add_mesh_fn`]）提交，
+//! - 实现：全部经 `Render2D` 动态 mesh 路径（[`Render2D::mesh_with`]）提交，
 //!   相邻图元同状态自动合并为同一动态段（一次绘制），调试开销小。
 //! - 默认管线无剔除（`RStates::default().cull == None`），三角形绕序无关紧要。
 
@@ -23,7 +23,8 @@ use crate::{Layer, Render2D};
 /// 纯几何函数（可单测）：`width` 为世界单位；`a == b` 或 `width <= 0` 时返回 `None`
 /// （退化线段，不产生图元）。
 #[inline]
-pub fn thick_line_quad(a: Vec2, b: Vec2, width: f32) -> Option<[Vec2; 4]> {
+pub fn thick_line_quad(a: impl Into<Vec2>, b: impl Into<Vec2>, width: f32) -> Option<[Vec2; 4]> {
+    let (a, b) = (a.into(), b.into());
     let d = b - a;
     let len = d.length();
     if len <= f32::EPSILON || width <= 0.0 {
@@ -36,8 +37,8 @@ pub fn thick_line_quad(a: Vec2, b: Vec2, width: f32) -> Option<[Vec2; 4]> {
 /// 画一条线段（世界坐标；`width` 为世界单位；`a == b` 或 `width <= 0` 时无操作）。
 pub fn draw_line(
     r2d: &mut Render2D,
-    a: Vec2,
-    b: Vec2,
+    a: impl Into<Vec2>,
+    b: impl Into<Vec2>,
     width: f32,
     color: Color,
     layer: impl Into<Layer>,
@@ -45,14 +46,14 @@ pub fn draw_line(
     let Some([tl, tr, bl, br]) = thick_line_quad(a, b, width) else {
         return;
     };
-    r2d.add_mesh_fn(color, layer, |sink| {
+    r2d.mesh_with(|sink| {
         let i0 = sink.push_vertex(tl);
         let i1 = sink.push_vertex(tr);
         let i2 = sink.push_vertex(bl);
         let i3 = sink.push_vertex(br);
         sink.push_tri(i0, i1, i2);
         sink.push_tri(i1, i3, i2);
-    });
+    }).color(color).layer(layer);
 }
 
 /// 矩形边框（4 条线段合并为一次 mesh 提交；世界坐标）。
@@ -76,7 +77,7 @@ pub fn draw_rect_outline(
         thick_line_quad(br, bl, width),
         thick_line_quad(bl, tl, width),
     ];
-    r2d.add_mesh_fn(color, layer, |sink| {
+    r2d.mesh_with(|sink| {
         for q in quads.into_iter().flatten() {
             let i0 = sink.push_vertex(q[0]);
             let i1 = sink.push_vertex(q[1]);
@@ -85,24 +86,25 @@ pub fn draw_rect_outline(
             sink.push_tri(i0, i1, i2);
             sink.push_tri(i1, i3, i2);
         }
-    });
+    }).color(color).layer(layer);
 }
 
 /// 圆环（`segments` 段折线近似，每段是带厚度四边形；世界坐标）。
 pub fn draw_circle_outline(
     r2d: &mut Render2D,
-    center: Vec2,
+    center: impl Into<Vec2>,
     radius: f32,
     segments: usize,
     width: f32,
     color: Color,
     layer: impl Into<Layer>,
 ) {
+    let center = center.into();
     if radius <= 0.0 || width <= 0.0 {
         return;
     }
     let seg = segments.max(3);
-    r2d.add_mesh_fn(color, layer, |sink| {
+    r2d.mesh_with(|sink| {
         for i in 0..seg {
             let a0 = i as f32 / seg as f32 * std::f32::consts::TAU;
             let a1 = (i + 1) as f32 / seg as f32 * std::f32::consts::TAU;
@@ -117,23 +119,24 @@ pub fn draw_circle_outline(
                 sink.push_tri(i1, i3, i2);
             }
         }
-    });
+    }).color(color).layer(layer);
 }
 
 /// 实心圆（三角扇；世界坐标）。
 pub fn draw_circle_filled(
     r2d: &mut Render2D,
-    center: Vec2,
+    center: impl Into<Vec2>,
     radius: f32,
     segments: usize,
     color: Color,
     layer: impl Into<Layer>,
 ) {
+    let center = center.into();
     if radius <= 0.0 {
         return;
     }
     let seg = segments.max(3);
-    r2d.add_mesh_fn(color, layer, |sink| {
+    r2d.mesh_with(|sink| {
         let c = sink.push_vertex(center);
         let mut prev: Option<u16> = None;
         for i in 0..=seg {
@@ -146,18 +149,19 @@ pub fn draw_circle_filled(
             }
             prev = Some(v);
         }
-    });
+    }).color(color).layer(layer);
 }
 
 /// 十字标记（点 / 采样位置可视化；世界坐标）。
 pub fn draw_cross(
     r2d: &mut Render2D,
-    center: Vec2,
+    center: impl Into<Vec2>,
     half: f32,
     width: f32,
     color: Color,
     layer: impl Into<Layer>,
 ) {
+    let center = center.into();
     // 先转成 Copy 的 Layer，两条线段各用一次（impl Into<Layer> 会消费所有权）。
     let layer = layer.into();
     draw_line(r2d, center - Vec2::new(half, 0.0), center + Vec2::new(half, 0.0), width, color, layer);
@@ -198,7 +202,7 @@ pub fn draw_grid(
     if segs.is_empty() {
         return;
     }
-    r2d.add_mesh_fn(color, layer, |sink| {
+    r2d.mesh_with(|sink| {
         for [a, b] in segs {
             if let Some([tl, tr, bl, br]) = thick_line_quad(a, b, width) {
                 let i0 = sink.push_vertex(tl);
@@ -209,7 +213,7 @@ pub fn draw_grid(
                 sink.push_tri(i1, i3, i2);
             }
         }
-    });
+    }).color(color).layer(layer);
 }
 
 #[cfg(test)]

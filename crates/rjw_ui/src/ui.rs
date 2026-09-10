@@ -793,9 +793,16 @@ impl<'a> Ui<'a> {
         self
     }
 
-    /// 屏幕空间线段（**绝对逻辑屏幕像素**，Y+ 向下；覆盖在 UI 内容之上）。
-    pub fn debug_line(&mut self, a: Vec2, b: Vec2, width: f32, color: Color) {
-        self.push_debug(DebugShape::Line { a, b, width }, color);
+    /// 屏幕空间线段（**绝对逻辑屏幕像素**，Y+ 向下；覆盖在 UI 内容之上；接受 `Vec2` 或 `(x, y)`）。
+    pub fn debug_line(&mut self, a: impl Into<Vec2>, b: impl Into<Vec2>, width: f32, color: Color) {
+        self.push_debug(
+            DebugShape::Line {
+                a: a.into(),
+                b: b.into(),
+                width,
+            },
+            color,
+        );
     }
 
     /// 屏幕空间矩形边框（逻辑像素）。
@@ -803,21 +810,36 @@ impl<'a> Ui<'a> {
         self.push_debug(DebugShape::RectOutline { rect, width }, color);
     }
 
-    /// 屏幕空间圆环（`segments` 段折线近似；逻辑像素）。
+    /// 屏幕空间圆环（`segments` 段折线近似；逻辑像素；接受 `Vec2` 或 `(x, y)`）。
     pub fn debug_circle_outline(
         &mut self,
-        center: Vec2,
+        center: impl Into<Vec2>,
         radius: f32,
         segments: usize,
         width: f32,
         color: Color,
     ) {
-        self.push_debug(DebugShape::CircleOutline { center, radius, segments, width }, color);
+        self.push_debug(
+            DebugShape::CircleOutline {
+                center: center.into(),
+                radius,
+                segments,
+                width,
+            },
+            color,
+        );
     }
 
-    /// 屏幕空间十字标记（逻辑像素）。
-    pub fn debug_cross(&mut self, center: Vec2, half: f32, width: f32, color: Color) {
-        self.push_debug(DebugShape::Cross { center, half, width }, color);
+    /// 屏幕空间十字标记（逻辑像素；接受 `Vec2` 或 `(x, y)`）。
+    pub fn debug_cross(&mut self, center: impl Into<Vec2>, half: f32, width: f32, color: Color) {
+        self.push_debug(
+            DebugShape::Cross {
+                center: center.into(),
+                half,
+                width,
+            },
+            color,
+        );
     }
 
     /// 屏幕空间网格（`rect` 范围内按 `spacing` 竖线 + 横线；每方向最多 512 条）。
@@ -2563,19 +2585,19 @@ impl<'a> Ui<'a> {
 
     /// 当前容器**下一子项**的最小尺寸约束（`0` = 该轴不约束；一次性）。
     /// 容器内便捷方法：`p.min_size(120.0, 0.0)`（见 [`crate::Ui`] 文档 / 示例）。
-    pub fn set_next_min(&mut self, min: Vec2) {
+    pub fn set_next_min(&mut self, min: impl Into<Vec2>) {
         self.frames
             .last_mut()
             .expect("min_size 需在容器内调用（顶层请用 *_at 定位）")
-            .set_next_min(min);
+            .set_next_min(min.into());
     }
 
     /// 当前容器**下一子项**的最大尺寸约束（`0` = 该轴不约束；一次性）。
-    pub fn set_next_max(&mut self, max: Vec2) {
+    pub fn set_next_max(&mut self, max: impl Into<Vec2>) {
         self.frames
             .last_mut()
             .expect("max_size 需在容器内调用（顶层请用 *_at 定位）")
-            .set_next_max(max);
+            .set_next_max(max.into());
     }
 
     /// **flex 容器**：固定总高 `total_h`（逻辑像素），子项按 `weights` 权重**等分高度**
@@ -2669,19 +2691,19 @@ impl<'a> Ui<'a> {
     /// - `seq`：同元素内同类命令保持录制顺序。
     ///
     /// **提交方式**（不使用 Sprite）：全部图元（背景 / 控件背景 / 文字）转为
-    /// **四边形顶点**（[`Render2D::add_quads`]），按 `(窗口, 纹理)` 分组后
+    /// **四边形顶点**（[`Render2D::quads`]），按 `(窗口, 纹理)` 分组后
     /// **由 UI 自行决定提交顺序**（不依赖 Render2D 排序）：
     /// `(win 升序, 白纹理图形组 → 字形文字组, 纹理 uid)`——
     /// 1. 非窗口内容（`win=0`）最底，窗口按 z 从下到上（`layer = base + z`）；
     /// 2. 同一窗口内**"背景/图形 → 文字"严格成立**（白纹理组先于字形图集组），
     ///    跨帧稳定、与 Render2D 任意排序模式结果一致。
     ///
-    /// **UI 的 Render2D 必须关闭排序**（`set_sorting(false)`，完全按提交顺序绘制）：
+    /// **UI 的 Render2D 必须关闭排序**（`set_sort_mode(SortMode::None)`，完全按提交顺序绘制）：
     /// UI 自行管理绘制顺序，排序键 `(win, depth, elem, group, seq)` 依赖**提交顺序**
-    /// 生效（图形组在文字组之前提交）。⚠ `set_sorting(true)`（`SortMode::LayerAndStates`）
+    /// 生效（图形组在文字组之前提交）。⚠ `set_sort_mode(SortMode::LayerAndStates)`
     /// 会在同一 layer 内按 `(rstates, texture_uid)` 重排——字形图集页先于程序化纹理页
-    /// （圆角/渐变）注册，重排后**圆角/渐变图形会盖住文字**；`set_layer_sort(true)`
-    /// （`SortMode::LayerOnly`，稳定按 layer 排序）可接受（同层保持提交顺序）。
+    /// （圆角/渐变）注册，重排后**圆角/渐变图形会盖住文字**；`set_sort_mode(SortMode::LayerOnly)`
+    /// （稳定按 layer 排序）可接受（同层保持提交顺序）。
     /// 提交本帧 UI 到渲染器。**视口与渲染器在此延迟传入**（`begin` 时不需要）——
     /// 录制阶段可完全独立于绘制资源；`viewport`（大小 + 位置）提供屏幕固定变换，
     /// `r2d` 接收四边形。UI 不需要相机（恒为 identity：不旋转/缩放），仅需视口。
@@ -2752,14 +2774,14 @@ impl<'a> Ui<'a> {
             white_uv_wh,
             &mut stats,
         );
-        // 提交：**UI 自行管理绘制顺序**，UI 的 Render2D 必须 `set_sorting(false)`
-        // （关闭排序，完全按提交顺序绘制）；`set_layer_sort(true)`（LayerOnly，稳定排序）
-        // 同层保持提交顺序也可。⚠ 不要用 `set_sorting(true)`（LayerAndStates）：
+        // 提交：**UI 自行管理绘制顺序**，UI 的 Render2D 必须 `set_sort_mode(SortMode::None)`
+        // （关闭排序，完全按提交顺序绘制）；`set_sort_mode(SortMode::LayerOnly)`（稳定排序）
+        // 同层保持提交顺序也可。⚠ 不要用 `SortMode::LayerAndStates`：
         // 它按 `(rstates, texture_uid)` 重排，字形图集页 uid < 程序化纹理页 uid →
         // 圆角/渐变会被排在文字之后绘制，盖住文字。
         //
         // 统一排序键 `(win, 元素序, 图形/文字组, 纹理 uid)`，每 (窗口, 元素, 组, 纹理)
-        // 一次 add_quads：
+        // 一次 quads：
         // 1. **win 升序**：非窗口内容（win=0，layer = base）最底，窗口按 z 从下到上
         //    （layer = base + z）——后提交的窗口覆盖先提交的；
         // 2. **窗口内按元素序（控件录制序）**：后录控件覆盖先录控件（重叠层级正确）；
@@ -2769,7 +2791,7 @@ impl<'a> Ui<'a> {
         //
         // transform = 屏幕固定变换（窗口原点物理像素）→ 局部顶点映射到世界。
         // ── 提交：**尽力而为的窗口合批**（`submit_quads`：ordered 排序 + 连续运行切段 +
-        //    每段一次 `add_quads_styled`；窗口级 FX 应用在段实例上，顶点缓存不变）──
+        //    每段一次 `quads(..).color(tint)`；窗口级 FX 应用在段实例上，顶点缓存不变）──
         let layer_base = self.base_layer;
         let submit_us = self.submit_quads(viewport, r2d, cached, &mut quads, layer_base);
 
@@ -3010,7 +3032,7 @@ impl<'a> Ui<'a> {
 
     /// **提交顶点**（`finish` 的提交步骤）：把"本帧重建 + 缓存命中"的顶点统一排序
     /// （`(win, 元素序, 图形/文字组, 纹理)`），按 `(win, tex)` 的**连续运行**切段，每段一次
-    /// `add_quads_styled`（单一窗口 transform + 窗口 tint）→ Render2D 一次 draw_indexed 合批。
+    /// `quads(..).color(tint)`（单一窗口 transform + 窗口 tint）→ Render2D 一次 draw_indexed 合批。
     /// 不同窗口 / 不同纹理（层级需保序）或超 `MAX_UI_SEG_VERTS` 时切段；窗口级 FX
     /// （tint + transform override）应用在段实例上（顶点缓存不变）。返回本阶段耗时（µs）。
     fn submit_quads(
@@ -3051,7 +3073,7 @@ impl<'a> Ui<'a> {
         t_submit.elapsed().as_secs_f64() * 1e6
     }
 
-    /// **冲刷一个窗口段**：把累计的顶点段经 `add_quads_styled` 提交（单一窗口的
+    /// **冲刷一个窗口段**：把累计的顶点段经 `quads(..).color(tint)` 提交（单一窗口的
     /// `screen_fixed_tf` 变换 + 窗口级 FX tint/transform override；`MeshBuilder` Drop 即提交）。
     fn flush_seg(
         &mut self,
@@ -3098,8 +3120,11 @@ impl<'a> Ui<'a> {
             None => base_tf,
         };
         let layer = Layer::from(layer_base + win as f64 * 1.0);
-        r2d.add_quads_styled(seg, tf, fx.tint, layer, &tex);
-        // MeshBuilder Drop 即提交 ✓
+        r2d.quads(seg, &tex)
+            .transform(tf)
+            .color(fx.tint)
+            .layer(layer);
+        // Builder Drop 即提交 ✓
         seg.clear();
     }
 
@@ -3137,7 +3162,7 @@ impl<'a> Ui<'a> {
             let anchor_px = self.win_origins.get(&win).copied().unwrap_or(Vec2::ZERO);
             let tf = screen_fixed_tf(viewport, anchor_px);
             let layer = Layer::from(layer_base + win as f64 * 1.0);
-            r2d.add_quads(&verts, tf, layer, &tex);
+            r2d.quads(&verts, &tex).transform(tf).layer(layer);
         }
     }
 
@@ -3321,7 +3346,7 @@ impl<'a> Ui<'a> {
                             let vertical = matches!(axis, GradientAxis::Vertical);
                             let device = r2d.device();
                             let queue = r2d.queue();
-                            let layout = r2d.tex_bind_group_layout();
+                            let layout = r2d.texture_layout();
                             if let Some((tex_uid, region)) =
                                 self.state.proc.gradient(device, queue, layout, vertical, stops)
                             {

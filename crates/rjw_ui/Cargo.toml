@@ -12,7 +12,7 @@ categories = ["game-development", "gui"]
 
 [dependencies]
 rjw_atlas = { path = "../rjw_atlas", version = "0.1.3" }
-rjw_2d_render = { path = "../rjw_2d_render", version = "0.1.3" }
+rjw_2d_render = { path = "../rjw_2d_render", version = "0.2.0" }
 rjw_render = { path = "../rjw_render", version = "0.1.0" }
 rjw_text = { path = "../rjw_text", version = "0.2.2" }
 rjw_transform = { path = "../rjw_transform", version = "0.1.3" }

@@ -61,14 +61,14 @@ impl InstanceData {
     pub(crate) const SIZE: usize = std::mem::size_of::<Self>();
 
     /// 身份实例：顶点即世界坐标、UV 直通、单位模型。
-    /// 供动态 Mesh（`add_mesh*` 系列）与静态 Mesh 单实例占位使用。
+    /// 供动态 Mesh（`mesh*` 系列）与静态 Mesh 单实例占位使用。
     #[inline]
     pub(crate) fn identity() -> Self {
         IDENTITY_INSTANCE
     }
 
     /// 带 model 变换的 identity 实例（顶点为**局部坐标**，经 `model` 到世界）。
-    /// 供动态 Mesh 带变换（`add_quads` / `add_mesh_transform`）使用——
+    /// 供动态 Mesh 带变换（`quads(..).transform(..)` / `mesh(..).transform(..)`）使用——
     /// 移动窗口/物体只需改变换矩阵，顶点不变（可缓存）。
     #[inline]
     pub(crate) fn from_model(model: glam::Mat4) -> Self {
@@ -172,7 +172,7 @@ pub(crate) enum DrawOp {
         rstates: u64,
         tex_uid: Option<u64>,
     },
-    /// 动态缓冲段（`add_mesh*` 系列）：使用 `draw_page.mesh_vb / mesh_ib`。
+    /// 动态缓冲段（`mesh*` 系列）：使用 `draw_page.mesh_vb / mesh_ib`。
     /// `index_range` 为动态段的三倍三角形范围。
     DynamicMesh {
         /// 实例所在页

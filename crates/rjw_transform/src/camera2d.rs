@@ -36,11 +36,12 @@ impl Default for Camera2D {
 #[allow(unused)]
 impl Camera2D {
     #[inline]
-    pub fn move_by(&mut self, position: Vec2) {
-        self.position += position;
+    pub fn move_by(&mut self, position: impl Into<Vec2>) {
+        self.position += position.into();
     }
     #[inline]
-    pub fn walk_xy(&mut self, xy: Vec2) {
+    pub fn walk_xy(&mut self, xy: impl Into<Vec2>) {
+        let xy = xy.into();
         let (sin, cos) = self.rotation.sin_cos();
         self.position += Vec2::new(xy.x * cos - xy.y * sin, xy.x * sin + xy.y * cos);
     }
@@ -58,22 +59,22 @@ impl Camera2D {
 
 #[allow(unused)]
 impl Camera2D {
-    /// Create a camera that covers the entire window.
+    /// Create a camera that covers the entire window（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn new(window_size_px: Vec2) -> Self {
+    pub fn new(window_size_px: impl Into<Vec2>) -> Self {
         Self {
             position: Vec2::ZERO,
             rotation: 0.0,
             zoom: Vec2::ONE,
             viewport_pos: Vec2::ZERO,
-            viewport_size: window_size_px,
+            viewport_size: window_size_px.into(),
         }
     }
 
     #[inline]
-    pub fn set_vp(&mut self, viewport_size: Vec2, viewport_pos: Vec2) {
-        self.viewport_size = viewport_size;
-        self.viewport_pos = viewport_pos;
+    pub fn set_vp(&mut self, viewport_size: impl Into<Vec2>, viewport_pos: impl Into<Vec2>) {
+        self.viewport_size = viewport_size.into();
+        self.viewport_pos = viewport_pos.into();
     }
 
     /// --- Matrix helpers ---

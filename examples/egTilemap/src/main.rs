@@ -6,18 +6,11 @@
 //! - **C 键**切换剔除：`TileMap::draw` 直接收 `&Camera2D`（`view_aabb` 世界保守 AABB →
 //!   局部空间 chunk AABB 粗剔）；同时开启 `Render2D::set_cull_camera`（对 sprite 生效）；
 //! - **Q/E** 旋转相机、**R/F** 缩放相机（旋转/缩放下剔除仍保守正确）；
-//! - WASD 移动玩家（`rjw_collision::move_and_collide` 对 solid 贴片滑动碰撞）；方向键移动相机。
+//! - WASD 移动玩家（`rjw_krusie::collision::move_and_collide` 对 solid 贴片滑动碰撞）；方向键移动相机。
 
-use glam::Vec2;
-use rjw_2d_render::{ClearConfig, Render2D};
-use rjw_atlas::{AtlasConfig, DynamicAtlas, RegionRef};
-use rjw_collision::move_and_collide;
-use rjw_color::Color;
-use rjw_main::*;
-use rjw_render::{RenderConfig, RenderContext, wgpu};
-use rjw_text::{Align, Text};
-use rjw_tilemap::{Tile, TileMap};
-use rjw_transform::{Camera2D, Transform2D};
+use rjw_krusie::atlas::RegionRef;
+use rjw_krusie::collision::move_and_collide;
+use rjw_krusie::prelude::*;
 
 const TILE: f32 = 64.0;
 const GRID_W: i32 = 22;
@@ -129,7 +122,7 @@ impl App for TilemapDemo {
         let mut atlas = DynamicAtlas::new(
             render2d.device(),
             render2d.queue(),
-            render2d.tex_bind_group_layout(),
+            render2d.texture_layout(),
             AtlasConfig { max_pages: 4, padding: 1, ..Default::default() },
             1024,
         );
@@ -139,7 +132,7 @@ impl App for TilemapDemo {
         self.font = Some(Text::new(
             render2d.device(),
             render2d.queue(),
-            render2d.tex_bind_group_layout(),
+            render2d.texture_layout(),
         ));
         self.render2d = Some(render2d);
     }
@@ -162,11 +155,11 @@ impl App for TilemapDemo {
         // C：切换剔除（判定闭包形式：世界 AABB 与相机 view_aabb 相交）
         if kb.get(KeyCode::KeyC).down_edge() {
             self.culling = !self.culling;
-            let cull_fn = |aabb: &rjw_text::Rect| aabb.intersects(&self.cam.view_aabb());
+            let cull_fn = |aabb: &Rect| aabb.intersects(&self.cam.view_aabb());
             eprintln!(
                 "culling: {}  visible {}/{}  chunks {}",
                 self.culling,
-                self.map.visible_count(self.culling.then_some(&cull_fn as &dyn Fn(&rjw_text::Rect) -> bool)),
+                self.map.visible_count(self.culling.then_some(&cull_fn as &dyn Fn(&Rect) -> bool)),
                 self.map.tile_count(),
                 self.map.chunk_count(),
             );
@@ -217,18 +210,15 @@ impl App for TilemapDemo {
 
         // TileMap 剔除：判定闭包（世界 AABB 与相机 view_aabb 相交），None = 不剔除
         let view_aabb = self.cam.view_aabb();
-        let cull_fn = |aabb: &rjw_text::Rect| aabb.intersects(&view_aabb);
-        let cull: Option<&dyn Fn(&rjw_text::Rect) -> bool> =
+        let cull_fn = |aabb: &Rect| aabb.intersects(&view_aabb);
+        let cull: Option<&dyn Fn(&Rect) -> bool> =
             if self.culling { Some(&cull_fn) } else { None };
         self.map.draw(r2d, atlas, 0.0, cull);
 
         // 玩家方块（地图旋转时玩家仍在世界坐标移动）
-        r2d.add_sprite2d_solid(
-            rjw_2d_render::SpriteRect::from_texture(self.player_pos, self.player_size),
-            Color::WHITE,
-            Transform2D::default(),
-            50.0,
-        );
+        r2d.solid(SpriteRect::new(self.player_pos, self.player_size))
+            .color(Color::WHITE)
+            .layer(50.0);
 
         // HUD（UI 文本，屏幕固定——内联实现，不依赖 rjw_text 扩展）：
         // - 位置：anchor = cam.screen_to_world(屏幕像素)，随相机旋转/缩放仍是屏幕左上角；
@@ -286,7 +276,7 @@ fn main() -> Result<(), EventLoopError> {
     if cam.rotation != 0.0 {
         eprintln!("initial cam rotation = {:.3} rad", cam.rotation);
     }
-    rjw_main::run_app(TilemapDemo {
+    run_app(TilemapDemo {
         render: None,
         render2d: None,
         font: None,

@@ -37,7 +37,7 @@ Ui::begin(window, &mut text, &mut state)
 - **录制阶段**：每次控件调用把一条/多条 `UiDraw` 命令压入队列（坐标是**相对当前容器的
   局部逻辑像素**，容器弹出时统一平移成绝对）。这一阶段不碰 GPU，也不碰输入设备（快照）。
 - **提交阶段**（`finish`）：排序 → 按窗口分组 → 收集成四边形 → 提交到独立的 `Render2D`
-  （UI 必须 `set_sorting(false)`，绘制顺序由 UI 自己管理）。
+  （UI 必须 `set_sort_mode(SortMode::None)`，绘制顺序由 UI 自己管理）。
 
 ### 2. 坐标与 DPI
 
@@ -131,7 +131,7 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 线性渐变仍在独立程序化 Atlas 页。
 
 **窗口级合批（尽力而为）**：`finish` 提交按窗口聚合——同一窗口内**连续的同纹理同状态
-内容**顶点合并成整段，一次 `add_quads_styled` → Render2D 一次 `draw_indexed`（命中其
+内容**顶点合并成整段，一次 `quads(..).color(tint)` → Render2D 一次 `draw_indexed`（命中其
 QuadVertices 合批）。窗口内出现不同纹理（白纹理 / 圆角渐变程序化页）或不同混合状态、
 或超顶点上限（`MAX_UI_SEG_VERTS`）时自动**切段**（层级保序）。
 
@@ -198,7 +198,7 @@ ui.window("win")
 
 // 提交
 let viewport = Viewport::new(render2d.size(), Vec2::ZERO);
-r2d_ui.set_mvp(viewport.vp_matrix());           // UI 的 Render2D 须 set_sorting(false)
+r2d_ui.set_mvp(viewport.vp_matrix());           // UI 的 Render2D 须 set_sort_mode(SortMode::None)
 ui.finish(&viewport, r2d_ui);
 ```
 

@@ -308,17 +308,17 @@ impl Style {
         self
     }
 
-    /// 归一化原点。
+    /// 归一化原点（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn origin(mut self, origin: Vec2) -> Self {
-        self.render.origin = Some(origin);
+    pub fn origin(mut self, origin: impl Into<Vec2>) -> Self {
+        self.render.origin = Some(origin.into());
         self
     }
 
-    /// 像素偏移。
+    /// 像素偏移（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn offset(mut self, offset: Vec2) -> Self {
-        self.render.offset = Some(offset);
+    pub fn offset(mut self, offset: impl Into<Vec2>) -> Self {
+        self.render.offset = Some(offset.into());
         self
     }
 
@@ -485,15 +485,15 @@ impl<'a> TextStyle<'a> {
         self.style = self.style.color(color);
         self
     }
-    /// 归一化原点。
+    /// 归一化原点（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn origin(mut self, origin: Vec2) -> Self {
+    pub fn origin(mut self, origin: impl Into<Vec2>) -> Self {
         self.style = self.style.origin(origin);
         self
     }
-    /// 像素偏移。
+    /// 像素偏移（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn offset(mut self, offset: Vec2) -> Self {
+    pub fn offset(mut self, offset: impl Into<Vec2>) -> Self {
         self.style = self.style.offset(offset);
         self
     }
@@ -632,17 +632,17 @@ impl<'a> TextLayout<'a> {
         self
     }
 
-    /// 渲染默认：归一化原点。
+    /// 渲染默认：归一化原点（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn origin(mut self, origin: Vec2) -> Self {
-        self.render.origin = Some(origin);
+    pub fn origin(mut self, origin: impl Into<Vec2>) -> Self {
+        self.render.origin = Some(origin.into());
         self
     }
 
-    /// 渲染默认：像素偏移。
+    /// 渲染默认：像素偏移（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn offset(mut self, offset: Vec2) -> Self {
-        self.render.offset = Some(offset);
+    pub fn offset(mut self, offset: impl Into<Vec2>) -> Self {
+        self.render.offset = Some(offset.into());
         self
     }
 
@@ -977,14 +977,15 @@ pub struct TextRender<'a> {
 impl TextRender<'_> {
     /// 归一化原点（相对内容宽高，[0,1]；`(0,0)` 左上角，`(0.5,0.5)` 居中）。
     #[inline]
-    pub fn origin(&mut self, norm: Vec2) -> &mut Self {
-        self.origin = norm;
+    pub fn origin(&mut self, norm: impl Into<Vec2>) -> &mut Self {
+        self.origin = norm.into();
         self
     }
 
-    /// 像素原点（相对内容左上角的偏移量）。
+    /// 像素原点（相对内容左上角的偏移量；接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn origin_px(&mut self, px: Vec2) -> &mut Self {
+    pub fn origin_px(&mut self, px: impl Into<Vec2>) -> &mut Self {
+        let px = px.into();
         self.origin = Vec2::new(
             if self.content_size.x > 0.0 { px.x / self.content_size.x } else { 0.0 },
             if self.content_size.y > 0.0 { px.y / self.content_size.y } else { 0.0 },
@@ -992,10 +993,10 @@ impl TextRender<'_> {
         self
     }
 
-    /// 额外像素偏移（叠加在 origin 之后）。
+    /// 额外像素偏移（叠加在 origin 之后；接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn offset(&mut self, px: Vec2) -> &mut Self {
-        self.offset = px;
+    pub fn offset(&mut self, px: impl Into<Vec2>) -> &mut Self {
+        self.offset = px.into();
         self
     }
 
@@ -1163,7 +1164,6 @@ impl TextRender<'_> {
     #[inline]
     pub fn draw_sprite2d(&self, r2d: &mut Render2D, layer: impl Into<Layer>) {
         let delta = self.render_delta();
-        let inv = Vec2::new(1.0 / self.page_size, 1.0 / self.page_size);
         let base: f64 = layer.into().as_f64();
         let render = self.transform;
         if self.cull {
@@ -1183,11 +1183,11 @@ impl TextRender<'_> {
                 }
             }
             let Some(tex) = TEXTURES.get(g.region.page_uid) else { continue };
-            let rect = SpriteRect::from_texture_px(
+            let rect = SpriteRect::with_uv_tex(
                 tl, g.size,
                 Vec2::new(g.region.tl_px.0 as f32, g.region.tl_px.1 as f32),
                 Vec2::new(g.region.wh_px.0 as f32, g.region.wh_px.1 as f32),
-                inv,
+                &tex,
             );
             let color = if g.glyph_type == GlyphType::Color {
                 // 彩色字形（Emoji）：保留自身 RGBA，不叠加全局 tint
@@ -1217,7 +1217,10 @@ impl TextRender<'_> {
                     }
                 }
             }
-            r2d.add_sprite2d(rect, color, transform, layer, &tex);
+            r2d.sprite(rect, &tex)
+                .color(color)
+                .transform(transform)
+                .layer(layer);
         }
     }
 
@@ -1286,7 +1289,7 @@ impl TextRender<'_> {
 
         for (uid, idxs) in pages {
             let Some(tex) = TEXTURES.get(uid) else { continue };
-            r2d.add_mesh_fn(Color::WHITE, layer, |sink| {
+            r2d.mesh_with(|sink| {
                 for &i in &idxs {
                     let g = &glyphs[i];
                     let tl = g.top_left + delta;
@@ -1349,7 +1352,9 @@ impl TextRender<'_> {
                     sink.push_tri(i1, i3, i2);
                 }
             })
-            .set_texture(&tex);
+            .color(Color::WHITE)
+            .layer(layer)
+            .texture(&tex);
         }
     }
 }// ─── 内部工具函数 ───────────────────────────────────────────────

@@ -100,13 +100,15 @@ impl Frame {
 
     /// 设置**下一子项**的最小尺寸约束（`0` = 该轴不约束）。一次性，`child_rect` 消耗。
     /// 多次调用取各轴最大值。
-    pub fn set_next_min(&mut self, min: Vec2) {
+    pub fn set_next_min(&mut self, min: impl Into<Vec2>) {
+        let min = min.into();
         self.next_min = Vec2::new(self.next_min.x.max(min.x), self.next_min.y.max(min.y));
     }
 
     /// 设置**下一子项**的最大尺寸约束（`0` = 该轴不约束）。一次性，`child_rect` 消耗。
     /// 多次调用取各轴最小值（0 表示不约束，取非零较小值）。
-    pub fn set_next_max(&mut self, max: Vec2) {
+    pub fn set_next_max(&mut self, max: impl Into<Vec2>) {
+        let max = max.into();
         let merge = |cur: f32, v: f32| {
             if cur <= 0.0 { v } else if v <= 0.0 { cur } else { cur.min(v) }
         };

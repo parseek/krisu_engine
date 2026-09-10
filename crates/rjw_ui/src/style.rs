@@ -703,7 +703,8 @@ impl ButtonStyle {
         self
     }
     /// 内边距（x = 水平，y = 垂直）。
-    pub fn with_padding(mut self, p: glam::Vec2) -> Self {
+    pub fn with_padding(mut self, p: impl Into<glam::Vec2>) -> Self {
+        let p = p.into();
         self.padding = p;
         self
     }
@@ -917,7 +918,8 @@ impl ModalStyle {
         self
     }
     /// 遮罩尺寸（**逻辑像素**）。
-    pub fn with_size(mut self, s: glam::Vec2) -> Self {
+    pub fn with_size(mut self, s: impl Into<glam::Vec2>) -> Self {
+        let s = s.into();
         self.size = Some(s);
         self
     }

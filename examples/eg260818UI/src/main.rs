@@ -1,9 +1,9 @@
 //! eg260818UI —— `rjw_ui` 示例：DOM 风格自动布局 + Tkinter 几何管理器（pack / grid / place）。
 //!
 //! 展示：
-//! - **独立 UI 渲染**：UI 录制到**单独 Render2D**（`set_sorting(false)`：关闭 Render2D
+//! - **独立 UI 渲染**：UI 录制到**单独 Render2D**（`set_sort_mode(SortMode::None)`：关闭 Render2D
 //!   排序，UI 自行管理绘制顺序——窗口按 z 提交、窗口内"背景/图形 → 文字"），与世界合并
-//!   提交（世界 `render_command_buffer` → UI `render_command_buffer` → 一次 present）
+//!   提交（世界 `encode` → UI `encode` → 一次 present）
 //! - **Window 容器**：可重叠 + 点击置顶（焦点 z-order）+ 可拖拽；同一 layer 内
 //!   "背景/图形 → 文字"顺序绘制（不做元素重叠处理）
 //! - **pack**：左侧主菜单（标题 / 按钮 / 滑块 / 勾选框 / 单选组）垂直堆叠
@@ -35,14 +35,7 @@
 
 use std::time::Instant;
 
-use glam::{Vec2, vec2};
-use rjw_2d_render::{ClearConfig, Render2D, SpriteRect};
-use rjw_color::Color;
-use rjw_main::*;
-use rjw_render::{wgpu, RenderConfig, RenderContext};
-use rjw_text::Text;
-use rjw_transform::{Rect, Transform2D, Viewport};
-use rjw_ui::{Anchor, Button, Divider, FontModal, IdAbsolute, Label, NumberInput, PackSide, PanelStyle, Slider, Theme, Ui, UiAdd, UiState, UiStats, WindowClamp, WindowFx};
+use rjw_krusie::prelude::*;
 
 const LAYER_UI: f64 = 10_000_000.0;
 
@@ -144,7 +137,7 @@ impl Menu {
     fn ui(&mut self, ui: &mut Ui, clicks: &mut u32) {
         ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {
             p.label("主菜单");
-            // 新控件 API（Widget trait + 属性化 builder，见 rjw_ui::widgets）：
+            // 新控件 API（Widget trait + 属性化 builder，见 rjw_krusie::ui::widgets）：
             // `p.add(…)` 占光标，属性逐控件覆盖主题（文本色/背景/圆角等），
             // 旧 `p.button(…)` API 仍可用。
             if p
@@ -646,20 +639,19 @@ impl PerfAgg {
 /// 与 `&mut self.render2d` 的字段借用冲突）。
 fn render_world(r2d: &mut Render2D) {
     let world_tf = Transform2D::default();
-    r2d.add_sprite2d_solid(
-        SpriteRect::from_texture(Vec2::new(-640.0, -360.0), Vec2::new(1280.0, 720.0)),
-        Color::rgba_u8(30, 36, 48, 255),
-        world_tf,
-        0.0,
-    );
+    r2d.solid(SpriteRect::new((-640.0, -360.0), (1280.0, 720.0)))
+    .color(Color::rgba_u8(30, 36, 48, 255))
+    .transform(world_tf)
+    .layer(0.0);
     for i in 0..6 {
         let x = -560.0 + i as f32 * 220.0;
-        r2d.add_sprite2d_solid(
-            SpriteRect::from_texture(Vec2::new(x, -280.0 + (i % 2) as f32 * 160.0), Vec2::new(160.0, 90.0)),
-            Color::rgba_u8(40 + i * 20, 60, 90, 255),
-            world_tf,
-            1.0,
-        );
+        r2d.solid(SpriteRect::new(
+            (x, -280.0 + (i % 2) as f32 * 160.0),
+            (160.0, 90.0),
+        ))
+        .color(Color::rgba_u8(40 + i * 20, 60, 90, 255))
+        .transform(world_tf)
+        .layer(1.0);
     }
 }
 
@@ -675,12 +667,12 @@ fn submit_frame(
     fps: f64,
 ) {
     let t_render = Instant::now();
-    let Some((surface_tex, view)) = r2d.begin_frame() else {
+    let Some((surface_tex, view)) = r2d.acquire_frame() else {
         return;
     };
     let begin_us = t_render.elapsed().as_secs_f64() * 1e6;
     let t_enc = Instant::now();
-    let cb_world = r2d.render_command_buffer(
+    let cb_world = r2d.encode(
         &ClearConfig {
             color: Some(wgpu::Color { r: 0.09, g: 0.11, b: 0.16, a: 1.0 }),
             depth: None,
@@ -689,7 +681,7 @@ fn submit_frame(
         &view,
         None,
     );
-    let cb_ui = r2d_ui.render_command_buffer(
+    let cb_ui = r2d_ui.encode(
         &ClearConfig { color: None, depth: None, stencil: None },
         &view,
         None,
@@ -722,14 +714,14 @@ impl App for UiApp {
         self.render = Some(RenderContext::new(window, &RenderConfig::default()));
         let render = self.render.as_ref().unwrap();
         let render2d = Render2D::new(render);
-        // 独立 UI 渲染器：**必须关闭 Render2D 排序**（set_sorting(false)）——
+        // 独立 UI 渲染器：**必须关闭 Render2D 排序**（set_sort_mode(SortMode::None)）——
         // UI 自行管理绘制顺序：`finish` 按（窗口 z 升序 → 窗口内图形组 → 字形文字组）提交，
         // 每窗口 `layer = base + z*1.0` 仅作兜底；Render2D 按提交顺序原样绘制。
-        // ⚠ 不要用 set_sorting(true)（LayerAndStates）：它会在同一 layer 内**按纹理 uid
+        // ⚠ 不要用 SortMode::LayerAndStates：它会在同一 layer 内**按纹理 uid
         // 重排**，字形图集页先于程序化纹理页（圆角/渐变）注册 → 圆角/渐变会盖住文字。
         let mut render2d_ui = Render2D::new(render);
-        render2d_ui.set_sorting(false);
-        let font = Text::new(render2d.device(), render2d.queue(), render2d.tex_bind_group_layout());
+        render2d_ui.set_sort_mode(SortMode::None);
+        let font = Text::new(render2d.device(), render2d.queue(), render2d.texture_layout());
         let (w, h) = render.size();
         let viewport = Viewport::new(Vec2::new(w as f32, h as f32), Vec2::ZERO);
         self.render2d = Some(render2d);

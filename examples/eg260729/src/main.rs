@@ -1,6 +1,4 @@
-use rjw_color::ColorF64;
-use rjw_main::*;
-use rjw_render::{RenderConfig, RenderContext};
+use rjw_krusie::prelude::*;
 
 struct ClearScreen {
     render: Option<RenderContext>,
@@ -81,6 +79,6 @@ impl App for ClearScreen {
 
 fn main() -> Result<(), EventLoopError> {
     env_logger::init();
-    log::info!("APP: {}", *rjw_main::PRIMARY_WINDOW_TITLE);
+    log::info!("APP: {}", *rjw_krusie::main::PRIMARY_WINDOW_TITLE);
     run_app(ClearScreen::new())
 }

@@ -25,7 +25,7 @@ pub fn screen_fixed_tf(viewport: &Viewport, anchor_px: Vec2) -> Transform2D {
 /// 屏幕矩形 → 精灵矩形（mesh 局部坐标从 (0,0) 起，尺寸 = 矩形宽高）。
 #[inline]
 pub fn rect_sprite(rect: &Rect) -> SpriteRect {
-    SpriteRect::from_texture(Vec2::ZERO, Vec2::new(rect.w, rect.h))
+    SpriteRect::new(Vec2::ZERO, (rect.w, rect.h))
 }
 
 /// **屏幕像素取整**（pixel snapping）：左上角与右下角分别四舍五入到整数像素，

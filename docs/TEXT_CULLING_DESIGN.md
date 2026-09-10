@@ -27,7 +27,7 @@ TextLayout（text/size/align/attrs…）
        ├─ shape_and_rasterize()         ① 排版（create_buffer → cosmic-text 整形 + 光栅化入图集）
        └─ collect_glyphs()              ② 遍历 layout_runs() 填充 Vec<GlyphData> / Vec<LineMeasureInfo>
             └─ TextRender
-                 ├─ draw_sprite2d()     ③ 逐字形 add_sprite2d（Render2D 批处理）
+                 ├─ draw_sprite2d()     ③ 逐字形 sprite（Render2D 批处理）
                  ├─ draw_2d_gradient()  ④ 逐字形动态 mesh（逐顶点色）
                  └─ draw_with()         ⑤ 逐字形回调（渲染器无关）
 ```
@@ -181,7 +181,7 @@ impl Text {
 2. 一个能分支的 fragment shader；
 3. mask 字形 1B/px 打包（`Format::Mask` 输出 + R8 纹理）。
 
-**障碍**：`Render2D`（`crates/rjw_2d_render`）的 `sprite.wgsl` 是**单一纹理采样**，`add_sprite2d` 不接受自定义 Shader / 额外 bind group，`Render2D` 无 shader 注册机制。
+**障碍**：`Render2D`（`crates/rjw_2d_render`）的 `sprite.wgsl` 是**单一纹理采样**，`sprite` 不接受自定义 Shader / 额外 bind group，`Render2D` 无 shader 注册机制。
 
 **三条路径评估**：
 - a) **Render2D 增加自定义 Shader/专用文本管线**（shader 注册 + bind group 扩展）：改动面大，跨 crate；收益=内存 4x 节省 + emoji sRGB 精确。

@@ -28,17 +28,17 @@ impl Transform2D {
         rotation: 0.0,
     };
 
-    /// Builder: set position. / 构建器模式：设置位置。
+    /// Builder: set position. / 构建器模式：设置位置（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn with_pos(mut self, pos: Vec2) -> Self {
-        self.pos = pos;
+    pub fn with_pos(mut self, pos: impl Into<Vec2>) -> Self {
+        self.pos = pos.into();
         self
     }
 
-    /// Builder: set scale. / 构建器模式：设置缩放。
+    /// Builder: set scale. / 构建器模式：设置缩放（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn with_scale(mut self, scale: Vec2) -> Self {
-        self.scale = scale;
+    pub fn with_scale(mut self, scale: impl Into<Vec2>) -> Self {
+        self.scale = scale.into();
         self
     }
 
@@ -49,27 +49,27 @@ impl Transform2D {
         self
     }
 
-    /// Builder: translate by `pos`. / 构建器模式：位移。
+    /// Builder: translate by `pos`. / 构建器模式：位移（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn with_move_by(mut self, pos: Vec2) -> Self {
-        self.pos += pos;
+    pub fn with_move_by(mut self, pos: impl Into<Vec2>) -> Self {
+        self.pos += pos.into();
         self
     }
 
-    /// Builder: translate by rotated `pos`. / 构建器模式：按旋转位移。
+    /// Builder: translate by rotated `pos`. / 构建器模式：按旋转位移（接受 `Vec2` 或 `(x, y)`）。
     ///
     /// 位移向量 `pos` 先按当前旋转角 `self.rotation` 旋转，再应用到位置。
     /// 等价于 `pos * R(rotation)`，与 `Camera2D::walk_xy` 的旋转约定一致。
     #[inline]
-    pub fn with_walk_by(mut self, pos: Vec2) -> Self {
-        self.pos += Vec2::from_angle(self.rotation).rotate(pos);
+    pub fn with_walk_by(mut self, pos: impl Into<Vec2>) -> Self {
+        self.pos += Vec2::from_angle(self.rotation).rotate(pos.into());
         self
     }
 
-    /// Builder: scale by `scale`. / 构建器模式：缩放。
+    /// Builder: scale by `scale`. / 构建器模式：缩放（接受 `Vec2` 或 `(x, y)`）。
     #[inline]
-    pub fn with_scale_by(mut self, scale: Vec2) -> Self {
-        self.scale *= scale;
+    pub fn with_scale_by(mut self, scale: impl Into<Vec2>) -> Self {
+        self.scale *= scale.into();
         self
     }
 

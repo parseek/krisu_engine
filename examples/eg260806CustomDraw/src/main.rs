@@ -1,18 +1,15 @@
-//! eg260806CustomDraw —— 演示引擎的「逃逸舱口」`add_custom` / `CustomDraw`
+//! eg260806CustomDraw —— 演示引擎的「逃逸舱口」`custom` / `CustomDraw`
 //!
 //! 展示能力：
 //! - **结构体形式**：实现 `CustomDraw` trait，持有自建管线 + 顶点缓冲，
 //!   在引擎已打开 RenderPass 内直接 `set_pipeline + set_vertex_buffer + draw`。
-//! - **闭包形式**：`add_custom(layer, move |pass| ...)`，blanket impl 自动实现。
+//! - **闭包形式**：`custom(move |pass| ...).layer(layer)`，blanket impl 自动实现。
 //! - 与引擎自带的 Sprite 批处理**混排**（custom 三角形夹在两个 Sprite 层之间），
-//!   证明 `add_custom` 参与 (layer, states) 排序并按需执行。
+//!   证明 `custom` 参与 (layer, states) 排序并按需执行。
 
-use glam::Vec2;
-use rjw_2d_render::{ClearConfig, CustomDraw, Render2D, SpriteRect};
-use rjw_color::Color;
-use rjw_main::*;
-use rjw_render::{RenderConfig, RenderContext, wgpu, wgpu::util::DeviceExt};
-use rjw_transform::{Camera2D, Transform2D};
+use rjw_krusie::gpu::wgpu::util::DeviceExt;
+use rjw_krusie::prelude::*;
+use rjw_krusie::render2d::CustomDraw;
 
 /// 自定义绘制指令着色器：顶点位置直接用 NDC 坐标（不经过 engine 的 VP 统一缓冲）。
 const CUSTOM_WGSL: &str = r#"
@@ -38,7 +35,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 /// 一个自绘三角形：独立管线 + 顶点缓冲（位置 + 颜色交错）。
-/// `Clone` 可行（wgpu 资源句柄内部 Arc），便于传入多个 `add_custom`。
+/// `Clone` 可行（wgpu 资源句柄内部 Arc），便于传入多个 `custom`。
 #[derive(Clone)]
 struct Tri {
     pipeline: wgpu::RenderPipeline,
@@ -51,7 +48,7 @@ impl Tri {
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         pts: [(f32, f32); 3],
-        color: [rjw_color::Color; 3],
+        color: [Color; 3],
     ) -> Self {
         // 交错：pos(2×f32) + color(4×f32) = 24 字节 / 顶点
         let mut verts = Vec::with_capacity(3 * 6);
@@ -166,7 +163,7 @@ impl CustomDrawApp {
 impl App for CustomDrawApp {
     fn primary_window_attrib(&self) -> WindowAttributes {
         WindowAttributes::default()
-            .with_title("eg260731CustomDraw - add_custom / CustomDraw")
+            .with_title("eg260731CustomDraw - custom / CustomDraw")
             .with_inner_size(LogicalSize::new(1280.0, 720.0))
     }
 
@@ -235,35 +232,34 @@ impl App for CustomDrawApp {
         render2d.set_mvp(self.cam.vp_matrix());
 
         // ── 引擎自己的 Sprite（layer 0：底层）── 旋转的蓝色方块
-        let board = SpriteRect::from_texture(Vec2::splat(-70.0), Vec2::splat(140.0));
-        render2d.add_sprite2d_solid(
-            board,
-            Color::rgba(0.12, 0.28, 0.6, 1.0),
-            Transform2D::default().with_pos(Vec2::ZERO).with_rot(t * 0.7),
-            LAYER_BACK,
-        );
+        let board = SpriteRect::new((-70.0, -70.0), (140.0, 140.0));
+        render2d
+            .solid(board)
+            .color(Color::rgba(0.12, 0.28, 0.6, 1.0))
+            .transform(Transform2D::default().with_pos(Vec2::ZERO).with_rot(t * 0.7))
+            .layer(LAYER_BACK);
 
         // ── 结构体形式：三个自绘三角形（layer 1，夹在 Sprite 之间）──
         for tri in &self.tris[1..] {
-            render2d.add_custom(LAYER_MID, tri.clone()); // CustomDraw: Send + Sync，Arc 句柄可 clone
+            render2d.custom(tri.clone()).layer(LAYER_MID); // CustomDraw: Send + Sync，Arc 句柄可 clone
         }
 
         // ── 闭包形式：等价写法（blanket impl：Fn(&mut RenderPass) + Send + Sync）──
         // 这里让第一个三角形再画一次，验证同一资源可多路复用。
         let tri0 = self.tris[0].clone();
-        render2d.add_custom(LAYER_MID - 0.1, move |pass: &mut wgpu::RenderPass<'_>| {
-            tri0.draw_to(pass);
-        });
+        render2d
+            .custom(move |pass: &mut wgpu::RenderPass<'_>| {
+                tri0.draw_to(pass);
+            })
+            .layer(LAYER_MID - 0.1);
 
         // ── 引擎自己的 Sprite（layer 2：顶层）── 半透明黄色条盖住 overlap 部分
-        let top = SpriteRect::from_texture(Vec2::new(-40.0, -240.0), Vec2::new(80.0, 480.0));
+        let top = SpriteRect::new((-40.0, -240.0), (80.0, 480.0));
         render2d
-            .add_sprite2d_solid(
-                top,
-                Color::rgba(1.0, 0.85, 0.2, 0.55),
-                Transform2D::default().with_pos(Vec2::splat(150.0)).with_rot(0.4),
-                LAYER_TOP,
-            );
+            .solid(top)
+            .color(Color::rgba(1.0, 0.85, 0.2, 0.55))
+            .transform(Transform2D::default().with_pos(Vec2::splat(150.0)).with_rot(0.4))
+            .layer(LAYER_TOP);
 
         if let Some(w) = ctx.primary_window() {
             w.set_title(&format!(
@@ -286,5 +282,5 @@ const LAYER_TOP: f32 = 2.0;
 
 fn main() -> Result<(), EventLoopError> {
     env_logger::init();
-    rjw_main::run_app(CustomDrawApp::new())
+    run_app(CustomDrawApp::new())
 }

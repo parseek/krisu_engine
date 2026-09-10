@@ -19,6 +19,7 @@
 ## ✨ 特性
 
 - 🎨 **Batch2D 批渲染**（`rjw_2d_render`）：Sprite/Mesh **统一管线** + RStates 渲染状态 bitfield（u64），按 (layer, states) 排序
+- 🚪 **统一入口**（`rjw_krusie`）：`use rjw_krusie::prelude::*;` **一行起步**（应用骨架 + 绘制 + 相机 + 文本 + UI），低层/冲突名走 `rjw_krusie::<模块>::…`
 - 🔗 **Builder 责任链**：`add_sprite2d(...).blend(Additive).depth_test(true)` 按对象定制渲染状态；不链式 = 全局默认
 - 🎛️ **渲染状态 RStates**：Blend（含 Inverse/Subtract/Min/Max/Disabled 9 种模式）/ Sampler / Cull+Raster / Depth / Stencil 6 域 bitfield，三级控制（全局默认 → 单条绘制 → 批量描述符）
 - 📦 **实例缓冲页池**：单帧精灵数量可远超单批上限（8192），自动分页绘制，不阻塞帧、无运行时扩张
@@ -32,6 +33,7 @@
 
 | crate | 职责 |
 |---|---|
+| `rjw_krusie` | ★ **统一入口**（聚合，无实现）：`rjw_krusie::prelude::*` 一行起步 + `main`/`gpu`/`render2d`/`transform`/`color`/`atlas`/`text`/`ui`/`tilemap`/`collision` 命名空间 |
 | `rjw_main` | 入口 `run_app(App)`、事件循环、窗口、`MainContext`（键盘/鼠标/计时） |
 | `rjw_render` | 底层 `RenderContext`、纹理 `TextureWrapped`、wgpu 重导出 |
 | `rjw_2d_render` | ★ 2D 批渲染器 `Render2D`、`RStates`、Builder 责任链、`SpriteRect`、`Mesh`、分页实例缓冲、**统一管线缓存** |

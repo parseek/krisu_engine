@@ -2,9 +2,9 @@
 
 use std::ops::Range;
 
-use rjw_transform::Transform2D;
+use rjw_transform::{Rect, Transform2D};
 
-use crate::{data::SpriteRect, rstates::RStates};
+use crate::{cull, data::SpriteRect, rstates::RStates, sort::SortKey};
 
 // ─── 绘制命令 / 排序 ──────────────────────────────────────────
 
@@ -93,18 +93,21 @@ pub(crate) struct States {
     pub(crate) texture_uid: Option<u64>,
 }
 
-/// 绘制命令队列：命令 + 层级 + 状态，支持排序合批
+/// 绘制命令队列：命令 + 层级 + 状态（三条并行数组 + 索引数组）。
+///
+/// **职责边界**：本类型只负责"存取"，不含排序 / 剔除策略——
+/// 排序见 [`crate::sort`]、剔除见 [`crate::cull`]，二者都只操作
+/// [`Self::take_order`] 取出的索引数组。
 #[derive(Debug, Default)]
 pub(crate) struct DrawCommandQueue {
     commands: Vec<DrawCommand>,
     layers: Vec<Layer>,
     states: Vec<States>,
-    cmd_indicies: Vec<usize>,
+    /// 绘制顺序（索引数组）：元素为 `commands` 的下标。排序 / 剔除都作用于它。
+    order: Vec<usize>,
 
     /// 高级 Sprite2D 的模型矩阵池（`DrawCommand::Sprite2DMatrix.mat_idx` 指向此处）。
     pub(crate) matrices: Vec<glam::Mat4>,
-
-    dirty: bool,
 }
 
 impl DrawCommandQueue {
@@ -112,57 +115,81 @@ impl DrawCommandQueue {
     fn check_vaild(&self) {
         debug_assert_eq!(self.commands.len(), self.layers.len());
         debug_assert_eq!(self.states.len(), self.layers.len());
-        debug_assert_eq!(self.states.len(), self.cmd_indicies.len());
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.check_vaild();
-        self.cmd_indicies.len()
+        debug_assert_eq!(self.states.len(), self.order.len());
     }
 
     pub(crate) fn push(&mut self, command: DrawCommand, layer: Layer, states: States) {
-        self.cmd_indicies.push(self.len());
+        self.order.push(self.commands.len());
         self.commands.push(command);
         self.layers.push(layer);
         self.states.push(states);
-        self.dirty = true;
         self.check_vaild();
     }
 
     pub(crate) fn clear(&mut self) {
-        self.cmd_indicies.clear();
+        self.order.clear();
         self.commands.clear();
         self.layers.clear();
         self.states.clear();
         self.matrices.clear();
-        self.dirty = false;
     }
 
-    #[allow(unused)]
-    pub(crate) fn sort_layer(&mut self) {
-        if !self.dirty {
-            return;
+    // ── 索引数组存取（排序 / 剔除的输入输出） ──────────────────
+
+    /// 索引数组是否为空（未被录制任何命令）。
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// 取出索引数组（所有权转移，便于在此期间继续借用队列自身）。
+    #[inline]
+    pub(crate) fn take_order(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.order)
+    }
+
+    /// 回填索引数组。
+    #[inline]
+    pub(crate) fn set_order(&mut self, order: Vec<usize>) {
+        self.order = order;
+    }
+
+    /// 生成与**命令下标**对齐的排序键（写进常驻缓冲，零堆分配）。
+    pub(crate) fn fill_sort_keys(&self, out: &mut Vec<SortKey>) {
+        self.check_vaild();
+        out.clear();
+        out.reserve(self.order.len());
+        for i in 0..self.commands.len() {
+            let s = &self.states[i];
+            out.push(SortKey {
+                layer: self.layers[i],
+                rstates: s.rstates,
+                texture_uid: s.texture_uid,
+            });
         }
-        self.cmd_indicies.sort_by_key(|&i| self.layers[i]);
-        self.dirty = false;
     }
 
-    pub(crate) fn sort_layer_then_states(&mut self) {
-        if !self.dirty {
-            return;
+    /// 命令 `i` 的世界 AABB（供剔除）；`None` = 该命令不参与剔除。
+    ///
+    /// 只有 Sprite 命令有确定的 AABB（动态 Mesh / StaticMesh / Custom 恒保留），
+    /// 与原"仅 Sprite 被剔除"的行为一致。
+    pub(crate) fn cull_aabb(&self, i: usize) -> Option<Rect> {
+        match &self.commands[i] {
+            DrawCommand::Sprite2D { rect, transform, .. } => Some(cull::sprite_world_aabb(
+                rect,
+                &cull::transform2d_model(transform),
+            )),
+            DrawCommand::Sprite2DMatrix { rect, mat_idx, .. } => {
+                Some(cull::sprite_world_aabb(rect, &self.matrices[*mat_idx]))
+            }
+            _ => None,
         }
-        self.cmd_indicies.sort_by(|&a, &b| {
-            self.layers[a]
-                .cmp(&self.layers[b])
-                .then(self.states[a].cmp(&self.states[b]))
-        });
-        self.dirty = false;
     }
 
+    /// 按绘制顺序迭代命令（`iter` 前应已应用排序 / 剔除结果）。
     #[inline]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&DrawCommand, Layer, &States)> {
-        self.cmd_indicies
+        self.order
             .iter()
             .map(|&i| (&self.commands[i], self.layers[i], &self.states[i]))
     }

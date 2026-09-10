@@ -12,6 +12,7 @@
 
 ## 目录
 
+- [0. 统一入口（rjw_krusie）](#0-统一入口rjw_krusie)
 - [1. Color / ColorF64（颜色）](#1-color--colorf64颜色)
 - [2. Transform2D（变换）](#2-transform2d变换)
 - [3. Camera2D（相机）](#3-camera2d相机)
@@ -24,6 +25,34 @@
 - [9. Text（文本渲染）](#9-text文本渲染)
 - [10. 其他常用小类型速查](#10-其他常用小类型速查)
 - [11. UI（rjw_ui）](#11-uirjw_ui)
+
+---
+
+## 0. 统一入口（`rjw_krusie`）
+
+crate：`rjw_krusie`（聚合，无实现）——**整套库一行起步**；低层与命名冲突走命名空间。
+
+```rust
+// 应用：应用骨架 + 绘制 + 相机 + 颜色 + 文本 + UI 一次到位
+use rjw_krusie::prelude::*;
+
+// 按需补充（低层类型 / 自由函数 / 冲突名）
+use rjw_krusie::atlas::RegionRef;
+use rjw_krusie::collision::move_and_collide;
+use rjw_krusie::render2d::CustomDraw;
+```
+
+| 层 | 内容 |
+|---|---|
+| `rjw_krusie::prelude` | `App` / `run_app` / `MainContext` / winit 骨架 / `Logical*`；`RenderContext` `RenderConfig` `wgpu` `glam`；`Render2D` `ClearConfig` `SpriteRect` `SpriteRectPx` `Edges` `Layer` `SortMode` `Cull` `Culler` `RStates` + 状态枚举；`Color` `ColorF64`；`Camera2D` `Transform2D` `Rect` `Viewport`；`DynamicAtlas` `AtlasConfig` `AtlasRegion`；`Text` `Align` `TextStyle` `TextBuffer` `TextLayout` `TextRender` `CachePolicy` `LineSpace`；`Ui` `UiInit` `UiAdd` `UiState` `Theme` + 常用控件；`TileMap` `Tile` |
+| 命名空间 | `main` `gpu` `render2d` `transform` `color` `atlas` `text` `ui` `tilemap` `collision`（同时保留原 crate 名，如 `rjw_krusie::rjw_ui::Ui`） |
+
+**命名冲突约定**：`prelude` 不含 `Window` / `Size` / `LogicalSize`（winit 与 `rjw_transform` / `rjw_ui` 同名）——
+需要时写 `rjw_krusie::ui::Window`、`rjw_krusie::transform::LogicalSize`，**不做 `as` 改名**。
+
+**裁剪**：`default-features = false` 可只保留 2D 绘制（不装 `atlas` / `text` / `ui` / `tilemap` / `collision`）。
+
+> 各 crate 仍可**单独使用**（`use rjw_2d_render::Render2D;` …）——`rjw_krusie` 只是聚合，不改变底层 crate 的 API。
 
 ---
 
@@ -94,7 +123,7 @@ pub struct Transform2D {
 | `with_transform(&parent)` | 组合父级：`result = parent * self` |
 | `inverse()` | 逆变换对象 |
 
-> 💡 **旋转中心 = pos**：让精灵绕自身中心转，矩形写成 `SpriteRect::from_texture(Vec2::splat(-w/2), Vec2::splat(w))`。
+> 💡 **旋转中心 = pos**：让精灵绕自身中心转，矩形写成 `SpriteRect::new((-w / 2.0, -w / 2.0), (w, w))`。
 
 ---
 
@@ -160,20 +189,27 @@ pub struct SpriteRect {
 
 | 函数 | 用法 | 说明 |
 |---|---|---|
-| `from_texture` | `SpriteRect::from_texture(tl, wh)` | 整张贴图 |
-| `from_texture_px` | `SpriteRect::from_texture_px(tl, wh, uv_tl_px, uv_wh_px, inv_tex_wh)` | 按像素取纹理子区 |
-| `new` | `SpriteRect::new(tl, wh, uv_tl, uv_wh)` | 全手动（UV 归一化） |
+| `new` | `SpriteRect::new(tl, wh)` | ★**整张纹理**铺满（最常用） |
+| `centered` | `SpriteRect::centered(center, wh)` | 以中心点 + 尺寸 |
+| `with_uv` | `SpriteRect::with_uv(tl, wh, uv_tl, uv_wh)` | 归一化 UV 全指定 |
+| `with_uv_px` | `SpriteRect::with_uv_px(tl, wh, uv_tl_px, uv_wh_px, tex_wh)` | 像素 UV 子区（**给纹理尺寸，无需算倒数**） |
+| `with_uv_tex` | `SpriteRect::with_uv_tex(tl, wh, uv_tl_px, uv_wh_px, &tex)` | 像素 UV 子区（尺寸自动取自纹理） |
+| `at` / `move_by` | `r.at(pos)` / `r.move_by(delta)` | 移动（保持尺寸与 UV） |
+| `size` | `r.size(wh)` | 改世界尺寸 |
+| `uv` / `uv_px` | `r.uv(tl, wh)` / `r.uv_px(tl_px, wh_px, tex_wh)` | 改 UV（归一化 / 像素） |
+| `shrink` / `shrink_uv` | `r.shrink(4.0)` / `r.shrink_uv((0.02, 0.0))` | 世界矩形 / 归一化 UV **各边**收窄（`f32` 四边同值 / `(x, y)` 分轴 / `Edges` 逐边；负值即外扩） |
+
+> 位置 / 尺寸 / UV 参数接受 `Vec2` 或 `(x, y)`（正方形写 `(x, x)`）。
+> **v0.2.0 起**：`new` 即"整张纹理"；需要子区用 `with_uv*`（旧 `from_texture` / `from_texture_px` 已删除）。
 
 ```rust
 use rjw_2d_render::SpriteRect;
 use glam::Vec2;
 
-let a = SpriteRect::from_texture(Vec2::ZERO, Vec2::splat(32.0));
-let b = SpriteRect::from_texture_px(
-    Vec2::ZERO, Vec2::splat(32.0),
-    Vec2::ZERO, Vec2::splat(32.0),
-    Vec2::new(1.0 / 128.0, 1.0 / 128.0),
-);
+let a = SpriteRect::new(Vec2::ZERO, (32.0, 32.0));                  // 整张纹理
+let b = SpriteRect::with_uv_tex(Vec2::ZERO, (32.0, 32.0), (8, 8), (16, 16), &tex);
+let c = SpriteRect::centered(pos, (48.0, 48.0));                     // 以 pos 为中心
+let d = a.shrink(4.0).at((100.0, 50.0));                             // 链式：四周各收 4px 后移动
 ```
 
 ### 4.1 SpriteRectPx（像素 UV 精灵矩形）
@@ -182,7 +218,7 @@ crate：`rjw_2d_render`（`data` 模块）
 
 与 `SpriteRect` 字段一一对应，但 `uv_tl` / `uv_wh` 以**像素**为单位（而非归一化坐标），
 并额外持有纹理像素尺寸 `tex_wh`，便于实现裁剪类特效（shrink / expand / exceed 等）。
-引擎主要使用 `ArcTextureWrapped`（内置 `width` / `height`），可直接用 `from_tex` / `from_tex_px` 构造。
+引擎主要使用 `ArcTextureWrapped`（内置 `width` / `height`），可直接用 `of_tex` / `with_uv_tex` 构造（尺寸自动取自纹理）。
 
 ```rust
 pub struct SpriteRectPx {
@@ -196,255 +232,204 @@ pub struct SpriteRectPx {
 
 | 函数 | 用法 | 说明 |
 |---|---|---|
-| `new` | `SpriteRectPx::new(tl, wh, uv_tl_px, uv_wh_px, tex_wh_px)` | 全手动（UV 像素） |
-| `from_texture` | `SpriteRectPx::from_texture(tl, wh, tex_wh_px)` | 整张贴图 |
-| `from_tex` | `SpriteRectPx::from_tex(tl, wh, &tex)` | 整张贴图（尺寸取 `tex.width`/`tex.height`） |
-| `from_tex_px` | `SpriteRectPx::from_tex_px(tl, wh, uv_tl_px, uv_wh_px, &tex)` | 像素子区（尺寸取 `tex.width`/`tex.height`） |
-| `to_sprite_rect` | `px.to_sprite_rect() -> SpriteRect` | 转为归一化 `SpriteRect`（`Into` 同样可用：`let s: SpriteRect = px.into();`） |
-| `shrink_mesh_x/y/(x,y)` | `px.shrink_mesh_x(8.0)` | 世界坐标网格收缩（同 `SpriteRect`） |
-| `shrink_uv_x/y/(x,y)` | `px.shrink_uv_x(8.0)` | UV 双侧各收窄 px（居中，clamp 到 0 不翻转） |
-| `shrink_left/right/up/down` | `px.shrink_left(8.0)` | UV 单侧收窄 px（clamp 到 0） |
-| `expand_left/right/up/down` | `px.expand_down(8.0)` | UV 单侧展开 px（**Clamp** 到纹理边界） |
-| `expand` | `px.expand(8.0)` | UV 四周各展开 px（Clamp） |
-| `exceed_left/right/up/down` | `px.exceed_left(8.0)` | UV 单侧展开 px（**不 Clamp**，允许越界采样） |
+| `new` | `SpriteRectPx::new(tl, wh, tex_wh)` | ★**整张纹理**（UV 覆盖全图） |
+| `of_tex` | `SpriteRectPx::of_tex(tl, wh, &tex)` | 整张纹理（尺寸取自纹理） |
+| `with_uv_px` | `SpriteRectPx::with_uv_px(tl, wh, uv_tl_px, uv_wh_px, tex_wh)` | 像素 UV 子区 |
+| `with_uv_tex` | `SpriteRectPx::with_uv_tex(tl, wh, uv_tl_px, uv_wh_px, &tex)` | 像素 UV 子区（尺寸取自纹理） |
+| `centered` | `SpriteRectPx::centered(center, wh, tex_wh)` | 以中心点 + 尺寸 |
+| `at` / `move_by` / `size` | `px.at(pos)` | 链式调整（同 `SpriteRect`） |
+| `shrink_mesh` | `px.shrink_mesh(4.0)` | 世界矩形**各边**收窄（`f32` / `(x, y)` / `Edges`） |
+| `shrink` / `expand` / `exceed` | `px.shrink(4.0)` / `px.expand(Edges::new().left(8.0))` / `px.exceed((4.0, 0.0))` | UV 各边收窄 / 外扩（Clamp 到纹理）/ 外扩（不 Clamp） |
+| `to_sprite_rect` | `px.to_sprite_rect() -> SpriteRect` | 转归一化 `SpriteRect`（`Into` 也可：`let s: SpriteRect = px.into();`） |
+
+**裁剪量 `Edges`**（每边各自的量，不是总量）：
+
+| 构造 | 说明 |
+|---|---|
+| `Edges::all(v)` / `Edges::xy(x, y)` / `Edges::lrtb(l, r, t, b)` | 四边同值 / 左右上下 / 逐边 |
+| `Edges::new().left(8.0)` | 链式只改某一边 |
+| 直接传 `f32` / `(x, y)` / `Vec2` / `[f32; 2]` | 等价 `all(v)` / `xy(x, y)` |
+
+> 过窄时按 `左 → 上 → 右 → 下` 顺序 clamp 到尺寸 0（不翻转）；`exceed` 不 clamp（允许越界采样）。
 
 ```rust
-use rjw_2d_render::{SpriteRectPx, TextureWrapped};
-use glam::Vec2;
+use rjw_2d_render::{Edges, SpriteRectPx};
 
 // 整张贴图（尺寸自动取自纹理）
-let base = SpriteRectPx::from_tex(Vec2::ZERO, Vec2::splat(64.0), &tex);
+let base = SpriteRectPx::of_tex(Vec2::ZERO, (64.0, 64.0), &tex);
 // 向下展开 16px（Clamp 到纹理下边界）
-let r = base.expand_down(16.0).to_sprite_rect();
-r2d.add_sprite2d(r, Color::WHITE, Transform2D::default(), 0.0, &tex);
-// 或直接传 SpriteRectPx（add_sprite2d* 接受 impl Into<SpriteRect>）
-r2d.add_sprite2d(base.shrink_uv_x(8.0), Color::WHITE, Transform2D::default(), 0.0, &tex);
+r2d.sprite(base.expand(Edges::new().bottom(16.0)), &tex);
+// 四周各收 8px
+r2d.sprite(base.shrink(8.0), &tex);
 // 向左越界展开 4px（不 Clamp）
-r2d.add_sprite2d(base.exceed_left(4.0), Color::WHITE, Transform2D::default(), 0.0, &tex);
+r2d.sprite(base.exceed(Edges::new().left(4.0)), &tex);
 ```
 
 ---
 
 ## 5. Render2D（2D 批渲染器）
 
-crate：`rjw_2d_render`
+crate：`rjw_2d_render`（**v0.2.0 起 API 重新设计**：统一 Builder 责任链 + 唯一状态入口 + 排序/剔除分离）
 
-> 生命周期：`Render2D::new(&RenderContext)` 持有 surface 的 `'static` 引用，要求 `RenderContext` 比 `Render2D` 活得更久。
+> 生命周期：`Render2D::new(&RenderContext)` 持有 surface 的 `'static` 引用，要求 `RenderContext` 比 `Render2D` 更久。
+>
+> **设计原则**：入口**少参数**（≤ 2）；"在哪层 / 什么色 / 什么变换 / 什么状态"全部走链式；
+> 排序与剔除是**对命令索引数组的操作**，已独立到 `rjw_2d_render::sort` / `cull`（纯函数、可单测、可复用）。
 
-### 5.1 创建 / 全局
+### 5.1 创建 / 相机 / 全局
 
 | 函数 | 用法 | 说明 |
 |---|---|---|
 | `new` | `Render2D::new(&render_ctx)` | 基于 `RenderContext` 创建 |
-| `set_mvp` | `r2d.set_mvp(cam.vp_matrix())` | 设置 VP（每帧渲染前调用） |
-| `create_texture` | `r2d.create_texture("label", &rgba8, w, h)` | 建纹理（RGBA8，`len==w*h*4` 否则 panic），返回 `ArcTextureWrapped` |
-| `register_mesh` | `r2d.register_mesh(Arc<MeshData>) -> u64` | 注册静态网格到全局 `MESHES` 注册表，返回可复用 `mesh_id` |
-| `white_texture()` | `r2d.white_texture()` | 1×1 白色默认纹理引用 |
-| `device()` / `queue()` | `r2d.device()` / `r2d.queue()` | 暴露底层 wgpu 给高级用法 |
+| `set_mvp` | `r2d.set_mvp(cam.vp_matrix())` | 设置 VP（每帧渲染前调用）；同时刷新 `Cull::Viewport` 视口 |
+| `mvp()` | `r2d.mvp()` | 当前 VP |
+| `texture_layout()` | `r2d.texture_layout()` | 纹理 bind group layout（`rjw_text` / `rjw_ui` 自建 bind group 用） |
+| `device()` / `queue()` | `r2d.device()` / `r2d.queue()` | 暴露底层 wgpu（高级用法） |
 
-### 5.2 全局默认渲染状态（责任链，返回 `&mut Self`）
+### 5.2 排序（`rjw_2d_render::sort`）
 
 | 函数 | 说明 |
 |---|---|
-| `reset_default_state()` | 重置为"出厂默认"（全零 bitfield） |
-| `default_blend(mode)` | 设置默认 BlendMode |
-| `default_samp_mag(f)` / `default_samp_min(f)` / `default_samp_mip(f)` | 设置默认采样器过滤 |
-| `default_samp_addr_u(a)` / `default_samp_addr_v(a)` / `default_samp_addr_w(a)` | 设置默认寻址模式 |
-| `default_cull(c)` / `default_polygon(p)` / `default_front_face(f)` | 默认剔除/光栅化 |
-| `default_conservative_raster(b)` | 默认保守光栅化 |
-| `default_depth_test(b)` / `default_depth_write(b)` / `default_depth_compare(f)` | 默认深度状态 |
-| `default_stencil_test(b)` / `default_stencil_write(b)` / `default_stencil_compare(f)` | 默认模板状态 |
-| `default_blend_state(d)` / `default_samp_state(d)` / `default_raster_state(s)` / `default_depth_state(s)` / `default_stencil_state(s)` | 批量设置 |
+| `set_sort_mode(SortMode)` | `LayerAndStates`（默认，按 `(layer, states)` 排序合批）/ `LayerOnly`（仅按 layer 稳定排序，同层保录制序，UI 适用）/ `None`（完全按录制顺序） |
+| `set_sorter(Option<Box<dyn SortPolicy>>)` | 注入**自定义排序策略**（`fn sort(&self, order: &mut [usize], keys: &[SortKey])`）；`None` 恢复内置模式 |
+| `sort_mode() -> SortMode` | 当前内置模式 |
+
+- `SortKey { layer, rstates, texture_uid }`：与**命令下标**对齐的排序键（`keys[order[i]]` 才是第 `i` 条命令的键）。
+- `SortMode::apply(order, keys)` / `SortPolicy::sort(..)`：纯函数，只重排索引数组，命令数据不动。
+
+### 5.3 剔除（`rjw_2d_render::cull`）
+
+| 函数 | 说明 |
+|---|---|
+| `set_cull(impl Into<Cull>)` | **单一入口**：`Cull::Off`（默认）/ `Cull::Viewport` / `Cull::Rect(rect)` / `Cull::Fn(Box<dyn Fn(&Rect) -> bool>)` |
+| `set_cull_camera(Option<&Camera2D>)` | 便捷：`Some(&cam)` = `Cull::from(&cam)`（冻结其 `view_aabb()`）；`None` = 关闭 |
+| `cull()` / `culler()` / `culler_mut()` | 当前模式 / 剔除器（下游可复用同一套可见性判定） |
+
+- `Culler::new(Cull::...)`、`visible(&Rect) -> bool`、`retain(&mut Vec<usize>, aabb_of)`（就地过滤索引数组）。
+- 纯几何：`sprite_world_aabb(&SpriteRect, &Mat4)`、`viewport_world_rect(&Mat4)`、`transform2d_model(&Transform2D)`。
+- **行为**：只有 Sprite 命令参与剔除（动态 Mesh / StaticMesh / Custom 恒保留）。
+
+### 5.4 全局默认渲染状态（**唯一状态入口**）
+
+| 函数 | 说明 |
+|---|---|
+| `set_states(RStates)` | 设置全局默认状态（未链式设置状态的命令继承它） |
+| `states() -> RStates` | 当前全局默认状态 |
+| `reset_states()` | 重置为出厂默认（全零 bitfield） |
 
 ```rust
-render2d
-    .default_blend(BlendMode::Additive)
-    .default_depth_test(true)
-    .default_depth_write(true)
-    .default_samp_addr_u(AddressMode::Repeat);
-// 此后所有不链式的 add_* 命令都继承这些状态
-```
-
-### 5.3 Sprite 绘制（返回 `Sprite2DBuilder`）
-
-| 函数 | 用法 | 说明 |
-|---|---|---|
-| `add_sprite2d` | `r2d.add_sprite2d(rect, color, transform, layer, &tex)` | 贴纹理精灵 |
-| `add_sprite2d_solid` | `r2d.add_sprite2d_solid(rect, color, transform, layer)` | 纯色精灵（内部用 1×1 白纹理） |
-
-```rust
-// 绕中心旋转的精灵
-let tf = Transform2D::IDENTITY
-    .with_pos(Vec2::new(0.0, 0.0))
-    .with_rot(t * 0.8);
-r2d.add_sprite2d(
-    SpriteRect::from_texture(Vec2::splat(-48.0), Vec2::splat(96.0)),
-    Color::WHITE, tf, 0.0, &my_texture,
+use rjw_2d_render::{AddressMode, BlendMode, CompareFunc, RStates};
+r2d.set_states(
+    RStates::new()
+        .blend(BlendMode::Additive)
+        .depth_test(true)
+        .depth_write(true)
+        .depth_compare(CompareFunc::Less)
+        .samp_addr_all(AddressMode::Repeat),
 );
-// 可链式设渲染状态：
-r2d.add_sprite2d(rect, Color::WHITE, tf, 0.0, &tex)
-    .blend(BlendMode::Additive)
-    .samp_mag(FilterMode::Nearest);
 ```
 
-### 5.4 Mesh / 多边形（返回 `MeshBuilder`）
+> 旧版的 21 个 `default_*` 方法已删除——`RStates` 本身就是链式状态语言，只需一个入口。
+
+### 5.5 录制入口（画什么）：数据版 / 流式版
 
 | 函数 | 用法 | 说明 |
 |---|---|---|
-| `add_mesh` | `r2d.add_mesh(&verts, &tri_indices, color, layer)` | 显式顶点+三角形索引（世界坐标） |
-| `add_polygon_fan` | `r2d.add_polygon_fan(&verts, color, layer)` | 顶点数组自动三角形扇 |
-| `add_polygon_strip` | `r2d.add_polygon_strip(&verts, color, layer)` | 三角形条带 |
-| `add_polygon_fan_uv` | `r2d.add_polygon_fan_uv(&verts, &uvs, color, layer)` | 三角形扇 + UV 坐标 |
-| `add_polygon_strip_uv` | `r2d.add_polygon_strip_uv(&verts, &uvs, color, layer)` | 三角形条带 + UV 坐标 |
-| `add_mesh_fn` | `r2d.add_mesh_fn(color, layer, \|sink\| { ... })` | 流程式安全建网格 |
-| `add_mesh_fn_prealloc` | `r2d.add_mesh_fn_prealloc(max_verts, max_tris, color, layer, \|v_slice, t_slice\| { ... })` | 已知顶点/三角形数，直接写预分配切片 |
+| `sprite(rect, &tex)` | `r2d.sprite(rect, &tex).color(c).transform(tf).layer(l)` | 贴纹理精灵（实例化合批） |
+| `solid(rect)` | `r2d.solid(rect).color(c).layer(l)` | 纯色精灵（内部 1×1 白纹理） |
+| `mesh(&verts, &tris)` | `r2d.mesh(&verts, &tris).color(c).transform(tf)` | 显式顶点 + u16 索引（世界坐标） |
+| `mesh_with(\|sink\| ..)` | `r2d.mesh_with(\|s\| { s.push_tri(a,b,c); }).color(c)` | 流式构造（自定三角化 / 逐顶点 UV） |
+| `mesh_with_cap(v, t, \|vs, ts\| ..)` | `r2d.mesh_with_cap(n, m, \|vs, ts\| { .. })` | 预分配快路径（零重分配） |
+| `polygon(&verts)` | `r2d.polygon(&verts).color(c).layer(l)` | 多边形（**fan 三角化**：首顶点为中心） |
+| `polygon_uv(&verts, &uvs)` | `r2d.polygon_uv(&verts, &uvs).color(c)` | 带 UV 的多边形（等长切片） |
+| `polygon_with(\|p\| ..)` | `r2d.polygon_with(\|p\| { p.vertex(a); .. })` | 流式多边形（闭包结束自动 fan 三角化，零临时 `Vec`） |
+| `quads(&verts, &tex)` | `r2d.quads(&verts, &tex).transform(tf).color(tint)` | 四边形段（顶点 TL,TR,BL,BR；`.color()` 为**整段实例色**） |
+| `quads_with(\|q\| .., &tex)` | `r2d.quads_with(\|q\| { q.quad(tl,tr,bl,br); }, &tex)` | 流式四边形段 |
+| `static_mesh(id, &tex)` | `r2d.static_mesh(id, &tex).color(c).transform(tf).layer(l)` | 静态网格实例（`MESHES` 注册表 + 实例化合批） |
+| `custom(cd)` | `r2d.custom(\|pass\| { .. }).layer(l)` | 注入原生 wgpu 绘制（`CustomDraw` / 闭包 blanket impl） |
 
-```rust
-// 画一个圆（中心 c, 半径 r）
-let mut verts = Vec::with_capacity(24);
-verts.push(c);
-for i in 0..=22 {
-    let a = i as f32 / 22.0 * std::f32::consts::TAU;
-    verts.push(c + Vec2::new(a.cos(), a.sin()) * r);
-}
-r2d.add_polygon_fan(&verts, Color::CYAN, 1.0);
+> **入口命名规则**：`kind(数据…)` = 已有数据直接给；`kind_with(|sink| …)` = 流式构造（零临时 `Vec`）。
+> 旧版 16 个 `add_*`（含 `_solid` / `_matrix` / `_transform` / `_uv` / `_prealloc` / `_styled` / `_fn` 后缀变体）已合并为上面 12 个入口。
 
-// Mesh 可链式设纹理：
-r2d.add_polygon_fan(&verts, Color::CYAN, 96.0)
-    .set_texture(&tex)
-    .blend(BlendMode::Multiply);
-```
+### 5.6 责任链修饰（4 个 kind 共用同一份实现）
 
-> 💡 `MeshBuilder` 独有 `.set_texture(&ArcTextureWrapped)`——mesh 默认白色纹理，此方法覆盖。
-
-### 5.4.1 外部自定义绘制（`add_custom` / `CustomDraw`，返回 `CustomBuilder`）
-
-| 函数 | 用法 | 说明 |
+| 方法 | 默认 | 说明 |
 |---|---|---|
-| `add_custom` | `r2d.add_custom(layer, \|pass\| { ... })` | 注入一段原生 wgpu 绘制调用，参与 (layer, states) 排序 |
-
-**👉 完整可运行示例见 `examples/eg260731CustomDraw/`**（`cargo run -p eg260731CustomDraw`）：演示结构体形式 + 闭包形式 + 与引擎 Sprite 混排。
+| `.layer(impl Into<Layer>)` | `0.0` | 绘制层级（数值小先绘制） |
+| `.color(Color)` | `WHITE` | Sprite/StaticMesh：实例色；mesh/polygon：**逐顶点色**；quads：**整段实例色**（tint） |
+| `.transform(Transform2D)` | `IDENTITY` | 局部 → 世界 |
+| `.pos(p)` / `.rot(r)` / `.scale(s)` | — | `transform` 便捷糖 |
+| `.model(Mat4)` | — | 直接给列主序模型矩阵（覆盖 transform） |
+| `.texture(&tex)` | 入口参数 | 覆盖采样纹理（Mesh 系默认白纹理） |
+| `.states(RStates)` | `None` = 继承全局 | 完整渲染状态 |
+| `.blend(..)` / `.samp(f, a)` / `.cull(..)` / `.depth(bool)` / `.depth_full(..)` / `.stencil(bool)` / `.stencil_full(..)` | — | `states` 便捷糖（高频） |
+| `.blend_state(..)` / `.samp_state(..)` / `.raster_state(..)` / `.depth_state(..)` / `.stencil_state(..)` | — | `states` 便捷糖（描述符批量） |
+| `.done()` | — | 显式提交（Builder **Drop 即提交**） |
 
 ```rust
-// 闭包直接传（blanket impl）—— pass 是 &mut wgpu::RenderPass
-r2d.add_custom(1.0, |pass| {
-    // 这里可以用任意原生 wgpu API：set_pipeline / draw / 自行绑定缓冲……
-    // 注意：pass 管理器已在引擎内打开，不要 begin_render_pass
-});
+// 世界坐标旋转精灵 + 加性混合
+r2d.sprite(rect, &tex)
+    .color(Color::WHITE)
+    .transform(Transform2D::IDENTITY.with_rot(t))
+    .layer(y_layer(foot_y))
+    .blend(BlendMode::Additive);
 
-// 或实现 CustomDraw trait 的结构体
-struct MyFx;
-impl rjw_2d_render::CustomDraw for MyFx {
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        // 自定义绘制……
+// 流式画圆（零临时 Vec）
+r2d.polygon_with(|p| {
+    p.vertex(center);
+    for i in 0..=22 {
+        let a = i as f32 / 22.0 * std::f32::consts::TAU;
+        p.vertex(center + Vec2::new(a.cos(), a.sin()) * r);
     }
-}
-r2d.add_custom(1.0, MyFx);
+})
+.color(Color::CYAN)
+.layer(96.0);
 ```
 
-> 💡 **最小完整模式**（自建管线 + 顶点缓冲，参考 `eg260731CustomDraw` 的 `Tri` 结构体）：
->
-> ```rust
-> // ① 建管线：模块 + 空 pipeline layout + 自定义 VertexBufferLayout
-> let shader = device.create_shader_module(...);               // 自定义 WGSL
-> let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
->     bind_group_layouts: &[],                 // 不需要 bind group 时传空
->     immediate_size: 0,
-> });
-> let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
->     layout: Some(&layout),                   // 其余字段按需（见 example）
->     ...
-> });
->
-> // ② 建顶点缓冲（bytemuck::cast_slice 传入 f32 数组）
-> let vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
->     contents: bytemuck::cast_slice(&verts),
->     usage: wgpu::BufferUsages::VERTEX,
-> });
->
-> // ③ 在 CustomDraw::draw / 闭包中执行（pass 已由引擎打开）
-> pass.set_pipeline(&pipeline);
-> pass.set_vertex_buffer(0, vbo.slice(..));
-> pass.draw(0..n_verts, 0..1);
-> ```
+> `Draw2D<'a, K>` 是本工程**唯一的绘制 Builder**（`Sprite` / `Mesh` / `StaticMesh` / `Custom` 四个 kind）；
+> 类型别名 `SpriteBuilder` / `MeshBuilder` / `StaticMeshBuilder` / `CustomBuilder` 供签名标注。
 
-要点：
-
-- **签名**：`add_custom<CD: CustomDraw + 'static>(&mut self, layer, cd) -> CustomBuilder<'_>`；`CustomDraw: Send + Sync`，闭包 `Fn(&mut wgpu::RenderPass) + Send + Sync` 自动实现。
-- **排序位置**：返回的 `CustomBuilder` 可链式设置 RStates（`.blend(...)` / `.depth_test(...)` 等，但注意 `CustomBuilder` **没有** `.set_texture()`），这些值参与 `(layer, states)` 排序，决定该闭包在 Sprite/Mesh 之间的**执行顺序**。
-- **执行时机**：闭包在 `render()` 或 `flush()` 的 `draw()` 阶段被调用；`buf_custom_draws` 每帧结束后 `clear()`，**请勿**跨帧持有 `add_custom` 内部状态。
-- **适用场景**：引擎封装之外的管线（自定义 shader、线框调试、后处理、自定义顶点格式等）。
-- 若不链式调用 RStates，则 `CustomBuilder` 仍按 `default_rstates` 参与排序（resolve 后为整数值相加大致落在默认位置）。
-
-### 5.4.2 静态网格 StaticMesh
-
-| 函数 | 用法 | 说明 |
-|---|---|---|
-| `add_static_mesh` | `r2d.add_static_mesh(mesh_id, color, transform, layer, &tex)` | 静态网格实例（Transform2D 变换），返回 `StaticMeshBuilder` |
-| `add_static_mesh_matrix` | `r2d.add_static_mesh_matrix(mesh_id, color, model_mat4, layer, &tex)` | 静态网格实例（直接列主序 Mat4，跳过 Transform2D 推导） |
-
-`MeshData`（`rjw_render`）包装 GPU 顶点/索引缓冲：
+### 5.7 静态网格 StaticMesh
 
 | 函数 | 说明 |
 |---|---|
-| `MeshData::from_buffers(vb, ib, index_count)` | 直接包装已创建缓冲（自动分配 uid） |
-| `MeshData::from_pod(device, &verts, &indices, label)` | 从 CPU 数据创建缓冲（`T: bytemuck::Pod`，索引 u16） |
-| `mesh.uid` | 全局唯一 id（`HasUid` trait） |
+| `register_mesh(Arc<MeshData>) -> u64` | 注册网格到全局 `MESHES`，返回可复用 `mesh_id` |
+| `static_mesh(mesh_id, &tex).color(..).transform(tf).layer(..)` | 提交一个实例（CPU 侧只有变换 + 颜色） |
+| `static_mesh(id, &tex).model(mat)` | 直接给模型矩阵（跳过 `Transform2D` 推导） |
 
-```rust
-use std::sync::Arc;
-use rjw_2d_render::MeshData;
+- **合批条件**：`(mesh_id, rstates, tex_uid)` 相同且绘制序列连续 → 合并为同一次 `draw_indexed`。
+- **适用**：固定层级、不参与 y-sort 的地图元素（石头 / 花 / 栅栏）；**会插入实体排序的（如 y-sort 的树）必须保持动态**。
+- `MeshData::from_pod(device, &verts, &indices, label)` / `MeshData::from_buffers(vb, ib, index_count)`。
 
-// ① 建单位圆网格（半径为 1，后续实例 transform = Translate(pos) * Scale(r) 复用）
-let circle = Arc::new(MeshData::from_pod(render2d.device(), &verts, &idx, "circle"));
-let circle_id = render2d.register_mesh(circle);
+### 5.8 提交（**提交即清帧**）
 
-// ② 提交多个静态实例（同 mesh_id + 同 RStates + 同纹理 → 自动合批为极少数 DrawCall）
-let white = render2d.white_texture().clone();
-for inst in &instances {
-    let tf = Transform2D::default().with_pos(inst.pos).with_scale(Vec2::splat(inst.r));
-    render2d.add_static_mesh(circle_id, inst.color, tf, inst.layer, &white).done();
-}
+| 函数 | 说明 |
+|---|---|
+| `render(&ClearConfig)` | 全流程：`acquire_frame` → `prepare` → pass → submit → present |
+| `record(&mut pass)` | 只把当前队列录进用户自建的 `wgpu::RenderPass`（离屏 / 自定义 pass 组合） |
+| `encode(&ClearConfig, &target, depth) -> CommandBuffer` | 只编码（不提交 / 不 present），适合多渲染器合并提交 |
+| `acquire_frame() -> Option<(SurfaceTexture, TextureView)>` | 取当前表面帧（`None` = 取帧失败，跳过本帧） |
 
-// 矩阵版（高级）
-render2d.add_static_mesh_matrix(circle_id, Color::WHITE, model, 96.0, &tex).done();
+### 5.9 每帧内部流水线
+
+```
+apply_order()：take_order() → fill_sort_keys() → SortPolicy::sort() → Culler::retain() → set_order()
+prepare()    ：RStates resolve（None → 全局默认）→ 生成实例 / 动态段 → 按 (layer, mesh_id, rstates, tex) 分组
+               → 按 MAX_INSTANCES_PER_DRAW(8192) 分页 → 上传实例页 / 动态顶点缓冲
+draw()       ：按 DrawOp.rstates 取/建管线 → 绑定纹理 bind group → 逐页 draw_indexed
 ```
 
-要点：
+- 实例缓冲是**页池**：单帧实例数可远超 8192，自动分页；**不要自己裁减数量去凑**。
+- 命令 / 网格 / 排序键缓冲全部**常驻复用**（`clear()` 只清长度不释放）；Builder 为栈上 struct，无堆分配。
 
-- **`StaticMeshBuilder`**：与 `Sprite2DBuilder` / `MeshBuilder` 相同的 RStates 责任链（`.blend(...)` / `.samp_mag(...)` / `.depth_test(...)` 等），**没有** `.set_texture()`——纹理由 `add_static_mesh*` 参数直接传入；`.done()` 立即消费提交，或依赖 Drop 自动 push。
-- **顶点坐标**：`MeshData` 顶点即世界坐标（静态网格走实例化直通 VP），变换由实例 `model` 提供；顶点自带 UV，配合采样器直通（同 `IDENTITY_INSTANCE` 语义）正确贴图。
-- **合批条件**：`(mesh_id, rstates, tex_uid)` 相同且绘制序列连续 → 合并为同一次 `draw_indexed`。相同内容的网格请**复用同一个 `Arc<MeshData>`** 注册，否则 id 不同无法合批。
-- **适用场景**：固定遮挡层、不参与 y-sort 的地图元素（石头、花、栅栏…）应静态化；**会插入实体绘制顺序的元素（如 RPG 中 `y_layer(foot_y)` 的树）保持动态**，切勿加入静态网格。
+### 5.10 纹理与采样器
 
-### 5.5 提交
-
-| 函数 | 用法 | 说明 |
-|---|---|---|
-| `render` | `r2d.render(&ClearConfig { ... })` | **全流程**：begin_frame → 创建 pass → 绘制 → 提交呈现 |
-| `flush` | `r2d.flush(&mut pass)` | 只录制绘制到用户自己建的 pass（仅传入 Pass） |
-| `render_command_buffer` | `r2d.render_command_buffer(&ClearConfig, &target_view, depth)` | 仅编码为 `CommandBuffer`（不提交/不 present，适合离屏渲染/合并提交） |
-| `begin_frame` | `r2d.begin_frame() -> Option<(SurfaceTexture, TextureView)>` | 手动获取表面 |
-
-```rust
-r2d.render(&ClearConfig {
-    color: Some(wgpu::Color { r: 0.1, g: 0.2, b: 0.15, a: 1.0 }),
-    depth: None,
-    stencil: None,
-});
-```
-
-### 5.6 分页机制（无需手动处理）
-
-- 实例缓冲是**页池**：单帧精灵数量可超 `MAX_INSTANCES_PER_DRAW`(8192)
-- `prepare()` 自动分页、每页只写一次、`draw()` 逐页绑定/绘制
-
-### 5.7 纹理与采样器
-
-- `TextureWrapped`（`rjw_render`）**只持有纹理本身**（`texture` / `view` / `width` / `height` / `uid`），**不再持有 sampler / bind group**——两者与纹理解耦。
-- **采样器完全由 `RStates` 位域（bits 8..24）驱动**：`.samp_mag(Nearest)` / `.samp_addr_u(Repeat)` 等链式方法**真正生效**，`Render2D` 按需创建并缓存 `wgpu::Sampler`（默认线性 + ClampToEdge 有零开销快路径）。
-- **bind group 由 `Render2D` 缓存**：key = `(tex_uid, samp_key)`，value 持有 `Arc<Texture>` 防悬挂；`prepare` 末尾自动剔除 `TEXTURES.remove` 掉的失效条目（资源正确释放）。
-- 全局注册表 `TEXTURES` 支持 `register` / `register_named` / `get` / `remove` / `remove_name_mapping` / `rename` / `contains_uid` / `contains_name`（`TypedRegistry<TextureWrapped>`）。
+- 创建：`create_texture(label, &rgba8, w, h)`（RGBA8，`len == w*h*4` 否则 panic）/ `register_texture(arc)`。
+- `TextureWrapped`（`rjw_render`）**只持有纹理本身**；采样器完全由 `RStates` 位域（bits 8..24）驱动
+  （`.samp(FilterMode::Nearest, AddressMode::Repeat)` 或 `.states(..)`），`Render2D` 内部按需创建并缓存 `wgpu::Sampler`。
+- bind group 按 `(tex_uid, samp_key)` 缓存，value 持有 `Arc<Texture>` 防悬挂；`prepare` 末尾自动剔除失效条目。
+- 1×1 白纹理：`white_texture()`（纯色绘制与 `solid` 使用）。
+- 全局注册表 `TEXTURES`（`TypedRegistry<TextureWrapped>`）：`register` / `register_named` / `get` / `remove` / `rename` / `contains_uid` / `contains_name`。
 
 ---
 
@@ -469,22 +454,21 @@ crate：`rjw_2d_render`（`rstates` 模块）
 | Stencil | `stencil_test(bool)` / `stencil_write(bool)` / `stencil_compare(CompareFunc)` | Always/Never/... |
 | | `stencil_state(StencilState)` | 批量设置模板 |
 
-### 6.2 Builder 链方法（`Sprite2DBuilder` / `MeshBuilder` / `StaticMeshBuilder` 通用）
+### 6.2 Builder 链方法（`SpriteBuilder` / `MeshBuilder` / `StaticMeshBuilder` / `CustomBuilder` 通用）
 
 | 分类 | 方法 |
 |---|---|
-| Blend | `.blend(m)` / `.blend_state(d)` |
-| Sampler | `.samp_mag(f)` / `.samp_min(f)` / `.samp_mip(f)` / `.samp_addr_u(a)` / `.samp_addr_v(a)` / `.samp_addr_w(a)` / `.samp_state(d)` |
-| Cull+Raster | `.cull(c)` / `.polygon(p)` / `.front_face(f)` / `.conservative_raster(b)` / `.raster_state(s)` |
-| Depth | `.depth_test(b)` / `.depth_write(b)` / `.depth_compare(f)` / `.depth_state(s)` |
-| Stencil | `.stencil_test(b)` / `.stencil_write(b)` / `.stencil_compare(f)` / `.stencil_state(s)` |
-| **MeshBuilder only** | `.set_texture(&tex)` |
-| **StaticMeshBuilder only** | `.done()`（立即消费提交；亦可靠 Drop 自动 push） |
+| 通用修饰 | `.layer(impl Into<Layer>)` / `.color(Color)` / `.transform(tf)` / `.pos(p)` / `.rot(r)` / `.scale(s)` / `.model(mat)` |
+| 纹理 | `.texture(&tex)`（Mesh 系默认白纹理；Sprite/StaticMesh 由入口参数给出） |
+| 状态（全量） | `.states(RStates)` |
+| 状态（高频糖） | `.blend(m)` / `.samp(FilterMode, AddressMode)` / `.cull(CullMode)` / `.depth(bool)` / `.depth_full(test, write, cmp)` / `.stencil(bool)` / `.stencil_full(test, write, cmp)` |
+| 状态（描述符） | `.blend_state(BlendDesc)` / `.samp_state(SamplerDesc)` / `.raster_state(RasterState)` / `.depth_state(DepthState)` / `.stencil_state(StencilState)` |
+| 提交 | `.done()`（立即消费提交；亦可依赖 Drop 自动 push） |
 
-> 💡 `StaticMeshBuilder` 的纹理由 `add_static_mesh*` 参数传入，因此**没有** `.set_texture()`。
-> 采样器相关方法（`.samp_*`）会真正创建对应 GPU 采样器（见 §5.7）。
+> 💡 需要 `RStates` 的完整表达能力（polygon / front_face / conservative_raster 等）时，用
+> `.states(RStates::new().polygon(PolygonMode::Line))`——**状态只有一个语言：`RStates`**。
 
-不链式调用 = `rstates: None` → `draw()` 阶段 resolve 为 `Render2D.default_rstates`。
+不链式调用 = 继承全局默认（`Render2D::states()`）；链式任一项 = 该命令显式状态。
 
 ### 6.3 重要类型一览
 
@@ -504,7 +488,7 @@ crate：`rjw_2d_render`（`rstates` 模块）
 | `DepthState` | `{ test: bool, write: bool, compare: CompareFunc }` |
 | `StencilState` | `{ test: bool, write: bool, compare: CompareFunc }` |
 | `MeshData` | 静态网格：`{ vertex_buffer, index_buffer, index_count, uid }`（`rjw_render`） |
-| `StaticMeshBuilder<'a>` | `add_static_mesh*` 返回（立即可 `.done()` 提交） |
+| `StaticMeshBuilder<'a>` | `static_mesh` 返回（Drop 即提交，或 `.done()` 显式） |
 | `HasUid` | trait：`fn uid(&self) -> u64`（`rjw_render`） |
 | `TypedRegistry<T: HasUid>` | 泛型注册表：`register` / `register_named` / `get` / `get_ref` / `remove` / `remove_name_mapping` / `rename` / `contains_uid` / `contains_name` |
 | `MESHES` | 全局静态网格注册表（`TypedRegistry<MeshData>`，`rjw_render`） |
@@ -512,31 +496,34 @@ crate：`rjw_2d_render`（`rstates` 模块）
 ### 6.4 使用示例
 
 ```rust
-use rjw_2d_render::{BlendMode, FilterMode, AddressMode, DepthState, CompareFunc};
+use rjw_2d_render::{BlendMode, FilterMode, AddressMode, DepthState, CompareFunc, RStates};
 
-// 不链式 = 默认
-render2d.add_sprite2d(rect, Color::WHITE, tf, 0.0, &tex);
+// 不链式 = 继承全局默认状态
+render2d.sprite(rect, &tex);
 
 // 单条链式覆盖
-render2d.add_sprite2d(rect, Color::WHITE, tf, 0.0, &tex)
-    .blend(BlendMode::Additive)
-    .samp_addr_u(AddressMode::Repeat)
-    .samp_mag(FilterMode::Nearest);
+render2d.sprite(rect, &tex)
+    .samp(FilterMode::Nearest, AddressMode::Repeat)
+    .blend(BlendMode::Additive);
 
-// Mesh + set_texture + 渲染状态
-render2d.add_polygon_fan(&verts, Color::CYAN, 96.0)
-    .set_texture(&tex)
-    .blend(BlendMode::Multiply);
+// Mesh + 纹理 + 渲染状态
+render2d.polygon(&verts)
+    .texture(&tex)
+    .blend(BlendMode::Multiply)
+    .layer(96.0)
+    .color(Color::CYAN);
 
-// 批量设置
-render2d.add_sprite2d(rect, Color::WHITE, tf, 0.0, &tex)
+// 描述符批量设置
+render2d.sprite(rect, &tex)
     .depth_state(DepthState { test: true, write: true, compare: CompareFunc::Less });
 
-// 全局默认（责任链，返回 &mut Render2D）
-render2d
-    .default_blend(BlendMode::Additive)
-    .default_depth_test(true)
-    .default_depth_write(true);
+// 全量状态（唯一状态语言）
+render2d.solid(rect).states(RStates::new().blend(BlendMode::Additive).depth_test(true));
+
+// 全局默认状态（唯一入口，返回 &mut Render2D）
+render2d.set_states(
+    RStates::new().blend(BlendMode::Additive).depth_test(true).depth_write(true),
+);
 ```
 
 ---
@@ -673,14 +660,17 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 | `ctx.timer.dt().get_f32()` | `rjw_time` | 帧间隔秒 |
 | `ctx.timer.get_fps()` | `rjw_time` | FPS |
 | `ArcTextureWrapped.uid` | `rjw_render` | 纹理唯一 ID |
-| `Sprite2DBuilder<'a>` | `rjw_2d_render` | add_sprite2d* 返回 |
-| `MeshBuilder<'a>` | `rjw_2d_render` | add_mesh / add_polygon_* 返回 |
-| `StaticMeshBuilder<'a>` | `rjw_2d_render` | add_static_mesh* 返回，`.done()` 立即提交 |
+| `SpriteBuilder<'a>` | `rjw_2d_render` | `sprite` / `solid` 返回 |
+| `MeshBuilder<'a>` | `rjw_2d_render` | `mesh*` / `polygon*` / `quads*` 返回 |
+| `StaticMeshBuilder<'a>` | `rjw_2d_render` | `static_mesh` 返回，Drop 即提交 |
+| `Draw2D<'a, K>` / `DrawKind` | `rjw_2d_render` | 唯一 Builder 本体 + kind 标记 |
+| `SortMode` / `SortPolicy` / `SortKey` | `rjw_2d_render` | 排序（对索引数组重排） |
+| `Cull` / `Culler` | `rjw_2d_render` | 剔除（对索引数组过滤 + 可见性判定） |
 | `MeshData` | `rjw_render` | 静态网格（GPU 顶点/索引 + uid） |
 | `HasUid` | `rjw_render` | 全局唯一 id trait |
 | `TypedRegistry<T>` | `rjw_render` | 泛型线程安全注册表（纹理/网格共用） |
 | `CustomDraw` | `rjw_2d_render` | 外部绘制 trait（闭包 blanket impl） |
-| `CustomBuilder<'a>` | `rjw_2d_render` | add_custom 返回，可链式 RStates |
+| `CustomBuilder<'a>` | `rjw_2d_render` | `custom` 返回，可链式 RStates |
 
 ---
 
@@ -872,8 +862,8 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 - 圆角**9-patch**：四角原样、四边/中心拉伸（任意矩形尺寸圆弧不畸变）；
   渐变矩形直接拉伸采样（主轴 64 级已平滑）；
 - 提交分组升级为 `(win, 图形/文字组, 纹理 uid)`：圆角 / 渐变属于**图形组**，先于文字
-  （不会因非白纹理 uid 排序错位盖住文字）；⚠ **UI 的 Render2D 必须 `set_sorting(false)`**
-  （完全按提交顺序绘制）——`set_sorting(true)`（`LayerAndStates`）会按纹理 uid 重排，
+  （不会因非白纹理 uid 排序错位盖住文字）；⚠ **UI 的 Render2D 必须 `set_sort_mode(SortMode::None)`**
+  （完全按提交顺序绘制）——`SortMode::LayerAndStates` 会按纹理 uid 重排，
   圆角/渐变会被排在文字之后绘制而盖住文字（示例 `eg260818UI` 即如此配置）；
 - 控件级集成：`Theme` 的 `PanelStyle::radius` / `ButtonStyle::radius` / `InputStyle::radius`。
 
@@ -931,8 +921,8 @@ ui.finish(&viewport, r2d);
 > （`rjw_keyboard::get_ime_commits` / `get_ime_preedit`，候选框跟随光标）；输入框聚焦时用
 > `UiState::capturing_text()` 屏蔽应用快捷键；
 > 控件文本排版缓冲自持于 `UiState.text_buffers`（`CachePolicy::User`，不推入 `rjw_text` LRU）；
-> **独立 UI 渲染**：UI 录到单独 Render2D（`Render2D::set_sorting(false)` 关闭排序），与世界
-> `render_command_buffer` 合并提交（一次 present）；`finish` 按 `(win, depth, 图形/文字, 录制序)`
+> **独立 UI 渲染**：UI 录到单独 Render2D（`set_sort_mode(SortMode::None)` 关闭排序），与世界
+> `encode` 合并提交（一次 present）；`finish` 按 `(win, depth, 图形/文字, 录制序)`
 > 免排序（win + depth 分桶）提交。
 
 ---

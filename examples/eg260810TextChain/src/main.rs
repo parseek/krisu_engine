@@ -6,16 +6,8 @@
 //! - `draw_sprite2d` / `draw_with` / `draw_2d_gradient`（Glyph/Line/Frame × 横/竖）
 //! - `map` 逐字形动画 + `glyph_str()` / `glyph_type`
 
-use glam::{Vec2, vec2};
-use rjw_2d_render::{ClearConfig, Render2D, SpriteRect};
-use rjw_color::Color;
-use rjw_main::*;
-use rjw_render::{RenderConfig, RenderContext, TEXTURES, wgpu};
-use rjw_text::{
-    Align, CachePolicy, GlyphData, GlyphType, GradientAxis, GradientMode, LineSpace, Rect, Style, Text,
-    TextBuffer, TextStyle, Transform2D, cosmic_text,
-};
-use rjw_transform::Camera2D;
+use rjw_krusie::prelude::*;
+use rjw_krusie::text::{GlyphData, GlyphType, GradientAxis, GradientMode, Style, cosmic_text};
 
 struct ChainDemo {
     render: Option<RenderContext>,
@@ -73,7 +65,7 @@ impl App for ChainDemo {
         self.font = Some(Text::new(
             render2d.device(),
             render2d.queue(),
-            render2d.tex_bind_group_layout(),
+            render2d.texture_layout(),
         ));
         self.render2d = Some(render2d);
     }
@@ -237,14 +229,18 @@ fn draw_text_demos(r2d: &mut Render2D, font: &mut Text, t: f32, half_w: f32, hal
             if let Some(tex) = TEXTURES.get(region.page_uid) {
                 let w = region.wh_px.0 as f32;
                 let h = region.wh_px.1 as f32;
-                r2d.add_sprite2d(
-                    SpriteRect::from_texture_px(Vec2::new(tr.pos.x, tr.pos.y), Vec2::new(w, h),
-                vec2_u32tup(region.tl_px), vec2_u32tup(region.wh_px), 1.0 / vec2(tex.width as f32, tex.height as f32)),
-                    Color::rgba(1.0, 0.9, 0.2, 0.7),
-                    Transform2D::default(),
-                    96.0,
+                r2d.sprite(
+                    SpriteRect::with_uv_tex(
+                        Vec2::new(tr.pos.x, tr.pos.y),
+                        Vec2::new(w, h),
+                        vec2_u32tup(region.tl_px),
+                        vec2_u32tup(region.wh_px),
+                        &tex,
+                    ),
                     &tex,
-                );
+                )
+                .color(Color::rgba(1.0, 0.9, 0.2, 0.7))
+                .layer(96.0);
             }
         });
 
@@ -320,5 +316,5 @@ fn draw_text_demos(r2d: &mut Render2D, font: &mut Text, t: f32, half_w: f32, hal
 
 fn main() -> Result<(), EventLoopError> {
     env_logger::init();
-    rjw_main::run_app(ChainDemo::new())
+    run_app(ChainDemo::new())
 }

@@ -58,13 +58,13 @@ for ((_, elem, g, tex), verts) in q.quads {
    - `sig_us`：窗口内容签名（摘要 + 全量哈希）
    - `collect_us`：缓存未命中 → 顶点重建（`collect_cmds`，含文本整形）
    - `clone_us`：缓存命中 → 提交列表组装（顶点克隆）
-   - `submit_us`：提交（ordered 排序 + `add_quads` 循环）
+   - `submit_us`：提交（ordered 排序 + `quads` 循环）
    - `finish_us` / `ui_frame_us`（begin → finish 结束）
    - 计数：`cmd_count` / `win_count` / `cache_hit` / `cache_miss`
 2. **示例 `eg260818UI`**（stdout 每 120 帧打印一行 `[perf]`）：
    - 整帧 `about_to_wait` 耗时、UI 各阶段、渲染细分
    - `render` 细分：`begin`（`begin_frame`/交换链 acquire）、`encode`（2 个
-     `render_command_buffer`）、`submit`、`present`
+     `encode`）、`submit`、`present`
    - `--auto-drag`：自动圆周拖动 win_b + 每帧改内容（等价"拖动中内容逐帧变化"最坏路径）
 
 ### 测量结果（每帧均值）
@@ -136,7 +136,7 @@ FPS/计数类标签每帧变化 → 缓存每帧全清 → **下一帧全部标�
 | 窗口顶点缓存改 `Arc<Vec<...>>` 零拷贝 | 命中帧免 memcpy（当前 ~10µs） | 低风险，收益小 |
 | `win=0` 非窗口内容顶点缓存 | 顶层静态面板/标签免每帧重建 | 需重构"局部顶点+窗口变换"语义（涉及可拖动面板） |
 | 文本缓存键免每帧 String 分配 | 每帧省 ~200 次小分配 | 需与 `Buffer` 内容校验防碰撞，正确性敏感 |
-| Render2D `add_quads` staging 拷贝 | 提交路径再省一次拷贝 | 渲染器侧，GPU 上传前必需，改动大 |
+| Render2D `quads` staging 拷贝 | 提交路径再省一次拷贝 | 渲染器侧，GPU 上传前必需，改动大 |
 
 ---
 

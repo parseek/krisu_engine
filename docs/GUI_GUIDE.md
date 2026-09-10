@@ -34,7 +34,7 @@ ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {
 });
 
 ui.finish(&viewport, r2d); // 视口/渲染器在此延迟传入（UI 无需相机，仅视口大小+位置）
-// r2d 提交（UI 的 Render2D 必须 set_sorting(false)；set_mvp 用 viewport.vp_matrix()）
+// r2d 提交（UI 的 Render2D 必须 set_sort_mode(SortMode::None)；set_mvp 用 viewport.vp_matrix()）
 ```
 
 ---
@@ -147,7 +147,7 @@ ui.add_at(Vec2::new(400.0, 40.0), Label::new("HUD"));
 
 | 现象 | 原因 / 处理 |
 |---|---|
-| UI 文字被图形盖住 / 顺序错乱 | UI 的 Render2D 必须 `set_sorting(false)`（UI 自管顺序） |
+| UI 文字被图形盖住 / 顺序错乱 | UI 的 Render2D 必须 `set_sort_mode(SortMode::None)`（UI 自管顺序） |
 | 高 DPI 下控件模糊/错位 | 用 `.scale_factor(ctx.scale_factor())`，坐标按逻辑像素 |
 | 窗口内 hover/click 不刷新 | 旧版摘要缓存漏颜色——已修（全量签名）；升级即可 |
 | 下拉浮层背后按钮响应 | 已修（window_rects 存绝对坐标） |

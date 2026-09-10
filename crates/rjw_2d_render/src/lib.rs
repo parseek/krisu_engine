@@ -1,45 +1,76 @@
-//! 2D Render using the Batching technique
+//! 2D 批渲染器：Sprite / Mesh 统一管线，按 (layer, states) 排序合批。
 //!
-//! # Batch2D 架构
+//! # 设计总览（职责分离）
 //!
-//! 用户通过 `add_sprite2d*` / `add_mesh` 录制绘制命令 → 命令按 (layer, states) 排序 →
-//! `render()` 或 `flush()` 中按相同状态合批，一次性写入实例缓冲并提交渲染。
+//! | 模块 | 职责 |
+//! |---|---|
+//! | [`draw`] | 录制：`Draw2D<K>` 统一 Builder（4 个 kind）+ 流式 sink |
+//! | [`sort`] | 排序：对**命令索引数组**重排的策略（`SortMode` / `SortPolicy` / `SortKey`） |
+//! | [`cull`] | 剔除：可见性判定 + 对**索引数组**过滤（`Cull` / `Culler` + 纯几何） |
+//! | [`render2d`] | 门面：`Render2D`（录制入口 / 全局状态 / 提交 / 资源） |
+//! | [`command`] | 命令队列（命令 + layer + states + 索引数组），不含策略 |
+//! | [`data`] | 几何/数据类型（`SpriteRect` / `VertexP3U2C4` / `MeshStorage` / `MeshSink`） |
+//! | [`draw_page`] | GPU 实例分页缓冲与统一管线缓存 |
+//! | [`debug_draw`] | 调试图元（线段 / 矩形框 / 圆 / 十字 / 网格） |
+//!
+//! # 最小用法
+//!
+//! ```no_run
+//! # use rjw_2d_render::{ArcTextureWrapped, ClearConfig, Color, Render2D, SpriteRect};
+//! # use rjw_transform::Transform2D;
+//! # let (mut r2d, tex, vp): (Render2D, ArcTextureWrapped, glam::Mat4) = unimplemented!();
+//! r2d.set_mvp(vp);
+//!
+//! // 贴纹理精灵：入口 2 参，其余全在链上（默认 IDENTITY / WHITE / layer 0）
+//! r2d.sprite(SpriteRect::new((-50.0, -50.0), (100.0, 100.0)), &tex)
+//!     .color(Color::WHITE)
+//!     .transform(Transform2D::IDENTITY.with_pos(glam::Vec2::new(10.0, 20.0)))
+//!     .layer(1.0);
+//!
+//! // 纯色多边形（流式构造，零临时 Vec）
+//! r2d.polygon_with(|p| {
+//!     p.vertex(glam::Vec2::new(0.0, 0.0));
+//!     p.vertex(glam::Vec2::new(40.0, 0.0));
+//!     p.vertex(glam::Vec2::new(20.0, 30.0));
+//! })
+//! .color(Color::CYAN);
+//!
+//! r2d.render(&ClearConfig::default());
+//! ```
 //!
 //! 坐标系（与 `rjw_transform::Camera2D` 一致）：原点在视口中心、X+ 为右、Y+ 为下。
-//!
-//! # 模块划分
-//!
-//! - [`data`]：几何/数据类型（`SpriteRect`/`SpriteRectPx`/`VertexP3U2C4`/`Index`/`TriIndicies`/`MeshStorage`/`MeshSink`）
-//! - [`command`]：绘制命令枚举、层级 `Layer`、状态与命令队列
-//! - [`draw_page`]：GPU 实例数据/缓冲页（`InstanceData`/`VPBuffer`/`MeshDrawItem`/`DrawOp`/`DrawPage`）
-//! - [`render2d`]：`Render2D` 渲染器主体 + `ClearConfig`
-//! - [`debug_draw`]：调试图元（线段 / 矩形框 / 圆 / 十字 / 网格）
-//! - 纹理类型（`TextureWrapped`/`ArcTextureWrapped`）已移入 [`rjw_render`] crate
-//!
-//! [`rjw_render`]: https://docs.rs/rjw_render
 
 // ─── 模块声明 ─────────────────────────────────────────────────
 
 pub mod command;
+pub mod cull;
 pub mod data;
 pub mod debug_draw;
+pub mod draw;
 pub mod draw_page;
 pub mod render2d;
 pub mod rstates;
+pub mod sort;
 
-// ─── 对外重导出（保持既有 API 不变） ──────────────────────────
+// ─── 对外重导出 ───────────────────────────────────────────────
 
 pub use command::Layer;
-pub use data::{Index, MeshSink, SpriteRect, SpriteRectPx, TriIndicies, Vertex, VertexP3U2C4};
+pub use cull::{Cull, Culler, sprite_world_aabb, transform2d_model, viewport_world_rect};
+pub use data::{
+    Edges, Index, MeshSink, SpriteRect, SpriteRectPx, TriIndicies, Vertex, VertexP3U2C4,
+};
 pub use draw_page::MAX_INSTANCES_PER_DRAW;
+pub use draw::{
+    Custom, CustomDraw, Draw2D, DrawKind, Mesh, PolygonSink, QuadSink, Sprite, StaticMesh,
+};
 pub use render2d::{
-    ClearConfig, CustomBuilder, CustomDraw, MeshBuilder, Render2D, Sprite2DBuilder,
-    StaticMeshBuilder,
+    ClearConfig, CustomBuilder, MeshBuilder, Render2D, SpriteBuilder, StaticMeshBuilder,
 };
 pub use rstates::{
     AddressMode, BlendDesc, BlendMode, CompareFunc, CullMode, DepthState, FilterMode,
     FrontFaceWinding, PolygonMode, RStates, RasterState, SamplerDesc, StencilState,
 };
+pub use sort::{SortKey, SortMode, SortPolicy};
 
 // 纹理 / 网格 / 注册表类型重导出（兼容旧路径并暴露静态网格 API）。
 pub use rjw_render::{
@@ -164,7 +195,7 @@ mod matrix_tests {
         // 单位变换、精灵中心在原点的顶点（local=(0.5,0.5)）应映射到 NDC 中心 (0,0)
         let vp = camera().vp_matrix();
         let model = model_matrix(&Transform2D::default());
-        let rect = SpriteRect::from_texture(glam::Vec2::splat(-50.0), glam::Vec2::splat(100.0));
+        let rect = SpriteRect::new((-50.0, -50.0), (100.0, 100.0));
         let ndc = mesh_ndc(vp, model, &rect, glam::Vec2::new(0.5, 0.5));
         assert!(
             (ndc - glam::Vec2::ZERO).length() < EPS,
@@ -195,7 +226,7 @@ mod matrix_tests {
         // 平移 (100, 80) 的精灵中心 → NDC 右下（x>0, y<0，因 y 上为负）
         let vp = camera().vp_matrix();
         let model = model_matrix(&Transform2D::default().with_pos(glam::Vec2::new(100.0, 80.0)));
-        let rect = SpriteRect::from_texture(glam::Vec2::splat(-10.0), glam::Vec2::splat(20.0));
+        let rect = SpriteRect::new((-10.0, -10.0), (20.0, 20.0));
         let ndc = mesh_ndc(vp, model, &rect, glam::Vec2::new(0.5, 0.5));
         assert!(
             ndc.x > 0.0,
@@ -214,7 +245,7 @@ mod matrix_tests {
         // 旋转 90°：中心点不变（绕中心旋转）
         let vp = camera().vp_matrix();
         let model = model_matrix(&Transform2D::default().with_rot(std::f32::consts::PI / 2.0));
-        let rect = SpriteRect::from_texture(glam::Vec2::splat(-50.0), glam::Vec2::splat(100.0));
+        let rect = SpriteRect::new((-50.0, -50.0), (100.0, 100.0));
         let ndc_center = mesh_ndc(vp, model, &rect, glam::Vec2::new(0.5, 0.5));
         assert!(
             (ndc_center - glam::Vec2::ZERO).length() < EPS,
@@ -229,7 +260,7 @@ mod matrix_tests {
             .with_pos(glam::Vec2::new(10.0, -20.0))
             .with_rot(0.5)
             .with_scale(glam::Vec2::new(2.0, 3.0));
-        let rect = SpriteRect::from_texture(glam::Vec2::ZERO, glam::Vec2::splat(16.0));
+        let rect = SpriteRect::new(glam::Vec2::ZERO, (16.0, 16.0));
         let id = draw_page::InstanceData::from_sprite(&rect, Color::WHITE, tf);
         let expected = model_matrix(&tf).to_cols_array_2d();
         for row in 0..4 {
@@ -282,15 +313,11 @@ mod sprite_rect_px_tests {
 
     /// 64×64 纹理的整张贴图精灵
     fn px64() -> SpriteRectPx {
-        SpriteRectPx::from_texture(
-            glam::Vec2::ZERO,
-            glam::Vec2::splat(32.0),
-            glam::Vec2::splat(64.0),
-        )
+        SpriteRectPx::new(glam::Vec2::ZERO, (32.0, 32.0), (64.0, 64.0))
     }
 
     #[test]
-    fn from_texture_maps_full_region() {
+    fn new_maps_full_region() {
         let r = px64();
         assert_eq!(r.uv_tl, glam::Vec2::ZERO);
         assert_eq!(r.uv_wh, glam::Vec2::splat(64.0));
@@ -304,12 +331,12 @@ mod sprite_rect_px_tests {
 
     #[test]
     fn pixel_subregion_normalizes_correctly() {
-        let r = SpriteRectPx::new(
-            glam::Vec2::new(-16.0, -8.0),
-            glam::Vec2::new(32.0, 16.0),
-            glam::Vec2::new(16.0, 32.0),
-            glam::Vec2::new(64.0, 32.0),
-            glam::Vec2::new(256.0, 128.0),
+        let r = SpriteRectPx::with_uv_px(
+            (-16.0, -8.0),
+            (32.0, 16.0),
+            (16.0, 32.0),
+            (64.0, 32.0),
+            (256.0, 128.0),
         );
         let s = r.to_sprite_rect();
         assert!((s.uv_tl - glam::Vec2::new(16.0 / 256.0, 32.0 / 128.0)).length() < EPS);
@@ -317,40 +344,44 @@ mod sprite_rect_px_tests {
     }
 
     #[test]
-    fn shrink_uv_is_centered_and_clamped() {
+    fn shrink_clamps_by_edge_without_flipping() {
         let r = px64();
-        let s = r.shrink_uv_x(8.0);
+        let s = r.shrink(8.0);
         assert!((s.uv_tl.x - 8.0).abs() < EPS, "tl.x = {}", s.uv_tl.x);
         assert!((s.uv_wh.x - 48.0).abs() < EPS, "wh.x = {}", s.uv_wh.x);
-        // 过窄：clamp 到 0，uv_tl 居中（不翻转）
-        let c = r.shrink_uv_x(64.0);
+        // 过窄：按边 clamp（左 → 上 → 右 → 下），尺寸到 0 且不翻转
+        let c = r.shrink(64.0);
         assert_eq!(c.uv_wh.x, 0.0);
-        assert!((c.uv_tl.x - 32.0).abs() < EPS);
+        assert!((c.uv_tl.x - 64.0).abs() < EPS);
+        // 分轴：左右各 4、上下各 2
+        let xy = r.shrink((4.0, 2.0));
+        assert_eq!(xy.uv_tl, glam::Vec2::new(4.0, 2.0));
+        assert_eq!(xy.uv_wh, glam::Vec2::new(56.0, 60.0));
     }
 
     #[test]
     fn expand_clamps_at_texture_bounds() {
         // 子区 (0,16)-(48,32)，纹理 64×64
-        let r = SpriteRectPx::new(
+        let r = SpriteRectPx::with_uv_px(
             glam::Vec2::ZERO,
-            glam::Vec2::splat(32.0),
-            glam::Vec2::new(0.0, 16.0),
-            glam::Vec2::new(48.0, 32.0),
-            glam::Vec2::splat(64.0),
+            (32.0, 32.0),
+            (0.0, 16.0),
+            (48.0, 32.0),
+            (64.0, 64.0),
         );
         // 左：tl.x 已贴 0，无可展开
-        let e = r.expand_left(1000.0);
+        let e = r.expand(Edges::new().left(1000.0));
         assert_eq!(e.uv_tl.x, 0.0);
         assert!((e.uv_wh.x - 48.0).abs() < EPS);
         // 右：0+48=48，剩 16px
-        let e = r.expand_right(1000.0);
+        let e = r.expand(Edges::new().right(1000.0));
         assert!((e.uv_wh.x - 64.0).abs() < EPS, "wh.x = {}", e.uv_wh.x);
         // 下：16+32=48，剩 16px
-        let e = r.expand_down(1000.0);
+        let e = r.expand(Edges::new().bottom(1000.0));
         assert!((e.uv_wh.y - 48.0).abs() < EPS, "wh.y = {}", e.uv_wh.y);
         assert_eq!(e.uv_tl.y, 16.0);
         // 上：tl.y=16，可展开 16px
-        let e = r.expand_up(1000.0);
+        let e = r.expand(Edges::new().top(1000.0));
         assert_eq!(e.uv_tl.y, 0.0);
         assert!((e.uv_wh.y - 48.0).abs() < EPS);
     }
@@ -358,10 +389,10 @@ mod sprite_rect_px_tests {
     #[test]
     fn exceed_does_not_clamp() {
         let r = px64();
-        let e = r.exceed_left(16.0).exceed_down(16.0);
+        let e = r.exceed(Edges::new().left(16.0).bottom(16.0));
         assert_eq!(e.uv_tl, glam::Vec2::new(-16.0, 0.0));
         assert_eq!(e.uv_wh, glam::Vec2::new(80.0, 80.0));
-        let e = r.exceed_up(8.0).exceed_right(8.0);
+        let e = r.exceed(Edges::new().top(8.0).right(8.0));
         assert_eq!(e.uv_tl, glam::Vec2::new(0.0, -8.0));
         assert_eq!(e.uv_wh, glam::Vec2::new(72.0, 72.0));
     }
@@ -369,13 +400,13 @@ mod sprite_rect_px_tests {
     #[test]
     fn shrink_single_side_clamps_to_zero() {
         let r = px64();
-        let s = r.shrink_left(100.0);
+        let s = r.shrink(Edges::new().left(100.0));
         assert_eq!(s.uv_wh.x, 0.0);
         assert!((s.uv_tl.x - 64.0).abs() < EPS);
-        let s = r.shrink_right(100.0);
+        let s = r.shrink(Edges::new().right(100.0));
         assert_eq!(s.uv_wh.x, 0.0);
         assert_eq!(s.uv_tl.x, 0.0);
-        let s = r.shrink_down(100.0);
+        let s = r.shrink(Edges::new().bottom(100.0));
         assert_eq!(s.uv_wh.y, 0.0);
         assert_eq!(s.uv_tl.y, 0.0);
     }
@@ -383,7 +414,7 @@ mod sprite_rect_px_tests {
     #[test]
     fn shrink_mesh_mirrors_sprite_rect() {
         let r = px64();
-        let s = r.shrink_mesh_x(4.0).shrink_mesh_y(2.0);
+        let s = r.shrink_mesh((4.0, 2.0));
         assert!((s.mesh_wh - glam::Vec2::new(24.0, 28.0)).length() < EPS);
         assert!((s.mesh_tl - glam::Vec2::new(4.0, 2.0)).length() < EPS);
         // UV 不受影响

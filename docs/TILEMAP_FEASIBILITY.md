@@ -14,7 +14,7 @@
   tile→实例生成层（可加 chunk 级脏标记增量更新）。
 - 建议：新增 `rjw_tilemap` crate，数据层与渲染层分离；存储用 **16×16 chunk 的 `HashMap<ChunkPos, [TileId; 256]>`**；
   `TileId` 用 **u32 打包（低 24 位 tile index + 翻转/旋转标志位）**，与 Tiled 的 GID 布局对齐；
-  渲染先复用 `add_sprite2d` 做 MVP，再演进为 chunk 级实例缓冲 + 脏标记；交换格式采用 **TMX/TSX**
+  渲染先复用 `sprite` 做 MVP，再演进为 chunk 级实例缓冲 + 脏标记；交换格式采用 **TMX/TSX**
   （用 [`tiled`](https://docs.rs/tiled/latest/tiled/) crate 做 loader）。
 - 工作量：MVP ≈ 1 个新 crate + 集成示例，纯 CPU 逻辑；完整版（chunk 增量实例、动画、翻转、TMX 导入、流式加载）为中等复杂度。
 
@@ -95,7 +95,7 @@
 - 单批上限 `MAX_INSTANCES_PER_DRAW = 8192`，实例缓冲页池自动分页，单帧可远超 8192 实例。
 
 三种发射策略：
-1. **方案 A（MVP，先做）**：每帧遍历可见 tile 区间，逐个 `add_sprite2d(...)`。实现量最小；1080p + 64px tile 下可见约 30×17 ≈ 500 实例，性能无虞。
+1. **方案 A（MVP，先做）**：每帧遍历可见 tile 区间，逐个 `sprite(...)`。实现量最小；1080p + 64px tile 下可见约 30×17 ≈ 500 实例，性能无虞。
 2. **方案 B（终态）**：按 chunk 收集实例（跳过空 tile），chunk 加**脏标记**，静态 chunk 缓存其 SpriteRect+Transform 列表，仅变更 chunk 重建。tileset 单纹理 → 所有 tile 同 (layer, states, texture)，合并为极少数 draw call。
 3. **方案 C（进阶）**：GPU 端分块 index buffer / 每 chunk 独立实例缓冲段，静态时 CPU 零成本；本引擎规模下非必需。
 
@@ -131,7 +131,7 @@ tile 行列区间（旋转相机取包围盒近似）→ 区间内按 chunk 迭�
 
 1. 瓦片数据模型：`TileSet` / `TileMap` / `ChunkMap` / 层 / 打包 TileId（全新代码，无 GPU 改动）。
 2. 可见 tile 区间 + chunk 迭代：相机世界 AABB 小工具 + 区间→chunk 映射。
-3. tile→实例生成层：MVP 走 `add_sprite2d`；终态走 chunk 实例缓存 + 脏标记。
+3. tile→实例生成层：MVP 走 `sprite`；终态走 chunk 实例缓存 + 脏标记。
 4. 动画 tile 帧选择；翻转/旋转标志→UV/model 处理。
 5. TMX 导入（可选依赖 `tiled` crate）。
 
@@ -139,7 +139,7 @@ tile 行列区间（旋转相机取包围盒近似）→ 区间内按 chunk 迭�
 
 | 里程碑 | 内容 | 复杂度 | 预估量级 |
 |---|---|---|---|
-| MVP | 新 crate `rjw_tilemap`：TileSet/TileMap（2D 数组或 chunk）+ 可见区间剔除 + `add_sprite2d` 发射 + demo | 低 | ~600–1000 行 + 1 个 example |
+| MVP | 新 crate `rjw_tilemap`：TileSet/TileMap（2D 数组或 chunk）+ 可见区间剔除 + `sprite` 发射 + demo | 低 | ~600–1000 行 + 1 个 example |
 | 标准版 | chunk 存储 + 脏标记实例缓存 + 翻转/动画 + 多 layer | 中 | 增量 ~500–800 行 |
 | 完整版 | TMX/TSX 导入（tiled crate）、流式加载、Wang 自动瓦片 | 中 | 增量 ~800–1500 行 |
 
@@ -149,7 +149,7 @@ tile 行列区间（旋转相机取包围盒近似）→ 区间内按 chunk 迭�
 ### 3.4 具体建议（5 条）
 
 1. **新建 `rjw_tilemap` crate**：依赖 `rjw_2d_render` / `rjw_atlas` / `rjw_transform`，数据层（TileSet/TileMap/ChunkMap）
-   与渲染层（Emitter）分离；MVP 直接复用 `add_sprite2d`。
+   与渲染层（Emitter）分离；MVP 直接复用 `sprite`。
 2. **存储用 16×16 chunk**（`HashMap<ChunkPos, [TileId; 256]>`），TileId u32 位打包（低 24 位 index + 高位 flip/旋转标志），
    **与 Tiled GID 布局对齐**——未来 TMX 导入零转换成本，且天然支持流式。
 3. **渲染终态为 chunk 级实例收集 + 脏标记增量更新**：tileset 单纹理时所有 tile 同批，draw call 数 ≈ 可见 chunk 数；

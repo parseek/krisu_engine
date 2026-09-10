@@ -2,6 +2,9 @@
 
 krusie 引擎的 UI 模块：**hybrid 模式**（立即外观 + ID 持久状态）+ **DOM 风格自动布局** + **Tkinter 风格几何管理器**（`place` / `pack` / `grid`）。
 
+> 整套库入口：`use rjw_krusie::prelude::*;` 可直接取到 `Ui` / `UiAdd` / `UiState` / `Theme` / 常用控件；
+> 低层与冲突名（如 UI 容器 `Window`）走 `rjw_krusie::ui::*`。
+
 ## 设计要点
 
 - **立即外观**：每帧 `Ui::begin(...)` → 录制控件 → `finish()` 深度排序后一次提交绘制（与 `Render2D` 逐帧录制架构一致）。

@@ -1,38 +1,60 @@
-//! `Render2D`：Batch2D 渲染器主体 + Clear 配置。
+//! `Render2D`：2D 批渲染器门面（录制 → 排序 → 剔除 → 合批 → 提交）。
+//!
+//! # 责任划分
+//!
+//! | 职责 | 位置 |
+//! |---|---|
+//! | 录制（画什么） | 本文件入口方法 → [`crate::draw::Draw2D`] 统一 Builder |
+//! | 排序（索引数组重排） | [`crate::sort`]（[`SortPolicy`] / [`SortMode`]） |
+//! | 剔除（索引数组过滤） | [`crate::cull`]（[`Culler`] / [`Cull`]） |
+//! | 全局默认状态 | [`Render2D::states`] / [`Render2D::set_states`]（`RStates` 唯一状态语言） |
+//! | 提交 | [`Render2D::render`] / [`Render2D::record`] / [`Render2D::encode`] / [`Render2D::acquire_frame`] |
+//! | 资源 | [`Render2D::create_texture`] / [`Render2D::register_mesh`] / [`Render2D::texture_layout`] |
+//!
+//! # 每帧流程
+//!
+//! ```text
+//! set_mvp / set_cull / set_sort_mode（可选）
+//!   → sprite/... 入口录制命令（链式 .layer().color()...）
+//!   → render(&ClearConfig)：prepare() 排序 + 剔除 + 分页 → draw() → submit → present
+//! ```
+//!
+//! 坐标系（与 `rjw_transform::Camera2D` 一致）：原点在视口中心、X+ 右、Y+ 下。
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
-use rjw_color::Color;
 use rjw_render::{ArcTextureWrapped, MeshData, MESHES, TEXTURES, TextureWrapped};
-use rjw_transform::{Camera2D, Rect, Transform2D};
+use rjw_transform::Camera2D;
 
-use crate::command::{DrawCommand, DrawCommandQueue, Layer, States};
+use crate::command::{DrawCommand, DrawCommandQueue, Layer};
+use crate::cull::{self, Cull, Culler};
 use crate::data::{
     Index, MeshSink, MeshStorage, QUAD_TRI_INDICIES, SpriteRect, TriIndicies, VertexP3U2C4,
 };
+use crate::draw::{Custom, Draw2D, Mesh, Sprite, StaticMesh};
 use crate::draw_page::{
     DEPTH_FORMAT, DrawOp, DrawPage, InstanceData, MAX_INSTANCES_PER_DRAW, MAX_MESH_VERTS,
 };
-use crate::rstates::{
-    AddressMode, BlendDesc, BlendMode, CompareFunc, CullMode, DepthState, FilterMode,
-    FrontFaceWinding, PolygonMode, RStates, RasterState, SamplerDesc, StencilState,
-};
+use crate::rstates::RStates;
+use crate::sort::{SortKey, SortMode, SortPolicy};
+
+// 对外可见的绘制相关类型（入口签名 / 闭包 sink）。
+pub use crate::draw::{CustomDraw, PolygonSink, QuadSink};
+
+// ─── Builder 类型别名（4 个 kind 共用同一实现） ───────────────
+
+/// `sprite` / `solid` 返回的 Builder。
+pub type SpriteBuilder<'a> = Draw2D<'a, Sprite>;
+/// `mesh` / `mesh_with` / `polygon` / `quads` 返回的 Builder。
+pub type MeshBuilder<'a> = Draw2D<'a, Mesh>;
+/// `static_mesh` 返回的 Builder。
+pub type StaticMeshBuilder<'a> = Draw2D<'a, StaticMesh>;
+/// `custom` 返回的 Builder。
+pub type CustomBuilder<'a> = Draw2D<'a, Custom>;
 
 // ─── Clear 配置 ───────────────────────────────────────────────
 
-/// 命令排序模式（[`Render2D::set_sorting`] / [`Render2D::set_layer_sort`]）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SortMode {
-    /// 按 `(layer, states)` 排序后合批绘制（引擎默认）。
-    #[default]
-    LayerAndStates,
-    /// **仅按 layer 稳定排序**：同 layer 内保持录制顺序（`states` 只参与相邻合批）。
-    /// 适合"每图层一个 layer、图层内部顺序由录制序保证"的场景（如 UI 窗口）。
-    LayerOnly,
-    /// 不排序：按录制顺序绘制（相邻同状态仍合批）。
-    None,
-}
-
+/// 清屏配置：`None` = 保留旧内容。
 #[derive(Debug, Clone, Copy)]
 pub struct ClearConfig {
     pub color: Option<wgpu::Color>,
@@ -50,626 +72,14 @@ impl Default for ClearConfig {
     }
 }
 
-// ─── Builder：责任链模式 ────────────────────────────────────
-
-pub struct Sprite2DBuilder<'a> {
-    queue: &'a mut DrawCommandQueue,
-    cmd: Option<DrawCommand>,
-    layer: Layer,
-    rstates: RStates,
-    texture_uid: Option<u64>,
-    has_rstates: bool,
-}
-
-impl<'a> Sprite2DBuilder<'a> {
-    pub fn blend(mut self, mode: BlendMode) -> Self {
-        self.rstates = self.rstates.blend(mode);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_mag(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_mag(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_min(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_min(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_mip(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_mip(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_u(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_u(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_v(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_v(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_w(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_w(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn cull(mut self, c: CullMode) -> Self {
-        self.rstates = self.rstates.cull(c);
-        self.has_rstates = true;
-        self
-    }
-    pub fn polygon(mut self, p: PolygonMode) -> Self {
-        self.rstates = self.rstates.polygon(p);
-        self.has_rstates = true;
-        self
-    }
-    pub fn front_face(mut self, f: FrontFaceWinding) -> Self {
-        self.rstates = self.rstates.front_face(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn conservative_raster(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.conservative_raster(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_test(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.depth_test(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_write(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.depth_write(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_compare(mut self, f: CompareFunc) -> Self {
-        self.rstates = self.rstates.depth_compare(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_test(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.stencil_test(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_write(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.stencil_write(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_compare(mut self, f: CompareFunc) -> Self {
-        self.rstates = self.rstates.stencil_compare(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn blend_state(mut self, d: BlendDesc) -> Self {
-        self.rstates = self.rstates.blend_state(d);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_state(mut self, d: SamplerDesc) -> Self {
-        self.rstates = self.rstates.samp_state(d);
-        self.has_rstates = true;
-        self
-    }
-    pub fn raster_state(mut self, s: RasterState) -> Self {
-        self.rstates = self.rstates.raster_state(s);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_state(mut self, s: DepthState) -> Self {
-        self.rstates = self.rstates.depth_state(s);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_state(mut self, s: StencilState) -> Self {
-        self.rstates = self.rstates.stencil_state(s);
-        self.has_rstates = true;
-        self
-    }
-}
-
-impl Drop for Sprite2DBuilder<'_> {
-    fn drop(&mut self) {
-        let rstates = if self.has_rstates {
-            Some(self.rstates)
-        } else {
-            None
-        };
-        if let Some(cmd) = self.cmd.take() {
-            self.queue.push(
-                cmd,
-                self.layer,
-                States {
-                    rstates,
-                    texture_uid: self.texture_uid,
-                },
-            );
-        }
-    }
-}
-
-/// 静态网格 Builder（由 `add_static_mesh` / `add_static_mesh_matrix` 返回）。
-/// 链式设置 RStates；`done()` 或 Drop 时 push `DrawCommand::StaticMesh*`。
-pub struct StaticMeshBuilder<'a> {
-    queue: &'a mut DrawCommandQueue,
-    cmd: Option<DrawCommand>,
-    layer: Layer,
-    rstates: RStates,
-    texture_uid: Option<u64>,
-    has_rstates: bool,
-}
-
-impl<'a> StaticMeshBuilder<'a> {
-    /// 消费 builder，立即提交命令（等价于直接 drop）。
-    pub fn done(mut self) {
-        // 无操作：Drop 实现自动 push 命令。
-        let _ = &mut self;
-    }
-
-    pub fn blend(mut self, mode: BlendMode) -> Self {
-        self.rstates = self.rstates.blend(mode);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_mag(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_mag(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_min(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_min(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_mip(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_mip(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_u(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_u(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_v(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_v(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_w(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_w(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn cull(mut self, c: CullMode) -> Self {
-        self.rstates = self.rstates.cull(c);
-        self.has_rstates = true;
-        self
-    }
-    pub fn polygon(mut self, p: PolygonMode) -> Self {
-        self.rstates = self.rstates.polygon(p);
-        self.has_rstates = true;
-        self
-    }
-    pub fn front_face(mut self, f: FrontFaceWinding) -> Self {
-        self.rstates = self.rstates.front_face(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn conservative_raster(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.conservative_raster(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_test(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.depth_test(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_write(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.depth_write(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_compare(mut self, f: CompareFunc) -> Self {
-        self.rstates = self.rstates.depth_compare(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_test(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.stencil_test(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_write(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.stencil_write(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_compare(mut self, f: CompareFunc) -> Self {
-        self.rstates = self.rstates.stencil_compare(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn blend_state(mut self, d: BlendDesc) -> Self {
-        self.rstates = self.rstates.blend_state(d);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_state(mut self, d: SamplerDesc) -> Self {
-        self.rstates = self.rstates.samp_state(d);
-        self.has_rstates = true;
-        self
-    }
-    pub fn raster_state(mut self, s: RasterState) -> Self {
-        self.rstates = self.rstates.raster_state(s);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_state(mut self, s: DepthState) -> Self {
-        self.rstates = self.rstates.depth_state(s);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_state(mut self, s: StencilState) -> Self {
-        self.rstates = self.rstates.stencil_state(s);
-        self.has_rstates = true;
-        self
-    }
-}
-
-impl Drop for StaticMeshBuilder<'_> {
-    fn drop(&mut self) {
-        let rstates = if self.has_rstates {
-            Some(self.rstates)
-        } else {
-            None
-        };
-        if let Some(cmd) = self.cmd.take() {
-            self.queue.push(
-                cmd,
-                self.layer,
-                States {
-                    rstates,
-                    texture_uid: self.texture_uid,
-                },
-            );
-        }
-    }
-}
-
-pub struct MeshBuilder<'a> {
-    queue: &'a mut DrawCommandQueue,
-    cmd: Option<DrawCommand>,
-    layer: Layer,
-    rstates: RStates,
-    texture_uid: Option<u64>,
-    has_rstates: bool,
-    /// 整段混合色（`Some` = 生成 `MeshStyled`，实例带 color；`None` = 通用 `Mesh`）。
-    color: Option<[f32; 4]>,
-}
-
-impl<'a> MeshBuilder<'a> {
-    pub fn set_texture(mut self, texture: &ArcTextureWrapped) -> Self {
-        self.texture_uid = Some(texture.uid);
-        self
-    }
-    /// 整段混合色（实例 color；`[1,1,1,1]` = 不染色）。设置后该段按
-    /// **已提前合批**的 QuadVerticesCommand 提交（自成一整段一次 draw，不参与跨段合批）。
-    pub fn color(mut self, c: Color) -> Self {
-        self.color = Some(c.into());
-        self
-    }
-    pub fn blend(mut self, mode: BlendMode) -> Self {
-        self.rstates = self.rstates.blend(mode);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_mag(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_mag(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_min(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_min(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_mip(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_mip(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_u(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_u(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_v(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_v(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_w(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_w(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn cull(mut self, c: CullMode) -> Self {
-        self.rstates = self.rstates.cull(c);
-        self.has_rstates = true;
-        self
-    }
-    pub fn polygon(mut self, p: PolygonMode) -> Self {
-        self.rstates = self.rstates.polygon(p);
-        self.has_rstates = true;
-        self
-    }
-    pub fn front_face(mut self, f: FrontFaceWinding) -> Self {
-        self.rstates = self.rstates.front_face(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn conservative_raster(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.conservative_raster(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_test(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.depth_test(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_write(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.depth_write(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_compare(mut self, f: CompareFunc) -> Self {
-        self.rstates = self.rstates.depth_compare(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_test(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.stencil_test(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_write(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.stencil_write(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_compare(mut self, f: CompareFunc) -> Self {
-        self.rstates = self.rstates.stencil_compare(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn blend_state(mut self, d: BlendDesc) -> Self {
-        self.rstates = self.rstates.blend_state(d);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_state(mut self, d: SamplerDesc) -> Self {
-        self.rstates = self.rstates.samp_state(d);
-        self.has_rstates = true;
-        self
-    }
-    pub fn raster_state(mut self, s: RasterState) -> Self {
-        self.rstates = self.rstates.raster_state(s);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_state(mut self, s: DepthState) -> Self {
-        self.rstates = self.rstates.depth_state(s);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_state(mut self, s: StencilState) -> Self {
-        self.rstates = self.rstates.stencil_state(s);
-        self.has_rstates = true;
-        self
-    }
-}
-
-impl Drop for MeshBuilder<'_> {
-    fn drop(&mut self) {
-        let rstates = if self.has_rstates {
-            Some(self.rstates)
-        } else {
-            None
-        };
-        if let Some(cmd) = self.cmd.take() {
-            let cmd = match (cmd, self.color) {
-                // 设置了整段混合色 → 转为"已提前合批"的 QuadVerticesCommand（实例带 color）。
-                (DrawCommand::Mesh { vert, tri_index, mat_idx }, Some(color)) => {
-                    DrawCommand::MeshStyled { vert, tri_index, mat_idx, color }
-                }
-                (other, _) => other,
-            };
-            self.queue.push(
-                cmd,
-                self.layer,
-                States {
-                    rstates,
-                    texture_uid: self.texture_uid,
-                },
-            );
-        }
-    }
-}
-
-/// 外部绘制 trait：实现此 trait 的结构体/闭包可通过 `add_custom` 注入绘制队列。
-/// 渲染器持有 `Arc<dyn CustomDraw>`，`draw()` 中可安全共享引用。
-pub trait CustomDraw: Send + Sync {
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>);
-}
-
-/// 闭包的 blanket impl——直接传 `|pass| { ... }` 即可。
-impl<F: Fn(&mut wgpu::RenderPass<'_>) + Send + Sync> CustomDraw for F {
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        self(pass);
-    }
-}
-
-/// 外部绘制 Builder（由 `add_custom` 返回）。
-/// 链式设置 RStates；Drop 时 push `DrawCommand::Custom`。
-pub struct CustomBuilder<'a> {
-    queue: &'a mut DrawCommandQueue,
-    cmd: Option<DrawCommand>,
-    layer: Layer,
-    rstates: RStates,
-    has_rstates: bool,
-}
-
-impl<'a> CustomBuilder<'a> {
-    pub fn blend(mut self, mode: BlendMode) -> Self {
-        self.rstates = self.rstates.blend(mode);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_mag(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_mag(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_min(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_min(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_mip(mut self, f: FilterMode) -> Self {
-        self.rstates = self.rstates.samp_mip(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_u(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_u(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_v(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_v(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_addr_w(mut self, a: AddressMode) -> Self {
-        self.rstates = self.rstates.samp_addr_w(a);
-        self.has_rstates = true;
-        self
-    }
-    pub fn cull(mut self, c: CullMode) -> Self {
-        self.rstates = self.rstates.cull(c);
-        self.has_rstates = true;
-        self
-    }
-    pub fn polygon(mut self, p: PolygonMode) -> Self {
-        self.rstates = self.rstates.polygon(p);
-        self.has_rstates = true;
-        self
-    }
-    pub fn front_face(mut self, f: FrontFaceWinding) -> Self {
-        self.rstates = self.rstates.front_face(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn conservative_raster(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.conservative_raster(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_test(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.depth_test(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_write(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.depth_write(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_compare(mut self, f: CompareFunc) -> Self {
-        self.rstates = self.rstates.depth_compare(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_test(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.stencil_test(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_write(mut self, b: bool) -> Self {
-        self.rstates = self.rstates.stencil_write(b);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_compare(mut self, f: CompareFunc) -> Self {
-        self.rstates = self.rstates.stencil_compare(f);
-        self.has_rstates = true;
-        self
-    }
-    pub fn blend_state(mut self, d: BlendDesc) -> Self {
-        self.rstates = self.rstates.blend_state(d);
-        self.has_rstates = true;
-        self
-    }
-    pub fn samp_state(mut self, d: SamplerDesc) -> Self {
-        self.rstates = self.rstates.samp_state(d);
-        self.has_rstates = true;
-        self
-    }
-    pub fn raster_state(mut self, s: RasterState) -> Self {
-        self.rstates = self.rstates.raster_state(s);
-        self.has_rstates = true;
-        self
-    }
-    pub fn depth_state(mut self, s: DepthState) -> Self {
-        self.rstates = self.rstates.depth_state(s);
-        self.has_rstates = true;
-        self
-    }
-    pub fn stencil_state(mut self, s: StencilState) -> Self {
-        self.rstates = self.rstates.stencil_state(s);
-        self.has_rstates = true;
-        self
-    }
-}
-
-impl Drop for CustomBuilder<'_> {
-    fn drop(&mut self) {
-        let rstates = if self.has_rstates {
-            Some(self.rstates)
-        } else {
-            None
-        };
-        if let Some(cmd) = self.cmd.take() {
-            self.queue.push(
-                cmd,
-                self.layer,
-                States {
-                    rstates,
-                    texture_uid: None,
-                },
-            );
-        }
-    }
-}
-
 // ─── 合批中间项 ───────────────────────────────────────────────
 
 /// `prepare` 阶段的合批中间项。
 ///
 /// - `mesh_id`: `Some(uid)` 为注册表网格（Sprite / StaticMesh）；`None` 为动态缓冲段
-///   （`add_mesh*` 系列，此时 `index_range` 为该段在动态索引缓冲中的范围）。
+///   （`mesh*` / `polygon*` / `quads*` 入口，此时 `index_range` 为该段在动态索引缓冲中的范围）。
 /// - `dyn_seq`: 动态段每帧递增的唯一序号（`0` 表示静态项）。
-///   每个动态段恰好一个 identity 实例；seq 唯一保证**不同动态段绝不互相合批**，
-///   否则多个 identity 实例会重复绘制整段动态缓冲。
+///   每个动态段恰好一个 identity 实例；seq 唯一保证**不同动态段绝不互相合批**。
 /// - `layer`: 绘制层级（越小越先绘制）。排序键以 layer 为主，**保证跨层级合批
 ///   不会打乱图层顺序**。
 /// - `index_range`: 索引范围（静态网格 = `0..index_count`；动态段 = `tri*3` 范围）。
@@ -677,7 +87,7 @@ struct BatchItem {
     mesh_id: Option<u64>,
     dyn_seq: u32,
     layer: Layer,
-    index_range: Range<u32>,
+    index_range: std::ops::Range<u32>,
     rstates: u64,
     tex_uid: Option<u64>,
     instance: InstanceData,
@@ -697,15 +107,15 @@ pub struct Render2D {
     depth_view: Option<wgpu::TextureView>,
     depth_size: (u32, u32),
     mvp: glam::Mat4,
-    /// 视口剔除开关（默认 **false**；[`Self::set_culling`]）。
-    culling: bool,
-    /// 命令排序模式（默认 [`SortMode::LayerAndStates`]；[`Self::set_sorting`] /
-    /// [`Self::set_layer_sort`]）。
-    sorting: SortMode,
-    /// 剔除判定闭包（[`Self::set_cull_with`] / [`Self::set_cull_camera`]）：`Fn(世界 AABB) -> bool`。
-    /// 未设置时回退为 [`Self::set_mvp`] 反推的视口矩形相交。
-    cull_pred: Option<Box<dyn Fn(&Rect) -> bool + Send + Sync>>,
-    default_rstates: RStates,
+
+    /// 排序模式（[`Render2D::set_sort_mode`]，默认 [`SortMode::LayerAndStates`]）。
+    sort_mode: SortMode,
+    /// 自定义排序策略（[`Render2D::set_sorter`]）：`Some` 时覆盖 `sort_mode`。
+    sorter: Option<Box<dyn SortPolicy>>,
+    /// 剔除器（[`Render2D::set_cull`]，默认关闭）。
+    culler: Culler,
+    /// 全局默认渲染状态（[`Render2D::set_states`]）：未链式设置状态的命令继承它。
+    default_states: RStates,
 
     /// 四边形网格（Sprite 合批用）的全局注册表 uid。
     quad_mesh_id: u64,
@@ -725,6 +135,8 @@ pub struct Render2D {
     buf_all_tris: Vec<TriIndicies>,
     buf_padded: Vec<u8>,
     buf_custom_draws: Vec<Arc<dyn CustomDraw>>,
+    /// 排序键常驻缓冲（每帧复用，零堆分配）。
+    buf_sort_keys: Vec<SortKey>,
 }
 
 impl Render2D {
@@ -801,6 +213,10 @@ impl Render2D {
         // 默认采样器（RStates::default()：线性 + ClampToEdge），samp_key == 0 零开销路径。
         let default_sampler = device.create_sampler(&RStates::default().to_sampler_desc());
 
+        // 视口缓存初始化为单位 MVP 对应的世界矩形（未调用 set_mvp 时 Cull::Viewport 也可用）。
+        let mut culler = Culler::new(Cull::Off);
+        culler.set_viewport(cull::viewport_world_rect(&glam::Mat4::IDENTITY));
+
         Self {
             surface,
             device,
@@ -813,10 +229,10 @@ impl Render2D {
             depth_view: None,
             depth_size: (0, 0),
             mvp: glam::Mat4::IDENTITY,
-            culling: false,
-            sorting: SortMode::LayerAndStates,
-            cull_pred: None,
-            default_rstates: RStates::default(),
+            sort_mode: SortMode::LayerAndStates,
+            sorter: None,
+            culler,
+            default_states: RStates::default(),
             quad_mesh_id,
             sampler_cache: HashMap::new(),
             default_sampler,
@@ -828,277 +244,107 @@ impl Render2D {
             buf_all_tris: Vec::new(),
             buf_padded: Vec::new(),
             buf_custom_draws: Vec::new(),
+            buf_sort_keys: Vec::new(),
         }
     }
 
+    // ── 相机 / 排序 / 剔除 / 全局状态 ───────────────────────
+
+    /// 设置 VP（视图投影）矩阵（每帧渲染前调用）；同时刷新 `Cull::Viewport` 的视口矩形。
     pub fn set_mvp(&mut self, vp: glam::Mat4) -> &mut Self {
-        self.mvp = vp;        self.draw_page.update_vp(&self.queue, vp);
+        self.mvp = vp;
+        self.culler.set_viewport(cull::viewport_world_rect(&vp));
+        self.draw_page.update_vp(&self.queue, vp);
         self
     }
 
-    /// 视口剔除开关（默认 **false**）。
+    /// 命令排序模式（默认 [`SortMode::LayerAndStates`]）。
     ///
-    /// 开启后，`add_sprite2d` / `add_sprite2d_matrix`（及经 `add_mesh` 提交的动态 mesh **除外**）
-    /// 在写入实例缓冲前，按精灵世界 AABB 与视口世界矩形相交测试，剔除完全不可见的精灵。
-    ///
-    /// 视口来源：优先用 [`Self::set_cull_with`] / [`Self::set_cull_camera`] 设置的**判定闭包**；
-    /// 未设置时回退为 [`Self::set_mvp`] 反推（正交相机下正确）。
+    /// - [`SortMode::LayerAndStates`]：按 `(layer, states)` 排序后合批（引擎默认）；
+    /// - [`SortMode::LayerOnly`]：仅按 layer 稳定排序（同层保持录制顺序），UI 适用；
+    /// - [`SortMode::None`]：完全按录制顺序（相邻同状态仍合批）。
     #[inline]
-    pub fn set_culling(&mut self, culling: bool) -> &mut Self {
-        self.culling = culling;
+    pub fn set_sort_mode(&mut self, mode: SortMode) -> &mut Self {
+        self.sort_mode = mode;
         self
     }
 
-    /// 命令排序模式（默认 **true**）。
-    ///
-    /// - `true`：[`SortMode::LayerAndStates`]——按 `(layer, states)` 排序后合批绘制（默认）；
-    /// - `false`：[`SortMode::None`]——**按录制顺序**直接绘制（跳过排序），相邻同状态仍合批。
+    /// 自定义排序策略（覆盖 [`Self::set_sort_mode`]；传 `None` 恢复内置模式）。
     #[inline]
-    pub fn set_sorting(&mut self, sorting: bool) -> &mut Self {
-        self.sorting = if sorting {
-            SortMode::LayerAndStates
-        } else {
-            SortMode::None
-        };
+    pub fn set_sorter(&mut self, sorter: Option<Box<dyn SortPolicy>>) -> &mut Self {
+        self.sorter = sorter;
         self
     }
 
-    /// 设置**仅按 layer 的稳定排序**（[`SortMode::LayerOnly`]；`false` 恢复
-    /// [`SortMode::LayerAndStates`]）。
-    ///
-    /// `LayerOnly`：命令**仅按 layer 稳定排序**（`states` 不参与排序，只用于相邻合批）——
-    /// **同 layer 内保持录制顺序**。适合**每图层一个 layer 且图层内部顺序由录制序保证**
-    /// 的场景（如 `rjw_ui` 窗口：每窗口 `layer = base + z*1.0`，窗口内
-    /// 背景 → 控件背景 → 文字按录制顺序提交，窗口间由 layer 排序保证层级）。
-    #[inline]
-    pub fn set_layer_sort(&mut self, layer_only: bool) -> &mut Self {
-        self.sorting = if layer_only {
-            SortMode::LayerOnly
-        } else {
-            SortMode::LayerAndStates
-        };
-        self
-    }
-
-    /// 当前排序模式。
+    /// 当前排序模式（设置自定义策略后仍返回最后一次设置的内置模式）。
     #[inline]
     pub fn sort_mode(&self) -> SortMode {
-        self.sorting
+        self.sort_mode
     }
 
-    /// 以**判定闭包**驱动剔除：`Some(f)` 开启（`f(世界 AABB) -> bool`，可见返回 true）；
-    /// `None` 关闭。
-    ///
-    /// 闭包形式最灵活：可直接捕获相机做视锥体/矩形判定（3D 亦同），无需实现 trait。
+    /// 剔除模式（**单一入口**，无隐式联动）：
+    /// [`Cull::Off`] / [`Cull::Viewport`] / [`Cull::Rect`] / [`Cull::Fn`]。
     #[inline]
-    pub fn set_cull_with(
-        &mut self,
-        f: Option<Box<dyn Fn(&Rect) -> bool + Send + Sync>>,
-    ) -> &mut Self {
-        self.cull_pred = f;
-        self.culling = self.cull_pred.is_some();
+    pub fn set_cull(&mut self, cull: impl Into<Cull>) -> &mut Self {
+        self.culler.set(cull.into());
         self
     }
 
-    /// 以 2D 相机驱动剔除（内部包装为 [`Self::set_cull_with`] 闭包：与 `view_aabb` 相交）。
+    /// 以 2D 相机剔除（`None` = 关闭；等价 `set_cull(Cull::from(&cam))`）。
     #[inline]
     pub fn set_cull_camera(&mut self, cam: Option<&Camera2D>) -> &mut Self {
-        self.set_cull_with(cam.map(|c| {
-            let view = c.view_aabb();
-            Box::new(move |aabb: &Rect| aabb.intersects(&view)) as Box<dyn Fn(&Rect) -> bool + Send + Sync>
-        }))
+        self.set_cull(cam.map(Cull::from).unwrap_or(Cull::Off))
     }
 
-    /// 视口世界矩形：由当前 MVP 逆变换 clip 空间四角得到（正交相机下 z 取 0 即可）。
-    fn viewport_world_rect(&self) -> Rect {
-        let inv = self.mvp.inverse();
-        let corners = [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)];
-        let mut pts = [glam::Vec2::ZERO; 4];
-        for (i, (cx, cy)) in corners.iter().enumerate() {
-            let v = inv * glam::Vec4::new(*cx, *cy, 0.0, 1.0);
-            pts[i] = glam::Vec2::new(v.x / v.w, v.y / v.w);
-        }
-        Rect::from_point_slice(&pts)
+    /// 当前剔除模式。
+    #[inline]
+    pub fn cull(&self) -> &Cull {
+        self.culler.mode()
     }
 
-    /// 精灵四角经 `model` 变换后的世界 AABB 是否与视口矩形相交（保守：旋转取包围盒）。
-    fn sprite_in_viewport(rect: &SpriteRect, model: glam::Mat4, vp: &Rect) -> bool {
-        let tl = rect.mesh_tl;
-        let wh = rect.mesh_wh;
-        let corners = [
-            tl,
-            glam::Vec2::new(tl.x + wh.x, tl.y),
-            glam::Vec2::new(tl.x, tl.y + wh.y),
-            tl + wh,
-        ];
-        let mut pts = [glam::Vec2::ZERO; 4];
-        for (i, c) in corners.iter().enumerate() {
-            let v = model * glam::Vec4::new(c.x, c.y, 0.0, 1.0);
-            pts[i] = glam::Vec2::new(v.x / v.w, v.y / v.w);
-        }
-        Rect::from_point_slice(&pts).intersects(vp)
+    /// 剔除器（只读；供下游复用同一套可见性判定）。
+    #[inline]
+    pub fn culler(&self) -> &Culler {
+        &self.culler
     }
 
-    /// 精灵四角经 `model` 变换后的世界 AABB 是否通过**判定闭包**（可见返回 true）。
-    fn sprite_in_viewport_pred(rect: &SpriteRect, model: glam::Mat4, pred: &dyn Fn(&Rect) -> bool) -> bool {
-        let tl = rect.mesh_tl;
-        let wh = rect.mesh_wh;
-        let corners = [
-            tl,
-            glam::Vec2::new(tl.x + wh.x, tl.y),
-            glam::Vec2::new(tl.x, tl.y + wh.y),
-            tl + wh,
-        ];
-        let mut pts = [glam::Vec2::ZERO; 4];
-        for (i, c) in corners.iter().enumerate() {
-            let v = model * glam::Vec4::new(c.x, c.y, 0.0, 1.0);
-            pts[i] = glam::Vec2::new(v.x / v.w, v.y / v.w);
-        }
-        let aabb = Rect::from_point_slice(&pts);
-        pred(&aabb)
+    /// 剔除器（可变；可刷新视口 / 直接 `retain` 过滤索引数组）。
+    #[inline]
+    pub fn culler_mut(&mut self) -> &mut Culler {
+        &mut self.culler
     }
 
-    /// `Transform2D` → 列主序 2D model 矩阵（与 [`InstanceData::from_sprite`] 一致）。
-    fn transform2d_model(t: &Transform2D) -> glam::Mat4 {
-        let (sin, cos) = t.rotation.sin_cos();
-        glam::Mat4::from_cols_array_2d(&[
-            [cos * t.scale.x, sin * t.scale.x, 0.0, 0.0],
-            [-sin * t.scale.y, cos * t.scale.y, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [t.pos.x, t.pos.y, 0.0, 1.0],
-        ])
+    /// 全局默认渲染状态（未链式设置状态的命令继承它）。
+    #[inline]
+    pub fn states(&self) -> RStates {
+        self.default_states
     }
 
-    pub fn reset_default_state(&mut self) -> &mut Self {
-        self.default_rstates = RStates::default();
-        self
-    }
-    pub fn default_blend(&mut self, m: BlendMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.blend(m);
-        self
-    }
-    pub fn default_samp_mag(&mut self, f: FilterMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.samp_mag(f);
-        self
-    }
-    pub fn default_samp_min(&mut self, f: FilterMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.samp_min(f);
-        self
-    }
-    pub fn default_samp_mip(&mut self, f: FilterMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.samp_mip(f);
-        self
-    }
-    pub fn default_samp_addr_u(&mut self, a: AddressMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.samp_addr_u(a);
-        self
-    }
-    pub fn default_samp_addr_v(&mut self, a: AddressMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.samp_addr_v(a);
-        self
-    }
-    pub fn default_samp_addr_w(&mut self, a: AddressMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.samp_addr_w(a);
-        self
-    }
-    pub fn default_samp_filter(&mut self, min: FilterMode, mag: FilterMode, mip: FilterMode) -> &mut Self {
-        self.default_rstates = self
-            .default_rstates
-            .samp_min(min)
-            .samp_mag(mag)
-            .samp_mip(mip);
-        self
-    }
-    pub fn default_samp_min_mag(&mut self, f: FilterMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.samp_min(f).samp_mag(f);
-        self
-    }
-    pub fn default_samp_addr(&mut self, u: AddressMode, v: AddressMode, w: AddressMode) -> &mut Self {
-        self.default_rstates = self
-            .default_rstates
-            .samp_addr_u(u)
-            .samp_addr_v(v)
-            .samp_addr_w(w);
-        self
-    }
-    pub fn default_samp_addr_all(&mut self, a: AddressMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.samp_addr_u(a).samp_addr_v(a).samp_addr_w(a);
+    /// 设置全局默认渲染状态（**唯一状态入口**）：
+    /// `r2d.set_states(RStates::new().blend(Additive).depth_test(true))`。
+    #[inline]
+    pub fn set_states(&mut self, states: RStates) -> &mut Self {
+        self.default_states = states;
         self
     }
 
-    pub fn default_cull(&mut self, c: CullMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.cull(c);
-        self
-    }
-    pub fn default_polygon(&mut self, p: PolygonMode) -> &mut Self {
-        self.default_rstates = self.default_rstates.polygon(p);
-        self
-    }
-    pub fn default_front_face(&mut self, f: FrontFaceWinding) -> &mut Self {
-        self.default_rstates = self.default_rstates.front_face(f);
-        self
-    }
-    pub fn default_conservative_raster(&mut self, b: bool) -> &mut Self {
-        self.default_rstates = self.default_rstates.conservative_raster(b);
-        self
-    }
-    pub fn default_depth_test(&mut self, b: bool) -> &mut Self {
-        self.default_rstates = self.default_rstates.depth_test(b);
-        self
-    }
-    pub fn default_depth_write(&mut self, b: bool) -> &mut Self {
-        self.default_rstates = self.default_rstates.depth_write(b);
-        self
-    }
-    pub fn default_depth_compare(&mut self, f: CompareFunc) -> &mut Self {
-        self.default_rstates = self.default_rstates.depth_compare(f);
-        self
-    }
-    pub fn default_stencil_test(&mut self, b: bool) -> &mut Self {
-        self.default_rstates = self.default_rstates.stencil_test(b);
-        self
-    }
-    pub fn default_stencil_write(&mut self, b: bool) -> &mut Self {
-        self.default_rstates = self.default_rstates.stencil_write(b);
-        self
-    }
-    pub fn default_stencil_compare(&mut self, f: CompareFunc) -> &mut Self {
-        self.default_rstates = self.default_rstates.stencil_compare(f);
-        self
-    }
-    pub fn default_blend_state(&mut self, d: BlendDesc) -> &mut Self {
-        self.default_rstates = self.default_rstates.blend_state(d);
-        self
-    }
-    pub fn default_samp_state(&mut self, d: SamplerDesc) -> &mut Self {
-        self.default_rstates = self.default_rstates.samp_state(d);
-        self
-    }
-    pub fn default_raster_state(&mut self, s: RasterState) -> &mut Self {
-        self.default_rstates = self.default_rstates.raster_state(s);
-        self
-    }
-    pub fn default_depth_state(&mut self, s: DepthState) -> &mut Self {
-        self.default_rstates = self.default_rstates.depth_state(s);
-        self
-    }
-    pub fn default_stencil_state(&mut self, s: StencilState) -> &mut Self {
-        self.default_rstates = self.default_rstates.stencil_state(s);
+    /// 重置全局默认状态为出厂默认（全零 bitfield）。
+    #[inline]
+    pub fn reset_states(&mut self) -> &mut Self {
+        self.default_states = RStates::default();
         self
     }
 
-    pub fn tex_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+    // ── 资源 ────────────────────────────────────────────────
+
+    /// 纹理 bind group layout（自建 bind group 的下游用：`rjw_text` / `rjw_ui` 等）。
+    #[inline]
+    pub fn texture_layout(&self) -> &wgpu::BindGroupLayout {
         &self.tex_bind_group_layout
     }
 
-    pub fn default_rstates(&self) -> RStates {
-        self.default_rstates
-    }
-    pub fn set_default_rstates(&mut self, r: RStates) -> &mut Self {
-        self.default_rstates = r;
-        self
-    }
-
+    /// 创建 RGBA8 纹理并注册进全局 `TEXTURES`
+    /// （`data.len()` 必须等于 `w * h * 4`，否则 panic）。
     pub fn create_texture(
         &mut self,
         label: &str,
@@ -1123,531 +369,229 @@ impl Render2D {
         tex
     }
 
+    /// 注册已有纹理进全局 `TEXTURES`。
+    #[inline]
     pub fn register_texture(&self, tex: ArcTextureWrapped) {
         TEXTURES.register(tex);
     }
 
-    // ── 静态网格 API ────────────────────────────────────────
-
-    /// 注册静态网格到全局 `MESHES` 注册表，返回可复用的 `mesh_id`。
+    /// 注册静态网格到全局 `MESHES`，返回可复用 `mesh_id`。
     ///
     /// 相同内容的网格应**复用同一个** `Arc<MeshData>` 注册，否则无法合批。
+    #[inline]
     pub fn register_mesh(&self, mesh: Arc<MeshData>) -> u64 {
         MESHES.register(mesh)
     }
 
-    /// 注册一个静态网格实例（带 `Transform2D` 变换，顶点自带 UV 采样纹理）。
-    pub fn add_static_mesh(
-        &mut self,
-        mesh_id: u64,
-        color: Color,
-        transform: Transform2D,
-        layer: impl Into<Layer>,
-        texture: &ArcTextureWrapped,
-    ) -> StaticMeshBuilder<'_> {
-        debug_assert!(
-            MESHES.contains_uid(mesh_id),
-            "mesh {mesh_id} is not registered in MESHES"
-        );
-        StaticMeshBuilder {
-            queue: &mut self.command_queue,
-            cmd: Some(DrawCommand::StaticMesh {
-                mesh_id,
-                color,
-                transform,
-            }),
-            layer: layer.into(),
-            rstates: RStates::default(),
-            texture_uid: Some(texture.uid),
-            has_rstates: false,
-        }
-    }
-
-    /// 注册一个静态网格实例（直接列主序模型矩阵，顶点自带 UV 采样纹理）。
-    pub fn add_static_mesh_matrix(
-        &mut self,
-        mesh_id: u64,
-        color: Color,
-        model: glam::Mat4,
-        layer: impl Into<Layer>,
-        texture: &ArcTextureWrapped,
-    ) -> StaticMeshBuilder<'_> {
-        debug_assert!(
-            MESHES.contains_uid(mesh_id),
-            "mesh {mesh_id} is not registered in MESHES"
-        );
-        let mat_idx = self.command_queue.matrices.len();
-        self.command_queue.matrices.push(model);
-        StaticMeshBuilder {
-            queue: &mut self.command_queue,
-            cmd: Some(DrawCommand::StaticMeshMatrix {
-                mesh_id,
-                color,
-                mat_idx,
-            }),
-            layer: layer.into(),
-            rstates: RStates::default(),
-            texture_uid: Some(texture.uid),
-            has_rstates: false,
-        }
-    }
-
-    // ── Sprite / Mesh / Custom API ───────────────────────────
-
-    pub fn add_sprite2d(
-        &mut self,
-        rect: impl Into<SpriteRect>,
-        color: Color,
-        transform: Transform2D,
-        layer: impl Into<Layer>,
-        texture: &ArcTextureWrapped,
-    ) -> Sprite2DBuilder<'_> {
-        let rect = rect.into();
-        Sprite2DBuilder {
-            queue: &mut self.command_queue,
-            cmd: Some(DrawCommand::Sprite2D {
-                rect,
-                color,
-                transform,
-            }),
-            layer: layer.into(),
-            rstates: RStates::default(),
-            texture_uid: Some(texture.uid),
-            has_rstates: false,
-        }
-    }
-
-    pub fn add_sprite2d_solid(
-        &mut self,
-        rect: impl Into<SpriteRect>,
-        color: Color,
-        transform: Transform2D,
-        layer: impl Into<Layer>,
-    ) -> Sprite2DBuilder<'_> {
-        let w = self.white_texture.clone();
-        self.add_sprite2d(rect, color, transform, layer, &w)
-    }
-
-    pub fn add_sprite2d_matrix(
-        &mut self,
-        rect: impl Into<SpriteRect>,
-        color: Color,
-        model: glam::Mat4,
-        layer: impl Into<Layer>,
-        texture: &ArcTextureWrapped,
-    ) -> Sprite2DBuilder<'_> {
-        let rect = rect.into();
-        let mat_idx = self.command_queue.matrices.len();
-        self.command_queue.matrices.push(model);
-        Sprite2DBuilder {
-            queue: &mut self.command_queue,
-            cmd: Some(DrawCommand::Sprite2DMatrix {
-                rect,
-                color,
-                mat_idx,
-            }),
-            layer: layer.into(),
-            rstates: RStates::default(),
-            texture_uid: Some(texture.uid),
-            has_rstates: false,
-        }
-    }
-
-    pub fn add_mesh(
-        &mut self,
-        vertices: &[glam::Vec2],
-        tri_indices: &[u16],
-        color: Color,
-        layer: impl Into<Layer>,
-    ) -> MeshBuilder<'_> {
-        assert!(
-            vertices.len() > 0
-                && tri_indices.len() % 3 == 0
-                && tri_indices.iter().all(|&i| (i as usize) < vertices.len())
-        );
-        let vs = self.mesh_storage.vertices.len();
-        let ts = self.mesh_storage.tri_indices.len();
-        let ca: [f32; 4] = color.into();
-        for p in vertices {
-            self.mesh_storage.vertices.push(VertexP3U2C4 {
-                pos: [p.x, p.y, 0.0],
-                uv: [0.0, 0.0],
-                color: ca,
-            });
-        }
-        for c in tri_indices.chunks_exact(3) {
-            self.mesh_storage.tri_indices.push(TriIndicies(
-                Index((c[0] as u32 + vs as u32) as u16),
-                Index((c[1] as u32 + vs as u32) as u16),
-                Index((c[2] as u32 + vs as u32) as u16),
-            ));
-        }
-        MeshBuilder {
-            queue: &mut self.command_queue,
-            cmd: Some(DrawCommand::Mesh {
-                vert: vs..self.mesh_storage.vertices.len(),
-                tri_index: ts..self.mesh_storage.tri_indices.len(),
-                mat_idx: None,
-            }),
-            layer: layer.into(),
-            rstates: RStates::default(),
-            texture_uid: None,
-            has_rstates: false,
-            color: None,
-        }
-    }
-
-    /// **QuadVertices**：以**四个 `VertexP3U2C4` 为一组**的四边形批量绘制。
-    ///
-    /// **Quad 顶点标准**：每组按 **TL, TR, BL, BR** 顺序存储，
-    /// 索引固定为每四边形 `[0,1,3, 3,2,0]`（两三角形共享对角线 TL–BR）。
-    /// 绘制顺序即顶点顺序——适合窗口/面板内部已确定绘制顺序的图元组
-    /// （背景 → 控件背景 → 文字按顶点顺序）。
-    ///
-    /// `transform`：顶点为**局部坐标**（相对 `transform` 原点的屏幕像素），
-    /// 经变换映射到世界——**移动窗口/物体只需改变换**（顶点可缓存不变，
-    /// 支持将窗口嵌入游戏场景）。传 `Transform2D::IDENTITY` 则顶点即世界坐标。
-    /// `texture` 为整组四边形共享的采样纹理。
-    ///
-    /// 注意：动态段顶点为 `u16` 索引，单组顶点数受 [`crate::MAX_MESH_VERTS`] 限制。
-    pub fn add_quads(
-        &mut self,
-        vertices: &[VertexP3U2C4],
-        transform: Transform2D,
-        layer: impl Into<Layer>,
-        texture: &ArcTextureWrapped,
-    ) -> MeshBuilder<'_> {
-        assert!(
-            vertices.len() % 4 == 0,
-            "add_quads: vertex count must be a multiple of 4 (one quad = 4 vertices)"
-        );
-        // Transform2D 未实现 PartialEq；按字段判定单位变换（IDENTITY）
-        let is_identity = transform.pos == glam::Vec2::ZERO
-            && transform.rotation == 0.0
-            && transform.scale == glam::Vec2::ONE;
-        let mat_idx = if is_identity {
-            None
-        } else {
-            let idx = self.command_queue.matrices.len();
-            self.command_queue
-                .matrices
-                .push(Self::transform2d_model(&transform));
-            Some(idx)
-        };
-        let vs = self.mesh_storage.vertices.len();
-        let ts = self.mesh_storage.tri_indices.len();
-        self.mesh_storage.vertices.extend_from_slice(vertices);
-        for i in (0..vertices.len()).step_by(4) {
-            let b = (vs + i) as u32;
-            // Quad 标准索引：TL,TR,BL,BR → 三角形 (0,1,3) + (3,2,0)
-            self.mesh_storage.tri_indices.push(TriIndicies(
-                Index(b as u16),
-                Index((b + 1) as u16),
-                Index((b + 3) as u16),
-            ));
-            self.mesh_storage.tri_indices.push(TriIndicies(
-                Index((b + 3) as u16),
-                Index((b + 2) as u16),
-                Index(b as u16),
-            ));
-        }
-        MeshBuilder {
-            queue: &mut self.command_queue,
-            cmd: Some(DrawCommand::Mesh {
-                vert: vs..self.mesh_storage.vertices.len(),
-                tri_index: ts..self.mesh_storage.tri_indices.len(),
-                mat_idx,
-            }),
-            layer: layer.into(),
-            rstates: RStates::default(),
-            texture_uid: Some(texture.uid),
-            has_rstates: false,
-            color: None,
-        }
-    }
-
-    /// **已提前合批的 QuadVerticesCommand**：一整段 QuadVertices + 单一变换矩阵 +
-    /// 单一**混合颜色**（`tint`）→ 一次 `draw_indexed`（实例 model + 整段 color，
-    /// shader 里 `顶点色 × 实例色`）。**自成一整段、不参与跨段合批比较**。
-    ///
-    /// 供"调用方已提前 concat 好的整段"使用（如 rjw_ui 的**窗口段**——窗口内同纹理
-    /// 同状态内容 concat 成一段，带窗口 transform 与窗口 tint → 整窗口动画/特效）。
-    /// 顶点为**局部坐标**，经 `transform` 映射到世界（同 [`Self::add_quads`]）。
-    pub fn add_quads_styled(
-        &mut self,
-        vertices: &[VertexP3U2C4],
-        transform: Transform2D,
-        tint: Color,
-        layer: impl Into<Layer>,
-        texture: &ArcTextureWrapped,
-    ) -> MeshBuilder<'_> {
-        let mut b = self.add_quads(vertices, transform, layer, texture);
-        b.color = Some(tint.into());
-        b
-    }
-
-    /// `add_mesh` 的带变换版本：顶点为**局部坐标**，经 `transform` 映射到世界
-    /// （同 [`Self::add_quads`] 的 transform 语义；`IDENTITY` 即原 `add_mesh` 行为）。
-    pub fn add_mesh_transform(
-        &mut self,
-        vertices: &[glam::Vec2],
-        tri_indices: &[u16],
-        color: Color,
-        transform: Transform2D,
-        layer: impl Into<Layer>,
-    ) -> MeshBuilder<'_> {
-        assert!(
-            vertices.len() > 0
-                && tri_indices.len() % 3 == 0
-                && tri_indices.iter().all(|&i| (i as usize) < vertices.len())
-        );
-        // Transform2D 未实现 PartialEq；按字段判定单位变换（IDENTITY）
-        let is_identity = transform.pos == glam::Vec2::ZERO
-            && transform.rotation == 0.0
-            && transform.scale == glam::Vec2::ONE;
-        let mat_idx = if is_identity {
-            None
-        } else {
-            let idx = self.command_queue.matrices.len();
-            self.command_queue
-                .matrices
-                .push(Self::transform2d_model(&transform));
-            Some(idx)
-        };
-        let vs = self.mesh_storage.vertices.len();
-        let ts = self.mesh_storage.tri_indices.len();
-        let ca: [f32; 4] = color.into();
-        for p in vertices {
-            self.mesh_storage.vertices.push(VertexP3U2C4 {
-                pos: [p.x, p.y, 0.0],
-                uv: [0.0, 0.0],
-                color: ca,
-            });
-        }
-        for c in tri_indices.chunks_exact(3) {
-            self.mesh_storage.tri_indices.push(TriIndicies(
-                Index((c[0] as u32 + vs as u32) as u16),
-                Index((c[1] as u32 + vs as u32) as u16),
-                Index((c[2] as u32 + vs as u32) as u16),
-            ));
-        }
-        MeshBuilder {
-            queue: &mut self.command_queue,
-            cmd: Some(DrawCommand::Mesh {
-                vert: vs..self.mesh_storage.vertices.len(),
-                tri_index: ts..self.mesh_storage.tri_indices.len(),
-                mat_idx,
-            }),
-            layer: layer.into(),
-            rstates: RStates::default(),
-            texture_uid: None,
-            has_rstates: false,
-            color: None,
-        }
-    }
-
-    pub fn add_mesh_fn_prealloc<F>(
-        &mut self,
-        max_v: usize,
-        max_t: usize,
-        color: Color,
-        layer: impl Into<Layer>,
-        f: F,
-    ) -> MeshBuilder<'_>
-    where
-        F: FnOnce(&mut [VertexP3U2C4], &mut [TriIndicies]) -> (usize, usize),
-    {
-        assert!(max_v > 0 && max_v <= MAX_MESH_VERTS);
-        let vo = self.mesh_storage.vertices.len();
-        let io = self.mesh_storage.tri_indices.len();
-        let ca: [f32; 4] = color.into();
-        self.mesh_storage
-            .vertices
-            .resize(vo + max_v, VertexP3U2C4::default());
-        self.mesh_storage
-            .tri_indices
-            .resize(io + max_t, TriIndicies::default());
-        let (uv, ut) = {
-            let vs = &mut self.mesh_storage.vertices[vo..vo + max_v];
-            let ts = &mut self.mesh_storage.tri_indices[io..io + max_t];
-            f(vs, ts)
-        };
-        self.mesh_storage.vertices.truncate(vo + uv);
-        self.mesh_storage.tri_indices.truncate(io + ut);
-        for v in &mut self.mesh_storage.vertices[vo..vo + uv] {
-            v.color = ca;
-        }
-        if ut != 0 {
-            let b = vo as u32;
-            for t in &mut self.mesh_storage.tri_indices[io..io + ut] {
-                *t = TriIndicies(
-                    Index((t.0.0 as u32 + b) as u16),
-                    Index((t.1.0 as u32 + b) as u16),
-                    Index((t.2.0 as u32 + b) as u16),
-                );
-            }
-        }
-        MeshBuilder {
-            queue: &mut self.command_queue,
-            cmd: Some(DrawCommand::Mesh {
-                vert: vo..vo + uv,
-                tri_index: io..io + ut,
-                mat_idx: None,
-            }),
-            layer: layer.into(),
-            rstates: RStates::default(),
-            texture_uid: None,
-            has_rstates: false,
-            color: None,
-        }
-    }
-
-    pub fn add_mesh_fn<F>(&mut self, color: Color, layer: impl Into<Layer>, f: F) -> MeshBuilder<'_>
-    where
-        F: FnOnce(&mut MeshSink<'_>),
-    {
-        let vs = self.mesh_storage.vertices.len();
-        let ts = self.mesh_storage.tri_indices.len();
-        let ca: [f32; 4] = color.into();
-        {
-            let mut sink = MeshSink {
-                base: vs as u32,
-                verts: &mut self.mesh_storage.vertices,
-                tris: &mut self.mesh_storage.tri_indices,
-                color_arr: ca,
-            };
-            f(&mut sink);
-        }
-        MeshBuilder {
-            queue: &mut self.command_queue,
-            cmd: Some(DrawCommand::Mesh {
-                vert: vs..self.mesh_storage.vertices.len(),
-                tri_index: ts..self.mesh_storage.tri_indices.len(),
-                mat_idx: None,
-            }),
-            layer: layer.into(),
-            rstates: RStates::default(),
-            texture_uid: None,
-            has_rstates: false,
-            color: None,
-        }
-    }
-
-    pub fn add_polygon_fan(
-        &mut self,
-        vertices: &[glam::Vec2],
-        color: Color,
-        layer: impl Into<Layer>,
-    ) -> MeshBuilder<'_> {
-        debug_assert!(vertices.len() >= 3);
-        let n = vertices.len();
-        self.add_mesh_fn_prealloc(n, n - 2, color, layer, |vs, ts| {
-            for (d, s) in vs.iter_mut().zip(vertices) {
-                d.pos = [s.x, s.y, 0.0];
-            }
-            for (i, t) in ts.iter_mut().enumerate() {
-                *t = TriIndicies::new(0, (i + 1) as u16, (i + 2) as u16);
-            }
-            (n, n - 2)
-        })
-    }
-
-    pub fn add_polygon_strip(
-        &mut self,
-        vertices: &[glam::Vec2],
-        color: Color,
-        layer: impl Into<Layer>,
-    ) -> MeshBuilder<'_> {
-        debug_assert!(vertices.len() >= 3);
-        let n = vertices.len();
-        self.add_mesh_fn_prealloc(n, n - 2, color, layer, |vs, ts| {
-            for (d, s) in vs.iter_mut().zip(vertices) {
-                d.pos = [s.x, s.y, 0.0];
-            }
-            for (i, t) in ts.iter_mut().enumerate() {
-                *t = TriIndicies::new(0, (i + 1) as u16, (i + 2) as u16);
-            }
-            (n, n - 2)
-        })
-    }
-
-    /// 带 UV 的多边形扇（fan triangulation：v0 作为中心，依次 v0, vi+1, vi+2）。
-    /// `vertices` 与 `uvs` 需等长，每个顶点对应一个归一化 UV 坐标。
-    pub fn add_polygon_fan_uv(
-        &mut self,
-        vertices: &[glam::Vec2],
-        uvs: &[glam::Vec2],
-        color: Color,
-        layer: impl Into<Layer>,
-    ) -> MeshBuilder<'_> {
-        debug_assert!(vertices.len() >= 3 && vertices.len() == uvs.len());
-        let n = vertices.len();
-        self.add_mesh_fn_prealloc(n, n - 2, color, layer, |vs, ts| {
-            for (d, (p, uv)) in vs.iter_mut().zip(vertices.iter().zip(uvs)) {
-                d.pos = [p.x, p.y, 0.0];
-                d.uv = [uv.x, uv.y];
-            }
-            for (i, t) in ts.iter_mut().enumerate() {
-                *t = TriIndicies::new(0, (i + 1) as u16, (i + 2) as u16);
-            }
-            (n, n - 2)
-        })
-    }
-
-    /// 带 UV 的多边形带（strip triangulation：v0 作为中心，依次 v0, vi+1, vi+2）。
-    /// `vertices` 与 `uvs` 需等长，每个顶点对应一个归一化 UV 坐标。
-    pub fn add_polygon_strip_uv(
-        &mut self,
-        vertices: &[glam::Vec2],
-        uvs: &[glam::Vec2],
-        color: Color,
-        layer: impl Into<Layer>,
-    ) -> MeshBuilder<'_> {
-        debug_assert!(vertices.len() >= 3 && vertices.len() == uvs.len());
-        let n = vertices.len();
-        self.add_mesh_fn_prealloc(n, n - 2, color, layer, |vs, ts| {
-            for (d, (p, uv)) in vs.iter_mut().zip(vertices.iter().zip(uvs)) {
-                d.pos = [p.x, p.y, 0.0];
-                d.uv = [uv.x, uv.y];
-            }
-            for (i, t) in ts.iter_mut().enumerate() {
-                *t = TriIndicies::new(0, (i + 1) as u16, (i + 2) as u16);
-            }
-            (n, n - 2)
-        })
-    }
-
-    pub fn add_custom(
-        &mut self,
-        layer: impl Into<Layer>,
-        cd: impl CustomDraw + 'static,
-    ) -> CustomBuilder<'_> {
-        let idx = self.buf_custom_draws.len();
-        self.buf_custom_draws.push(Arc::new(cd));
-        CustomBuilder {
-            queue: &mut self.command_queue,
-            cmd: Some(DrawCommand::Custom { idx }),
-            layer: layer.into(),
-            rstates: RStates::default(),
-            has_rstates: false,
-        }
-    }
-
+    /// 1×1 白色纹理（纯色绘制用；`solid` 内部即用它）。
+    #[inline]
     pub fn white_texture(&self) -> &ArcTextureWrapped {
         &self.white_texture
     }
 
+    #[inline]
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    #[inline]
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// 当前 VP 矩阵。
+    #[inline]
+    pub fn mvp(&self) -> glam::Mat4 {
+        self.mvp
+    }
+
+    // ── 录制入口（画什么）：数据版 ──────────────────────────
+
+    /// 贴纹理精灵：`r2d.sprite(rect, &tex).color(..).transform(..).layer(..)`。
+    #[inline]
+    pub fn sprite(
+        &mut self,
+        rect: impl Into<SpriteRect>,
+        texture: &ArcTextureWrapped,
+    ) -> SpriteBuilder<'_> {
+        Draw2D::sprite(
+            &mut self.command_queue,
+            &mut self.mesh_storage,
+            rect.into(),
+            texture.uid,
+        )
+    }
+
+    /// 纯色精灵（内部用 1×1 白纹理）：`r2d.solid(rect).color(..)`。
+    #[inline]
+    pub fn solid(&mut self, rect: impl Into<SpriteRect>) -> SpriteBuilder<'_> {
+        let uid = self.white_texture.uid;
+        Draw2D::sprite(&mut self.command_queue, &mut self.mesh_storage, rect.into(), uid)
+    }
+
+    /// 四边形段（顶点由调用者提供，顺序 **TL, TR, BL, BR**）：
+    /// `r2d.quads(&verts, &tex).transform(tf).color(tint).layer(l)`。
+    #[inline]
+    pub fn quads(
+        &mut self,
+        vertices: &[VertexP3U2C4],
+        texture: &ArcTextureWrapped,
+    ) -> MeshBuilder<'_> {
+        Draw2D::quads(
+            &mut self.command_queue,
+            &mut self.mesh_storage,
+            vertices,
+            texture.uid,
+        )
+    }
+
+    /// 四边形段（**流式构造**，零临时 `Vec`）：
+    /// `r2d.quads_with(|q| { q.quad(tl, tr, bl, br); }, &tex)`。
+    #[inline]
+    pub fn quads_with<F>(&mut self, f: F, texture: &ArcTextureWrapped) -> MeshBuilder<'_>
+    where
+        F: FnOnce(&mut QuadSink<'_>),
+    {
+        Draw2D::quads_with(
+            &mut self.command_queue,
+            &mut self.mesh_storage,
+            f,
+            texture.uid,
+        )
+    }
+
+    // ── 录制入口（画什么）：网格 / 多边形 / 流式 ────────────
+
+    /// 显式顶点 + 三角形索引（世界坐标；默认白纹理）：
+    /// `r2d.mesh(&verts, &tris).color(..).transform(..).layer(..)`。
+    #[inline]
+    pub fn mesh(&mut self, vertices: &[glam::Vec2], tri_indices: &[u16]) -> MeshBuilder<'_> {
+        Draw2D::mesh(
+            &mut self.command_queue,
+            &mut self.mesh_storage,
+            vertices,
+            tri_indices,
+            None,
+        )
+    }
+
+    /// **流式构造网格**（零临时 `Vec`；自定三角化 / 逐顶点 UV）：
+    /// `r2d.mesh_with(|s| { let a = s.push_vertex(p); ... s.push_tri(a, b, c); })`。
+    #[inline]
+    pub fn mesh_with<F>(&mut self, f: F) -> MeshBuilder<'_>
+    where
+        F: FnOnce(&mut MeshSink<'_>),
+    {
+        Draw2D::mesh_with(&mut self.command_queue, &mut self.mesh_storage, f, None)
+    }
+
+    /// 预分配流式构造网格（已知顶点 / 三角形数时的零重分配快路径）。
+    #[inline]
+    pub fn mesh_with_cap<F>(&mut self, max_verts: usize, max_tris: usize, f: F) -> MeshBuilder<'_>
+    where
+        F: FnOnce(&mut [VertexP3U2C4], &mut [TriIndicies]) -> (usize, usize),
+    {
+        Draw2D::mesh_with_cap(
+            &mut self.command_queue,
+            &mut self.mesh_storage,
+            max_verts,
+            max_tris,
+            f,
+            None,
+        )
+    }
+
+    /// 多边形（**fan 三角化**：首顶点为中心）：`r2d.polygon(&verts).color(..).layer(..)`。
+    #[inline]
+    pub fn polygon(&mut self, vertices: &[glam::Vec2]) -> MeshBuilder<'_> {
+        Draw2D::polygon(
+            &mut self.command_queue,
+            &mut self.mesh_storage,
+            vertices,
+            None,
+            None,
+        )
+    }
+
+    /// 带 UV 的多边形（`vertices` 与 `uvs` 等长；fan 三角化）。
+    #[inline]
+    pub fn polygon_uv(&mut self, vertices: &[glam::Vec2], uvs: &[glam::Vec2]) -> MeshBuilder<'_> {
+        Draw2D::polygon(
+            &mut self.command_queue,
+            &mut self.mesh_storage,
+            vertices,
+            Some(uvs),
+            None,
+        )
+    }
+
+    /// **流式构造多边形**（闭包结束自动 fan 三角化，零临时 `Vec`）：
+    /// `r2d.polygon_with(|p| { p.vertex(a); p.vertex(b); p.vertex(c); })`。
+    #[inline]
+    pub fn polygon_with<F>(&mut self, f: F) -> MeshBuilder<'_>
+    where
+        F: FnOnce(&mut PolygonSink<'_>),
+    {
+        Draw2D::polygon_with(&mut self.command_queue, &mut self.mesh_storage, f, None)
+    }
+
+    /// 静态网格实例（`MESHES` 注册表 + 实例化合批）：
+    /// `r2d.static_mesh(id, &tex).color(..).transform(tf).layer(..)`。
+    #[inline]
+    pub fn static_mesh(
+        &mut self,
+        mesh_id: u64,
+        texture: &ArcTextureWrapped,
+    ) -> StaticMeshBuilder<'_> {
+        debug_assert!(
+            MESHES.contains_uid(mesh_id),
+            "mesh {mesh_id} is not registered in MESHES"
+        );
+        Draw2D::static_mesh(
+            &mut self.command_queue,
+            &mut self.mesh_storage,
+            mesh_id,
+            texture.uid,
+        )
+    }
+
+    /// 外部绘制（逃逸舱口）：`r2d.custom(|pass| { ... }).layer(..)`。
+    ///
+    /// 闭包在 `render()` / `record()` 的 `draw()` 阶段被调用，此时 `RenderPass` 已打开——
+    /// **不要**在闭包内 `begin_render_pass`。
+    #[inline]
+    pub fn custom(&mut self, cd: impl CustomDraw + 'static) -> CustomBuilder<'_> {
+        let idx = self.buf_custom_draws.len();
+        self.buf_custom_draws.push(Arc::new(cd));
+        Draw2D::custom(&mut self.command_queue, &mut self.mesh_storage, idx)
+    }
+
+    // ── 提交（何时画） ─────────────────────────────────────
+
+    /// 清空本帧录制内容（命令队列 / 动态网格 / 外部绘制句柄）。
+    ///
+    /// 三个提交出口（[`Self::render`] / [`Self::record`] / [`Self::encode`]）都以此收尾，
+    /// 契约一致：**提交即清帧**。
+    #[inline]
+    fn clear_frame(&mut self) {
+        self.command_queue.clear();
+        self.mesh_storage.clear();
+        self.buf_custom_draws.clear();
+    }
+
+    /// 全流程提交：`acquire_frame` → `prepare` → 绘制 → submit → `present`。
+    ///
+    /// 取帧失败（超时 / 丢失）时仅清帧并返回，不 panic。
     pub fn render(&mut self, clear: &ClearConfig) -> &mut Self {
-        let Some((st, view)) = self.begin_frame() else {
-            self.command_queue.clear();
-            self.mesh_storage.clear();
+        let Some((st, view)) = self.acquire_frame() else {
+            self.clear_frame();
             return self;
         };
         self.prepare();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("render2d encoder"),
+                label: Some("Render2D: encoder"),
             });
         let nd = clear.depth.is_some() || clear.stencil.is_some();
         let size = self
@@ -1660,27 +604,8 @@ impl Render2D {
         }
         let dv = if nd { self.depth_view.as_ref() } else { None };
         {
-            let co = match clear.color {
-                Some(c) => wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(c),
-                    store: wgpu::StoreOp::Store,
-                },
-                None => wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            };
-            let dsa = dv.map(|dv| wgpu::RenderPassDepthStencilAttachment {
-                view: dv,
-                depth_ops: clear.depth.map(|d| wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(d),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: clear.stencil.map(|s| wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(s),
-                    store: wgpu::StoreOp::Store,
-                }),
-            });
+            let co = color_ops(clear.color);
+            let dsa = depth_attachment(dv, clear);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render2D: RenderPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1698,44 +623,27 @@ impl Render2D {
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(st);
-        self.command_queue.clear();
-        self.mesh_storage.clear();
-        self.buf_custom_draws.clear();
+        self.clear_frame();
         self
     }
 
-    /// 将当前队列中的命令**只录制到用户自建的 `wgpu::RenderPass`**（仅传入 Pass，不编码/提交）。
+    /// 把当前队列**只录制进用户自建的 `wgpu::RenderPass`**（不编码 / 不提交）。
     ///
-    /// 适合离屏渲染 / 自定义 pass 组合；命令队列在录制完成后清空（与 [`Render2D::render`] 一致）。
-    pub fn flush(&mut self, pass: &mut wgpu::RenderPass<'_>) {
+    /// 适合离屏渲染 / 自定义 pass 组合；录制后清帧（与 [`Self::render`] 一致）。
+    pub fn record(&mut self, pass: &mut wgpu::RenderPass<'_>) {
         self.prepare();
         self.draw(pass);
-        self.command_queue.clear();
-        self.mesh_storage.clear();
-        self.buf_custom_draws.clear();
+        self.clear_frame();
     }
 
-    /// 将当前队列中的命令**仅编码为 `wgpu::CommandBuffer`**（不提交、不 present）。
+    /// 把当前队列**只编码为 `wgpu::CommandBuffer`**（不提交 / 不 present）。
     ///
-    /// 适合离屏渲染 / 多渲染器合并提交 / 自定义 submit 时机；用法：
+    /// - `target`：渲染目标纹理视图（离屏纹理 / surface view 均可）；
+    /// - `depth`：可选外部深度/模板视图；传 `None` 且 `clear` 需要深度时，
+    ///   自动按 `target` 尺寸创建 / 复用内部深度纹理。
     ///
-    /// ```no_run
-    /// # let mut render2d: rjw_2d_render::Render2D = unimplemented!();
-    /// # let target: wgpu::TextureView = unimplemented!();
-    /// let cb = render2d.render_command_buffer(
-    ///     &rjw_2d_render::ClearConfig::default(),
-    ///     &target,
-    ///     None,
-    /// );
-    /// render2d.queue().submit(std::iter::once(cb));
-    /// ```
-    ///
-    /// - `target`：渲染目标纹理视图（离屏纹理 / surface view 均可）。
-    /// - `depth`：可选外部深度/模板视图；传 `None` 且 `clear` 需要深度时，自动按
-    ///   `target` 尺寸创建 / 复用内部深度纹理。
-    ///
-    /// 编码完成后清空命令队列（与 [`Render2D::render`] / [`Render2D::flush`] 一致）。
-    pub fn render_command_buffer(
+    /// 编码后清帧（与 [`Self::render`] / [`Self::record`] 一致）。
+    pub fn encode(
         &mut self,
         clear: &ClearConfig,
         target: &wgpu::TextureView,
@@ -1754,27 +662,8 @@ impl Render2D {
         }
         let dv = if nd { depth.or(self.depth_view.as_ref()) } else { None };
         {
-            let co = match clear.color {
-                Some(c) => wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(c),
-                    store: wgpu::StoreOp::Store,
-                },
-                None => wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            };
-            let dsa = dv.map(|dv| wgpu::RenderPassDepthStencilAttachment {
-                view: dv,
-                depth_ops: clear.depth.map(|d| wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(d),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: clear.stencil.map(|s| wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(s),
-                    store: wgpu::StoreOp::Store,
-                }),
-            });
+            let co = color_ops(clear.color);
+            let dsa = depth_attachment(dv, clear);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render2D: command buffer pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1791,13 +680,12 @@ impl Render2D {
             self.draw(&mut pass);
         }
         let cb = encoder.finish();
-        self.command_queue.clear();
-        self.mesh_storage.clear();
-        self.buf_custom_draws.clear();
+        self.clear_frame();
         cb
     }
 
-    pub fn begin_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
+    /// 取当前表面帧（`None` = 取帧失败 / 丢失，调用方应跳过本帧）。
+    pub fn acquire_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
         let t = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -1809,14 +697,30 @@ impl Render2D {
         Some((t, v))
     }
 
-    fn prepare(&mut self) {
-        // 排序模式：LayerOnly 仅按 layer 稳定排序（同层保持录制顺序，states 只合批）；
-        // None 完全按录制顺序（相邻同状态仍合批）。
-        match self.sorting {
-            SortMode::LayerAndStates => self.command_queue.sort_layer_then_states(),
-            SortMode::LayerOnly => self.command_queue.sort_layer(),
-            SortMode::None => {}
+    // ── prepare：排序（索引数组）→ 剔除（索引数组）→ 合批 → 上传 ──
+
+    /// 对**索引数组**应用排序策略与剔除器（原地操作，零额外分配）。
+    fn apply_order(&mut self) {
+        if self.command_queue.is_empty() {
+            return;
         }
+        // 先取排序键（此时索引数组仍与命令一一对应），再移交索引数组的所有权。
+        self.command_queue.fill_sort_keys(&mut self.buf_sort_keys);
+        let mut order = self.command_queue.take_order();
+        match &self.sorter {
+            Some(policy) => policy.sort(&mut order, &self.buf_sort_keys),
+            None => self.sort_mode.sort(&mut order, &self.buf_sort_keys),
+        }
+        if !self.culler.is_off() {
+            let q = &self.command_queue;
+            self.culler.retain(&mut order, |i| q.cull_aabb(i));
+        }
+        self.command_queue.set_order(order);
+    }
+
+    fn prepare(&mut self) {
+        self.apply_order();
+
         self.buf_instances.clear();
         self.buf_ops.clear();
         self.buf_all_verts.clear();
@@ -1938,15 +842,11 @@ impl Render2D {
             }};
         }
 
-        // 剔除：优先判定闭包；未设置时回退 MVP 反推的视口矩形。
-        let vp_cull = if self.culling && self.cull_pred.is_none() {
-            Some(self.viewport_world_rect())
-        } else {
-            None
-        };
+        // 排序与剔除已在 `apply_order()` 阶段作用于索引数组（见 `crate::sort` / `crate::cull`），
+        // 此处只按最终顺序生成实例与绘制操作。
         for (cmd, layer, states) in self.command_queue.iter() {
             let tu = states.texture_uid;
-            let rr = states.rstates.unwrap_or(self.default_rstates).raw();
+            let rr = states.rstates.unwrap_or(self.default_states).raw();
             match cmd {
                 DrawCommand::Sprite2D {
                     rect,
@@ -1954,20 +854,6 @@ impl Render2D {
                     transform,
                 } => {
                     flush_dyn!();
-                    // 视口剔除：世界 AABB 判定（闭包或 MVP 矩形）不通过 → 跳过（不产生实例）。
-                    if self.culling {
-                        if let Some(p) = &self.cull_pred {
-                            let model = Self::transform2d_model(transform);
-                            if !Self::sprite_in_viewport_pred(rect, model, p.as_ref()) {
-                                continue;
-                            }
-                        } else if let Some(vp) = vp_cull {
-                            let model = Self::transform2d_model(transform);
-                            if !Self::sprite_in_viewport(rect, model, &vp) {
-                                continue;
-                            }
-                        }
-                    }
                     self.buf_items.push(BatchItem {
                         mesh_id: Some(self.quad_mesh_id),
                         dyn_seq: 0,
@@ -1985,17 +871,6 @@ impl Render2D {
                 } => {
                     flush_dyn!();
                     let m = self.command_queue.matrices[*mat_idx];
-                    if self.culling {
-                        if let Some(p) = &self.cull_pred {
-                            if !Self::sprite_in_viewport_pred(rect, m, p.as_ref()) {
-                                continue;
-                            }
-                        } else if let Some(vp) = vp_cull {
-                            if !Self::sprite_in_viewport(rect, m, &vp) {
-                                continue;
-                            }
-                        }
-                    }
                     self.buf_items.push(BatchItem {
                         mesh_id: Some(self.quad_mesh_id),
                         dyn_seq: 0,
@@ -2341,11 +1216,42 @@ impl Render2D {
         self.depth_view = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
         self.depth_size = (w.max(1), h.max(1));
     }
+}
 
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
+// ─── Pass 附件辅助（render / encode 共用） ─────────────────────
+
+/// 颜色附件操作（`None` = 保留旧内容）。
+fn color_ops(color: Option<wgpu::Color>) -> wgpu::Operations<wgpu::Color> {
+    match color {
+        Some(c) => wgpu::Operations {
+            load: wgpu::LoadOp::Clear(c),
+            store: wgpu::StoreOp::Store,
+        },
+        None => wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        },
     }
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
+}
+
+/// 深度/模板附件（`clear` 未要求清除或视图为空时返回 `None`）。
+fn depth_attachment<'a>(
+    view: Option<&'a wgpu::TextureView>,
+    clear: &ClearConfig,
+) -> Option<wgpu::RenderPassDepthStencilAttachment<'a>> {
+    if clear.depth.is_none() && clear.stencil.is_none() {
+        return None;
     }
+    let view = view?;
+    Some(wgpu::RenderPassDepthStencilAttachment {
+        view,
+        depth_ops: clear.depth.map(|d| wgpu::Operations {
+            load: wgpu::LoadOp::Clear(d),
+            store: wgpu::StoreOp::Store,
+        }),
+        stencil_ops: clear.stencil.map(|s| wgpu::Operations {
+            load: wgpu::LoadOp::Clear(s),
+            store: wgpu::StoreOp::Store,
+        }),
+    })
 }

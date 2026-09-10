@@ -570,9 +570,7 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "log",
- "rjw_color 0.1.0",
- "rjw_main",
- "rjw_render",
+ "rjw_krusie",
  "wgpu",
 ]
 
@@ -583,11 +581,7 @@ dependencies = [
  "env_logger",
  "glam",
  "log",
- "rjw_2d_render",
- "rjw_color 0.1.0",
- "rjw_main",
- "rjw_render",
- "rjw_transform",
+ "rjw_krusie",
 ]
 
 [[package]]
@@ -597,13 +591,7 @@ dependencies = [
  "env_logger",
  "glam",
  "log",
- "rjw_2d_render",
- "rjw_atlas",
- "rjw_color 0.1.0",
- "rjw_main",
- "rjw_render",
- "rjw_text",
- "rjw_transform",
+ "rjw_krusie",
 ]
 
 [[package]]
@@ -614,11 +602,7 @@ dependencies = [
  "env_logger",
  "glam",
  "log",
- "rjw_2d_render",
- "rjw_color 0.1.0",
- "rjw_main",
- "rjw_render",
- "rjw_transform",
+ "rjw_krusie",
 ]
 
 [[package]]
@@ -628,12 +612,7 @@ dependencies = [
  "env_logger",
  "glam",
  "log",
- "rjw_2d_render",
- "rjw_color 0.1.0",
- "rjw_main",
- "rjw_render",
- "rjw_text",
- "rjw_transform",
+ "rjw_krusie",
 ]
 
 [[package]]
@@ -641,13 +620,7 @@ name = "eg260818UI"
 version = "0.1.0"
 dependencies = [
  "glam",
- "rjw_2d_render",
- "rjw_color 0.1.0",
- "rjw_main",
- "rjw_render",
- "rjw_text",
- "rjw_transform",
- "rjw_ui",
+ "rjw_krusie",
 ]
 
 [[package]]
@@ -655,13 +628,7 @@ name = "egDebugDraw"
 version = "0.1.0"
 dependencies = [
  "glam",
- "rjw_2d_render",
- "rjw_color 0.1.0",
- "rjw_main",
- "rjw_render",
- "rjw_text",
- "rjw_transform",
- "rjw_ui",
+ "rjw_krusie",
 ]
 
 [[package]]
@@ -671,15 +638,7 @@ dependencies = [
  "env_logger",
  "glam",
  "log",
- "rjw_2d_render",
- "rjw_atlas",
- "rjw_collision",
- "rjw_color 0.1.0",
- "rjw_main",
- "rjw_render",
- "rjw_text",
- "rjw_tilemap",
- "rjw_transform",
+ "rjw_krusie",
 ]
 
 [[package]]
@@ -2019,7 +1978,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rjw_2d_render"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "glam",
@@ -2089,6 +2048,22 @@ name = "rjw_keystate"
 version = "0.1.1"
 
 [[package]]
+name = "rjw_krusie"
+version = "0.2.0"
+dependencies = [
+ "rjw_2d_render",
+ "rjw_atlas",
+ "rjw_collision",
+ "rjw_color 0.1.0",
+ "rjw_main",
+ "rjw_render",
+ "rjw_text",
+ "rjw_tilemap",
+ "rjw_transform",
+ "rjw_ui",
+]
+
+[[package]]
 name = "rjw_main"
 version = "0.1.1"
 dependencies = [
@@ -2111,9 +2086,9 @@ name = "rjw_render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "dashmap",
  "log",
  "pollster",
+ "rjw_typed_registry",
  "wgpu",
  "winit",
 ]
@@ -2156,6 +2131,13 @@ version = "0.1.3"
 dependencies = [
  "glam",
  "serde",
+]
+
+[[package]]
+name = "rjw_typed_registry"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
 ]
 
 [[package]]

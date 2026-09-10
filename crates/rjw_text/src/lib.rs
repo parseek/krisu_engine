@@ -625,11 +625,12 @@ impl Text {
     #[allow(clippy::too_many_arguments)]
     pub fn draw_label_with<F>(
         &mut self, text: &str, size: f32, line_height: f32,
-        pos: Vec2, family: &str, align: Align, origin: Vec2,
+        pos: impl Into<Vec2>, family: &str, align: Align, origin: impl Into<Vec2>,
         callback: F,
     ) -> Vec2
     where F: FnMut(&AtlasRegion, Vec2, Vec2)
     {
+        let (pos, origin) = (pos.into(), origin.into());
         let attrs = if family.is_empty() {
             Attrs::new()
         } else {
@@ -650,7 +651,7 @@ impl Text {
     #[allow(clippy::too_many_arguments)]
     pub fn draw_label(
         &mut self, r2d: &mut Render2D, text: &str, color: Color,
-        size: f32, line_height: f32, pos: Vec2, family: &str, align: Align, layer: impl Into<Layer> + Clone,
+        size: f32, line_height: f32, pos: impl Into<Vec2>, family: &str, align: Align, layer: impl Into<Layer> + Clone,
     ) -> Vec2 {
         self.draw_label_ex(r2d, text, color, size, line_height, pos, family, align, layer, Vec2::ZERO)
     }
@@ -663,22 +664,21 @@ impl Text {
     #[allow(clippy::too_many_arguments)]
     pub fn draw_label_ex(
         &mut self, r2d: &mut Render2D, text: &str, color: Color,
-        size: f32, line_height: f32, pos: Vec2, family: &str, align: Align, layer: impl Into<Layer> + Clone,
-        origin: Vec2,
+        size: f32, line_height: f32, pos: impl Into<Vec2>, family: &str, align: Align, layer: impl Into<Layer> + Clone,
+        origin: impl Into<Vec2>,
     ) -> Vec2 {
-        let ps = self.glyph_cache.page_size() as f32;
-        let inv = Vec2::new(1.0 / ps, 1.0 / ps);
         self.draw_label_with(text, size, line_height, pos, family, align, origin, |region, world_tl, wh| {
-            // 默认绘制：rjw_2d_render 直接方法
-            let rect = SpriteRect::from_texture_px(
+            let Some(tex) = TEXTURES.get(region.page_uid) else {
+                return;
+            };
+            // 默认绘制：rjw_2d_render 直接方法（纹理像素尺寸自动取自 tex）
+            let rect = SpriteRect::with_uv_tex(
                 world_tl, wh,
                 Vec2::new(region.tl_px.0 as f32, region.tl_px.1 as f32),
                 Vec2::new(region.wh_px.0 as f32, region.wh_px.1 as f32),
-                inv,
+                &tex,
             );
-            if let Some(tex) = TEXTURES.get(region.page_uid) {
-                r2d.add_sprite2d(rect, color, Transform2D::default(), layer.clone().into(), &tex);
-            }
+            r2d.sprite(rect, &tex).color(color).layer(layer.clone());
         })
     }
 

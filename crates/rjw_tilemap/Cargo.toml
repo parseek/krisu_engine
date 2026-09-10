@@ -10,7 +10,7 @@ keywords = ["tilemap", "tiles", "2d", "atlas"]
 categories = ["game-development", "graphics"]
 
 [dependencies]
-rjw_2d_render = { path = "../rjw_2d_render", version = "0.1.1" }
+rjw_2d_render = { path = "../rjw_2d_render", version = "0.2.0" }
 rjw_atlas = { path = "../rjw_atlas", version = "0.1.1" }
 rjw_transform = { path = "../rjw_transform", version = "0.1.1" }
 rjw_render = { path = "../rjw_render", version = "0.1.0" }

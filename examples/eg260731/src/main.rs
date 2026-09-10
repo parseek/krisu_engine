@@ -1,8 +1,4 @@
-use rjw_2d_render::{ArcTextureWrapped, ClearConfig, Render2D, SpriteRect};
-use rjw_color::Color;
-use rjw_main::*;
-use rjw_render::{RenderConfig, RenderContext, wgpu};
-use rjw_transform::{Camera2D, Transform2D};
+use rjw_krusie::prelude::*;
 
 struct SpriteDemo {
     render: Option<RenderContext>,
@@ -117,45 +113,30 @@ impl App for SpriteDemo {
 
         // ── 坐标系指示线（验证 X+ 右 / Y+ 下）──
         // X+ 右（红）
-        render2d.add_sprite2d_solid(
-            SpriteRect::from_texture(glam::Vec2::new(0.0, -2.0), glam::Vec2::new(axis_len, 4.0)),
-            Color::RED,
-            Transform2D::default(),
-            95.0,
-        );
+        render2d.solid(SpriteRect::new((0.0, -2.0), (axis_len, 4.0)))
+        .color(Color::RED)
+        .layer(95.0);
         // X- 左（暗红）
-        render2d.add_sprite2d_solid(
-            SpriteRect::from_texture(glam::Vec2::new(-axis_len, -2.0), glam::Vec2::new(axis_len, 4.0)),
-            Color::rgba(0.5, 0.0, 0.0, 1.0),
-            Transform2D::default(),
-            95.0,
-        );
+        render2d.solid(SpriteRect::new((-axis_len, -2.0), (axis_len, 4.0)))
+        .color(Color::rgba(0.5, 0.0, 0.0, 1.0))
+        .layer(95.0);
         // Y+ 下（绿）
-        render2d.add_sprite2d_solid(
-            SpriteRect::from_texture(glam::Vec2::new(-2.0, 0.0), glam::Vec2::new(4.0, axis_len)),
-            Color::GREEN,
-            Transform2D::default(),
-            95.0,
-        );
+        render2d.solid(SpriteRect::new((-2.0, 0.0), (4.0, axis_len)))
+        .color(Color::GREEN)
+        .layer(95.0);
         // Y- 上（暗绿）
-        render2d.add_sprite2d_solid(
-            SpriteRect::from_texture(glam::Vec2::new(-2.0, -axis_len), glam::Vec2::new(4.0, axis_len)),
-            Color::rgba(0.0, 0.4, 0.0, 1.0),
-            Transform2D::default(),
-            95.0,
-        );
+        render2d.solid(SpriteRect::new((-2.0, -axis_len), (4.0, axis_len)))
+        .color(Color::rgba(0.0, 0.4, 0.0, 1.0))
+        .layer(95.0);
 
         // 1. 带纹理的精灵（棋盘格），绕中心旋转 + 缩放（验证变换正确）。
         if let Some(tex) = &self.tex {
-            let rect = SpriteRect::from_texture(
-                glam::Vec2::new(-96.0, -96.0),
-                glam::Vec2::new(192.0, 192.0),
-            );
+            let rect = SpriteRect::new((-96.0, -96.0), (192.0, 192.0));
             let tf = Transform2D::default()
                 .with_pos(glam::Vec2::new(0.0, 0.0))
                 .with_rot(t * 0.8)
                 .with_scale(glam::Vec2::splat(1.0 + 0.2 * t.sin()));
-            render2d.add_sprite2d(rect, Color::WHITE, tf, 0.0, tex);
+            render2d.sprite(rect, tex).color(Color::WHITE).transform(tf);
         }
 
         // 2. 8 个纯色矩形（不同层级），验证 solid 包装（原 BUG：只有 7 个）。
@@ -166,10 +147,7 @@ impl App for SpriteDemo {
                 ((i%COUNTW) as f32 - (COUNTW as f32 - 1.0) * 0.5) * 80.0,
                 (t * 0.5 + (i/COUNTH) as f32).sin() * 20.0 + ((i/COUNTH) as f32 - (COUNTH as f32 - 1.0) * 0.5) * 50.0,
             );
-            let rect = SpriteRect::from_texture(
-                glam::Vec2::splat(-40.0),
-                glam::Vec2::new(80.0, 80.0),
-            );
+            let rect = SpriteRect::new((-40.0, -40.0), (80.0, 80.0));
             let tf = Transform2D::default()
                 .with_pos(center)
                 .with_rot(t * 0.3 + i as f32);
@@ -180,7 +158,11 @@ impl App for SpriteDemo {
                 0.9 - i_mapped * 0.7,
                 0.7,
             );
-            render2d.add_sprite2d_solid(rect, color, tf, (i%COUNTW) as f32 / COUNTW as f32 * 192.0 + 1.0);
+            render2d
+                .solid(rect)
+                .color(color)
+                .transform(tf)
+                .layer((i % COUNTW) as f32 / COUNTW as f32 * 192.0 + 1.0);
         }
 
         // 3. 凸多边形便捷接口（auto fan；世界坐标顶点）。
@@ -191,7 +173,7 @@ impl App for SpriteDemo {
             glam::Vec2::new(220.0, 200.0),
             glam::Vec2::new(280.0, 100.0),
         ];
-        render2d.add_polygon_fan(&triangle, Color::CYAN, 96.0);
+        render2d.polygon(&triangle).color(Color::CYAN).layer(96.0);
 
         // 3b. 通用 Mesh（显式索引；四边形 4 顶点 2 三角形）。
         let quad_verts = [
@@ -200,22 +182,17 @@ impl App for SpriteDemo {
             glam::Vec2::new(45.0, 260.0),
             glam::Vec2::new(-45.0, 260.0),
         ];
-        render2d.add_mesh(
-            &quad_verts,
-            &[0, 1, 2,
-              0, 2, 3],
-            Color::PURPLE,
-            96.0,
-        );
+        render2d
+            .mesh(&quad_verts, &[0, 1, 2, 0, 2, 3])
+            .color(Color::PURPLE)
+            .layer(96.0);
 
         // 4. 左上 UI 面板（最大层级，最上层）—— 世界坐标左上角 (-half_w+10, -half_h+10)。
         let ui_tl = glam::Vec2::new(-half_w + 10.0, -half_h + 10.0);
-        render2d.add_sprite2d_solid(
-            SpriteRect::from_texture(ui_tl, glam::Vec2::new(220.0, 60.0)),
-            Color::rgba(0.1, 0.1, 0.1, 0.8),
-            Transform2D::default(),
-            100.0,
-        );
+        render2d
+            .solid(SpriteRect::new(ui_tl, (220.0, 60.0)))
+            .color(Color::rgba(0.1, 0.1, 0.1, 0.8))
+            .layer(100.0);
 
         if let Some(w) = ctx.primary_window() {
             w.set_title(&format!(
@@ -231,13 +208,13 @@ impl App for SpriteDemo {
             depth: None,   // 需要深度纹理时在此传入 Some(1.0)
             stencil: None,
         };
-        // 全流程：begin_frame → 内部创建 RenderPass（按 clear）→ draw → submit/present。
+        // 全流程：acquire_frame → 内部创建 RenderPass（按 clear）→ draw → submit/present。
         render2d.render(&clear);
     }
 }
 
 fn main() -> Result<(), EventLoopError> {
     env_logger::init();
-    log::info!("APP: {}", *rjw_main::PRIMARY_WINDOW_TITLE);
+    log::info!("APP: {}", *rjw_krusie::main::PRIMARY_WINDOW_TITLE);
     run_app(SpriteDemo::new())
 }

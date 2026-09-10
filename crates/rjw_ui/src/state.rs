@@ -103,7 +103,7 @@ pub struct UiStats {
     pub collect_us: f64,
     /// 缓存命中 → 提交列表组装（顶点克隆）耗时（µs）。
     pub clone_us: f64,
-    /// 提交（ordered 排序 + add_quads）耗时（µs）。
+    /// 提交（ordered 排序 + quads）耗时（µs）。
     pub submit_us: f64,
     /// `Ui::finish` 总耗时（µs）。
     pub finish_us: f64,

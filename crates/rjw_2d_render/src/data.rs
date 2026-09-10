@@ -11,7 +11,15 @@ pub const QUAD_TRI_INDICIES: [u16; 6] = [0, 1, 3, 3, 2, 0];
 
 // ─── 几何 / 数据类型 ──────────────────────────────────────────
 
-/// 精灵矩形：网格范围（世界坐标）+ 纹理 UV（已归一化到 `[0,1]`）
+/// 精灵矩形：网格范围（世界坐标）+ 纹理 UV（已归一化到 `[0,1]`）。
+///
+/// 位置 / 尺寸 / UV 参数接受 `Vec2` 或 `(x, y)`（正方形写 `(x, x)`）。
+///
+/// ```ignore
+/// r2d.sprite(SpriteRect::new((10.0, 20.0), (64.0, 64.0)), &tex);   // 整张纹理
+/// r2d.sprite(SpriteRect::centered(pos, (32.0, 48.0)), &tex);       // 以 pos 为中心
+/// r2d.sprite(SpriteRect::with_uv_tex(tl, wh, (8, 8), (16, 16), &tex), &tex);
+/// ```
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SpriteRect {
     pub mesh_tl: glam::Vec2,
@@ -21,101 +29,279 @@ pub struct SpriteRect {
 }
 
 impl SpriteRect {
-    /// 手动指定（UV 为 `[0,1]` 归一化坐标）
-    #[inline]
-    pub const fn new(
-        mesh_tl: glam::Vec2,
-        mesh_wh: glam::Vec2,
-        uv_tl: glam::Vec2,
-        uv_wh: glam::Vec2,
-    ) -> Self {
-        Self {
-            mesh_tl,
-            mesh_wh,
-            uv_tl,
-            uv_wh,
-        }
-    }
+    // ── 构造 ──
 
-    /// 整张纹理平铺
+    /// **最常用**：世界矩形（左上角 + 尺寸）+ **整张纹理** UV。
     #[inline]
-    pub fn from_texture(mesh_tl: glam::Vec2, mesh_wh: glam::Vec2) -> Self {
+    pub fn new(tl: impl Into<glam::Vec2>, wh: impl Into<glam::Vec2>) -> Self {
         Self {
-            mesh_tl,
-            mesh_wh,
+            mesh_tl: tl.into(),
+            mesh_wh: wh.into(),
             uv_tl: glam::Vec2::ZERO,
             uv_wh: glam::Vec2::ONE,
         }
     }
 
-    /// 以**像素**指定纹理子区域，自动归一化到 `[0,1]`
+    /// 以**中心点** + 尺寸构造（旋转 / 居中绘制更自然）。
     #[inline]
-    pub fn from_texture_px(
-        mesh_tl: glam::Vec2,
-        mesh_wh: glam::Vec2,
-        uv_tl_px: glam::Vec2,
-        uv_wh_px: glam::Vec2,
-        inv_tex_wh: glam::Vec2,
+    pub fn centered(center: impl Into<glam::Vec2>, wh: impl Into<glam::Vec2>) -> Self {
+        let wh = wh.into();
+        Self::new(center.into() - wh * 0.5, wh)
+    }
+
+    /// 完整指定（UV 为**归一化** `[0,1]` 坐标）。
+    #[inline]
+    pub fn with_uv(
+        tl: impl Into<glam::Vec2>,
+        wh: impl Into<glam::Vec2>,
+        uv_tl: impl Into<glam::Vec2>,
+        uv_wh: impl Into<glam::Vec2>,
     ) -> Self {
         Self {
-            mesh_tl,
-            mesh_wh,
-            uv_tl: glam::Vec2::new(uv_tl_px.x, uv_tl_px.y) * inv_tex_wh,
-            uv_wh: glam::Vec2::new(uv_wh_px.x, uv_wh_px.y) * inv_tex_wh,
+            mesh_tl: tl.into(),
+            mesh_wh: wh.into(),
+            uv_tl: uv_tl.into(),
+            uv_wh: uv_wh.into(),
+        }
+    }
+
+    /// 以**像素**指定纹理子区域：给纹理像素尺寸 `tex_wh`（**无需手算倒数**，内部归一化）。
+    #[inline]
+    pub fn with_uv_px(
+        tl: impl Into<glam::Vec2>,
+        wh: impl Into<glam::Vec2>,
+        uv_tl_px: impl Into<glam::Vec2>,
+        uv_wh_px: impl Into<glam::Vec2>,
+        tex_wh: impl Into<glam::Vec2>,
+    ) -> Self {
+        let inv = 1.0 / tex_wh.into().max(glam::Vec2::ONE);
+        Self {
+            mesh_tl: tl.into(),
+            mesh_wh: wh.into(),
+            uv_tl: uv_tl_px.into() * inv,
+            uv_wh: uv_wh_px.into() * inv,
+        }
+    }
+
+    /// 以**像素**指定纹理子区域，纹理像素尺寸直接取自 [`ArcTextureWrapped`]。
+    #[inline]
+    pub fn with_uv_tex(
+        tl: impl Into<glam::Vec2>,
+        wh: impl Into<glam::Vec2>,
+        uv_tl_px: impl Into<glam::Vec2>,
+        uv_wh_px: impl Into<glam::Vec2>,
+        tex: &ArcTextureWrapped,
+    ) -> Self {
+        Self::with_uv_px(tl, wh, uv_tl_px, uv_wh_px, tex_size(tex))
+    }
+
+    // ── 链式调整（`Copy`，返回新值） ──
+
+    /// 移动（保持尺寸与 UV）。
+    #[inline]
+    pub fn at(self, tl: impl Into<glam::Vec2>) -> Self {
+        Self {
+            mesh_tl: tl.into(),
+            ..self
+        }
+    }
+
+    /// 相对移动。
+    #[inline]
+    pub fn move_by(self, delta: impl Into<glam::Vec2>) -> Self {
+        self.at(self.mesh_tl + delta.into())
+    }
+
+    /// 改世界尺寸（保持左上角与 UV）。
+    #[inline]
+    pub fn size(self, wh: impl Into<glam::Vec2>) -> Self {
+        Self {
+            mesh_wh: wh.into(),
+            ..self
+        }
+    }
+
+    /// 改**归一化** UV。
+    #[inline]
+    pub fn uv(self, uv_tl: impl Into<glam::Vec2>, uv_wh: impl Into<glam::Vec2>) -> Self {
+        Self {
+            uv_tl: uv_tl.into(),
+            uv_wh: uv_wh.into(),
+            ..self
+        }
+    }
+
+    /// 改**像素** UV（`tex_wh` = 纹理像素尺寸）。
+    #[inline]
+    pub fn uv_px(
+        self,
+        uv_tl_px: impl Into<glam::Vec2>,
+        uv_wh_px: impl Into<glam::Vec2>,
+        tex_wh: impl Into<glam::Vec2>,
+    ) -> Self {
+        let inv = 1.0 / tex_wh.into().max(glam::Vec2::ONE);
+        self.uv(uv_tl_px.into() * inv, uv_wh_px.into() * inv)
+    }
+
+    /// 世界矩形**各边**收窄（`f32` = 四边同值 / `(x, y)` = 左右、上下 / [`Edges`] 逐边；负值即外扩）。
+    #[inline]
+    pub fn shrink(self, edges: impl Into<Edges>) -> Self {
+        let e = edges.into();
+        Self {
+            mesh_tl: self.mesh_tl + glam::Vec2::new(e.left, e.top),
+            mesh_wh: self.mesh_wh - glam::Vec2::new(e.left + e.right, e.top + e.bottom),
+            ..self
+        }
+    }
+
+    /// 归一化 UV **各边**收窄（参数同 [`Self::shrink`]）。
+    #[inline]
+    pub fn shrink_uv(self, edges: impl Into<Edges>) -> Self {
+        let e = edges.into();
+        Self {
+            uv_tl: self.uv_tl + glam::Vec2::new(e.left, e.top),
+            uv_wh: self.uv_wh - glam::Vec2::new(e.left + e.right, e.top + e.bottom),
+            ..self
         }
     }
 }
 
-impl SpriteRect {
+/// 纹理像素尺寸（`Vec2`；1×1 下限防除零）。
+#[inline]
+fn tex_size(tex: &ArcTextureWrapped) -> glam::Vec2 {
+    glam::Vec2::new(tex.width as f32, tex.height as f32).max(glam::Vec2::ONE)
+}
+
+// ─── 四边量（裁剪类特效） ─────────────────────────────────────
+
+/// 四边量（左 / 右 / 上 / 下）：一律表示**每边各自**的量（不是总量）。
+///
+/// 用于 [`SpriteRectPx`] 的收缩 / 展开 / 越界扩展。构造方式：
+/// - `Edges::all(v)`：四边同值（等价直接传 `f32`）
+/// - `Edges::xy(x, y)`：左右 `x`、上下 `y`（等价直接传 `(x, y)` / `Vec2`）
+/// - `Edges::lrtb(l, r, t, b)`：逐边指定
+/// - `Edges::new().left(8.0)`：链式只改某一边
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Edges {
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
+}
+
+impl Edges {
+    pub const ZERO: Self = Self {
+        left: 0.0,
+        right: 0.0,
+        top: 0.0,
+        bottom: 0.0,
+    };
+
     #[inline]
-    pub fn shrink_mesh_x(self, sh: f32) -> Self {
-        let mut mesh_wh = self.mesh_wh;
-        let mut mesh_tl = self.mesh_tl;
-        mesh_wh.x -= sh*2.0;
-        mesh_tl.x += sh;
-        Self { mesh_tl, mesh_wh, ..self }
+    pub const fn new() -> Self {
+        Self::ZERO
     }
+
+    /// 四边同值。
     #[inline]
-    pub fn shrink_mesh_y(self, sh: f32) -> Self {
-        let mut mesh_wh = self.mesh_wh;
-        let mut mesh_tl = self.mesh_tl;
-        mesh_wh.y -= sh*2.0;
-        mesh_tl.y += sh;
-        Self { mesh_tl, mesh_wh, ..self }
+    pub const fn all(v: f32) -> Self {
+        Self {
+            left: v,
+            right: v,
+            top: v,
+            bottom: v,
+        }
     }
+
+    /// 左右 = `x`，上下 = `y`。
     #[inline]
-    pub fn shrink_mesh(self, x: f32, y: f32) -> Self {
-        self.shrink_mesh_x(x).shrink_mesh_y(y)
+    pub const fn xy(x: f32, y: f32) -> Self {
+        Self {
+            left: x,
+            right: x,
+            top: y,
+            bottom: y,
+        }
     }
+
+    /// 逐边指定（左 / 右 / 上 / 下）。
     #[inline]
-    pub fn shrink_uv_x(self, sh: f32) -> Self {
-        let mut uv_wh = self.uv_wh;
-        let mut uv_tl = self.uv_tl;
-        uv_wh.x -= sh*2.0;
-        uv_tl.x += sh;
-        Self { uv_tl, uv_wh, ..self }
+    pub const fn lrtb(left: f32, right: f32, top: f32, bottom: f32) -> Self {
+        Self {
+            left,
+            right,
+            top,
+            bottom,
+        }
     }
+
     #[inline]
-    pub fn shrink_uv_y(self, sh: f32) -> Self {
-        let mut uv_wh = self.uv_wh;
-        let mut uv_tl = self.uv_tl;
-        uv_wh.y -= sh*2.0;
-        uv_tl.y += sh;
-        Self { uv_tl, uv_wh, ..self }
+    pub fn left(mut self, v: f32) -> Self {
+        self.left = v;
+        self
     }
+
     #[inline]
-    pub fn shrink_uv(self, u: f32, v: f32) -> Self {
-        self.shrink_uv_x(u).shrink_uv_y(v)
+    pub fn right(mut self, v: f32) -> Self {
+        self.right = v;
+        self
+    }
+
+    #[inline]
+    pub fn top(mut self, v: f32) -> Self {
+        self.top = v;
+        self
+    }
+
+    #[inline]
+    pub fn bottom(mut self, v: f32) -> Self {
+        self.bottom = v;
+        self
     }
 }
 
-/// 精灵矩形（像素 UV 版）：`uv_tl` / `uv_wh` 以**像素**为单位（而非归一化坐标），
-/// 便于实现裁剪类特效（shrink、expand_left、expand_down 等）。
+/// `f32` → 四边同值。
+impl From<f32> for Edges {
+    #[inline]
+    fn from(v: f32) -> Self {
+        Self::all(v)
+    }
+}
+
+/// `(x, y)` → 左右 `x`、上下 `y`。
+impl From<(f32, f32)> for Edges {
+    #[inline]
+    fn from(v: (f32, f32)) -> Self {
+        Self::xy(v.0, v.1)
+    }
+}
+
+impl From<[f32; 2]> for Edges {
+    #[inline]
+    fn from(v: [f32; 2]) -> Self {
+        Self::xy(v[0], v[1])
+    }
+}
+
+impl From<glam::Vec2> for Edges {
+    #[inline]
+    fn from(v: glam::Vec2) -> Self {
+        Self::xy(v.x, v.y)
+    }
+}
+
+// ─── 精灵矩形（像素 UV） ──────────────────────────────────────
+
+/// 精灵矩形（**像素 UV** 版）：`uv_tl` / `uv_wh` 以**像素**为单位，便于做裁剪类特效。
 ///
-/// 持有纹理像素尺寸 [`SpriteRectPx::tex_wh`]，通过 [`SpriteRectPx::to_sprite_rect`] /
+/// 持有纹理像素尺寸 [`SpriteRectPx::tex_wh`]，用 [`SpriteRectPx::to_sprite_rect`] /
 /// `From` 可无损转为归一化 UV 的 [`SpriteRect`]。
-/// 引擎主要使用 [`ArcTextureWrapped`]（内置 `width`/`height`），可直接用
-/// [`SpriteRectPx::from_tex`] / [`SpriteRectPx::from_tex_px`] 构造。
+///
+/// ```ignore
+/// let r = SpriteRectPx::of_tex(pos, size, &tex);                    // 整张纹理
+/// let r = SpriteRectPx::with_uv_px(pos, size, (8, 8), (32, 32), (256, 128));
+/// let r = r.shrink(4.0).expand(Edges::new().left(8.0));            // 裁剪特效
+/// ```
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SpriteRectPx {
     pub mesh_tl: glam::Vec2, // 世界坐标左上角
@@ -126,87 +312,168 @@ pub struct SpriteRectPx {
 }
 
 impl SpriteRectPx {
-    /// 手动指定（UV 为**像素**坐标）
-    #[inline]
-    pub const fn new(
-        mesh_tl: glam::Vec2,
-        mesh_wh: glam::Vec2,
-        uv_tl: glam::Vec2,
-        uv_wh: glam::Vec2,
-        tex_wh: glam::Vec2,
-    ) -> Self {
-        Self {
-            mesh_tl,
-            mesh_wh,
-            uv_tl,
-            uv_wh,
-            tex_wh,
-        }
-    }
+    // ── 构造 ──
 
-    /// 整张纹理平铺
+    /// **最常用**：世界矩形 + **整张纹理**（UV 覆盖全图）。
     #[inline]
-    pub fn from_texture(mesh_tl: glam::Vec2, mesh_wh: glam::Vec2, tex_wh: glam::Vec2) -> Self {
+    pub fn new(
+        tl: impl Into<glam::Vec2>,
+        wh: impl Into<glam::Vec2>,
+        tex_wh: impl Into<glam::Vec2>,
+    ) -> Self {
+        let tex_wh = tex_wh.into().max(glam::Vec2::ONE);
         Self {
-            mesh_tl,
-            mesh_wh,
+            mesh_tl: tl.into(),
+            mesh_wh: wh.into(),
             uv_tl: glam::Vec2::ZERO,
             uv_wh: tex_wh,
             tex_wh,
         }
     }
 
-    /// 整张纹理平铺（纹理尺寸取自 `ArcTextureWrapped` 内置的 `width` / `height`）
+    /// 整张纹理（像素尺寸取自 [`ArcTextureWrapped`]）。
     #[inline]
-    pub fn from_tex(mesh_tl: glam::Vec2, mesh_wh: glam::Vec2, tex: &ArcTextureWrapped) -> Self {
-        Self::from_texture(
-            mesh_tl,
-            mesh_wh,
-            glam::Vec2::new(tex.width as f32, tex.height as f32),
-        )
-    }
-
-    /// 以**像素**指定纹理子区域（纹理尺寸取自 `ArcTextureWrapped` 内置的 `width` / `height`）
-    #[inline]
-    pub fn from_tex_px(
-        mesh_tl: glam::Vec2,
-        mesh_wh: glam::Vec2,
-        uv_tl: glam::Vec2,
-        uv_wh: glam::Vec2,
+    pub fn of_tex(
+        tl: impl Into<glam::Vec2>,
+        wh: impl Into<glam::Vec2>,
         tex: &ArcTextureWrapped,
     ) -> Self {
-        Self::new(
-            mesh_tl,
-            mesh_wh,
-            uv_tl,
-            uv_wh,
-            glam::Vec2::new(tex.width as f32, tex.height as f32),
-        )
+        Self::new(tl, wh, tex_size(tex))
     }
 
-    /// 以**像素**指定纹理子区域（纹理尺寸取自 `ArcTextureWrapped` 内置的 `width` / `height`）
+    /// 以**中心点** + 尺寸构造。
     #[inline]
-    pub fn from_tex_wh_px(
-        mesh_tl: glam::Vec2,
-        mesh_wh: glam::Vec2,
-        uv_tl: glam::Vec2,
-        uv_wh: glam::Vec2,
-        tex_wh: glam::Vec2,
+    pub fn centered(
+        center: impl Into<glam::Vec2>,
+        wh: impl Into<glam::Vec2>,
+        tex_wh: impl Into<glam::Vec2>,
     ) -> Self {
-        Self::new(
-            mesh_tl,
-            mesh_wh,
-            uv_tl,
-            uv_wh,
-            tex_wh,
-        )
+        let wh = wh.into();
+        Self::new(center.into() - wh * 0.5, wh, tex_wh)
     }
 
-    /// 转为归一化 UV 的 [`SpriteRect`]（`tex_wh` 各轴按 `max(1.0)` 防除零）
+    /// 以**像素**指定纹理子区域。
+    #[inline]
+    pub fn with_uv_px(
+        tl: impl Into<glam::Vec2>,
+        wh: impl Into<glam::Vec2>,
+        uv_tl_px: impl Into<glam::Vec2>,
+        uv_wh_px: impl Into<glam::Vec2>,
+        tex_wh: impl Into<glam::Vec2>,
+    ) -> Self {
+        Self {
+            mesh_tl: tl.into(),
+            mesh_wh: wh.into(),
+            uv_tl: uv_tl_px.into(),
+            uv_wh: uv_wh_px.into(),
+            tex_wh: tex_wh.into().max(glam::Vec2::ONE),
+        }
+    }
+
+    /// 以**像素**指定纹理子区域（像素尺寸取自 [`ArcTextureWrapped`]）。
+    #[inline]
+    pub fn with_uv_tex(
+        tl: impl Into<glam::Vec2>,
+        wh: impl Into<glam::Vec2>,
+        uv_tl_px: impl Into<glam::Vec2>,
+        uv_wh_px: impl Into<glam::Vec2>,
+        tex: &ArcTextureWrapped,
+    ) -> Self {
+        Self::with_uv_px(tl, wh, uv_tl_px, uv_wh_px, tex_size(tex))
+    }
+
+    // ── 链式调整（`Copy`，返回新值） ──
+
+    /// 移动（保持尺寸与 UV）。
+    #[inline]
+    pub fn at(self, tl: impl Into<glam::Vec2>) -> Self {
+        Self {
+            mesh_tl: tl.into(),
+            ..self
+        }
+    }
+
+    /// 相对移动。
+    #[inline]
+    pub fn move_by(self, delta: impl Into<glam::Vec2>) -> Self {
+        self.at(self.mesh_tl + delta.into())
+    }
+
+    /// 改世界尺寸（保持左上角与 UV）。
+    #[inline]
+    pub fn size(self, wh: impl Into<glam::Vec2>) -> Self {
+        Self {
+            mesh_wh: wh.into(),
+            ..self
+        }
+    }
+
+    /// 世界矩形**各边**收窄（`f32` = 四边同值 / `(x, y)` = 左右、上下 / [`Edges`] 逐边）。
+    #[inline]
+    pub fn shrink_mesh(self, edges: impl Into<Edges>) -> Self {
+        let e = edges.into();
+        Self {
+            mesh_tl: self.mesh_tl + glam::Vec2::new(e.left, e.top),
+            mesh_wh: self.mesh_wh - glam::Vec2::new(e.left + e.right, e.top + e.bottom),
+            ..self
+        }
+    }
+
+    // ── 裁剪特效（UV，单位为像素；每边量见 [`Edges`]） ──
+
+    /// 各边收窄（像素）：超出按 `左 → 上 → 右 → 下` 顺序 clamp，尺寸不小于 0。
+    #[inline]
+    pub fn shrink(self, edges: impl Into<Edges>) -> Self {
+        let e = edges.into();
+        let w = self.uv_wh.x.max(0.0);
+        let h = self.uv_wh.y.max(0.0);
+        let l = e.left.max(0.0).min(w);
+        let t = e.top.max(0.0).min(h);
+        let r = e.right.max(0.0).min(w - l);
+        let b = e.bottom.max(0.0).min(h - t);
+        Self {
+            uv_tl: self.uv_tl + glam::Vec2::new(l, t),
+            uv_wh: glam::Vec2::new(w - l - r, h - t - b),
+            ..self
+        }
+    }
+
+    /// 各边外扩（像素）：clamp 在纹理边界内，不越界。
+    #[inline]
+    pub fn expand(self, edges: impl Into<Edges>) -> Self {
+        let e = edges.into();
+        let l = e.left.max(0.0).min(self.uv_tl.x.max(0.0));
+        let t = e.top.max(0.0).min(self.uv_tl.y.max(0.0));
+        let room_r = (self.tex_wh.x - (self.uv_tl.x + self.uv_wh.x)).max(0.0);
+        let room_b = (self.tex_wh.y - (self.uv_tl.y + self.uv_wh.y)).max(0.0);
+        let r = e.right.max(0.0).min(room_r);
+        let b = e.bottom.max(0.0).min(room_b);
+        Self {
+            uv_tl: self.uv_tl - glam::Vec2::new(l, t),
+            uv_wh: glam::Vec2::new(self.uv_wh.x + l + r, self.uv_wh.y + t + b),
+            ..self
+        }
+    }
+
+    /// 各边外扩（像素）：**不 clamp**，允许越过纹理边界（采样依赖寻址模式）。
+    #[inline]
+    pub fn exceed(self, edges: impl Into<Edges>) -> Self {
+        let e = edges.into();
+        Self {
+            uv_tl: self.uv_tl - glam::Vec2::new(e.left, e.top),
+            uv_wh: glam::Vec2::new(
+                self.uv_wh.x + e.left + e.right,
+                self.uv_wh.y + e.top + e.bottom,
+            ),
+            ..self
+        }
+    }
+
+    /// 转为归一化 UV 的 [`SpriteRect`]（`tex_wh` 各轴按 `max(1.0)` 防除零）。
     #[inline]
     pub fn to_sprite_rect(&self) -> SpriteRect {
-        let safe = 1.0 / self.tex_wh.max(glam::Vec2::splat(1.0));
-        SpriteRect::new(self.mesh_tl, self.mesh_wh, self.uv_tl * safe, self.uv_wh * safe)
+        let inv = 1.0 / self.tex_wh.max(glam::Vec2::ONE);
+        SpriteRect::with_uv(self.mesh_tl, self.mesh_wh, self.uv_tl * inv, self.uv_wh * inv)
     }
 }
 
@@ -214,199 +481,6 @@ impl From<SpriteRectPx> for SpriteRect {
     #[inline]
     fn from(v: SpriteRectPx) -> Self {
         v.to_sprite_rect()
-    }
-}
-
-impl SpriteRectPx {
-    /// 左右两侧各收窄 `sh`（世界坐标，同 [`SpriteRect::shrink_mesh_x`]）
-    #[inline]
-    pub fn shrink_mesh_x(self, sh: f32) -> Self {
-        let mut mesh_wh = self.mesh_wh;
-        let mut mesh_tl = self.mesh_tl;
-        mesh_wh.x -= sh * 2.0;
-        mesh_tl.x += sh;
-        Self { mesh_tl, mesh_wh, ..self }
-    }
-
-    /// 上下两侧各收窄 `sh`（世界坐标，同 [`SpriteRect::shrink_mesh_y`]）
-    #[inline]
-    pub fn shrink_mesh_y(self, sh: f32) -> Self {
-        let mut mesh_wh = self.mesh_wh;
-        let mut mesh_tl = self.mesh_tl;
-        mesh_wh.y -= sh * 2.0;
-        mesh_tl.y += sh;
-        Self { mesh_tl, mesh_wh, ..self }
-    }
-
-    /// 四周各收窄（世界坐标）
-    #[inline]
-    pub fn shrink_mesh(self, x: f32, y: f32) -> Self {
-        self.shrink_mesh_x(x).shrink_mesh_y(y)
-    }
-
-    /// UV 水平双侧各收窄 `px` 像素（居中收缩；`px` 过大时 clamp 到 0，不翻转）
-    #[inline]
-    pub fn shrink_uv_x(self, px: f32) -> Self {
-        let w = self.uv_wh.x;
-        let nw = (w - px * 2.0).max(0.0);
-        let d = (w - nw) * 0.5;
-        Self {
-            uv_tl: self.uv_tl + glam::Vec2::new(d, 0.0),
-            uv_wh: glam::Vec2::new(nw, self.uv_wh.y),
-            ..self
-        }
-    }
-
-    /// UV 垂直双侧各收窄 `px` 像素（居中收缩；`px` 过大时 clamp 到 0，不翻转）
-    #[inline]
-    pub fn shrink_uv_y(self, px: f32) -> Self {
-        let h = self.uv_wh.y;
-        let nh = (h - px * 2.0).max(0.0);
-        let d = (h - nh) * 0.5;
-        Self {
-            uv_tl: self.uv_tl + glam::Vec2::new(0.0, d),
-            uv_wh: glam::Vec2::new(self.uv_wh.x, nh),
-            ..self
-        }
-    }
-
-    /// UV 四周各收窄（像素）
-    #[inline]
-    pub fn shrink_uv(self, x: f32, y: f32) -> Self {
-        self.shrink_uv_x(x).shrink_uv_y(y)
-    }
-
-    /// UV 左侧收窄 `px` 像素（clamp 到宽度为 0）
-    #[inline]
-    pub fn shrink_left(self, px: f32) -> Self {
-        let a = px.min(self.uv_wh.x.max(0.0));
-        Self {
-            uv_tl: self.uv_tl + glam::Vec2::new(a, 0.0),
-            uv_wh: glam::Vec2::new(self.uv_wh.x - a, self.uv_wh.y),
-            ..self
-        }
-    }
-
-    /// UV 右侧收窄 `px` 像素（clamp 到宽度为 0）
-    #[inline]
-    pub fn shrink_right(self, px: f32) -> Self {
-        let a = px.min(self.uv_wh.x.max(0.0));
-        Self {
-            uv_wh: glam::Vec2::new(self.uv_wh.x - a, self.uv_wh.y),
-            ..self
-        }
-    }
-
-    /// UV 上侧收窄 `px` 像素（clamp 到高度为 0）
-    #[inline]
-    pub fn shrink_up(self, px: f32) -> Self {
-        let a = px.min(self.uv_wh.y.max(0.0));
-        Self {
-            uv_tl: self.uv_tl + glam::Vec2::new(0.0, a),
-            uv_wh: glam::Vec2::new(self.uv_wh.x, self.uv_wh.y - a),
-            ..self
-        }
-    }
-
-    /// UV 下侧收窄 `px` 像素（clamp 到高度为 0）
-    #[inline]
-    pub fn shrink_down(self, px: f32) -> Self {
-        let a = px.min(self.uv_wh.y.max(0.0));
-        Self {
-            uv_wh: glam::Vec2::new(self.uv_wh.x, self.uv_wh.y - a),
-            ..self
-        }
-    }
-}
-
-impl SpriteRectPx {
-    /// UV 左侧展开 `px` 像素（clamp 到纹理左边界，不越界）
-    #[inline]
-    pub fn expand_left(self, px: f32) -> Self {
-        let a = px.min(self.uv_tl.x.max(0.0));
-        Self {
-            uv_tl: self.uv_tl - glam::Vec2::new(a, 0.0),
-            uv_wh: glam::Vec2::new(self.uv_wh.x + a, self.uv_wh.y),
-            ..self
-        }
-    }
-
-    /// UV 右侧展开 `px` 像素（clamp 到纹理右边界，不越界）
-    #[inline]
-    pub fn expand_right(self, px: f32) -> Self {
-        let a = px.min((self.tex_wh.x - (self.uv_tl.x + self.uv_wh.x)).max(0.0));
-        Self {
-            uv_wh: glam::Vec2::new(self.uv_wh.x + a, self.uv_wh.y),
-            ..self
-        }
-    }
-
-    /// UV 上侧展开 `px` 像素（clamp 到纹理上边界，不越界）
-    #[inline]
-    pub fn expand_up(self, px: f32) -> Self {
-        let a = px.min(self.uv_tl.y.max(0.0));
-        Self {
-            uv_tl: self.uv_tl - glam::Vec2::new(0.0, a),
-            uv_wh: glam::Vec2::new(self.uv_wh.x, self.uv_wh.y + a),
-            ..self
-        }
-    }
-
-    /// UV 下侧展开 `px` 像素（clamp 到纹理下边界，不越界）
-    #[inline]
-    pub fn expand_down(self, px: f32) -> Self {
-        let a = px.min((self.tex_wh.y - (self.uv_tl.y + self.uv_wh.y)).max(0.0));
-        Self {
-            uv_wh: glam::Vec2::new(self.uv_wh.x, self.uv_wh.y + a),
-            ..self
-        }
-    }
-
-    /// UV 四周各展开 `px` 像素（clamp 到纹理边界）
-    #[inline]
-    pub fn expand(self, px: f32) -> Self {
-        self.expand_left(px)
-            .expand_right(px)
-            .expand_up(px)
-            .expand_down(px)
-    }
-
-    /// UV 左侧展开 `px` 像素（**不 Clamp**：允许 `uv_tl` 越过 0）
-    #[inline]
-    pub fn exceed_left(self, px: f32) -> Self {
-        Self {
-            uv_tl: self.uv_tl - glam::Vec2::new(px, 0.0),
-            uv_wh: glam::Vec2::new(self.uv_wh.x + px, self.uv_wh.y),
-            ..self
-        }
-    }
-
-    /// UV 右侧展开 `px` 像素（**不 Clamp**：允许 UV 越过纹理右边界）
-    #[inline]
-    pub fn exceed_right(self, px: f32) -> Self {
-        Self {
-            uv_wh: glam::Vec2::new(self.uv_wh.x + px, self.uv_wh.y),
-            ..self
-        }
-    }
-
-    /// UV 上侧展开 `px` 像素（**不 Clamp**：允许 `uv_tl` 越过 0）
-    #[inline]
-    pub fn exceed_up(self, px: f32) -> Self {
-        Self {
-            uv_tl: self.uv_tl - glam::Vec2::new(0.0, px),
-            uv_wh: glam::Vec2::new(self.uv_wh.x, self.uv_wh.y + px),
-            ..self
-        }
-    }
-
-    /// UV 下侧展开 `px` 像素（**不 Clamp**：允许 UV 越过纹理下边界）
-    #[inline]
-    pub fn exceed_down(self, px: f32) -> Self {
-        Self {
-            uv_wh: glam::Vec2::new(self.uv_wh.x, self.uv_wh.y + px),
-            ..self
-        }
     }
 }
 
@@ -461,7 +535,7 @@ impl Index {
 #[derive(Debug, Default, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct TriIndicies(pub(crate) Index, pub(crate) Index, pub(crate) Index);
 impl TriIndicies {
-    /// 以**局部**索引构造一个三角形（`add_mesh_fn_prealloc` 闭包内使用；
+    /// 以**局部**索引构造一个三角形（`mesh_with_cap` 闭包内使用；
     /// 内部会自动重定位为全局索引）。
     #[inline]
     pub const fn new(a: u16, b: u16, c: u16) -> Self {
@@ -483,7 +557,7 @@ impl MeshStorage {
     }
 }
 
-/// `add_mesh_fn` 闭包内使用的安全网格写入封装。
+/// `mesh_with` 闭包内使用的安全网格写入封装。
 ///
 /// 内部持有 `Render2D` 的 `MeshStorage` 的**可变借用**；闭包执行完毕后借用自动释放。
 /// `push_vertex(pos)` 返回**局部**顶点索引（相对本 mesh 从 0 起），
@@ -502,7 +576,8 @@ impl<'a> MeshSink<'a> {
     ///
     /// 返回该顶点的**局部索引**，可直接传给 `push_tri`。
     #[inline]
-    pub fn push_vertex(&mut self, pos: glam::Vec2) -> u16 {
+    pub fn push_vertex(&mut self, pos: impl Into<glam::Vec2>) -> u16 {
+        let pos = pos.into();
         let idx = self.verts.len() as u32 - self.base;
         debug_assert!(
             idx <= u16::MAX as u32,
@@ -520,7 +595,8 @@ impl<'a> MeshSink<'a> {
     ///
     /// 返回该顶点的**局部索引**，可直接传给 `push_tri`。
     #[inline]
-    pub fn push_vertex_uv(&mut self, pos: glam::Vec2, uv: glam::Vec2) -> u16 {
+    pub fn push_vertex_uv(&mut self, pos: impl Into<glam::Vec2>, uv: impl Into<glam::Vec2>) -> u16 {
+        let (pos, uv) = (pos.into(), uv.into());
         let idx = self.verts.len() as u32 - self.base;
         debug_assert!(
             idx <= u16::MAX as u32,
@@ -538,7 +614,13 @@ impl<'a> MeshSink<'a> {
     ///
     /// 用于逐顶点渐变等场景（如文本渐变）。返回该顶点的**局部索引**。
     #[inline]
-    pub fn push_vertex_uv_color(&mut self, pos: glam::Vec2, uv: glam::Vec2, color: [f32; 4]) -> u16 {
+    pub fn push_vertex_uv_color(
+        &mut self,
+        pos: impl Into<glam::Vec2>,
+        uv: impl Into<glam::Vec2>,
+        color: [f32; 4],
+    ) -> u16 {
+        let (pos, uv) = (pos.into(), uv.into());
         let idx = self.verts.len() as u32 - self.base;
         debug_assert!(
             idx <= u16::MAX as u32,

@@ -6,6 +6,9 @@
 English：
 `rjw_main` is the app entry point: a winit `ApplicationHandler` event loop that manages the primary window, timer, keyboard and mouse, calling into the user `App` trait every frame.
 
+> 整套库入口：`use rjw_krusie::prelude::*;` 已含 `App` / `run_app` / `MainContext` / winit 骨架 / 输入 / 计时；
+> 低层（`Window` / `Size` / `PRIMARY_WINDOW_TITLE`…）走 `rjw_krusie::main::*`。
+
 ---
 
 ## 功能特性 / Features
