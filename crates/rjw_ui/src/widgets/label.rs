@@ -163,20 +163,18 @@ impl Widget for Label<'_> {
         };
         if self.ellipsis {
             // 省略：宽度 ≤ 可用宽（单行；高度 = 自然行高）。
-            if let Some(avail) = ui.avail_w() {
-                if avail < natural.x {
+            if let Some(avail) = ui.avail_w()
+                && avail < natural.x {
                     return Vec2::new(avail, natural.y);
                 }
-            }
             natural
         } else if wrap.is_none() || wrap.is_some_and(|w| w <= 0.0) {
             // 默认（无显式换行宽）：**LimitedInParent**——在父级可用宽内自动换行
             // （Resizable 窗口缩窄后 Label 不溢出；无可用宽 = 自然尺寸）。
-            if let Some(avail) = ui.avail_w() {
-                if avail < natural.x {
+            if let Some(avail) = ui.avail_w()
+                && avail < natural.x {
                     return ui.text_size_wrap(self.text, size, family.as_deref(), avail);
                 }
-            }
             natural
         } else {
             natural

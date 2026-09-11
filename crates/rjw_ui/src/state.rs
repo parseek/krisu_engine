@@ -8,6 +8,7 @@ use rjw_2d_render::VertexP3U2C4;
 use rjw_text::Buffer;
 use rjw_transform::Rect;
 
+use crate::focus::FocusKind;
 use crate::id::IdAbsolute;
 use crate::proc::ProcTextures;
 
@@ -118,6 +119,9 @@ pub struct UiState {
     pub widgets: HashMap<IdAbsolute<'static>, WidgetState>,
     /// 当前持有焦点的控件 **绝对 ID**（文本输入框等）。
     pub focused: Option<IdAbsolute<'static>>,
+    /// 当前焦点控件的**类型**（与 `focused` 同步；[`UiState::text_focus`] 据此区分
+    /// "文本焦点"与"按钮/滑块焦点"）。
+    pub(crate) focused_kind: Option<FocusKind>,
     /// 单选组：组名 → 当前选中的控件 **绝对 ID**。
     pub radio_groups: HashMap<String, IdAbsolute<'static>>,
     /// 可拖拽面板 / 窗口：**绝对 ID** → 左上角位置（屏幕逻辑像素，跨帧持久）。
@@ -129,7 +133,7 @@ pub struct UiState {
     ///
     /// 用途：窗口**遮挡判定**（[`crate::hit::window_occluded`]）——控件命中测试时
     /// 检查鼠标下是否有更高 z 的窗口覆盖，修复"点击穿透"（背后窗口的控件在重叠
-    /// 区域不响应）。录制窗口时更新（[`Ui::window_at`]），`finish` 末尾只保留
+    /// 区域不响应）。录制窗口时更新（[`crate::Ui::window`]），`finish` 末尾只保留
     /// **本帧录制过**的窗口（销毁/停用窗口自动清除，z 变化时旧条目随帧清理）。
     pub(crate) window_rects: HashMap<u32, Rect>,
     /// grid 容器：**绝对 ID** → 结算后的单元格尺寸（跨帧缓存，保证布局稳定）。
@@ -173,6 +177,11 @@ pub struct UiState {
     /// **诊断**：最近一次按下由哪个窗口接收（`finish::resolve_win_press` 写入；
     /// 即重叠点击时被置顶/可拖拽的**最上层**窗口）。跨帧保留直至下一次按下。
     pub(crate) last_press_window: Option<(IdAbsolute<'static>, u32)>,
+    /// **诊断**：窗口 z → 上一次 inish **实际提交用的平移量**（lush_seg 写）。
+    ///
+    /// Ui 每帧由 egin 重建，帧内诊断（Ui::debug_dump）常在本帧**录制期**调用，
+    /// 故放在跨帧状态里；与 win_origins 对照即可判定"引擎状态 vs 视觉"是否一致。
+    pub(crate) debug_submit: HashMap<u32, Vec2>,
     /// **程序化纹理缓存**（圆角矩形 / 渐变 / WHITE）：塞进动态 Atlas，跨帧复用。
     pub(crate) proc: ProcTextures,
     /// **滚动容器状态**：`scroll_at` 的 **绝对 ID** → (偏移, 内容高)，跨帧持久。
@@ -225,6 +234,7 @@ impl UiState {
         self.widgets.remove(id.as_str());
         if self.focused.as_ref().is_some_and(|f| f.as_str() == id.as_str()) {
             self.focused = None;
+            self.focused_kind = None;
         }
         for group in self.radio_groups.values_mut() {
             if group.as_str() == id.as_str() {
@@ -237,6 +247,7 @@ impl UiState {
     pub fn reset(&mut self) {
         self.widgets.clear();
         self.focused = None;
+        self.focused_kind = None;
         self.radio_groups.clear();
         self.grid_cells.clear();
         self.panel_pos.clear();
@@ -255,23 +266,31 @@ impl UiState {
         self.stats = UiStats::default();
     }
 
-    /// 是否正在**捕获键盘输入**（有文本输入框持有焦点）。
+    /// **文本焦点**（`None` = 当前焦点不是文本控件 / 无焦点）。
     ///
     /// 应用应在处理自己的按键逻辑（如 `R` 重置、`Esc` 退出）前检查并跳过：
     /// ```no_run
     /// # let ui_state: rjw_ui::UiState = rjw_ui::UiState::new();
-    /// if !ui_state.capturing_text() {
+    /// if ui_state.text_focus().is_none() {
     ///     // 处理游戏/应用快捷键……
     /// }
     /// ```
+    ///
+    /// 与旧的 `capturing_text()`（= `focused.is_some()`，任何控件持焦点都为真）的区别：
+    /// 只有**文本输入框**持焦点时才认定"键盘被文本捕获"——按钮 / 滑块 / 下拉框持焦点
+    /// （Tab 导航）不该吞掉应用快捷键。
     #[inline]
-    pub fn capturing_text(&self) -> bool {
-        self.focused.is_some()
+    pub fn text_focus(&self) -> Option<TextFocus> {
+        let id = self.focused.clone()?;
+        if self.focused_kind != Some(FocusKind::TextInput) {
+            return None;
+        }
+        Some(TextFocus { id })
     }
 
     /// 光标是否处于"亮"相位（每 30 帧切换）。
     pub fn caret_blink_on(&self) -> bool {
-        (self.frame / 30) % 2 == 0
+        (self.frame / 30).is_multiple_of(2)
     }
 
     /// **诊断**：上一帧**命中但被更高窗口遮挡而未响应**的控件次数
@@ -289,6 +308,13 @@ impl UiState {
             .as_ref()
             .map(|(id, z)| (id.as_str(), *z))
     }
+}
+
+/// **文本焦点**（[`UiState::text_focus`] 的产物）：持有焦点的**文本输入控件** id。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextFocus {
+    /// 文本控件的**绝对 ID**（与状态键 / 焦点 id 一致）。
+    pub id: IdAbsolute<'static>,
 }
 
 /// 按钮返回给用户的状态视图（复制值，非借用）。

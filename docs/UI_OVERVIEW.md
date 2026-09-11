@@ -30,8 +30,8 @@
 Ui::begin(window, &mut text, &mut state)
    .capture(&mouse, &keyboard)   // 拷贝输入快照（与设备解耦）
    .theme(theme).scale_factor(dpi).build()
-   → 录制：ui.label_at / pack_at / window_at / add(...)  …
-   → Ui::finish(&viewport, &mut render2d)
+   → 录制：ui.label_at / pack_at / ui.window(id).show(..) / add(...)  …
+   → Ui::finish(&mut render2d)
 ```
 
 - **录制阶段**：每次控件调用把一条/多条 `UiDraw` 命令压入队列（坐标是**相对当前容器的
@@ -56,7 +56,7 @@ scroll / row）压一帧。控件经 `child_rect(w, h)` 在栈顶帧内占一个
 
 - **pack**：按 `PackSide::Top`（垂直）/ `Left`（水平）堆叠，尺寸 = 最大子项；
 - **grid**：`cols` 列均匀网格，单元格尺寸跨帧缓存（内容变化可扩可缩）；
-- **固定宽容器**（`window_at_w`）：子项宽度 clamp 到固定值、高度自然（egui 风格）；
+- **固定宽容器**（`ui.window(id).width(w)`）：子项宽度 clamp 到固定值、高度自然（egui 风格）；
 - **flex**：固定总高按权重等分；
 - **min/max 约束**：`p.min_size(w,h)` / `p.max_size(w,h)` 作用于下一子项；
 - **row（等高）**：水平排列 + `Theme.row_h` 强制所有子项等高 → 文字中心线对齐。
@@ -85,7 +85,7 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 
 裁剪分**两层**：
 
-- **强制层（硬裁剪）**：ScrollView 可视区 / Clip 沙箱（`window_at_strict`、文本框）。
+- **强制层（硬裁剪）**：ScrollView 可视区 / Clip 沙箱（`ui.window(id).placement(Placement::Clip)`、文本框）。
   `UiDraw.clip` 恒为该层，**所有绘制（含 noclip 变体）都服从**——内容超出可视区是物理约束；
 - **软层（内容裁剪）**：控件自身内容边界，由调用方显式传（`push_text_rect` 的局部 clip、
   文本框内容区）。内容**自洽**的控件（自动换行 / "…"省略 / 滚动）用 `push_*_noclip`
@@ -107,10 +107,10 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 
 ### 7. 窗口系统
 
-`window_at` 可重叠 + 点击置顶（z-order）+ 可拖拽（位置持久于 `UiState.panel_pos`，可经
-`pos_handler` 责任链由脚本/动画驱动）。`window_at_w` 固定宽 + 右下角缩放柄（`resize_handle`
-通用原语，持久于 `UiState.window_widths` / `UiState.sizes`）。`window_at_strict` 内容严格
-裁剪（Clip 沙箱）；默认窗口是 Expand 语义（内容自动换行 / 撑高）。
+`ui.window(id)` 可重叠 + 点击置顶（z-order）+ 可拖拽（位置持久于 `UiState.panel_pos`，可经
+`pos_handler` 责任链由脚本/动画驱动）。`.width(w)` 固定宽 + 右下角缩放柄（`resize_handle`
+通用原语，持久于 `UiState.window_widths` / `UiState.sizes`）。`.placement(Placement::Clip)`
+内容严格裁剪（Clip 沙箱）；默认 `.placement(Expand)`（内容自动换行 / 撑高）。
 
 ### 8. 文本编辑（`edit.rs` 纯逻辑，可单测）
 
@@ -187,7 +187,7 @@ ui.pack_at(Vec2::new(16.0, 56.0), PackSide::Top, |p| {
 });
 
 // 窗口 + Label 溢出处理（容器责任链 builder：`ui.window(id).pos(..).width(..)`
-// 等价旧 `window_at_w`；`.strict()` = 强制裁剪；`.style(..)` = 逐窗口样式覆盖）
+// 固定宽 + 右下角缩放；`.placement(Placement::Clip)` = 强制裁剪；`.style(..)` = 逐窗口样式覆盖）
 ui.window("win")
     .pos(Vec2::new(560.0, 240.0))
     .width(220.0)
@@ -199,14 +199,14 @@ ui.window("win")
 // 提交
 let viewport = Viewport::new(render2d.size(), Vec2::ZERO);
 r2d_ui.set_mvp(viewport.vp_matrix());           // UI 的 Render2D 须 set_sort_mode(SortMode::None)
-ui.finish(&viewport, r2d_ui);
+ui.finish(r2d_ui);                              // UI 无需相机/视口参数（屏幕固定变换由本次 MVP 决定）
 ```
 
 ### 常用控件 / 方法速查
 
 | 分类 | 方法 / 控件 |
 |---|---|
-| 容器 | `ui.window(id)`/`ui.panel()`/`ui.modal(id)` builder（选项链 + `.show(..)`，统一 `window_at*` / `panel_at` / `modal_at*`）/ `pack_at` / `grid_at` / `flex_at` / `scroll_at` / `list_at` / `row` / `view_at` |
+| 容器 | `ui.window(id)`/`ui.panel()`/`ui.modal(id)` builder（选项链 + `.show(..)`，已统一旧的 `window_at*` / `modal_at*`）/ `panel_at` / `pack_at` / `grid_at` / `flex_at` / `scroll_at` / `list_at` / `row` / `view_at` |
 | 占光标便捷 | `p.label` / `p.button` / `p.checkbox(_mut)` / `p.radio` / `p.slider` / `p.text_input` / `p.text_area(_nw)` / `p.combo` / `p.divider` / `p.row` |
 | Widget builder | `Label`（`wrap` / `ellipsis`）/ `Button` / `Checkbox` / `Divider`（`p.add(...)` 放置） |
 | 组合控件 | `NumberInput`（拖动调值 + 输入）/ `FontModal`（字体切换） |
@@ -214,8 +214,8 @@ ui.finish(&viewport, r2d_ui);
 
 ### 输入屏蔽
 
-`UiState::capturing_text()` 为真表示有输入框持有焦点——应用处理快捷键（`R` 重置、
-`Esc` 退出等）前应检查并跳过。
+`UiState::text_focus()` 为 `Some` 表示有**文本控件**持有焦点（按钮/滑块的 Tab 焦点不算）——
+应用处理快捷键（`R` 重置、`Esc` 退出等）前应检查并跳过。
 
 ---
 

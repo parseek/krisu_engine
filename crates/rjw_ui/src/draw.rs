@@ -1,25 +1,25 @@
 //! 绘制原语：屏幕固定变换 + 实心矩形 / 边框（记录式，实际提交在 `Ui::finish`）。
 //!
-//! 屏幕固定变换数学（与 `rjw_transform` 单元测试
-//! `viewport_screen_fixed_transform_maps_local_to_screen_1to1` 一致）：
-//! `{ pos: viewport.screen_to_world(anchor_px), rotation: 0, scale: 1 }`
-//! —— 局部像素点经该变换到世界、再 `world_to_screen`，恒等于 `anchor_px + local`
-//! （1:1，不随相机旋转/缩放而变形）。UI 相机恒为 identity（rot=0/zoom=1/pos=0），
-//! 仅需视口（[`rjw_transform::Viewport`]：大小 + 位置）做屏幕像素 ↔ 世界换算。
+//! 屏幕固定变换数学：`{ pos: anchor_px, rotation: 0, scale: 1 }`——**UI 层渲染器的坐标空间
+//! 就是"物理像素、左上原点"**（运行时给它一个平移了 `region.center()` 的 identity 相机，
+//! 见 `Ctx::submit_with`），所以局部像素点经本变换即 1:1 落在屏幕上
+//! （不随世界相机旋转/缩放而变形）。
+//!
+//! 与"世界层"的区别：世界层相机由应用持有（可平移/旋转/缩放），UI 层相机由运行时固定。
 
 use glam::Vec2;
 use rjw_2d_render::SpriteRect;
 use rjw_color::Color;
 use rjw_text::Buffer;
-use rjw_transform::{Rect, Transform2D, Viewport};
+use rjw_transform::{Rect, Transform2D};
 use std::sync::Arc;
 
-/// 屏幕固定变换：把屏幕像素锚点映射为世界中的 `Transform2D`（UI 恒等特例）。
+/// 屏幕固定变换：把屏幕像素锚点映射为 **UI 层**中的 `Transform2D`。
+///
+/// UI 层坐标空间 = 物理像素、左上原点 ⇒ 本变换就是"平移到 `anchor_px`"。
 #[inline]
-pub fn screen_fixed_tf(viewport: &Viewport, anchor_px: Vec2) -> Transform2D {
-    // UI 相机恒为 identity（rot=0 / zoom=1 / pos=0）：变换 = 平移到
-    // viewport.screen_to_world(anchor_px)（屏幕固定 1:1，不旋转/缩放）。
-    Transform2D::IDENTITY.with_pos(viewport.screen_to_world(anchor_px))
+pub fn screen_fixed_tf(anchor_px: Vec2) -> Transform2D {
+    Transform2D::IDENTITY.with_pos(anchor_px)
 }
 
 /// 屏幕矩形 → 精灵矩形（mesh 局部坐标从 (0,0) 起，尺寸 = 矩形宽高）。
@@ -339,14 +339,9 @@ pub enum DebugShape {
     Grid { rect: Rect, spacing: f32, width: f32 },
 }
 
-/// 渐变方向（`Gradient` 绘制命令）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GradientAxis {
-    /// 沿 y（0 = 顶部 → 底部）。
-    Vertical,
-    /// 沿 x（0 = 左侧 → 右侧）。
-    Horizontal,
-}
+/// 渐变方向（`Gradient` 绘制命令）——**与 `rjw_text::GradientAxis` 同一类型**（R13 简并：
+/// 同一概念只留一份定义，避免两个 crate 各有一个同名枚举）。
+pub use rjw_text::GradientAxis;
 
 /// 绘制命令种类（记录式；`Ui::finish` 逐条提交到 `Render2D`）。
 #[derive(Clone, Debug)]
@@ -419,7 +414,7 @@ impl DrawKind {
 pub struct UiDraw {
     pub depth: u32,
     pub seq: u32,
-    /// 所属窗口的 z 序（[`crate::Ui::window_at`]；非窗口内容 = 0）。
+    /// 所属窗口的 z 序（[`crate::Ui::window`]；非窗口内容 = 0）。
     /// 窗口间按 z 升序绘制（焦点窗口 z 最大 → 最后画 → 最上层）。
     pub win: u32,
     /// **元素序**：所属控件（元素）开始录制时的序号。

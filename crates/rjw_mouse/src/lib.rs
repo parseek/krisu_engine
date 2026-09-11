@@ -1,6 +1,9 @@
 use rjw_keystate::*;
 use winit::dpi::PhysicalPosition;
 use winit::event::WindowEvent;
+pub use rjw_keystate::KeyState;
+
+/// 重导出鼠标按键类型（无需直接依赖 winit）。
 pub use winit::event::MouseButton;
 
 fn mb_to_idx(button: MouseButton) -> usize {
@@ -33,42 +36,37 @@ pub enum ScrollDelta {
 }
 
 impl ScrollDelta {
-    pub const DEFAULT_LINE_FACTOR:f64 = 300.0;
+    /// 行 → 像素的**唯一**换算因子（不再有第二套线因子）。
+    pub const LINE_FACTOR: f64 = 300.0;
+
+    /// 换算为像素增量（像素滚轮原样返回）。
     #[inline]
-    pub fn to_pixel(&self, line_factor: Option<f64>) -> (f64, f64) {
+    pub fn to_pixel(&self) -> (f64, f64) {
         match self {
             Self::Pixel(f) => *f,
-            Self::Line((x, y)) => {
-                let line_factor = line_factor.unwrap_or(Self::DEFAULT_LINE_FACTOR);
-                (*x * line_factor, *y * line_factor)
-            }
+            Self::Line((x, y)) => (*x * Self::LINE_FACTOR, *y * Self::LINE_FACTOR),
         }
     }
+
+    /// 换算为行增量（行滚轮原样返回）。
     #[inline]
-    pub fn to_line(&self, line_factor: Option<f64>) -> (f64, f64) {
+    pub fn to_line(&self) -> (f64, f64) {
         match self {
             Self::Line(f) => *f,
             Self::Pixel((x, y)) => {
-                let line_factor = line_factor.unwrap_or(Self::DEFAULT_LINE_FACTOR);
-                let line_factor = 1.0 / line_factor;
-                (*x * line_factor, *y * line_factor)
+                let k = 1.0 / Self::LINE_FACTOR;
+                (*x * k, *y * k)
             }
         }
     }
 
     #[inline]
     pub fn is_pixel(&self) -> bool {
-        match self {
-            Self::Pixel(_) => true,
-            _ => false
-        }
+        matches!(self, Self::Pixel(_))
     }
     #[inline]
     pub fn is_line(&self) -> bool {
-        match self {
-            Self::Line(_) => true,
-            _ => false
-        }
+        matches!(self, Self::Line(_))
     }
 }
 
@@ -85,63 +83,93 @@ pub struct MouseInput {
 }
 
 impl MouseInput {
+    /// 鼠标按键状态。
     #[inline]
-    #[allow(unused)]
-    pub fn get_mouse_position(&self) -> (f64, f64) {
-        self.mouse_position
-    }
-    #[inline]
-    #[allow(unused)]
-    pub fn get_mouse_delta(&self) -> (f64, f64) {
-        self.mouse_delta
-    }
-    #[inline]
-    #[allow(unused)]
-    pub fn get_mouse_button_state(&self, button: MouseButton) -> KeyState {
+    pub fn button(&self, button: MouseButton) -> KeyState {
         self.mouse_buttons[mb_to_idx(button)]
     }
+
+    /// 光标位置（**物理像素**，左上原点）。
     #[inline]
-    #[allow(unused)]
-    pub fn get(&self, button: MouseButton) -> KeyState {
-        self.mouse_buttons[mb_to_idx(button)]
+    pub fn pos_px(&self) -> glam::Vec2 {
+        glam::Vec2::new(self.mouse_position.0 as f32, self.mouse_position.1 as f32)
     }
+
+    /// 本帧鼠标位移（`DeviceEvent::MouseMotion` 累加；帧末归零）。
     #[inline]
-    #[allow(unused)]
-    pub fn get_mouse_wheel_delta(&self) -> (f64, f64) {
-        self.mouse_wheel_delta
+    pub fn motion(&self) -> glam::Vec2 {
+        glam::Vec2::new(self.mouse_delta.0 as f32, self.mouse_delta.1 as f32)
     }
+
+    /// 本帧滚轮增量（像素 / 行）。
     #[inline]
-    #[allow(unused)]
+    pub fn wheel(&self) -> ScrollDelta {
+        if let Some(d) = self.pixel_wheel {
+            ScrollDelta::Pixel(d)
+        } else {
+            ScrollDelta::Line(self.mouse_wheel_delta)
+        }
+    }
+
+    /// 本帧滚轮增量（**行**为单位；像素滚轮按 [`ScrollDelta::to_line`] 换算）。
+    #[inline]
+    pub fn wheel_lines(&self) -> (f64, f64) {
+        match self.pixel_wheel {
+            Some(pixel) => pixel,
+            None => {
+                let (x, y) = self.mouse_wheel_delta;
+                (x * ScrollDelta::LINE_FACTOR, y * ScrollDelta::LINE_FACTOR)
+            }
+        }
+    }
+
+    /// 光标是否在窗口内。
+    #[inline]
     pub fn in_window(&self) -> bool {
         self.in_window
     }
-    #[inline]
-    #[allow(unused)]
-    pub fn get_pixel_wheel(&self) -> Option<(f64, f64)> {
-        self.pixel_wheel
+
+    /// 全部鼠标按键状态遍历（`(按键, 状态)`）。
+    pub fn buttons(&self) -> impl Iterator<Item = (winit::event::MouseButton, KeyState)> + '_ {
+        self.mouse_buttons.iter().enumerate().map(|(idx, s)| (idx_to_mb(idx), *s))
     }
+
+    /// 帧末结算（引擎每帧调用；用户不应自行调用）。
     #[inline]
-    #[allow(unused)]
-    pub fn get_wheel_line_delta(&self) -> (f64, f64) {
-        if let Some(pixel) = self.get_pixel_wheel() {
-            pixel
-        } else {
-            let (x, y) = self.get_mouse_wheel_delta();
-            const LINE_DELTA: f64 = 15.0;
-            (x * LINE_DELTA, y * LINE_DELTA)
-        }
+    pub fn next_frame(&mut self) {
+        self.end_frame();
     }
-    #[inline]
-    #[allow(unused)]
-    pub fn get_wheel_delta(&self) -> ScrollDelta {
-        if let Some(d) = self.get_pixel_wheel() {
-            ScrollDelta::Pixel(d)
-        } else {
-            let d = self.get_mouse_wheel_delta();
-            ScrollDelta::Line(d)
-        }
+
+    /// **调试注入**（脚本化复现交互；见 `docs/DEBUGGING.md`）：直接把"光标位置 +
+    /// 左键状态"写进快照——不需要真实鼠标 / 不需要窗口事件。
+    ///
+    /// 用途：无鼠标环境（CI / 远程）复现"拖动没反应""点击穿透"这类**交互**问题，
+    /// 或用脚本驱动一条确定的鼠标轨迹（回归测试）。
+    /// `left` 传入合成的 `KeyState`（含边沿：按下帧用 `down_edge`、按住用 `pressed`、
+    /// 释放帧用 `up_edge`——见 `Ctx::debug_inject_mouse` 的自动合成）。
+    pub fn debug_inject(&mut self, pos_px: (f64, f64), left: KeyState) {
+        self.mouse_position = pos_px;
+        self.mouse_buttons[mb_to_idx(MouseButton::Left)] = left;
+        self.in_window = true;
     }
-    pub fn end_frame(&mut self) {
+
+    /// **调试注入（含边沿合成）**：`down` = 本帧左键是否按住，`was_down` = 上一帧是否按住
+    /// ——本函数按与真实设备一致的状态机语义合成 `KeyState`（按下帧带 `down_edge`、
+    /// 按住给 `pressed`、释放帧带 `up_edge`），因此命中 / 拖拽 / 点击逻辑无差别生效。
+    ///
+    /// 供 `rjw_krusie::Ctx::debug_inject_mouse` 使用（脚本化复现交互；见 `docs/DEBUGGING.md`）。
+    pub fn debug_inject_press(&mut self, pos_px: (f64, f64), down: bool, was_down: bool) {
+        let state = match (was_down, down) {
+            (false, true) => KEY_STATE_DOWN_TRUE_EDGE,
+            (true, true) => KEY_STATE_PRESSING,
+            (true, false) => KEY_STATE_UP_TRUE_EDGE,
+            (false, false) => KEY_STATE_RELEASED,
+        };
+        self.debug_inject(pos_px, state);
+    }
+
+    /// 帧末结算实现（**非公开**：引擎每帧经 [`Self::next_frame`] 调用）。
+    pub(crate) fn end_frame(&mut self) {
         for button_state in self.mouse_buttons.iter_mut() {
             *button_state = button_state.off_edge();
             if button_state.sudden_up()
@@ -154,13 +182,6 @@ impl MouseInput {
         self.pixel_wheel = None;
     }
 
-    #[inline]
-    #[allow(unused)]
-    pub fn get_mouse_button_states_iter(
-        &self,
-    ) -> impl Iterator<Item = (winit::event::MouseButton, KeyState)> + '_ {
-        self.mouse_buttons.iter().enumerate().map(|(idx, s)| {(idx_to_mb(idx), *s)})
-    }
     pub fn window_event(&mut self, event: &winit::event::WindowEvent) {
         match event {
             winit::event::WindowEvent::CursorMoved { position, .. } => {
@@ -234,27 +255,10 @@ impl MouseInput {
         }
     }
     pub fn device_event(&mut self, event: &winit::event::DeviceEvent) {
-        match event {
-            winit::event::DeviceEvent::MouseMotion { delta } => {
-                // Frame delta is accumulated, and will be reset at the end of the frame.
-                self.mouse_delta.0 += delta.0;
-                self.mouse_delta.1 += delta.1;
-            }
-            // winit::event::DeviceEvent::Button { button, state } =>
-            // winit::event::DeviceEvent::MouseWheel { delta } => {
-            //     match delta {
-            //         winit::event::MouseScrollDelta::LineDelta(x, y) => {
-            //             self.mouse_wheel_delta.0 += *x as f64;
-            //             self.mouse_wheel_delta.1 += *y as f64;
-            //         }
-            //         // winit::event::MouseScrollDelta::PixelDelta(pos) => {
-            //         //     self.mouse_wheel_delta.0 += pos.x;
-            //         //     self.mouse_wheel_delta.1 += pos.y;
-            //         // }
-            //         _ => {}
-            //     }
-            // }
-            _ => {}
+        // 只关心鼠标运动（`MouseMotion`）：帧内累加，帧末（`next_frame`）归零。
+        if let winit::event::DeviceEvent::MouseMotion { delta } = event {
+            self.mouse_delta.0 += delta.0;
+            self.mouse_delta.1 += delta.1;
         }
     }
 }

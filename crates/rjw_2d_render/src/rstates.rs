@@ -346,8 +346,28 @@ impl RStates {
         self
     }
 
+    /// 本状态是否声明了深度 / 模板（等价于 `to_depth_stencil*` 是否返回 `Some`）。
+    ///
+    /// 供渲染器在开 pass 之前判断"需要不需要深度附件"（附件是 pass 级的）。
+    #[inline]
+    pub fn uses_depth_stencil(self) -> bool {
+        (self.0 >> 32) & 1 != 0 || (self.0 >> 40) & 1 != 0
+    }
+
+    /// 深度 / 模板管线状态（附件格式取默认 [`rjw_render::DEFAULT_DEPTH_FORMAT`]）。
+    #[inline]
     pub fn to_depth_stencil(self) -> Option<wgpu::DepthStencilState> {
-        let depth_test = (self.0 >> 32) & 1 != 0;
+        self.to_depth_stencil_with(rjw_render::DEFAULT_DEPTH_FORMAT)
+    }
+
+    /// 深度 / 模板管线状态（显式指定附件格式，通常为 `RenderConfig::depth_format`）。
+    ///
+    /// 格式是**帧级常量**（构造期固定 ⇒ 不进管线缓存 key）；声明了但附件格式缺少
+    /// 对应切面时 panic（可读信息，替代 wgpu 的校验报错）。
+    pub fn to_depth_stencil_with(
+        self,
+        format: wgpu::TextureFormat,
+    ) -> Option<wgpu::DepthStencilState> {        let depth_test = (self.0 >> 32) & 1 != 0;
         let depth_write = (self.0 >> 33) & 1 != 0;
         let depth_compare = ((self.0 >> 34) & 0x7) as u32;
 
@@ -357,8 +377,16 @@ impl RStates {
         if !depth_test && !stencil_test {
             return None;
         }
+        assert!(
+            rjw_render::has_depth_aspect(format) || !depth_test,
+            "RStates 声明了 depth_test，但深度附件格式 {format:?} 无深度切面"
+        );
+        assert!(
+            rjw_render::has_stencil_aspect(format) || !stencil_test,
+            "RStates 声明了 stencil_test，但深度附件格式 {format:?} 无模板切面"
+        );
         Some(wgpu::DepthStencilState {
-            format: crate::draw_page::DEPTH_FORMAT,
+            format,
             depth_write_enabled: Some(depth_test && depth_write),
             depth_compare: if depth_test {
                 Some(CompareFunc::from_u32(depth_compare).to_wgpu())
@@ -389,8 +417,25 @@ impl RStates {
         })
     }
 
-    // ─── Stencil 域 (bits 40..48) ───
+    /// **声明但禁用**的深度 / 模板管线状态。
+    ///
+    /// 使用场景：pass 绑定了深度附件（同一 pass 内另有命令声明了 depth），本条命令自身
+    /// 不使用深度——此时它的管线**仍必须声明同格式附件**，否则 wgpu 报
+    /// 「Render pipeline targets are incompatible with render pass」。
+    #[inline]
+    pub fn declared_depth_stencil(format: wgpu::TextureFormat) -> wgpu::DepthStencilState {
+        let has_depth = rjw_render::has_depth_aspect(format);
+        wgpu::DepthStencilState {
+            format,
+            depth_write_enabled: if has_depth { Some(false) } else { None },
+            depth_compare: if has_depth { Some(wgpu::CompareFunction::Always) } else { None },
+            // wgpu 30 的 `stencil` 不是 `Option`：无模板切面时给默认值即可（不会生效）。
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }
+    }
 
+    // ─── Stencil 域 (bits 40..48) ───
     #[inline]
     pub fn stencil_test(mut self, b: bool) -> Self {
         if b {
@@ -759,6 +804,38 @@ impl Default for DepthState {
     }
 }
 
+impl DepthState {
+    /// 深度测试 + 写入（最常用组合）：取代旧的 `.depth_full(true, true, f)`。
+    #[inline]
+    pub const fn test_write(compare: CompareFunc) -> Self {
+        Self { test: true, write: true, compare }
+    }
+
+    /// 只测试不写入（透明物体叠在已写深度的不透明物之上）。
+    #[inline]
+    pub const fn test_only(compare: CompareFunc) -> Self {
+        Self { test: true, write: false, compare }
+    }
+
+    /// 深度关闭（出厂默认）。
+    #[inline]
+    pub const fn off() -> Self {
+        Self { test: false, write: false, compare: CompareFunc::Less }
+    }
+}
+
+impl From<bool> for DepthState {
+    /// 便捷：`true` = 只测试（兼容旧的 `.depth(true)`），`false` = 关闭。
+    #[inline]
+    fn from(value: bool) -> Self {
+        if value {
+            Self::test_only(CompareFunc::Less)
+        } else {
+            Self::off()
+        }
+    }
+}
+
 /// 模板状态描述符。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StencilState {
@@ -774,5 +851,83 @@ impl Default for StencilState {
             write: false,
             compare: CompareFunc::Always,
         }
+    }
+}
+
+impl StencilState {
+    /// 模板测试 + 写入：取代旧的 `.stencil_full(true, true, f)`。
+    #[inline]
+    pub const fn test_write(compare: CompareFunc) -> Self {
+        Self { test: true, write: true, compare }
+    }
+
+    /// 只测试不写入。
+    #[inline]
+    pub const fn test_only(compare: CompareFunc) -> Self {
+        Self { test: true, write: false, compare }
+    }
+
+    /// 模板关闭（出厂默认）。
+    #[inline]
+    pub const fn off() -> Self {
+        Self { test: false, write: false, compare: CompareFunc::Always }
+    }
+}
+
+impl From<bool> for StencilState {
+    /// 便捷：`true` = 只测试（兼容旧的 `.stencil(true)`），`false` = 关闭。
+    #[inline]
+    fn from(value: bool) -> Self {
+        if value {
+            Self::test_only(CompareFunc::Always)
+        } else {
+            Self::off()
+        }
+    }
+}
+
+// ─── 单元测试（无 GPU 依赖） ──────────────────────────────────
+
+#[cfg(test)]
+mod depth_state_tests {
+    use super::*;
+
+    /// `uses_depth_stencil()` 必须与 `to_depth_stencil().is_some()` 完全一致：
+    /// 前者用于"开 pass 前判断是否需要附件"，后者用于"烘焙管线"。
+    #[test]
+    fn uses_depth_stencil_matches_pipeline_state() {
+        let cases = [
+            RStates::default(),
+            RStates::new().depth_test(true),
+            RStates::new().depth_write(true),
+            RStates::new().depth_test(true).depth_write(true),
+            RStates::new().stencil_test(true),
+            RStates::new().stencil_write(true),
+            RStates::new().depth_test(true).stencil_test(true),
+        ];
+        for (i, s) in cases.into_iter().enumerate() {
+            assert_eq!(
+                s.uses_depth_stencil(),
+                s.to_depth_stencil().is_some(),
+                "case {i}: {s:?}"
+            );
+        }
+    }
+
+    /// 默认深度格式含深度 + 模板切面。
+    #[test]
+    fn default_depth_format_has_both_aspects() {
+        assert!(rjw_render::has_depth_aspect(rjw_render::DEFAULT_DEPTH_FORMAT));
+        assert!(rjw_render::has_stencil_aspect(rjw_render::DEFAULT_DEPTH_FORMAT));
+        assert!(RStates::new().depth_test(true).to_depth_stencil().is_some());
+    }
+
+    /// 声明了深度状态但格式无深度切面 ⇒ 可读 panic（替代 wgpu 的校验报错）。
+    #[test]
+    #[should_panic(expected = "无深度切面")]
+    fn depth_state_with_stencil_only_format_panics() {
+        RStates::new()
+            .depth_test(true)
+            .to_depth_stencil_with(wgpu::TextureFormat::Stencil8);
     }
 }

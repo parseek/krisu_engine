@@ -20,7 +20,7 @@ pub struct Theme {
     pub debug: DebugStyle,
     /// **焦点样式**（键盘导航）：当前焦点控件的描边（`finish` 绘制）。
     pub focus: FocusStyle,
-    /// **模态对话框样式**（[`Ui::modal_at`](crate::ui::Ui::modal_at) 遮罩）。
+    /// **模态对话框样式**（[`Ui::modal`](crate::ui::Ui::modal) 遮罩）。
     pub modal: ModalStyle,
     /// **下拉框（combo）样式**：触发按钮用 [`ButtonStyle`]；选项浮层 = 现代右键菜单外观。
     pub combo: ComboStyle,
@@ -354,7 +354,7 @@ impl ComboStyle {
     }
 }
 
-/// 模态对话框样式（`modal_at` 的全屏遮罩）。
+/// 模态对话框样式（[`Ui::modal`](crate::ui::Ui::modal) 的全屏遮罩）。
 #[derive(Clone, Debug)]
 pub struct ModalStyle {
     /// 遮罩颜色（默认半透明黑，遮住背后内容）。
@@ -930,9 +930,9 @@ impl ModalStyle {
     }
 }
 
-impl Theme {
-    /// 浅色主题（默认）。
-    pub fn default() -> Self {
+/// 浅色主题（默认）：实现标准 [`Default`] 特化（`Theme::default()` 即浅色）。
+impl Default for Theme {
+    fn default() -> Self {
         Self {
             label: LabelStyle::default(),
             panel: PanelStyle::default(),
@@ -949,6 +949,9 @@ impl Theme {
             gap: 6.0,
         }
     }
+}
+
+impl Theme {
 
     /// 深色主题：逐一组装每个子样式的 [`dark()`](LabelStyle::dark) 预设
     /// （深色配色、尺寸同 `Default`）+ 主题级 `row_h` / `gap`。

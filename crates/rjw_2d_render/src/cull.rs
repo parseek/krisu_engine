@@ -274,7 +274,7 @@ mod tests {
         assert!(culler.visible(&Rect::new(1.0, 0.0, 1.0, 1.0)));
         assert!(!culler.visible(&Rect::new(-5.0, 0.0, 1.0, 1.0)));
 
-        let cam = Camera2D::new(Vec2::new(800.0, 600.0));
+        let cam = Camera2D::full(Vec2::new(800.0, 600.0));
         let c = Culler::new(Cull::from(&cam));
         assert!(!c.is_off());
         assert!(c.visible(&cam.view_aabb()));

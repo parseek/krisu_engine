@@ -11,6 +11,7 @@
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
+use rjw_krusie::gpu::{MeshData, TEXTURES, wgpu};
 use rjw_krusie::prelude::*;
 use rjw_krusie::render2d::VertexP3U2C4;
 
@@ -36,8 +37,12 @@ const MAX_HP: i32 = 5;
 const LAYER_GROUND: f32 = 0.0;
 const LAYER_TERRAIN: f32 = 1.0;
 const LAYER_Y_SORT_BASE: f32 = 10.0;
-const LAYER_UI: f32 = 10000000.0;
-const LAYER_GAMEOVER: f32 = 20000000.0;
+/// 世界层「效果」层：远高于 y-sort（`LAYER_Y_SORT_BASE + foot_y`），把攻击弧等效果
+/// 压在实体之上（仍是**世界层**内容，随相机移动）。
+const LAYER_EFFECT: f32 = 1000000.0;
+
+// 屏幕固定 UI 走 **UI 层**（`f.draw_ui()` / `f.text_ui()`）：UI 层按**录制顺序**提交
+// （`SortMode::None`），所以那里的小 layer 只用于同层内微调，与世界的 `LAYER_*` 无关。
 
 #[inline]
 fn y_layer(foot_y: f32) -> f32 {
@@ -102,11 +107,10 @@ impl Map {
         let ty1 = (max.y / TILE).floor() as i32;
         for ty in ty0..=ty1 {
             for tx in tx0..=tx1 {
-                if let Some(t) = self.tile_at(tx, ty) {
-                    if t.is_blocked() {
+                if let Some(t) = self.tile_at(tx, ty)
+                    && t.is_blocked() {
                         return true;
                     }
-                }
             }
         }
         false
@@ -276,7 +280,7 @@ impl Game {
     fn new() -> Self {
         let map = generate_map();
         let free = free_tiles(&map);
-        let mut rng = Rng::new(0x1234_567);
+        let mut rng = Rng::new(0x0123_4567);
         let mut game = Self {
             map,
             map_rev: MAP_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -335,7 +339,7 @@ fn spawn_burst(particles: &mut Vec<Particle>, center: Vec2, color: Color, count:
     }
 }
 
-fn update(game: &mut Game, cam: &Camera2D, ctx: &MainContext, dt: f32) {
+fn update(game: &mut Game, cam: &Camera2D, ctx: &Ctx, dt: f32) {
     game.elapsed += dt;
     for p in &mut game.particles {
         p.vel *= (1.0 - 6.0 * dt).max(0.0);
@@ -344,7 +348,7 @@ fn update(game: &mut Game, cam: &Camera2D, ctx: &MainContext, dt: f32) {
     }
     game.particles.retain(|p| p.life > 0.0);
     if game.state == GameState::GameOver {
-        if ctx.keyboard.get(KeyCode::KeyR).down_edge() {
+        if ctx.keys().key(KeyCode::KeyR).down_edge() {
             *game = Game::new();
         }
         return;
@@ -353,18 +357,18 @@ fn update(game: &mut Game, cam: &Camera2D, ctx: &MainContext, dt: f32) {
     p.attack_timer = (p.attack_timer - dt).max(0.0);
     p.attack_cooldown = (p.attack_cooldown - dt).max(0.0);
     p.flash_timer = (p.flash_timer - dt).max(0.0);
-    let k = &ctx.keyboard;
+    let k = ctx.keys();
     let mut dir = Vec2::ZERO;
-    if k.get(KeyCode::KeyA).pressed() || k.get(KeyCode::ArrowLeft).pressed() {
+    if k.key(KeyCode::KeyA).pressed() || k.key(KeyCode::ArrowLeft).pressed() {
         dir.x -= 1.0;
     }
-    if k.get(KeyCode::KeyD).pressed() || k.get(KeyCode::ArrowRight).pressed() {
+    if k.key(KeyCode::KeyD).pressed() || k.key(KeyCode::ArrowRight).pressed() {
         dir.x += 1.0;
     }
-    if k.get(KeyCode::KeyW).pressed() || k.get(KeyCode::ArrowUp).pressed() {
+    if k.key(KeyCode::KeyW).pressed() || k.key(KeyCode::ArrowUp).pressed() {
         dir.y -= 1.0;
     }
-    if k.get(KeyCode::KeyS).pressed() || k.get(KeyCode::ArrowDown).pressed() {
+    if k.key(KeyCode::KeyS).pressed() || k.key(KeyCode::ArrowDown).pressed() {
         dir.y += 1.0;
     }
     if dir != Vec2::ZERO {
@@ -372,15 +376,15 @@ fn update(game: &mut Game, cam: &Camera2D, ctx: &MainContext, dt: f32) {
         p.facing_angle = dir.y.atan2(dir.x);
         move_entity(&mut p.pos, dir * PLAYER_SPEED, &game.map, PLAYER_RADIUS, dt);
     }
-    if ctx.mouse.in_window() {
-        let mouse = ctx.mouse.get_mouse_position();
-        let mouse_world = cam.screen_to_world(Vec2::new(mouse.0 as f32, mouse.1 as f32));
+    if ctx.mouse().in_window() {
+        let mouse = ctx.mouse().pos_px();
+        let mouse_world = cam.screen_to_world(mouse);
         let aim = mouse_world - p.pos;
         if aim.length_squared() > 1.0 {
             p.facing_angle = aim.y.atan2(aim.x);
         }
     }
-    let want_attack = k.get(KeyCode::Space).down_edge() || ctx.mouse.get_mouse_button_state(MouseButton::Left).down_edge();
+    let want_attack = k.key(KeyCode::Space).down_edge() || ctx.mouse().button(MouseButton::Left).down_edge();
     if want_attack && p.attack_cooldown <= 0.0 {
         p.attack_timer = SLASH_DURATION;
         p.attack_cooldown = 0.45;
@@ -461,7 +465,7 @@ fn draw_circle(r2d: &mut Render2D, center: Vec2, radius: f32, color: Color, laye
         let a = i as f32 / SEGS as f32 * TAU;
         verts.push(center + Vec2::new(a.cos(), a.sin()) * radius);
     }
-    r2d.polygon(&verts).color(color).layer(layer);
+    r2d.polygon(&verts).tint(color).layer(layer);
 }
 fn draw_attack_slash(r2d: &mut Render2D, center: Vec2, angle: f32, opacity: f32) {
     let mut verts = Vec::with_capacity(14);
@@ -472,8 +476,8 @@ fn draw_attack_slash(r2d: &mut Render2D, center: Vec2, angle: f32, opacity: f32)
         verts.push(center + Vec2::new(a.cos(), a.sin()) * SLASH_RANGE);
     }
     r2d.polygon(&verts)
-        .color(Color::rgba_one(1.0 * opacity))
-        .layer(LAYER_UI - 10.0)
+        .tint(Color::rgba_one(1.0 * opacity))
+        .layer(LAYER_EFFECT)
         .blend(BlendMode::Inverse);
 }
 
@@ -485,7 +489,8 @@ fn draw_attack_slash(r2d: &mut Render2D, center: Vec2, angle: f32, opacity: f32)
 //   纹理（white） + 同 RStates → 整张地图的石头/花全部合批为极少数 DrawCall。
 // - 树**不能**放入静态地形：树的遮挡层是 `y_layer(foot_y)`，会插入玩家/史莱姆的实体
 //   Y 排序，必须保持动态绘制；石头/花使用固定 `LAYER_TERRAIN`，不参与实体排序，安全静态化。
-// - 静态地形在 `map_rev` 变化（R 重开 → `Game::new()`）时自动重建，复用 register_mesh。
+// - 静态地形在 `map_rev` 变化（R 重开 → `Game::new()`）时自动重建；重建发生在**帧内**
+//   （`init` 的 `Gfx` 借用期已过），故应用在 `init` 里存一份 `wgpu::Device` 句柄（克隆共享）。
 
 /// 单个静态圆实例：圆心 + 半径（单位圆网格 instance scale）+ 颜色 + 层级。
 struct StaticInst {
@@ -499,13 +504,17 @@ struct StaticInst {
 struct StaticTerrain {
     /// 构建时的 map_rev；不匹配则重建。
     rev: u64,
-    circle_mesh_id: u64,
+    circle_mesh_id: MeshId,
     stone_insts: Vec<StaticInst>,
     flower_insts: Vec<StaticInst>,
 }
 
 /// 构建单位圆扇面网格（中心 (0,0)、半径 1，世界坐标直通），供所有圆实例共享。
-fn unit_circle_mesh(device: &wgpu::Device) -> Arc<MeshData> {
+///
+/// 注：`Gfx` 只在 `App::init` 里存在（借用期不覆盖每帧重建），而静态地形会在 `map_rev`
+/// 变化时**帧内**重建，所以这里走低层注册路径（`MeshData::from_pod` + 全局 `MESHES`），
+/// 与 `Gfx::mesh` 内部完全等价。
+fn unit_circle_mesh(device: &wgpu::Device) -> MeshId {
     const SEGS: usize = 22;
     let mut verts = Vec::with_capacity(SEGS + 2);
     verts.push(VertexP3U2C4 {
@@ -525,13 +534,14 @@ fn unit_circle_mesh(device: &wgpu::Device) -> Arc<MeshData> {
     for i in 0..SEGS {
         idx.extend_from_slice(&[0, (i + 1) as u16, (i + 2) as u16]);
     }
-    Arc::new(MeshData::from_pod(device, &verts, &idx, "RPG static circle"))
+    let mesh = MeshData::from_pod(device, &verts, &idx, "RPG static circle");
+    MeshId::new(rjw_krusie::gpu::MESHES.register(Arc::new(mesh)))
 }
 
 impl StaticTerrain {
-    fn build(render2d: &Render2D, map: &Map, rev: u64) -> Self {
-        let circle_mesh = unit_circle_mesh(render2d.device());
-        let circle_mesh_id = render2d.register_mesh(circle_mesh);
+    fn build(device: &wgpu::Device, map: &Map, rev: u64) -> Self {
+        let circle_mesh = unit_circle_mesh(device);
+        let circle_mesh_id = circle_mesh;
         let mut stone_insts = Vec::new();
         let mut flower_insts = Vec::new();
         for y in 0..MAP_H {
@@ -593,7 +603,7 @@ impl StaticTerrain {
             for inst in insts {
                 let tf = Transform2D::default().with_pos(inst.pos).with_scale(Vec2::splat(inst.r));
                 r2d.static_mesh(self.circle_mesh_id, &white)
-                    .color(inst.color)
+                    .tint(inst.color)
                     .transform(tf)
                     .layer(inst.layer);
             }
@@ -604,10 +614,12 @@ impl StaticTerrain {
 }
 
 fn draw_tiles(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, game: &Game) {
-    let hw = cam.viewport_size.x * 0.5 / cam.zoom.x;
-    let hh = cam.viewport_size.y * 0.5 / cam.zoom.y;
-    let min = cam.position - Vec2::new(hw, hh);
-    let max = cam.position + Vec2::new(hw, hh);
+    let size = cam.region.size();
+    let zoom = cam.zoom();
+    let hw = size.x * 0.5 / zoom.x;
+    let hh = size.y * 0.5 / zoom.y;
+    let min = cam.transform.pos - Vec2::new(hw, hh);
+    let max = cam.transform.pos + Vec2::new(hw, hh);
     let tx0 = (min.x / TILE).floor().max(0.0) as usize;
     let ty0 = (min.y / TILE).floor().max(0.0) as usize;
     let tx1 = ((max.x / TILE).floor() as usize).min(MAP_W - 1);
@@ -709,98 +721,132 @@ fn draw_entities(r2d: &mut Render2D, tex: &Tex, game: &Game) {
     }
 }
 
-fn draw_ui(r2d: &mut Render2D, cam: &Camera2D, tex: &Tex, font: &mut Text, game: &Game) {
-    let hw = cam.viewport_size.x * 0.5 / cam.zoom.x;
-    let hh = cam.viewport_size.y * 0.5 / cam.zoom.y;
-    let tl = cam.position - Vec2::new(hw, hh);
+/// HUD 几何（纯色矩形 / 圆）：**屏幕固定 UI ⇒ 走 UI 层**（`Frame::draw_ui()`）。
+///
+/// 坐标系 = **物理像素、左上原点**（UI 层用 identity 相机提交，无需相机反算）；
+/// 常量按 DPI（`scale`）缩放，保证在 1.5×/2× 屏幕上尺寸与位置和逻辑像素一致。
+fn draw_ui(r2d: &mut Render2D, tex: &Tex, game: &Game, scale: f32) {
+    // 逻辑 → 物理的 HUD 基准（左上角留白 12 逻辑像素）。
+    let px = |v: f32| v * scale;
+    let origin = Vec2::new(px(12.0), px(12.0));
+    let panel_wh = Vec2::new(px(242.0), px(62.0));
     tex.draw(
         r2d,
         &tex.white,
-        tl + Vec2::new(12.0, 12.0),
-        Vec2::new(242.0, 62.0),
+        origin,
+        panel_wh,
         Color::rgba(0.08, 0.08, 0.14, 0.72),
         Transform2D::default(),
-        LAYER_UI,
+        0.0,
     );
-    let bar_pos = tl + Vec2::new(26.0, 26.0);
-    let bar_wh = Vec2::new(204.0, 16.0);
-    tex.draw(r2d, &tex.white, bar_pos, bar_wh, Color::rgba(0.15, 0.0, 0.0, 1.0), Transform2D::default(), LAYER_UI + 0.5);
+    let bar_pos = origin + Vec2::new(px(14.0), px(14.0));
+    let bar_wh = Vec2::new(px(204.0), px(16.0));
+    tex.draw(r2d, &tex.white, bar_pos, bar_wh, Color::rgba(0.15, 0.0, 0.0, 1.0), Transform2D::default(), 0.1);
     let frac = game.player.hp as f32 / game.player.max_hp as f32;
     if frac > 0.0 {
         let hp_color = if frac > 0.5 { Color::rgba(0.25, 0.9, 0.35, 1.0) } else { Color::rgba(0.95, 0.32, 0.25, 1.0) };
         tex.draw(
             r2d,
             &tex.white,
-            bar_pos + Vec2::new(2.0, 2.0),
-            Vec2::new((bar_wh.x - 4.0) * frac, bar_wh.y - 4.0),
+            bar_pos + Vec2::new(px(2.0), px(2.0)),
+            Vec2::new((bar_wh.x - px(4.0)) * frac, bar_wh.y - px(4.0)),
             hp_color,
             Transform2D::default(),
-            LAYER_UI + 0.6,
+            0.2,
         );
     }
-    let coin = tl + Vec2::new(34.0, 58.0);
-    draw_circle(r2d, coin + Vec2::new(5.0, 0.0), 6.0, Color::rgba(1.0, 0.82, 0.2, 1.0), LAYER_UI + 0.6);
+    let coin = origin + Vec2::new(px(22.0), px(46.0));
+    draw_circle(r2d, coin + Vec2::new(px(5.0), 0.0), px(6.0), Color::rgba(1.0, 0.82, 0.2, 1.0), 0.2);
     for i in 0..10 {
         let lit = game.coins > i * 3;
         tex.draw(
             r2d,
             &tex.white,
-            coin + Vec2::new(18.0 + i as f32 * 9.0, -4.0),
-            Vec2::new(6.0, 8.0),
+            coin + Vec2::new(px(18.0 + i as f32 * 9.0), px(-4.0)),
+            Vec2::new(px(6.0), px(8.0)),
             if lit { Color::rgba(1.0, 0.82, 0.2, 1.0) } else { Color::rgba(1.0, 1.0, 1.0, 0.18) },
             Transform2D::default(),
-            LAYER_UI + 0.6,
+            0.2,
         );
     }
-    let kill = tl + Vec2::new(34.0, 78.0);
-    draw_circle(r2d, kill + Vec2::new(5.0, 0.0), 6.0, Color::rgba(0.95, 0.3, 0.3, 1.0), LAYER_UI + 0.6);
+    let kill = origin + Vec2::new(px(22.0), px(66.0));
+    draw_circle(r2d, kill + Vec2::new(px(5.0), 0.0), px(6.0), Color::rgba(0.95, 0.3, 0.3, 1.0), 0.2);
     for i in 0..10 {
         let lit = game.kills > i;
         tex.draw(
             r2d,
             &tex.white,
-            kill + Vec2::new(18.0 + i as f32 * 9.0, -4.0),
-            Vec2::new(6.0, 8.0),
+            kill + Vec2::new(px(18.0 + i as f32 * 9.0), px(-4.0)),
+            Vec2::new(px(6.0), px(8.0)),
             if lit { Color::rgba(0.95, 0.3, 0.3, 1.0) } else { Color::rgba(1.0, 1.0, 1.0, 0.18) },
             Transform2D::default(),
-            LAYER_UI + 0.6,
+            0.2,
         );
     }
-    // Debug 指示位置
+}
 
-    // HP Label 左上角
+/// Game Over 全屏压暗（**UI 层**，在 HUD 之后录制 ⇒ 盖住 HUD）。
+fn draw_gameover(r2d: &mut Render2D, tex: &Tex, size: Vec2) {
+    tex.draw(
+        r2d,
+        &tex.white,
+        Vec2::ZERO,
+        size,
+        Color::rgba(0.45, 0.0, 0.0, 0.38),
+        Transform2D::default(),
+        1.0,
+    );
+}
+
+/// HUD 文本（HP / 波次 / 击杀）：**UI 层**文本（`Frame::text_ui`），物理像素定位。
+///
+/// 与几何分成两个函数，是为了走 `Frame::text_ui(|t| ..)`（文本子系统与 UI 层渲染器需同时
+/// 可变借用）；二者都录制进**同一个 UI 层队列**，UI 层按录制顺序提交（`SortMode::None`）。
+///
+/// 文本渲染（唯一链）：`TextStyle` 公共字号/行距一次定义，逐标签只写差异
+/// （`Label::style(..)` 套用；定位走 `at` / `center`）。
+fn draw_ui_text(t: &mut TextCtx<'_>, game: &Game, scale: f32) {
+    let px = |v: f32| v * scale;
+    let origin = Vec2::new(px(12.0), px(12.0));
+    let bar_pos = origin + Vec2::new(px(14.0), px(14.0));
+    let coin = origin + Vec2::new(px(22.0), px(46.0));
+    let kill = origin + Vec2::new(px(22.0), px(66.0));
+
     // ── 文本渲染（TextStyle：公共字体/字号/行距一次定义，逐处只写差异） ──
-    let mut ui = font.build_style()
+    // 字号同样按 DPI 缩放（UI 层坐标是物理像素）。
+    let style = TextStyle::new()
         .font_family("SimHei")
-        .size(14.0)
+        .size(px(14.0))
         .line_space(LineSpace::Multiple(1.5))
         .align(Align::Left);
-    ui.text(format!("❤HP: {} / {}", game.player.hp, game.player.max_hp))
+    t.label(format!("❤HP: {} / {}", game.player.hp, game.player.max_hp))
+        .style(style.clone())
         .color(Color::WHITE)
-        .offset(bar_pos + vec2(0.0, -18.0))
-        .draw_sprite2d(r2d, LAYER_UI + 0.5);
-    ui.text(format!("第 {} 波", game.wave))
+        .at(bar_pos + vec2(0.0, px(26.0)))
+        .draw(0.3);
+    t.label(format!("第 {} 波", game.wave))
+        .style(style.clone())
         .color(Color::rgba(1.0, 0.82, 0.2, 1.0))
-        .offset(coin + vec2(120.0, -6.0))
-        .draw_sprite2d(r2d, LAYER_UI + 0.7);
-    ui.text(format!("击杀 {}", game.kills))
+        .at(coin + vec2(px(120.0), px(-2.0)))
+        .draw(0.3);
+    t.label(format!("击杀 {}", game.kills))
+        .style(style)
         .color(Color::rgba(0.95, 0.3, 0.3, 1.0))
-        .offset(kill + vec2(120.0, -6.0))
-        .draw_sprite2d(r2d, LAYER_UI + 0.7);
+        .at(kill + vec2(px(120.0), px(-2.0)))
+        .draw(0.3);
+}
 
-
-    if game.state == GameState::GameOver {
-        tex.draw(
-            r2d,
-            &tex.white,
-            tl,
-            Vec2::new(cam.viewport_size.x / cam.zoom.x, cam.viewport_size.y / cam.zoom.y),
-            Color::rgba(0.45, 0.0, 0.0, 0.38),
-            Transform2D::default(),
-            LAYER_GAMEOVER,
-        );
-        font.draw_label_ex(r2d, "❤GAME OVER — 按\n R 重开❤", Color::rgba(1.0, 0.3, 0.3, 1.0), 22.0, 28.0, cam.position, "SimHei", Align::Center, LAYER_GAMEOVER + 1.0, Vec2::new(0.5, 0.5));
-    }
+/// Game Over 提示文本（**UI 层**，在压暗层之后录制 ⇒ 恒在最上）。
+fn draw_gameover_text(t: &mut TextCtx<'_>, size: Vec2, scale: f32) {
+    let px = |v: f32| v * scale;
+    t.label("❤GAME OVER — 按 R 重开❤")
+        .font_family("SimHei")
+        .size(px(22.0))
+        .line_height(px(28.0))
+        .align(Align::Center)
+        .center(size * 0.5)
+        .color(Color::rgba(1.0, 0.3, 0.3, 1.0))
+        .draw(1.1);
 }
 
 // ── 程序化纹理 ────────────────────────────────────────────────────
@@ -888,7 +934,7 @@ fn make_field() -> Vec<u8> {
 fn make_sand() -> Vec<u8> {
     let (w, h) = (32, 32);
     let mut buf = vec![0u8; w * h * 4];
-    let mut rng = Rng::new(0xF15A_BC);
+    let mut rng = Rng::new(0x00F1_5ABC);
     for y in 0..h {
         for x in 0..w {
             let v = 0.92 + rng.f32() * 0.1;
@@ -972,25 +1018,23 @@ struct Tex {
     white: AtlasRegion,
 }
 impl Tex {
-    fn create(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) -> Self {
+    fn create(gfx: &Gfx) -> Self {
         let mut atlas = DynamicAtlas::new(
-            device,
-            queue,
-            layout,
+            gfx,
             AtlasConfig {
                 max_pages: 2,
+                page_size: 512, // 够了
                 ..Default::default()
             },
-            512, // 够了
         );
-        let white = atlas.insert_white();
-        let grass = atlas.insert_ex("grass", &make_grass(), 32, 32).unwrap();
-        let field = atlas.insert_ex("field", &make_field(), 32, 32).unwrap();
-        let sand = atlas.insert_ex("sand", &make_sand(), 32, 32).unwrap();
-        let water = atlas.insert_ex("water", &make_water(), 32, 32).unwrap();
-        let tree = atlas.insert_ex("tree", &make_tree(), 64, 64).unwrap();
-        let player = atlas.insert_ex("player", &make_player(), 32, 32).unwrap();
-        let slime = atlas.insert_ex("slime", &make_slime(), 32, 32).unwrap();
+        let white = atlas.white();
+        let grass = atlas.insert("grass".to_string(), Rgba8::new(&make_grass(), (32, 32))).unwrap();
+        let field = atlas.insert("field".to_string(), Rgba8::new(&make_field(), (32, 32))).unwrap();
+        let sand = atlas.insert("sand".to_string(), Rgba8::new(&make_sand(), (32, 32))).unwrap();
+        let water = atlas.insert("water".to_string(), Rgba8::new(&make_water(), (32, 32))).unwrap();
+        let tree = atlas.insert("tree".to_string(), Rgba8::new(&make_tree(), (64, 64))).unwrap();
+        let player = atlas.insert("player".to_string(), Rgba8::new(&make_player(), (32, 32))).unwrap();
+        let slime = atlas.insert("slime".to_string(), Rgba8::new(&make_slime(), (32, 32))).unwrap();
         Self {
             atlas,
             grass,
@@ -1004,6 +1048,7 @@ impl Tex {
         }
     }
 
+    #[allow(clippy::too_many_arguments, reason = "示例内的绘制辅助函数：渲染器/区域/世界坐标/图元全部必要")]
     fn draw<'a>(
         &self,
         r2d: &'a mut Render2D,
@@ -1023,7 +1068,7 @@ impl Tex {
             &tex_ref,
         );
         r2d.sprite(spr, &tex_ref)
-            .color(color)
+            .tint(color)
             .transform(transform)
             .layer(layer)
     }
@@ -1031,101 +1076,99 @@ impl Tex {
 
 // ── App ───────────────────────────────────────────────────────────
 struct RpgApp {
-    render: Option<RenderContext>,
-    render2d: Option<Render2D>,
+    /// 底层设备（`init` 里取一次；静态地形重建需要在**取帧之前**也能建网格）。
+    device: Option<Arc<wgpu::Device>>,
     cam: Camera2D,
     tex: Option<Tex>,
-    font: Option<Text>,
     game: Game,
     /// 石头/花静态地形缓存（按 `map_rev` 重建，R 重开后自动更新）。
     static_terrain: Option<StaticTerrain>,
 }
-impl RpgApp {
-    fn new() -> Self {
-        let game = Game::new();
-        let mut cam = Camera2D::new(Vec2::new(1280.0, 720.0));
-        cam.position = game.player.pos;
+impl Default for RpgApp {
+    fn default() -> Self {
         Self {
-            render: None,
-            render2d: None,
-            cam,
+            device: None,
+            cam: Camera2D::default(),
             tex: None,
-            font: None,
-            game,
+            game: Game::new(),
             static_terrain: None,
         }
     }
 }
 impl App for RpgApp {
-    fn primary_window_attrib(&self) -> WindowAttributes {
-        WindowAttributes::default().with_title("eg260731RPG").with_inner_size(LogicalSize::new(1280.0, 720.0))
+    fn config(&self) -> AppConfig {
+        AppConfig::new("eg260731RPG").size(1280.0, 720.0)
     }
-    fn on_init(&mut self, _ctx: &mut MainContext) {
-        let window = _ctx.primary_window().expect("window");
-        self.render = Some(RenderContext::new(window, &RenderConfig::default()));
-        let render = self.render.as_ref().unwrap();
-        let render2d = Render2D::new(render);
-        let tex = Tex::create(render2d.device(), render2d.queue(), render2d.texture_layout());
-        let font = Text::new(render2d.device(), render2d.queue(), render2d.texture_layout());
-        let (w, h) = render.size();
-        let mut cam = Camera2D::new(Vec2::new(w as f32, h as f32));
-        cam.set_vp(Vec2::new(w as f32, h as f32), Vec2::ZERO);
-        cam.position = self.game.player.pos;
-        self.render2d = Some(render2d);
-        self.cam = cam;
-        self.tex = Some(tex);
-        self.font = Some(font);
+
+    fn init(&mut self, gfx: &Gfx) {
+        // `wgpu::Device` 是共享句柄（`Clone` 共享同一底层设备），存一份供帧内重建静态网格用。
+        self.device = Some(Arc::new(gfx.device().clone()));
+        self.tex = Some(Tex::create(gfx));
+        // 文本子系统由运行时 `Ctx` 持有（`Frame::text` 借出），应用不再自建。
+        // 相机视口在 `update` 里用当前画面矩形写回（`f.region()`），与窗口尺寸自动一致。
+        self.cam.transform.pos = self.game.player.pos;
     }
-    fn on_resized(&mut self, _ctx: &mut MainContext, width: u32, height: u32) {
-        if let Some(r) = &mut self.render {
-            r.resize(width, height);
+
+    fn update(&mut self, ctx: &mut Ctx) {
+        if ctx.key(KeyCode::Escape).down_edge() {
+            ctx.exit();
         }
-        self.cam.set_vp(Vec2::new(width as f32, height as f32), Vec2::ZERO);
-    }
-    fn about_to_wait(&mut self, ctx: &mut MainContext) {
-        if ctx.keyboard.get(KeyCode::Escape).down_edge() {
-            ctx.request_exit();
-        }
-        let dt = ctx.timer.dt().get_f32().min(0.05);
+        let dt = ctx.dt().min(0.05);
+        // ── 逻辑半程：无帧也执行 ──
         update(&mut self.game, &self.cam, ctx, dt);
-        self.cam.position += (self.game.player.pos - self.cam.position) * (1.0 - (-20.0 * dt).exp());
-        let Some(render2d) = &mut self.render2d else {
-            return;
-        };
-        let tex = self.tex.as_ref().unwrap();
-        if let Some(w) = ctx.primary_window() {
+        self.cam.transform.pos += (self.game.player.pos - self.cam.transform.pos) * (1.0 - (-20.0 * dt).exp());
+
+        // ── 渲染半程：守卫在应用里（无帧不执行渲染代码）──
+        let Some(mut f) = ctx.frame() else { return };
+        // 相机：把画面矩形写回相机（相机自己存视口），随后可用它做屏幕 ↔ 世界换算。
+        self.cam.set_region(f.region());
+        let tex = self.tex.as_ref().expect("tex 已在 init 建立");
+
+        if let Some(w) = f.window_handle() {
             w.set_title(&format!(
                 "eg260731RPG  第 {} 波 FPS {:.0} | HP {}/{} | 金币 {} | 击杀 {} | WASD 移动 · 空格/左键 攻击 · R 重开 · Esc 退出",
                 self.game.wave,
-                ctx.timer.get_fps(),
+                f.fps(),
                 self.game.player.hp,
                 self.game.player.max_hp,
                 self.game.coins,
                 self.game.kills
             ));
         }
-        render2d
-            .set_mvp(self.cam.vp_matrix())
-//          .set_states(RStates::new().samp_min_mag(FilterMode::Nearest))
-        ;
+
         // 石头 / 花静态地形：地图版本变化时重建一次（单位圆网格 + 实例列表常驻），
         // 每帧只提交实例数据，全部合批。树保持动态（Y 排序插入实体，绝不入此地）。
         if self.static_terrain.as_ref().map(|t| t.rev) != Some(self.game.map_rev) {
-            self.static_terrain = Some(StaticTerrain::build(render2d, &self.game.map, self.game.map_rev));
+            let device = self.device.as_ref().expect("device 已在 init 取得");
+            self.static_terrain = Some(StaticTerrain::build(device, &self.game.map, self.game.map_rev));
         }
-        self.static_terrain.as_ref().unwrap().draw(render2d);
-        let font = self.font.as_mut().unwrap();
-        draw_tiles(render2d, &self.cam, tex, &self.game);
-        draw_entities(render2d, tex, &self.game);
-        draw_ui(render2d, &self.cam, tex, font, &self.game);
-        render2d.render(&ClearConfig {
-            color: Some(wgpu::Color { r: 0.13, g: 0.24, b: 0.12, a: 1.0 }),
-            depth: None,
-            stencil: None,
-        });
+        self.static_terrain.as_ref().unwrap().draw(f.draw());
+        draw_tiles(f.draw(), &self.cam, tex, &self.game);
+        draw_entities(f.draw(), tex, &self.game);
+
+        // ── 屏幕固定 UI ⇒ **UI 层**（`f.draw_ui()` / `f.text_ui()`）──
+        // 层级：世界层（`f.draw()` / `f.text()`）先提交，UI 层随后提交 ⇒ UI 恒在世界之上；
+        // 位置：UI 层是**物理像素、左上原点**（identity 相机），不再用相机反算屏幕左上角，
+        //       相机旋转 / 缩放 / 跟随都不会影响 HUD；常量按 DPI（`f.scale()`）缩放。
+        let s = f.scale();
+        let region = f.region();
+        draw_ui(f.draw_ui(), tex, &self.game, s);
+        f.text_ui(|t| draw_ui_text(t, &self.game, s));
+        if self.game.state == GameState::GameOver {
+            // 顺序：压暗层（盖住 HUD）→ GAME OVER 文本（恒在最上）；UI 层按录制顺序提交。
+            draw_gameover(f.draw_ui(), tex, region.size());
+            f.text_ui(|t| draw_gameover_text(t, region.size(), s));
+        }
+
+        f.submit(&mut self.cam, Clear::color(Color::rgb(0.13, 0.24, 0.12)));
+    }
+
+    fn resized(&mut self, _ctx: &mut Ctx) {
+        // 画面矩形已自动跟随（提交时写回 `cam.region`），本应用无依赖尺寸的资源需重建。
     }
 }
+
 fn main() -> Result<(), EventLoopError> {
     env_logger::init();
-    run_app(RpgApp::new())
+    run(RpgApp::default())
 }

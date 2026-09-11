@@ -1,0 +1,9 @@
+[package]
+name = "egHello"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+rjw_krusie = { path = "../../crates/rjw_krusie" }
+env_logger = "0.11"
+log = "0.4"

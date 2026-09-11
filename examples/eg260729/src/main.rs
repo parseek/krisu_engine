@@ -1,84 +1,54 @@
+//! eg260729 —— 最小清屏示例（重设计后的写法）。
+//!
+//! 与 `egHello` 的区别：本示例**不做任何绘制**，只用配置里的清屏颜色把整帧刷成
+//! 随滚轮变化的颜色，用来验证「运行时接管 begin_pass / present」这条路径。
+//!
+//! 要点：
+//! - 不调用 `submit` 时，帧尾会用 `AppConfig::clear` 自动开 pass、清屏并 present；
+//! - `Ctx::frame()` 取不到表面（最小化 / 遮挡）时 `None`，渲染代码一行不执行；
+//! - 需要原生 wgpu pass 时用 `f.escape()`（逃生口）。
+
 use rjw_krusie::prelude::*;
 
+#[derive(Default)]
 struct ClearScreen {
-    render: Option<RenderContext>,
-}
-
-impl ClearScreen {
-    fn new() -> Self {
-        Self { render: None }
-    }
+    /// 滚轮累积的色调偏移（验证鼠标输入）。
+    hue: f32,
 }
 
 impl App for ClearScreen {
-    fn primary_window_attrib(&self) -> WindowAttributes {
-        WindowAttributes::default()
-            .with_title("eg260729 - Clear Screen")
-            .with_inner_size(LogicalSize::new(1280.0, 720.0))
+    fn config(&self) -> AppConfig {
+        AppConfig::new("eg260729 - Clear Screen")
+            .size(1280.0, 720.0)
+            .clear(Color::rgb(0.10, 0.20, 0.40))
     }
 
-    fn on_init(&mut self, ctx: &mut MainContext) {
-        let window = ctx.primary_window().expect("primary window must exist during on_init");
-        self.render = Some(RenderContext::new(window, &RenderConfig::default()));
-    }
-
-    fn on_resized(&mut self, _ctx: &mut MainContext, width: u32, height: u32) {
-        if let Some(render) = &mut self.render {
-            render.resize(width, height);
-        }
-    }
-
-    fn about_to_wait(&mut self, ctx: &mut MainContext) {
-        if ctx.keyboard.get(KeyCode::Escape).down_edge() {
-            ctx.request_exit();
+    fn update(&mut self, ctx: &mut Ctx) {
+        if ctx.key(KeyCode::Escape).down_edge() {
+            ctx.exit();
         }
 
-        let Some(render) = &mut self.render else {
-            return;
-        };
+        // 滚轮：`ScrollDelta` 可直接换算为像素。
+        let (_, dy) = ctx.mouse().wheel().to_pixel();
+        self.hue += dy as f32 * 0.03;
 
-        let Some((surface_texture, view)) = render.begin_frame() else {
-            return;
-        };
+        let Some(mut f) = ctx.frame() else { return };
 
+        // 只清屏（不提交任何绘制）：显式提交一个带颜色的 pass。
+        f.submit(
+            &mut Camera2D::full(f.region().size()),
+            Clear::color(Color::rgb(0.10, 0.20, 0.40 + self.hue.clamp(-0.2, 0.5))),
+        );
 
-        if let Some(w) = ctx.primary_window() {
-            w.set_title(&format!("FPS: {:.02}; wheel: {:?}", ctx.timer.get_fps(), ctx.mouse.get_wheel_delta().to_pixel(None)));
+        // FPS / 输入诊断（低层逃生口；取到帧之后一律经 `f` 访问只读面）
+        if let Some(w) = f.window_handle() {
+            let (mx, my) = f.mouse().wheel().to_pixel();
+            w.set_title(&format!("FPS: {:.02}; wheel: ({mx:.1}, {my:.1})", f.fps()));
         }
-
-        // Use ColorF64 which can convert directly to wgpu::Color.
-        let clear = ColorF64::rgba(0.1, 0.2, 0.4 + ctx.mouse.get_wheel_delta().to_pixel(None).1 * 0.03, 1.0).into();
-
-        let mut encoder = render.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("clear encoder"),
-        });
-
-        {
-            let mut _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-            // RenderPass drops here, finishing the pass.
-        }
-
-        render.end_frame(surface_texture, encoder);
     }
 }
 
 fn main() -> Result<(), EventLoopError> {
     env_logger::init();
-    log::info!("APP: {}", *rjw_krusie::main::PRIMARY_WINDOW_TITLE);
-    run_app(ClearScreen::new())
+    run(ClearScreen::default())
 }

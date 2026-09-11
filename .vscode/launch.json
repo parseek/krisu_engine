@@ -1,0 +1,90 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "调试 egHello（最小骨架）",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--bin=egHello", "--package=egHello"],
+        "filter": { "name": "egHello", "kind": "bin" }
+      },
+      "args": ["--frames", "300"],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "rjw_krusie=debug,rjw_ui=debug", "RUST_BACKTRACE": "1" },
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "调试 eg260818UI（UI 交互；--sim-drag 脚本化拖动 + --ui-dump 状态打印）",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--bin=eg260818UI", "--package=eg260818UI"],
+        "filter": { "name": "eg260818UI", "kind": "bin" }
+      },
+      "args": ["--sim-drag", "--ui-dump", "--frames", "300"],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "rjw_krusie=debug,rjw_ui=debug", "RUST_BACKTRACE": "1" },
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "调试 eg260731RPG（世界 + UI 层）",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--bin=eg260731RPG", "--package=eg260731RPG"],
+        "filter": { "name": "eg260731RPG", "kind": "bin" }
+      },
+      "args": ["--frames", "300"],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "rjw_krusie=debug", "RUST_BACKTRACE": "1" },
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "调试当前打开的示例（手动选 bin）",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--bin=${input:binName}"],
+        "filter": { "name": "${input:binName}", "kind": "bin" }
+      },
+      "args": ["--frames", "300"],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "trace", "RUST_BACKTRACE": "1" },
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "调试单元测试（指定测试名）",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["test", "--no-run", "--package=${input:crateName}"],
+        "filter": { "name": "${input:crateName}", "kind": "lib" }
+      },
+      "args": ["--exact", "${input:testName}", "--nocapture"],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_BACKTRACE": "1" },
+      "sourceLanguages": ["rust"]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "binName",
+      "type": "promptString",
+      "description": "示例 bin 名（如 eg260818UI / egHello / egTilemap）",
+      "default": "eg260818UI"
+    },
+    {
+      "id": "crateName",
+      "type": "promptString",
+      "description": "crate 名（如 rjw_ui / rjw_2d_render / rjw_krusie）",
+      "default": "rjw_ui"
+    },
+    {
+      "id": "testName",
+      "type": "promptString",
+      "description": "测试函数名（如 window_transform_tracks_origin）",
+      "default": "window_transform_tracks_origin"
+    }
+  ]
+}

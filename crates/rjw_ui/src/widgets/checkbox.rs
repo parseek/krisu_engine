@@ -75,7 +75,7 @@ impl<'a> Checkbox<'a> {
             font_size: self.font_size.map(|s| s.to_physical(scale)).unwrap_or(base.font_size),
             font_family: self
                 .font_family
-                .map(|f| Arc::from(f))
+                .map(Arc::from)
                 .or_else(|| base.font_family.clone()),
             gap: base.gap,
         }

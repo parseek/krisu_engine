@@ -1,0 +1,7 @@
+[package]
+name = "rjw_typed_registry"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+dashmap = "6.2.1"

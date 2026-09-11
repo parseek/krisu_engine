@@ -55,8 +55,8 @@ pub struct FocusEntry {
 /// - `current` 为 `None` 或不在链中（焦点控件本帧未录制）→ `dir > 0` 从链首开始、
 ///   `dir < 0` 从链尾开始；
 /// - 链空返回 `None`。
-pub fn focus_step<'a>(
-    chain: &[&'a FocusEntry],
+pub fn focus_step(
+    chain: &[&FocusEntry],
     current: Option<&IdAbsolute<'static>>,
     dir: i32,
 ) -> Option<IdAbsolute<'static>> {
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn stable_sort_by_win_preserves_registration_order() {
         // 注册序：win0 a, win1 b, win0 c → 排序后 win0 内 a 先于 c（稳定）。
-        let mut chain = vec![entry("a", 0), entry("b", 1), entry("c", 0)];
+        let mut chain = [entry("a", 0), entry("b", 1), entry("c", 0)];
         chain.sort_by_key(|e| e.win);
         let ids: Vec<&str> = chain.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["a", "c", "b"]);

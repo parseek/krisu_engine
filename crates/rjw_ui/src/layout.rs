@@ -34,6 +34,21 @@ pub(crate) enum FrameKind {
     Grid { cols: usize, cell: Vec2 },
 }
 
+/// **子项对父级尺寸的贡献方式**（取代旧的 `expands: bool` 裸布尔开关）。
+///
+/// 用于 [`Ui::child_rect`](crate::Ui::child_rect) / [`UiAdd::add`](crate::UiAdd::add)：
+/// - [`Child::Expand`]（默认）：子项尺寸计入父级 `max_child`（Stack 撑大父级 / Grid 扩格）；
+/// - [`Child::Fit`]：**不撑大父级**——按自身尺寸放置，溢出由控件自洽
+///   （对应 [`crate::widgets::Expansion::DisableAutoExpansion`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Child {
+    /// 撑大父级（默认）。
+    #[default]
+    Expand,
+    /// 不撑大父级（限制在父级可用空间内，内容自洽）。
+    Fit,
+}
+
 /// 容器布局帧（`Ui` 内部维护一个栈）。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Frame {
@@ -64,7 +79,7 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
-    pub fn new_stack(side: PackSide, gap: f32, pad_total: f32) -> Self {
+    pub(crate) fn new_stack(side: PackSide, gap: f32, pad_total: f32) -> Self {
         let p = pad_total;
         Self {
             kind: FrameKind::Stack { side, gap },
@@ -81,7 +96,7 @@ impl Frame {
         }
     }
 
-    pub fn new_grid(cols: usize, cell: Vec2, pad_total: f32) -> Self {
+    pub(crate) fn new_grid(cols: usize, cell: Vec2, pad_total: f32) -> Self {
         let p = pad_total;
         Self {
             kind: FrameKind::Grid { cols, cell },
@@ -100,14 +115,14 @@ impl Frame {
 
     /// 设置**下一子项**的最小尺寸约束（`0` = 该轴不约束）。一次性，`child_rect` 消耗。
     /// 多次调用取各轴最大值。
-    pub fn set_next_min(&mut self, min: impl Into<Vec2>) {
+    pub(crate) fn set_next_min(&mut self, min: impl Into<Vec2>) {
         let min = min.into();
         self.next_min = Vec2::new(self.next_min.x.max(min.x), self.next_min.y.max(min.y));
     }
 
     /// 设置**下一子项**的最大尺寸约束（`0` = 该轴不约束）。一次性，`child_rect` 消耗。
     /// 多次调用取各轴最小值（0 表示不约束，取非零较小值）。
-    pub fn set_next_max(&mut self, max: impl Into<Vec2>) {
+    pub(crate) fn set_next_max(&mut self, max: impl Into<Vec2>) {
         let max = max.into();
         let merge = |cur: f32, v: f32| {
             if cur <= 0.0 { v } else if v <= 0.0 { cur } else { cur.min(v) }
@@ -116,23 +131,23 @@ impl Frame {
     }
 
     /// 强制**下一子项**高度（flex 权重分配）。一次性，`child_rect` 消耗。
-    pub fn force_next_h(&mut self, h: f32) {
+    pub(crate) fn force_next_h(&mut self, h: f32) {
         self.next_fixed_h = Some(h.max(0.0));
     }
 
     /// **强制本 frame 全部子项等高**（水平行 `row` 用）：`child_rect` 时高度 =
     /// `force_h_all`（覆盖自然高 / 一次性 next_fixed_h），持续到 frame 结束。
-    pub fn set_force_h_all(&mut self, h: f32) {
+    pub(crate) fn set_force_h_all(&mut self, h: f32) {
         self.force_h_all = Some(h.max(0.0));
     }
 
     /// 固定容器结算高度（`settle_size` 覆盖自然高度）。
-    pub fn set_fixed_h(&mut self, h: f32) {
+    pub(crate) fn set_fixed_h(&mut self, h: f32) {
         self.fixed_h = Some(h.max(0.0));
     }
 
     /// 固定容器结算宽度（`settle_size` 覆盖自然宽度；子项宽度 clamp 到该值）。
-    pub fn set_fixed_w(&mut self, w: f32) {
+    pub(crate) fn set_fixed_w(&mut self, w: f32) {
         self.fixed_w = Some(w.max(0.0));
     }
 
@@ -155,24 +170,26 @@ impl Frame {
         self.max_child.x
     }
 
-    /// 为尺寸 `(w, h)` 的子项分配一个局部矩形，并推进光标 / 更新统计。
+    /// 为尺寸 `(w, h)` 的子项分配一个局部矩形，并推进光标 / 更新统计
+    /// （**撑大父级**；等价 `child_rect_exp(w, h, true)`）。
     ///
-    /// 应用顺序：**min/max 约束** → **容器固定宽**（`fixed_w` clamp）→ **flex 强制高度**
-    /// （覆盖测量值）。
-    pub fn child_rect(&mut self, w: f32, h: f32) -> Rect {
+    /// 生产路径统一走 [`Self::child_rect_exp`]（`Child::Fit/Expand` 由 `Ui` 决定）；
+    /// 本便捷入口只给本模块单测用。
+    #[cfg(test)]
+    pub(crate) fn child_rect(&mut self, w: f32, h: f32) -> Rect {
         self.child_rect_inner(w, h, true)
     }
 
     /// 同 [`Self::child_rect`]，但 `expands = false` 时该子项**不撑大父级**
     /// （`max_child` 不更新、grid 不扩格）——`DisableAutoExpansion` 控件语义：
     /// 内容按自身尺寸放置，溢出由控件自身自洽（noclip / 省略）。
-    pub fn child_rect_exp(&mut self, w: f32, h: f32, expands: bool) -> Rect {
+    pub(crate) fn child_rect_exp(&mut self, w: f32, h: f32, expands: bool) -> Rect {
         self.child_rect_inner(w, h, expands)
     }
 
     /// **外部放置**（嵌套容器结算后补记）：按 Stack 语义推进光标 + 更新 `max_child`
     /// + 计数——供"占光标"式嵌套容器（如 [`crate::ui::UiAdd::row`]）使用：
-    /// 子容器已按自身 Frame 放置内容，结算尺寸 `size` 后由父 Frame 补记占位。
+    ///   子容器已按自身 Frame 放置内容，结算尺寸 `size` 后由父 Frame 补记占位。
     pub(crate) fn place_external(&mut self, size: Vec2) {
         match &mut self.kind {
             FrameKind::Stack { side, gap } => {
@@ -274,7 +291,7 @@ impl Frame {
     }
 
     /// 结算容器自然尺寸（含 pad_total 外扩；相对容器 origin）。
-    pub fn settle_size(&self) -> Vec2 {
+    pub(crate) fn settle_size(&self) -> Vec2 {
         match &self.kind {
             FrameKind::Stack { side, gap } => {
                 if self.count == 0 {

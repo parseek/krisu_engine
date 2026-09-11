@@ -1,22 +1,26 @@
-//! 责任链 API：`Text::text(..)` → [`TextLayout`]（排版配置）→ [`TextRender`]（渲染配置）。
+//! **唯一文本链**：`Text::label(..)` → [`Label`] → 终点（`draw` / `draw_with` / `measure` / `into_buffer`）。
 //!
-//! 转换方向单向：`TextLayout` 可经 `into_render()`（用 `Text` 内部缓冲）或 `into_render_with(&mut TextBuffer)`
-//! （用户持缓冲，多标签并存）转为 [`TextRender`]，反向不可。
+//! 取代旧的 10 条绘制路径与 3 份样式类型（`TextLayout` / `TextRender` / `Style` / `RenderDefaults`）：
+//! - 唯一样式类型 [`TextStyle`]：owned / `Clone` / 可存字段，链式 setter 每项 ≤1 参；
+//! - 唯一入口 [`Label`]：样式覆盖 + 定位 + 裁剪/缓存 + 终点（终点才提交）；
+//! - 唯一字形载荷 [`Glyph`]：`map` 与 `draw_with` 共用一种回调形状（`&Glyph`）；
+//! - 唯一定位语言：`at`（世界左上角）/ `center`（内容中心）/ `anchor`（归一化锚点）/ `offset`（像素微调）；
+//! - 剔除默认**开启**（`.no_cull()` 关闭）。
 //!
-//! - [`TextLayout`]（阶段一）：`text` / `size` / `line_height` / `line_space` / `align` / `attrs` / `font_family`，
-//!   及 `measure` / `into_buffer` / `precache` / `into_render` / `into_render_with`。
-//! - [`TextRender`]（阶段二，借用缓冲）：`origin` / `origin_px` / `offset` / `color` / `transform` / `map` / `draw_with`；
-//!   默认 feature `rjw_2d_render` 下额外提供 `draw_sprite2d` / `draw_2d_gradient`（含横向/竖向渐变）。
-//! - [`Style`] / [`TextStyle`]：与 `Text` 解耦的可复用样式（family 用 `AttrsOwned` 无借用），克隆继承。
+//! `Label` 有两种获得方式：
+//! - **运行时（绑定世界层 `Render2D`）**：`Frame::text(|t| { t.label("HP").draw(10.0); })`
+//!   —— `t: `[`TextCtx`] 同时持有 `&mut Text` 与 `&mut Render2D`，`draw(layer)` 只收 1 个参数；
+//! - **独立（不绑定）**：`Text::label(..)` → [`Label::draw_to`]`(&mut r2d, layer)`（2 参）；
+//!   未绑定而调用 `draw(layer)` 会 panic 并提示改用 `draw_to`。
 //!
-//! 存储：`TextRender` 借用 `Vec`（`Text` 内部默认缓冲或用户 `TextBuffer`），跨帧 clear+填充复用容量，
-//! 无栈内大数组。常量字符串经 [`TextStorage`] 内联存储。
+//! 低层类型 `GlyphData` / `GlyphType` / `MeasureInfo` / `LineMeasureInfo` 保留（`Glyph` 与 UI 集成面内部使用），
+//! **不再出现在 happy path 上**。
 //!
-//! 性能：`Text` 内部对 cosmic-text 排版做 **LRU 缓存**（[`MAX_LAYOUT_CACHE`]）——相同
+//! 存储：字形/行收集写入复用缓冲（`Text` 内部默认缓冲或用户 [`TextBuffer`]），跨帧 clear+填充复用容量。
+//! 性能：`Text` 内部对 cosmic-text 排版做 **LRU 缓存**（[`crate::MAX_LAYOUT_CACHE`]）——相同
 //! （文本/字号/行高/对齐/attrs）输入经 O(1) 签名命中后返回共享 `Arc<Buffer>`（不深拷贝），
 //! 跳过每帧重复整形；空格等无图字形只判定一次；字形图集去碎片重排后自动同步各字形区域。
 
-use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -34,7 +38,7 @@ use swash::scale::image::Content as SwashContent;
 pub use rjw_transform::{Rect, Transform2D};
 
 use cosmic_text::{AttrsOwned, FamilyOwned, Stretch, Weight};
-use crate::{Align, Attrs, Buffer, Family, GlyphLocation, Text};
+use crate::{Align, Attrs, Buffer, GlyphLocation, Text};
 
 // ─── 内联容量常量 ───────────────────────────────────────────────
 
@@ -94,27 +98,23 @@ pub enum LineSpace {
     Multiple(f32),
 }
 
-/// 渐变应用方式（`TextRender::draw_2d_gradient`，feature = `rjw_2d_render`）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GradientMode {
-    /// 每个字形自身渐变
-    Glyph,
-    /// 整行渐变（同一行所有字形共享行跨度）
-    Line,
-    /// 整个文本块渐变（跨行）
-    Frame,
+/// 排版缓存策略（**每个文本操作**可指定；默认 [`CachePolicy::Auto`] 保持现状）。
+///
+/// 作用于内部 LRU 排版缓存（见 [`crate::MAX_LAYOUT_CACHE`]）：
+/// - [`CachePolicy::Auto`]：Debug 恒缓存；Release 仅缓存 ≤ [`crate::LARGE_TEXT_CACHE_LIMIT`] 字节的小文本；
+/// - [`CachePolicy::Always`]：强制进 LRU（含大文本；注意会挤压 LRU 容量）；
+/// - [`CachePolicy::Never`]：不缓存、不写 LRU（每帧整形；适合一次性/超低频文本）；
+/// - [`CachePolicy::User`]：不使用内部 LRU（配合 [`Text::label_from`] 由用户持有 `Arc<Buffer>` 管理缓存）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CachePolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
+    User,
 }
 
-/// 渐变方向（`TextRender::draw_2d_gradient`，feature = `rjw_2d_render`）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GradientAxis {
-    /// 横向渐变（左 → 右）
-    Horizontal,
-    /// 竖向渐变（上 → 下）
-    Vertical,
-}
-
-/// 整体测量信息（`draw_with` 回调参数）。
+/// 整体测量信息（低层；[`Glyph`] 内部使用）。
 #[derive(Clone, Copy, Debug)]
 pub struct MeasureInfo {
     /// 排版内容宽高（行盒）
@@ -125,13 +125,12 @@ pub struct MeasureInfo {
     pub glyph_count: usize,
 }
 
-/// 单行测量信息（`draw_with` 回调参数）。
+/// 单行测量信息（低层；UI 集成面 [`Text::geometry`](crate::Text::geometry) 的对应实现基础）。
 #[derive(Clone, Debug)]
 pub struct LineMeasureInfo {
     /// 原始文本行索引
     pub line_i: usize,
-    /// 行盒左上角（相对文本视觉原点；**整数像素**——行顶已取整，与字形 tl 一致；
-    /// 绘制时叠加 `origin` / `offset`）
+    /// 行盒左上角（相对文本视觉原点；**整数像素**——行顶已取整，与字形 tl 一致）
     pub top_left: Vec2,
     /// 行内容宽（像素）
     pub width: f32,
@@ -139,11 +138,11 @@ pub struct LineMeasureInfo {
     pub line_height: f32,
     /// 基线 y（相对行盒顶，正数向下）
     pub baseline: f32,
-    /// 该行在 `TextRender::glyphs()` 中的字形范围
+    /// 该行在收集缓冲中的字形范围
     pub glyph_range: Range<usize>,
 }
 
-/// 字形类型（`GlyphData::glyph_type`）。
+/// 字形类型（[`Glyph::glyph_type`]）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GlyphType {
     /// 普通字形（单色 mask / 亚像素，可染色）
@@ -152,13 +151,12 @@ pub enum GlyphType {
     Color,
 }
 
-/// 单个字形渲染记录（`map` 可原地修改）。
+/// 单个字形渲染记录（低层存储；`map` 可原地修改）。
 #[derive(Clone, Debug)]
 pub struct GlyphData {
-    /// 所在行（`TextRender::lines()` 数组索引）
+    /// 所在行（收集缓冲的 `lines` 数组索引）
     pub line: usize,
-    /// 字形精灵左上角（相对文本视觉原点；**整数像素**——收集期对字形位置逐项取整，
-    /// 与块偏移相加两侧均为整数；绘制时叠加 `origin` / `offset`）
+    /// 字形精灵左上角（相对文本视觉原点；**整数像素**——收集期对字形位置逐项取整）
     pub top_left: Vec2,
     /// 字形像素宽高
     pub size: Vec2,
@@ -166,7 +164,7 @@ pub struct GlyphData {
     pub region: AtlasRegion,
     /// 字形颜色（RGBA，默认白色；最终颜色 = 全局 `color` × 此值）
     pub color: [f32; 4],
-    /// 相对层级偏移（叠加到 `draw_sprite2d` 传入的基础层上；渐变忽略）
+    /// 相对层级偏移（叠加到 `draw(layer)` 传入的基础层上；渐变忽略）
     pub layer: f64,
     /// 可选逐字形变换（`None` = 单位变换；渐变忽略）
     pub transform: Option<Transform2D>,
@@ -182,42 +180,44 @@ impl GlyphData {
     pub fn glyph_str(&self) -> &str {
         std::str::from_utf8(&self.cluster).unwrap_or("")
     }
-}// ─── 样式 Style / TextStyle ─────────────────────────────────────
+}
 
-/// 无借用的完整文本属性（cosmic-text 0.19 `AttrsOwned`，family 为 `FamilyOwned`，可长期存储）。
+// ─── TextStyle（唯一样式类型） ──────────────────────────────────
+
+/// 无借用的完整文本属性（cosmic-text `AttrsOwned`，family 为 `FamilyOwned`，可长期存储）。
 pub type OwnedAttrs = AttrsOwned;
 
-/// 渲染默认设置（color / origin / offset / transform，均可继承/覆盖）。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RenderDefaults {
+/// **唯一样式类型**：owned / `Clone` / 可存字段；链式 setter 每个 ≤1 参。
+///
+/// 与 `Text` 解耦（可作字段保存、克隆继承：`base.clone().size(..)`）。
+/// `Text::style()` / `Text::style_mut()` 持有全局默认样式，[`Label`] 从中继承；
+/// 也可经 [`Label::style`] 把保存的样式套到单个标签上。
+///
+/// 字段语义（`Default`）：`size = 14.0`、`align = Left`、颜色白色（`color = None`）、
+/// `origin` / `offset` / `transform` 不设置。
+#[derive(Clone, Debug)]
+pub struct TextStyle {
+    /// 完整无借用文本属性（family 为 `FamilyOwned::Name`，无生命周期）
+    pub attrs: OwnedAttrs,
+    /// 字号（像素），默认 14.0
+    pub size: f32,
+    /// 显式行高（None = 由 `line_space` / 字号推导）
+    pub line_height: Option<f32>,
+    /// 行距（None = 引擎默认：`size × 1.2`）
+    pub line_space: Option<LineSpace>,
+    /// 对齐，默认 Left
+    pub align: Align,
     /// 全局颜色（RGBA；None = 白色）
     pub color: Option<[f32; 4]>,
-    /// 归一化原点（None = (0,0)）
+    /// 归一化锚点（None = (0,0)，即内容左上角）——等价于 [`Label::anchor`]
     pub origin: Option<Vec2>,
-    /// 像素偏移（None = (0,0)）
+    /// 像素偏移（None = (0,0)）——等价于 [`Label::offset`]
     pub offset: Option<Vec2>,
     /// 渲染级变换（None = 单位）
     pub transform: Option<Transform2D>,
 }
 
-/// 与 `Text` 完全解耦的可复用样式：可独立存储、克隆继承（`base.clone().size(..)`）。
-#[derive(Clone, Debug)]
-pub struct Style {
-    /// 完整无借用文本属性（family 为 `FamilyOwned::Name`，无生命周期）
-    pub attrs: OwnedAttrs,
-    /// 字号（像素），默认 14.0
-    pub size: f32,
-    /// 显式行高（None = 引擎默认）
-    pub line_height: Option<f32>,
-    /// 行距（None = 引擎默认）
-    pub line_space: Option<LineSpace>,
-    /// 对齐，默认 Left
-    pub align: Align,
-    /// 渲染默认
-    pub render: RenderDefaults,
-}
-
-impl Default for Style {
+impl Default for TextStyle {
     fn default() -> Self {
         Self {
             attrs: AttrsOwned::new(&Attrs::new()),
@@ -225,13 +225,20 @@ impl Default for Style {
             line_height: None,
             line_space: None,
             align: Align::Left,
-            render: RenderDefaults::default(),
+            color: None,
+            origin: None,
+            offset: None,
+            transform: None,
         }
     }
 }
 
-impl Style {
-    /// 字体族名称（转 `FamilyOwned::Name(SmolStr)`，owned 可长期存储）。
+impl TextStyle {
+    /// 等价 [`Default`]（字号 14.0 / 左对齐 / 白色）。
+    #[inline]
+    pub fn new() -> Self { Self::default() }
+
+    /// 字体族名称（转 `FamilyOwned::Name`，owned 可长期存储）。
     #[inline]
     pub fn font_family(mut self, family: impl Into<String>) -> Self {
         self.attrs.family_owned = FamilyOwned::Name(family.into().into());
@@ -242,6 +249,41 @@ impl Style {
     #[inline]
     pub fn attrs(mut self, attrs: OwnedAttrs) -> Self {
         self.attrs = attrs;
+        self
+    }
+
+    /// 字号（像素）。
+    #[inline]
+    pub fn size(mut self, size: f32) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// 显式行高（像素）。
+    #[inline]
+    pub fn line_height(mut self, value: f32) -> Self {
+        self.line_height = Some(value);
+        self
+    }
+
+    /// 行距（像素增量或字号倍率）。未设置 `line_height` 时生效。
+    #[inline]
+    pub fn line_space(mut self, value: impl Into<LineSpace>) -> Self {
+        self.line_space = Some(value.into());
+        self
+    }
+
+    /// 对齐。
+    #[inline]
+    pub fn align(mut self, align: Align) -> Self {
+        self.align = align;
+        self
+    }
+
+    /// 全局颜色（RGBA）。
+    #[inline]
+    pub fn color(mut self, color: impl Into<[f32; 4]>) -> Self {
+        self.color = Some(color.into());
         self
     }
 
@@ -273,260 +315,32 @@ impl Style {
         self
     }
 
-    /// 字号（像素）。
-    #[inline]
-    pub fn size(mut self, size: f32) -> Self {
-        self.size = size;
-        self
-    }
-
-    /// 显式行高。
-    #[inline]
-    pub fn line_height(mut self, value: f32) -> Self {
-        self.line_height = Some(value);
-        self
-    }
-
-    /// 行距（像素或倍率）。
-    #[inline]
-    pub fn line_space(mut self, value: impl Into<LineSpace>) -> Self {
-        self.line_space = Some(value.into());
-        self
-    }
-
-    /// 对齐。
-    #[inline]
-    pub fn align(mut self, align: Align) -> Self {
-        self.align = align;
-        self
-    }
-
-    /// 全局颜色（RGBA）。
-    #[inline]
-    pub fn color(mut self, color: impl Into<[f32; 4]>) -> Self {
-        self.render.color = Some(color.into());
-        self
-    }
-
-    /// 归一化原点（接受 `Vec2` 或 `(x, y)`）。
+    /// 归一化锚点（[0,1]；`(0,0)` 左上角，`(0.5,0.5)` 居中）。等价 [`Label::anchor`]。
     #[inline]
     pub fn origin(mut self, origin: impl Into<Vec2>) -> Self {
-        self.render.origin = Some(origin.into());
+        self.origin = Some(origin.into());
         self
     }
 
-    /// 像素偏移（接受 `Vec2` 或 `(x, y)`）。
+    /// 像素偏移。等价 [`Label::offset`]。
     #[inline]
     pub fn offset(mut self, offset: impl Into<Vec2>) -> Self {
-        self.render.offset = Some(offset.into());
+        self.offset = Some(offset.into());
         self
     }
 
-    /// 渲染级变换。
+    /// 渲染级变换（`None` = 单位；作用于整个文本块）。
     #[inline]
     pub fn transform(mut self, transform: impl Into<Option<Transform2D>>) -> Self {
-        self.render.transform = transform.into();
+        self.transform = transform.into();
         self
     }
 }
 
-/// 临时持有的 `Text` + [`Style`]：简化重复的字体/字号/行距设置（`Text::build_style` 构造，可复用）。
-pub struct TextStyle<'a> {
-    text: &'a mut Text,
-    style: Style,
-}
+// ─── TextBuffer（复用缓冲） ─────────────────────────────────────
 
-impl Text {
-    /// 构建可复用样式（临时持有 `&mut Text`；配置可用 [`Style`] 独立保存/克隆继承）。
-    #[inline]
-    pub fn build_style(&mut self) -> TextStyle<'_> {
-        TextStyle { text: self, style: Style::default() }
-    }
-
-    /// 从用户保存的（共享）`Buffer` 直接进入阶段二 [`TextRender`]（责任链渲染）。
-    ///
-    /// 适用于**静态大文本**：[`Text::create_buffer`] / [`TextLayout::into_buffer`] 返回的
-    /// `Arc<Buffer>` 由用户保存一次，每帧调用本方法渲染——跳过重复整形
-    /// （Release 下大文本不缓存，此举即官方“手动缓存”路径）。
-    ///
-    /// 首次调用会确保该 Buffer 的字形已入图集（后续调用 O(字形数) 收集+绘制，不再整形）；
-    /// 返回的 [`TextRender`] 可继续 `.origin/.offset/.color/.transform/.map/`
-    /// `.draw_sprite2d/.draw_2d_gradient/.draw_with`。
-    #[inline]
-    pub fn render_from<'a>(&'a mut self, buffer: &Buffer) -> TextRender<'a> {
-        // 确保全部字形已渲染入图集（buffer_origin 依赖 bearing 数据）；无图像字形只判定一次。
-        for run in buffer.layout_runs() {
-            for glyph in run.glyphs.iter() {
-                let cache_key = glyph.physical((0.0, 0.0), 1.0).cache_key;
-                if !self.locations.contains_key(&cache_key) && !self.no_image.contains(&cache_key) {
-                    self.rasterize_and_pack(cache_key);
-                }
-            }
-        }
-        self.sync_atlas_regions();
-        let visual_origin = self.buffer_origin(buffer);
-        let page_size = self.glyph_cache.page_size() as f32;
-        let (content_size, measure) = collect_glyphs(
-            &self.locations, buffer, visual_origin,
-            &mut self.buf.glyphs, &mut self.buf.lines, None,
-        );
-        let glyphs = &mut self.buf.glyphs;
-        let lines = &mut self.buf.lines;
-        TextRender {
-            glyphs, lines, content_size, measure,
-            origin: Vec2::ZERO, offset: Vec2::ZERO, color: [1.0; 4], transform: None, page_size,
-            clip: None, clip_world: None, cull: false,
-        }
-    }
-}
-
-impl<'a> TextStyle<'a> {
-    /// 从独立 [`Style`] 构造（样式继承：先建 `Style` 再套用）。
-    #[inline]
-    pub fn with_style(text: &'a mut Text, style: &Style) -> TextStyle<'a> {
-        TextStyle { text, style: style.clone() }
-    }
-
-    /// 替换为给定样式。
-    #[inline]
-    pub fn set_style(&mut self, style: &Style) {
-        self.style = style.clone();
-    }
-
-    /// 当前样式引用。
-    #[inline]
-    pub fn style(&self) -> &Style {
-        &self.style
-    }
-
-    /// 应用文本 → `TextLayout`（继承 style 的布局与渲染默认）。
-    #[inline]
-    pub fn text(&mut self, text: impl Into<TextStorage>) -> TextLayout<'_> {
-        let style = &self.style;
-        TextLayout {
-            text: &mut *self.text,
-            string: text.into(),
-            family: None,
-            attrs: Some(style.attrs.as_attrs()),
-            size: style.size,
-            line_height: style.line_height,
-            line_space: style.line_space,
-            align: style.align,
-            render: style.render,
-            clip: None,
-            cull: false,
-            cache: CachePolicy::Auto,
-        }
-    }
-
-    /// 字体族名称。
-    #[inline]
-    pub fn font_family(mut self, family: impl Into<String>) -> Self {
-        self.style = self.style.font_family(family);
-        self
-    }
-    /// 完整文本属性。
-    #[inline]
-    pub fn attrs(mut self, attrs: OwnedAttrs) -> Self {
-        self.style = self.style.attrs(attrs);
-        self
-    }
-    /// 字重。
-    #[inline]
-    pub fn weight(mut self, weight: Weight) -> Self {
-        self.style = self.style.weight(weight);
-        self
-    }
-    /// 斜体（无斜体字面时由光栅化合成伪斜体，见 [`Style::italic`]）。
-    #[inline]
-    pub fn italic(mut self, italic: bool) -> Self {
-        self.style = self.style.italic(italic);
-        self
-    }
-    /// 拉伸。
-    #[inline]
-    pub fn stretch(mut self, stretch: Stretch) -> Self {
-        self.style = self.style.stretch(stretch);
-        self
-    }
-    /// 字距。
-    #[inline]
-    pub fn letter_spacing(mut self, letter_spacing: f32) -> Self {
-        self.style = self.style.letter_spacing(letter_spacing);
-        self
-    }
-    /// 字号。
-    #[inline]
-    pub fn size(mut self, size: f32) -> Self {
-        self.style = self.style.size(size);
-        self
-    }
-    /// 显式行高。
-    #[inline]
-    pub fn line_height(mut self, value: f32) -> Self {
-        self.style = self.style.line_height(value);
-        self
-    }
-    /// 行距。
-    #[inline]
-    pub fn line_space(mut self, value: impl Into<LineSpace>) -> Self {
-        self.style = self.style.line_space(value);
-        self
-    }
-    /// 对齐。
-    #[inline]
-    pub fn align(mut self, align: Align) -> Self {
-        self.style = self.style.align(align);
-        self
-    }
-    /// 全局颜色。
-    #[inline]
-    pub fn color(mut self, color: impl Into<[f32; 4]>) -> Self {
-        self.style = self.style.color(color);
-        self
-    }
-    /// 归一化原点（接受 `Vec2` 或 `(x, y)`）。
-    #[inline]
-    pub fn origin(mut self, origin: impl Into<Vec2>) -> Self {
-        self.style = self.style.origin(origin);
-        self
-    }
-    /// 像素偏移（接受 `Vec2` 或 `(x, y)`）。
-    #[inline]
-    pub fn offset(mut self, offset: impl Into<Vec2>) -> Self {
-        self.style = self.style.offset(offset);
-        self
-    }
-    /// 渲染级变换。
-    #[inline]
-    pub fn transform(mut self, transform: impl Into<Option<Transform2D>>) -> Self {
-        self.style = self.style.transform(transform);
-        self
-    }
-}
-
-// ─── 缓存策略 / 剔除开关 ────────────────────────────────────────
-
-/// 排版缓存策略（**每个文本操作**可指定；默认 [`CachePolicy::Auto`] 保持现状）。
-///
-/// 作用于内部 LRU 排版缓存（见 [`crate::MAX_LAYOUT_CACHE`]）：
-/// - [`CachePolicy::Auto`]：Debug 恒缓存；Release 仅缓存 ≤ [`crate::LARGE_TEXT_CACHE_LIMIT`] 字节的小文本；
-/// - [`CachePolicy::Always`]：强制进 LRU（含大文本；注意会挤压 LRU 容量）；
-/// - [`CachePolicy::Never`]：不缓存、不写 LRU（每帧整形；适合一次性/超低频文本）；
-/// - [`CachePolicy::User`]：不使用内部 LRU（配合 [`Text::render_from`] / [`TextLayout::into_render_with`]
-///   由用户持有 `Arc<Buffer>` / `TextBuffer` 管理缓存）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CachePolicy {
-    #[default]
-    Auto,
-    Always,
-    Never,
-    User,
-}
-
-// ─── TextBuffer / TextLayout（阶段一：排版配置） ─────────────────
-
-/// 用户可持有的可复用字形/行缓冲（`into_render_with` 使用；跨帧 clear+填充，容量保留）。
+/// 用户可持有的可复用字形/行缓冲（[`Label::into_buffer`] / UI 集成面使用；
+/// 跨帧 clear+填充，容量保留）。
 #[derive(Clone, Debug, Default)]
 pub struct TextBuffer {
     /// 字形记录
@@ -535,315 +349,580 @@ pub struct TextBuffer {
     pub lines: Vec<LineMeasureInfo>,
 }
 
-/// 阶段一：排版配置责任链。持有 `&mut Text` 借用；可 `measure` / `into_buffer` / `precache` / `into_render` / `into_render_with`。
-pub struct TextLayout<'a> {
-    text: &'a mut Text,
-    string: TextStorage,
-    family: Option<String>,
-    attrs: Option<Attrs<'a>>,
-    size: f32,
-    line_height: Option<f32>,
-    line_space: Option<LineSpace>,
-    align: Align,
-    render: RenderDefaults,
-    /// 文本局部裁剪区域（相对字形 `top_left` 坐标；`cull(true)` 时启用收集期剔除）。
-    clip: Option<Rect>,
-    /// 剔除开关（默认 false；配合 `clip` 与 [`TextRender::clip_world`]）。
-    cull: bool,
-    /// 排版缓存策略（默认 Auto）。
-    cache: CachePolicy,
+// ─── Gradient（唯一点阵渐变表达） ───────────────────────────────
+
+/// 渐变应用方式（[`Gradient`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradientMode {
+    /// 每个字形自身渐变
+    Glyph,
+    /// 整行渐变（同一行所有字形共享行跨度）
+    Line,
+    /// 整个文本块渐变（跨行）
+    Frame,
 }
 
-impl Text {
-    /// 启动一条文本责任链（阶段一：排版配置）。常量字符串内联存储，不堆分配。
-    #[inline]
-    pub fn text<'a>(&'a mut self, text: impl Into<TextStorage>) -> TextLayout<'a> {
-        TextLayout {
-            text: self,
-            string: text.into(),
-            family: None,
-            attrs: None,
-            size: 14.0,
-            line_height: None,
-            line_space: None,
-            align: Align::Left,
-            render: RenderDefaults::default(),
-            clip: None,
-            cull: false,
-            cache: CachePolicy::Auto,
+/// 渐变方向（[`Gradient`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradientAxis {
+    /// 横向渐变（左 → 右）
+    Horizontal,
+    /// 竖向渐变（上 → 下）
+    Vertical,
+}
+
+/// 文本渐变：`mode`（Glyph/Line/Frame）× `axis`（H/V）+ 颜色停靠点。
+///
+/// 用命名构造器表达六种组合（`glyph_h` / `line_v` / `frame_h` …）；`stops` 至少两项，
+/// `t ∈ [0,1]`（越界钳制，超出两端取端点色）。
+#[cfg(feature = "rjw_2d_render")]
+#[derive(Clone, Debug)]
+pub struct Gradient {
+    /// 渐变域（字形自身 / 整行 / 整块）
+    pub mode: GradientMode,
+    /// 渐变方向
+    pub axis: GradientAxis,
+    /// 颜色停靠点（`(t, color)`，至少两项）
+    pub stops: Vec<(f32, Color)>,
+}
+
+#[cfg(feature = "rjw_2d_render")]
+impl Gradient {
+    fn of(mode: GradientMode, axis: GradientAxis, stops: &[(f32, Color)]) -> Self {
+        Self { mode, axis, stops: stops.to_vec() }
+    }
+
+    /// 逐字形 × 横向（左 → 右）。
+    pub fn glyph_h(stops: &[(f32, Color)]) -> Self { Self::of(GradientMode::Glyph, GradientAxis::Horizontal, stops) }
+    /// 逐字形 × 竖向（上 → 下）。
+    pub fn glyph_v(stops: &[(f32, Color)]) -> Self { Self::of(GradientMode::Glyph, GradientAxis::Vertical, stops) }
+    /// 整行 × 横向。
+    pub fn line_h(stops: &[(f32, Color)]) -> Self { Self::of(GradientMode::Line, GradientAxis::Horizontal, stops) }
+    /// 整行 × 竖向。
+    pub fn line_v(stops: &[(f32, Color)]) -> Self { Self::of(GradientMode::Line, GradientAxis::Vertical, stops) }
+    /// 整块 × 横向（跨行）。
+    pub fn frame_h(stops: &[(f32, Color)]) -> Self { Self::of(GradientMode::Frame, GradientAxis::Horizontal, stops) }
+    /// 整块 × 竖向（跨行）。
+    pub fn frame_v(stops: &[(f32, Color)]) -> Self { Self::of(GradientMode::Frame, GradientAxis::Vertical, stops) }
+}
+
+// ─── Glyph（唯一字形载荷） ─────────────────────────────────────
+
+/// **唯一字形载荷**：`map`（可原地修改）与 `draw_with`（只读）共用同一种回调形状。
+///
+/// 只读访问器：`region` / `top_left` / `size` / `transform` / `line_index` / `glyph_str` /
+/// `glyph_type` / `color` / `layer`；修改访问器：`color_mut` / `translate` / `set_transform` /
+/// `set_layer`（仅在 [`Label::map`] 中有效——`draw_with` 收到的是只读快照语义的值）。
+#[derive(Clone, Debug)]
+pub struct Glyph {
+    line: usize,
+    top_left: Vec2,
+    size: Vec2,
+    region: AtlasRegion,
+    color: [f32; 4],
+    layer: f64,
+    transform: Option<Transform2D>,
+    glyph_type: GlyphType,
+    cluster: ArrayVec<u8, GLYPH_CLUSTER_CAP>,
+    /// 已组合的世界变换（`draw_with` 时Some；`map` 中为 None → 返回局部变换）。
+    world: Option<Transform2D>,
+}
+
+impl Glyph {
+    fn from_data(g: &GlyphData) -> Self {
+        Self {
+            line: g.line,
+            top_left: g.top_left,
+            size: g.size,
+            region: g.region,
+            color: g.color,
+            layer: g.layer,
+            transform: g.transform,
+            glyph_type: g.glyph_type,
+            cluster: g.cluster.clone(),
+            world: None,
         }
     }
+
+    fn write_back(&self, g: &mut GlyphData) {
+        g.top_left = self.top_left;
+        g.size = self.size;
+        g.color = self.color;
+        g.layer = self.layer;
+        g.transform = self.transform;
+        g.glyph_type = self.glyph_type;
+    }
+
+    /// 图集区域（像素坐标 + 页 uid）。
+    #[inline]
+    pub fn region(&self) -> AtlasRegion { self.region }
+
+    /// 字形精灵左上角（相对文本视觉原点；`map` 中为局部坐标）。
+    #[inline]
+    pub fn top_left(&self) -> Vec2 { self.top_left }
+
+    /// 字形像素宽高。
+    #[inline]
+    pub fn size(&self) -> Vec2 { self.size }
+
+    /// 字形变换：
+    /// - `draw_with`：**世界变换**（已含字形位置 + 渲染级 `transform`）——
+    ///   `transform().transform_point(Vec2::ZERO)` 即字形左上角世界坐标；
+    /// - `map`：局部变换（仅字形自身 `transform` + 位置，未叠加文本块定位）。
+    #[inline]
+    pub fn transform(&self) -> Transform2D {
+        match self.world {
+            Some(t) => t,
+            None => {
+                let base = self.transform.unwrap_or(Transform2D::IDENTITY);
+                base.with_pos(base.pos + self.top_left)
+            }
+        }
+    }
+
+    /// 所在视觉行（0 = 首行）。
+    #[inline]
+    pub fn line_index(&self) -> usize { self.line }
+
+    /// 对应字符（簇）。
+    #[inline]
+    pub fn glyph_str(&self) -> &str {
+        std::str::from_utf8(&self.cluster).unwrap_or("")
+    }
+
+    /// 字形类型（`Color` = Emoji 等彩色字形，保留原色）。
+    #[inline]
+    pub fn glyph_type(&self) -> GlyphType { self.glyph_type }
+
+    /// 字形颜色（RGBA；最终颜色 = 全局色 × 此值；彩色字形保留自身 RGBA）。
+    #[inline]
+    pub fn color(&self) -> [f32; 4] { self.color }
+
+    /// 相对层级偏移（叠加到 `draw(layer)` 的基础上）。
+    #[inline]
+    pub fn layer(&self) -> f64 { self.layer }
+
+    /// 修改字形颜色（[`Label::map`] 中用）。
+    #[inline]
+    pub fn color_mut(&mut self) -> &mut [f32; 4] { &mut self.color }
+
+    /// 平移字形（[`Label::map`] 中用；叠加到收集期位置）。
+    #[inline]
+    pub fn translate(&mut self, delta: impl Into<Vec2>) { self.top_left += delta.into(); }
+
+    /// 设置逐字形变换（`None` = 单位；[`Label::map`] 中用）。
+    #[inline]
+    pub fn set_transform(&mut self, transform: impl Into<Option<Transform2D>>) {
+        self.transform = transform.into();
+    }
+
+    /// 设置相对层级偏移（[`Label::map`] 中用）。
+    #[inline]
+    pub fn set_layer(&mut self, layer: f64) { self.layer = layer; }
 }
 
-impl<'a> TextLayout<'a> {
-    /// 替换文本内容。
+// ─── Label（唯一链） ───────────────────────────────────────────
+
+/// 文本链句柄：文本 + 样式 + 终点选项（+ 可选 `&mut Render2D` 绑定）。
+///
+/// 由 [`Text::label`]、[`Text::label_from`] 或 [`TextCtx::label`] 构造；
+/// 样式覆盖 / 定位 / 裁剪 / 缓存均为消费式链式方法，**终点才提交**。
+#[cfg(feature = "rjw_2d_render")]
+pub struct Label<'t> {
+    text: &'t mut Text,
+    string: TextStorage,
+    /// 直接复用已排版缓冲（[`Text::label_from`]；不重新整形）。
+    bound: Option<&'t Arc<Buffer>>,
+    style: TextStyle,
+    /// 定位点（`at` / `center` 设置；内容按 `anchor` 相对它摆放）。
+    at: Vec2,
+    /// 归一化锚点（[0,1]；样式 `origin` 继承）。
+    anchor: Vec2,
+    /// 像素偏移（叠加在锚点换算之后；样式 `offset` 继承）。
+    offset: Vec2,
+    /// 文本局部裁剪（相对字形 `top_left`，不含定位）。
+    clip: Option<Rect>,
+    /// 世界坐标裁剪（整块 + 逐字形保守剔除）。
+    clip_world: Option<Rect>,
+    /// 剔除开关（默认 **true**；`.no_cull()` 关闭）。
+    cull: bool,
+    /// 排版缓存策略（默认 [`CachePolicy::Auto`]）。
+    cache: CachePolicy,
+    /// 渐变（Some 时走渐变渲染路径）。
+    gradient: Option<Gradient>,
+    /// 逐字形修改闭包。
+    #[allow(clippy::type_complexity, reason = "闭包类型本身即 `Option<Box<dyn FnMut>>`，别名不增益")]
+    mapper: Option<Box<dyn FnMut(&mut Glyph) + 't>>,
+    /// 绑定的世界层渲染器（[`TextCtx::label`] 提供；`None` = 独立用法）。
+    r2d: Option<&'t mut Render2D>,
+}
+
+#[cfg(feature = "rjw_2d_render")]
+impl<'t> Label<'t> {
+    /// 内部构造：继承 `text` 的全局默认样式。
+    pub(crate) fn new(text: &'t mut Text, string: TextStorage) -> Self {
+        let style = text.style.clone();
+        Self {
+            anchor: style.origin.unwrap_or(Vec2::ZERO),
+            offset: style.offset.unwrap_or(Vec2::ZERO),
+            at: Vec2::ZERO,
+            bound: None,
+            gradient: None,
+            mapper: None,
+            r2d: None,
+            clip: None,
+            clip_world: None,
+            cull: true,
+            cache: CachePolicy::Auto,
+            string,
+            text,
+            style,
+        }
+    }
+
+    // ── 样式覆盖（与 [`TextStyle`] 同名同义） ──
+
+    /// 绑定已排版缓冲（[`Text::label_from`](crate::Text::label_from) 内部使用）。
     #[inline]
-    pub fn text(mut self, text: impl Into<TextStorage>) -> Self {
-        self.string = text.into();
+    pub(crate) fn bind_buffer(mut self, buffer: &'t Arc<Buffer>) -> Self {
+        self.bound = Some(buffer);
         self
     }
 
-    /// 字号（像素）。默认 14.0。
+    /// 字号（像素）。
     #[inline]
-    pub fn size(mut self, value: f32) -> Self {
-        self.size = value;
-        self
-    }
+    pub fn size(mut self, size: f32) -> Self { self.style = self.style.size(size); self }
+
+    /// 全局颜色（RGBA）。
+    #[inline]
+    pub fn color(mut self, color: impl Into<[f32; 4]>) -> Self { self.style = self.style.color(color); self }
+
+    /// 对齐。
+    #[inline]
+    pub fn align(mut self, align: Align) -> Self { self.style = self.style.align(align); self }
 
     /// 显式行高（像素）。
     #[inline]
-    pub fn line_height(mut self, value: f32) -> Self {
-        self.line_height = Some(value);
-        self
-    }
+    pub fn line_height(mut self, value: f32) -> Self { self.style = self.style.line_height(value); self }
 
-    /// 行距（像素增量或字号倍率）。未设置 `line_height` 时生效。
+    /// 行距（像素增量或字号倍率）。
     #[inline]
-    pub fn line_space(mut self, value: impl Into<LineSpace>) -> Self {
-        self.line_space = Some(value.into());
-        self
-    }
+    pub fn line_space(mut self, value: impl Into<LineSpace>) -> Self { self.style = self.style.line_space(value); self }
 
-    /// 对齐方式。
+    /// 字体族名称（空字符串回退系统默认）。
     #[inline]
-    pub fn align(mut self, align: Align) -> Self {
-        self.align = align;
-        self
-    }
+    pub fn font_family(mut self, family: impl Into<String>) -> Self { self.style = self.style.font_family(family); self }
 
-    /// 完整文本属性；设置后 `font_family` 被忽略。
+    /// 字重。
     #[inline]
-    pub fn attrs(mut self, attrs: Attrs<'a>) -> Self {
-        self.attrs = Some(attrs);
-        self
-    }
+    pub fn weight(mut self, weight: Weight) -> Self { self.style = self.style.weight(weight); self }
 
-    /// 字体族名称（如 `"SimHei"`）；传空字符串回退系统默认。
+    /// 斜体（无斜体字面时由光栅化合成伪斜体）。
     #[inline]
-    pub fn font_family(mut self, family: impl Into<String>) -> Self {
-        self.family = Some(family.into());
-        self
-    }
+    pub fn italic(mut self, italic: bool) -> Self { self.style = self.style.italic(italic); self }
 
-    /// 渲染默认：颜色（转换到 `TextRender` 时应用）。
+    /// 字距（EM）。
     #[inline]
-    pub fn color(mut self, color: impl Into<[f32; 4]>) -> Self {
-        self.render.color = Some(color.into());
+    pub fn letter_spacing(mut self, letter_spacing: f32) -> Self {
+        self.style = self.style.letter_spacing(letter_spacing);
         self
     }
 
-    /// 渲染默认：归一化原点（接受 `Vec2` 或 `(x, y)`）。
-    #[inline]
-    pub fn origin(mut self, origin: impl Into<Vec2>) -> Self {
-        self.render.origin = Some(origin.into());
-        self
-    }
-
-    /// 渲染默认：像素偏移（接受 `Vec2` 或 `(x, y)`）。
-    #[inline]
-    pub fn offset(mut self, offset: impl Into<Vec2>) -> Self {
-        self.render.offset = Some(offset.into());
-        self
-    }
-
-    /// 渲染默认：渲染级变换。
+    /// 渲染级变换（`None` = 单位；作用于整个文本块）。
     #[inline]
     pub fn transform(mut self, transform: impl Into<Option<Transform2D>>) -> Self {
-        self.render.transform = transform.into();
+        self.style.transform = transform.into();
         self
     }
 
-    /// 文本局部裁剪区域（相对字形 `top_left` 坐标，**不含** origin/offset）。
+    /// **整体套用已保存的样式**（[`TextStyle`] 可存字段 / `Clone`；链上调用会覆盖之前的样式设置）。
+    #[inline]
+    pub fn style(mut self, style: TextStyle) -> Self {
+        self.anchor = style.origin.unwrap_or(Vec2::ZERO);
+        self.offset = style.offset.unwrap_or(Vec2::ZERO);
+        self.style = style;
+        self
+    }
+
+    // ── 定位 ──
+
+    /// 定位点：内容按 `anchor`（默认左上角）摆放到该点。
+    #[inline]
+    pub fn at(mut self, pos: impl Into<Vec2>) -> Self { self.at = pos.into(); self }
+
+    /// 以**内容中心**定位（等价 `anchor((0.5,0.5)).at(pos)`）。
+    #[inline]
+    pub fn center(mut self, pos: impl Into<Vec2>) -> Self {
+        self.at = pos.into();
+        self.anchor = Vec2::splat(0.5);
+        self
+    }
+
+    /// 归一化锚点（`0..1`；`(0,0)` 左上角，`(0.5,0.5)` 居中）——锚点落在 `at` 上。
+    #[inline]
+    pub fn anchor(mut self, anchor: impl Into<Vec2>) -> Self { self.anchor = anchor.into(); self }
+
+    /// 像素偏移（在锚点换算之后叠加）。
+    #[inline]
+    pub fn offset(mut self, offset: impl Into<Vec2>) -> Self { self.offset = offset.into(); self }
+
+    // ── 裁剪 / 剔除 / 缓存 / 渐变 / 逐字形 ──
+
+    /// 文本**局部**裁剪（相对字形 `top_left` 坐标，不含定位/变换）。
+    #[inline]
+    pub fn clip(mut self, clip: impl Into<Option<Rect>>) -> Self { self.clip = clip.into(); self }
+
+    /// **世界坐标**裁剪（整块 + 逐字形保守剔除）。
+    #[inline]
+    pub fn clip_world(mut self, clip: impl Into<Option<Rect>>) -> Self { self.clip_world = clip.into(); self }
+
+    /// 关闭裁剪剔除（默认开启）。
     ///
-    /// 配合 [`Self::cull`]：`cull(true)` 时在**收集期**剔除裁剪区外的行/字形
-    /// （轨道 A：GUI 无变换文本；对测量与坐标零副作用）。默认 `None`。
+    /// 默认开启时 `clip` / `clip_world` 生效（收集期 + 提交期剔除）；关闭后两者都被忽略。
+    /// 注：视口剔除由 `Render2D` 自身的剔除模式负责（与本开关无关）。
     #[inline]
-    pub fn clip(mut self, clip: impl Into<Option<Rect>>) -> Self {
-        self.clip = clip.into();
+    pub fn no_cull(mut self) -> Self { self.cull = false; self }
+
+    /// 排版缓存策略（默认 [`CachePolicy::Auto`]）。
+    #[inline]
+    pub fn cache(mut self, policy: CachePolicy) -> Self { self.cache = policy; self }
+
+    /// 渐变渲染（替代纯色；见 [`Gradient`]）。
+    #[inline]
+    pub fn gradient(mut self, gradient: Gradient) -> Self { self.gradient = Some(gradient); self }
+
+    /// 逐字形修改（收集后、提交/回调前应用；可改颜色 / 位置 / 层级 / 变换）。
+    #[inline]
+    pub fn map<F>(mut self, f: F) -> Self
+    where F: FnMut(&mut Glyph) + 't {
+        self.mapper = Some(Box::new(f));
         self
     }
 
-    /// 是否启用剔除（默认 **false**；与 [`Self::clip`] / [`TextRender::clip_world`] 配合）。
+    // ── 终点 ──
+
+    /// 提交到**绑定的** `Render2D`（[`TextCtx::label`] 提供的链）。
     ///
-    /// 默认关闭保证现有行为完全不变；开启后：
-    /// - 收集期按 `clip`（文本局部）剔除不可见行/字形；
-    /// - 渲染期按 [`TextRender::clip_world`]（世界坐标）做整块 + 逐字形保守剔除。
-    #[inline]
-    pub fn cull(mut self, cull: bool) -> Self {
-        self.cull = cull;
-        self
+    /// 独立用法（`Text::label(..)`，未绑定）请改用 [`Self::draw_to`]；未绑定而调用本方法会 panic。
+    pub fn draw(self, layer: impl Into<Layer>) {
+        let mut label = self;
+        match label.r2d.take() {
+            Some(r2d) => label.draw_to(r2d, layer),
+            None => panic!(
+                "Label::draw(layer) 需要绑定的 Render2D：\
+                 运行时路径用 `Frame::text(|t| t.label(..).draw(layer))`；\
+                 独立路径改用 `Label::draw_to(&mut r2d, layer)`"
+            ),
+        }
     }
 
-    /// 排版缓存策略（默认 [`CachePolicy::Auto`] 保持现状）。
-    #[inline]
-    pub fn cache(mut self, policy: CachePolicy) -> Self {
-        self.cache = policy;
-        self
-    }
-
-    /// 便捷绘制：内部 `into_render()` 后逐字形回调 `(measure, line, region, transform)`。
-    #[inline]
-    pub fn draw_with<F>(self, callback: F)
-    where F: FnMut(&MeasureInfo, &LineMeasureInfo, &AtlasRegion, Transform2D) {
-        self.into_render().draw_with(callback)
-    }
-
-    /// 便捷绘制：内部 `into_render()` 后直接渲染到 `Render2D`（feature = `rjw_2d_render`）。
-    #[cfg(feature = "rjw_2d_render")]
-    #[inline]
-    pub fn draw_sprite2d(self, r2d: &mut Render2D, layer: impl Into<Layer>) {
-        self.into_render().draw_sprite2d(r2d, layer)
-    }
-
-    /// 便捷绘制：内部 `into_render()` 后渐变渲染（feature = `rjw_2d_render`）。
-    #[cfg(feature = "rjw_2d_render")]
-    #[inline]
-    pub fn draw_2d_gradient(
-        self,
-        r2d: &mut Render2D,
-        layer: impl Into<Layer>,
-        mode: GradientMode,
-        axis: GradientAxis,
-        stops: &[(f32, Color)],
-    ) {
-        self.into_render().draw_2d_gradient(r2d, layer, mode, axis, stops)
-    }
-
-    /// 排版 + 测量：返回内容宽高（不消费链）。
-    #[inline]
-    pub fn measure(&mut self) -> Vec2 {
-        let attrs: Attrs<'_> = match &self.attrs {
-            Some(a) => a.clone(),
-            None => match self.family.as_deref() {
-                Some(f) => Attrs::new().family(Family::Name(f)),
-                None => Attrs::new(),
-            },
+    /// 提交到给定 `Render2D`（独立用法；两参）。
+    pub fn draw_to(mut self, r2d: &mut Render2D, layer: impl Into<Layer>) {
+        let layer: Layer = layer.into();
+        let buffer = self.resolve_buffer();
+        let clip = if self.cull { self.clip } else { None };
+        let (content_size, _measure, page_size) = collect_into_scratch(&mut *self.text, &buffer, clip);
+        let delta = block_delta(content_size, self.at, self.anchor, self.offset);
+        if let Some(m) = self.mapper.as_mut() {
+            apply_map(&mut self.text.buf.glyphs, m);
+        }
+        let gradient = self.gradient.take();
+        let resolved = Resolved {
+            glyphs: &self.text.buf.glyphs,
+            lines: &self.text.buf.lines,
+            content_size,
+            delta,
+            render: self.style.transform,
+            clip: self.clip,
+            clip_world: self.clip_world,
+            cull: self.cull,
+            page_size,
         };
-        let lh = effective_line_height(self.size, self.line_height, self.line_space);
-        let string = self.string.as_str();
-        let size = self.size;
-        let align = self.align;
-        let cache = self.cache;
-        let text = &mut *self.text;
-        let buffer = text.create_buffer_policy(string, attrs, size, lh, align, cache);
+        match gradient {
+            Some(g) => resolved.draw_gradient(r2d, &g, layer),
+            None => resolved.draw_sprites(r2d, self.style.color.unwrap_or([1.0; 4]), layer.as_f64()),
+        }
+    }
+
+    /// 逐字形回调（不绘制）：回调收到**世界坐标**语义的 [`Glyph`]。
+    pub fn draw_with<F: FnMut(&Glyph)>(mut self, mut f: F) {
+        let buffer = self.resolve_buffer();
+        let clip = if self.cull { self.clip } else { None };
+        let (content_size, _measure, page_size) = collect_into_scratch(&mut *self.text, &buffer, clip);
+        let _ = page_size;
+        let delta = block_delta(content_size, self.at, self.anchor, self.offset);
+        if let Some(m) = self.mapper.as_mut() {
+            apply_map(&mut self.text.buf.glyphs, m);
+        }
+        let render = self.style.transform;
+        if self.cull
+            && let Some(cw) = self.clip_world
+                && !block_world_rect(content_size, delta, render).intersects(&cw) {
+                    return;
+                }
+        for g in self.text.buf.glyphs.iter() {
+            let tl = g.top_left + delta;
+            if self.cull
+                && let Some(c) = self.clip
+                    && !Rect::new(g.top_left.x, g.top_left.y, g.size.x, g.size.y).intersects(&c) {
+                        continue;
+                    }
+            let world = world_transform(g, tl, render);
+            if self.cull
+                && let Some(cw) = self.clip_world
+                    && !world_aabb(g, world).intersects(&cw) {
+                        continue;
+                    }
+            let mut view = Glyph::from_data(g);
+            view.world = Some(world);
+            f(&view);
+        }
+    }
+
+    /// 测量：排版内容宽高（行盒；不提交、不光栅化）。
+    pub fn measure(mut self) -> Vec2 {
+        let buffer = self.resolve_buffer();
         Text::measure_buffer(&buffer)
     }
 
     /// 排版并交出共享 `Arc<Buffer>`（cosmic-text；缓存命中间接共享，不深拷贝），消费链。
-    #[inline]
-    pub fn into_buffer(self) -> Arc<Buffer> {
-        let TextLayout { text, string, family, attrs, size, line_height, line_space, align, cache, .. } = self;
-        let attrs: Attrs<'_> = match attrs {
-            Some(a) => a,
-            None => match family.as_deref() {
-                Some(f) => Attrs::new().family(Family::Name(f)),
-                None => Attrs::new(),
-            },
-        };
-        let lh = effective_line_height(size, line_height, line_space);
-        text.create_buffer_policy(string.as_str(), attrs, size, lh, align, cache)
+    ///
+    /// 字形/行信息收集到 `buf`（跨帧 clear+填充，容量保留）。
+    pub fn into_buffer(mut self, buf: &mut TextBuffer) -> Arc<Buffer> {
+        let buffer = self.resolve_buffer();
+        rasterize_all(&mut *self.text, &buffer);
+        let visual_origin = self.text.buffer_origin(&buffer);
+        let clip = if self.cull { self.clip } else { None };
+        collect_glyphs(
+            &self.text.locations,
+            &buffer,
+            visual_origin,
+            &mut buf.glyphs,
+            &mut buf.lines,
+            clip,
+        );
+        buffer
     }
 
-    /// 预缓存：排版 + 光栅化（字形入图集），**不收集数据**。返回自身，可稍后 `into_render` / `into_render_with`。
-    #[inline]
-    pub fn precache(self) -> Self {
-        let attrs: Attrs<'_> = match &self.attrs {
-            Some(a) => a.clone(),
-            None => match self.family.as_deref() {
-                Some(f) => Attrs::new().family(Family::Name(f)),
-                None => Attrs::new(),
-            },
-        };
-        let lh = effective_line_height(self.size, self.line_height, self.line_space);
-        let _ = shape_and_rasterize(
-            &mut *self.text, self.string.as_str(), attrs, self.size, lh, self.align, self.cache,
-        );
-        self
-    }
-
-    /// 转为阶段二 [`TextRender`]，消费链。**用 `Text` 内部默认缓冲**（单标签快速路径，跨帧复用容量）。
-    #[inline]
-    pub fn into_render(self) -> TextRender<'a> {
-        let TextLayout { text, string, family, attrs, size, line_height, line_space, align, render, clip, cull, cache } = self;
-        let attrs: Attrs<'_> = match attrs {
-            Some(a) => a,
-            None => match family.as_deref() {
-                Some(f) => Attrs::new().family(Family::Name(f)),
-                None => Attrs::new(),
-            },
-        };
-        let lh = effective_line_height(size, line_height, line_space);
-        let buffer = shape_and_rasterize(&mut *text, string.as_str(), attrs, size, lh, align, cache);
-        let visual_origin = text.buffer_origin(&buffer);
-        let page_size = text.glyph_cache.page_size() as f32;
-        let (content_size, measure) = collect_glyphs(
-            &text.locations, &buffer, visual_origin,
-            &mut text.buf.glyphs, &mut text.buf.lines,
-            if cull { clip } else { None },
-        );
-        let glyphs = &mut text.buf.glyphs;
-        let lines = &mut text.buf.lines;
-        let mut tr = TextRender {
-            glyphs, lines, content_size, measure,
-            origin: Vec2::ZERO, offset: Vec2::ZERO, color: [1.0; 4], transform: None, page_size,
-            clip: if cull { clip } else { None }, clip_world: None, cull,
-        };
-        tr.color = render.color.unwrap_or([1.0; 4]);
-        tr.origin = render.origin.unwrap_or(Vec2::ZERO);
-        tr.offset = render.offset.unwrap_or(Vec2::ZERO);
-        tr.transform = render.transform;
-        tr
-    }
-
-    /// 转为阶段二 [`TextRender`]，消费链。**用用户提供的缓冲**（多标签并存互不冲突；跨帧复用容量）。
-    #[inline]
-    pub fn into_render_with<'b>(self, buf: &'b mut TextBuffer) -> TextRender<'b> {
-        let TextLayout { text, string, family, attrs, size, line_height, line_space, align, render, clip, cull, cache } = self;
-        let attrs: Attrs<'_> = match attrs {
-            Some(a) => a,
-            None => match family.as_deref() {
-                Some(f) => Attrs::new().family(Family::Name(f)),
-                None => Attrs::new(),
-            },
-        };
-        let lh = effective_line_height(size, line_height, line_space);
-        let buffer = shape_and_rasterize(&mut *text, string.as_str(), attrs, size, lh, align, cache);
-        let visual_origin = text.buffer_origin(&buffer);
-        let page_size = text.glyph_cache.page_size() as f32;
-        let (content_size, measure) = collect_glyphs(
-            &text.locations, &buffer, visual_origin,
-            &mut buf.glyphs, &mut buf.lines,
-            if cull { clip } else { None },
-        );
-        let glyphs = &mut buf.glyphs;
-        let lines = &mut buf.lines;
-        let mut tr = TextRender {
-            glyphs, lines, content_size, measure,
-            origin: Vec2::ZERO, offset: Vec2::ZERO, color: [1.0; 4], transform: None, page_size,
-            clip: if cull { clip } else { None }, clip_world: None, cull,
-        };
-        tr.color = render.color.unwrap_or([1.0; 4]);
-        tr.origin = render.origin.unwrap_or(Vec2::ZERO);
-        tr.offset = render.offset.unwrap_or(Vec2::ZERO);
-        tr.transform = render.transform;
-        tr
+    /// 排版缓冲：已绑定 `Buffer` 直接复用（不重新整形），否则按样式整形（走 LRU 排版缓存）。
+    fn resolve_buffer(&mut self) -> Arc<Buffer> {
+        if let Some(b) = self.bound {
+            return Arc::clone(b);
+        }
+        let attrs = self.style.attrs.as_attrs();
+        let lh = effective_line_height(self.style.size, self.style.line_height, self.style.line_space);
+        self.text.create_buffer_policy(
+            self.string.as_str(),
+            attrs,
+            self.style.size,
+            lh,
+            self.style.align,
+            self.cache,
+        )
     }
 }
 
-// ─── 排版 + 收集（阶段一 → 阶段二） ─────────────────────────────
+// ─── TextCtx（运行时绑定） ──────────────────────────────────────
 
-/// 排版 + 光栅化（字形入图集），返回共享 `Arc<Buffer>` 供收集。
-fn shape_and_rasterize(
-    text: &mut Text,
-    string: &str,
-    attrs: Attrs<'_>,
-    size: f32,
-    line_height: f32,
-    align: Align,
-    cache: CachePolicy,
-) -> Arc<Buffer> {
-    let buffer = text.create_buffer_policy(string, attrs, size, line_height, align, cache);
-    // 确保所有字形已渲染入图集（buffer_origin 依赖 bearing 数据）；无图像字形只判定一次。
+/// 运行时文本上下文：同时持有 `&mut Text` 与 `&mut Render2D`（世界层）。
+///
+/// 由 [`Frame::text`](crate::Text) 提供；[`Self::label`] 返回的 [`Label`] 已绑定该 `Render2D`，
+/// 因此终点 `draw(layer)` **只收 1 个参数**。
+#[cfg(feature = "rjw_2d_render")]
+pub struct TextCtx<'a> {
+    text: &'a mut Text,
+    r2d: &'a mut Render2D,
+}
+
+#[cfg(feature = "rjw_2d_render")]
+impl<'a> TextCtx<'a> {
+    /// 构造（运行时 [`Frame::text`](crate::Text) 使用）。
+    #[inline]
+    pub fn new(text: &'a mut Text, r2d: &'a mut Render2D) -> Self { Self { text, r2d } }
+
+    /// 起链：文本 → [`Label`]（已绑定本上下文的 `Render2D`）。
+    #[inline]
+    pub fn label<'t>(&'t mut self, text: impl Into<TextStorage>) -> Label<'t> {
+        let mut label = Label::new(&mut *self.text, text.into());
+        label.r2d = Some(&mut *self.r2d);
+        label
+    }
+
+    /// 从**已排版** `Arc<Buffer>` 起链（不重新整形；已绑定本上下文的 `Render2D`）。
+    ///
+    /// 语义同 [`Text::label_from`]，但终点仍是一参的 `draw(layer)`。
+    #[inline]
+    pub fn label_from<'t>(&'t mut self, buffer: &'t Arc<Buffer>) -> Label<'t> {
+        let mut label = Label::new(&mut *self.text, TextStorage::from("")).bind_buffer(buffer);
+        label.r2d = Some(&mut *self.r2d);
+        label
+    }
+
+    /// **UI / 大文本集成面**：排版缓冲（语义与 [`Text::buffer`] 完全一致）。
+    #[inline]
+    pub fn buffer(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        wrap: f32,
+        policy: CachePolicy,
+    ) -> Arc<Buffer> {
+        self.text.buffer(text, style, wrap, policy)
+    }
+
+    /// **UI 集成面**：排版几何（语义与 [`Text::geometry`] 完全一致）。
+    #[inline]
+    pub fn geometry(&mut self, buffer: &Buffer) -> crate::TextGeometry {
+        self.text.geometry(buffer)
+    }
+
+    /// **UI 集成面**：排版内容宽高（语义与 [`Text::measure_buffer`] 完全一致）。
+    #[inline]
+    pub fn measure_buffer(buffer: &Buffer) -> Vec2 {
+        Text::measure_buffer(buffer)
+    }
+
+    /// **UI 集成面**：已排版 Buffer 的视觉行（语义与 [`Text::lines`] 完全一致）。
+    #[inline]
+    pub fn lines(buffer: &Buffer) -> Vec<crate::VisualLine> {
+        Text::lines(buffer)
+    }
+
+    /// **UI 集成面**：字形图集内的 WHITE region（语义与 [`Text::white_region`] 完全一致）。
+    #[inline]
+    pub fn white_region(&mut self) -> Option<AtlasRegion> {
+        self.text.white_region()
+    }
+
+    /// **UI 集成面**：往字形图集插入用户纹理（语义与 [`Text::user_texture`] 完全一致）。
+    #[inline]
+    pub fn user_texture(&mut self, id: u64, px: rjw_render::Rgba8<'_>) -> Option<AtlasRegion> {
+        self.text.user_texture(id, px)
+    }
+
+    /// 全局默认样式（[`Text`] 持有；[`Label`] 从中继承）。
+    #[inline]
+    pub fn style(&self) -> &TextStyle { self.text.style() }
+
+    /// 全局默认样式（可变；改动影响后续所有 [`Label`]）。
+    #[inline]
+    pub fn style_mut(&mut self) -> &mut TextStyle { self.text.style_mut() }
+
+    /// 字形图集（低层诊断用，如 `page_count()`）——语义同 [`Text::glyph_cache`](crate::Text::glyph_cache)。
+    #[inline]
+    pub fn glyph_cache(&self) -> &rjw_atlas::DynamicAtlas<crate::AtlasKey> { self.text.glyph_cache() }
+}
+
+// ─── 收集 / 提交内核 ───────────────────────────────────────────
+
+/// 文本块定位量：最终位置 = 字形相对坐标 + `delta`。
+#[inline]
+fn block_delta(content_size: Vec2, at: Vec2, anchor: Vec2, offset: Vec2) -> Vec2 {
+    at - Vec2::new(content_size.x * anchor.x, content_size.y * anchor.y) + offset
+}
+
+/// 确保 `buffer` 的全部字形已入图集，并同步去碎片重排后的区域。
+fn rasterize_all(text: &mut Text, buffer: &Buffer) {
     for run in buffer.layout_runs() {
         for glyph in run.glyphs.iter() {
             let cache_key = glyph.physical((0.0, 0.0), 1.0).cache_key;
@@ -852,17 +931,283 @@ fn shape_and_rasterize(
             }
         }
     }
-    // 光栅化过程中图集可能触发去碎片重排（搬动字形），同步各字形区域。
     text.sync_atlas_regions();
-    buffer
 }
+
+/// 光栅化 + 收集到 `Text` 内部缓冲，返回 `(内容宽高, 测量, 图集页尺寸)`。
+fn collect_into_scratch(text: &mut Text, buffer: &Buffer, clip: Option<Rect>) -> (Vec2, MeasureInfo, f32) {
+    rasterize_all(text, buffer);
+    let visual_origin = text.buffer_origin(buffer);
+    let page_size = text.glyph_cache.page_size() as f32;
+    let (content_size, measure) = collect_glyphs(
+        &text.locations,
+        buffer,
+        visual_origin,
+        &mut text.buf.glyphs,
+        &mut text.buf.lines,
+        clip,
+    );
+    (content_size, measure, page_size)
+}
+
+/// 对已收集的字形应用 `map` 闭包（按值包装 → 写回）。
+fn apply_map(glyphs: &mut [GlyphData], m: &mut (dyn FnMut(&mut Glyph) + '_)) {
+    for g in glyphs.iter_mut() {
+        let mut view = Glyph::from_data(g);
+        m(&mut view);
+        view.write_back(g);
+    }
+}
+
+/// 文本块世界包围盒（`content_size` 四角经 `delta` 与渲染变换后的保守 AABB）。
+fn block_world_rect(content_size: Vec2, delta: Vec2, render: Option<Transform2D>) -> Rect {
+    let c = content_size;
+    let pts = [
+        Vec2::new(0.0, 0.0) + delta,
+        Vec2::new(c.x, 0.0) + delta,
+        Vec2::new(0.0, c.y) + delta,
+        c + delta,
+    ];
+    match render {
+        Some(t) => Rect::from_point_slice(&t.transform_points(&pts)),
+        None => Rect::from_point_slice(&pts),
+    }
+}
+
+/// `draw_with` 语义的逐字形世界变换：`translate(tl) ∘ 字形变换 ∘ 渲染变换`。
+fn world_transform(g: &GlyphData, tl: Vec2, render: Option<Transform2D>) -> Transform2D {
+    let base = g.transform.unwrap_or(Transform2D::IDENTITY);
+    let tr = base.with_pos(base.pos + tl);
+    match render {
+        Some(t) => tr.compose(&t),
+        None => tr,
+    }
+}
+
+/// `draw_with` 语义的逐字形世界 AABB（世界变换作用于字形局部矩形）。
+fn world_aabb(g: &GlyphData, world: Transform2D) -> Rect {
+    let local = [
+        Vec2::ZERO,
+        Vec2::new(g.size.x, 0.0),
+        Vec2::new(0.0, g.size.y),
+        g.size,
+    ];
+    Rect::from_point_slice(&world.transform_points(&local))
+}
+
+/// 精灵路径的逐字形变换（`Render2D::sprite` 对 rect 施加的变换；不含字形平移）。
+fn sprite_transform(g: &GlyphData, render: Option<Transform2D>) -> Transform2D {
+    match (render, g.transform) {
+        (Some(rt), Some(gt)) => gt.compose(&rt),
+        (Some(rt), None) => rt,
+        (None, Some(gt)) => gt,
+        (None, None) => Transform2D::default(),
+    }
+}
+
+/// 已解析的提交上下文（字形切片 + 定位 + 裁剪，供纯色 / 渐变两条提交路径共用）。
+struct Resolved<'a> {
+    glyphs: &'a [GlyphData],
+    lines: &'a [LineMeasureInfo],
+    content_size: Vec2,
+    delta: Vec2,
+    render: Option<Transform2D>,
+    clip: Option<Rect>,
+    clip_world: Option<Rect>,
+    cull: bool,
+    page_size: f32,
+}
+
+#[cfg(feature = "rjw_2d_render")]
+impl Resolved<'_> {
+    /// 整块世界剔除：不可见 → 整个跳过。
+    #[inline]
+    fn block_visible(&self) -> bool {
+        if !self.cull {
+            return true;
+        }
+        match self.clip_world {
+            Some(cw) => block_world_rect(self.content_size, self.delta, self.render).intersects(&cw),
+            None => true,
+        }
+    }
+
+    /// 局部裁剪剔除（字形自身矩形）。
+    #[inline]
+    fn clipped_out(&self, g: &GlyphData) -> bool {
+        if !self.cull {
+            return false;
+        }
+        match self.clip {
+            Some(c) => !Rect::new(g.top_left.x, g.top_left.y, g.size.x, g.size.y).intersects(&c),
+            None => false,
+        }
+    }
+
+    /// 纯色路径：逐字形精灵提交。
+    fn draw_sprites(&self, r2d: &mut Render2D, color: [f32; 4], layer: f64) {
+        if !self.block_visible() {
+            return;
+        }
+        for g in self.glyphs {
+            let tl = g.top_left + self.delta;
+            if self.clipped_out(g) {
+                continue;
+            }
+            let Some(tex) = TEXTURES.get(g.region.page_uid) else { continue };
+            let rect = SpriteRect::with_uv_tex(
+                tl,
+                g.size,
+                Vec2::new(g.region.tl_px.0 as f32, g.region.tl_px.1 as f32),
+                Vec2::new(g.region.wh_px.0 as f32, g.region.wh_px.1 as f32),
+                &tex,
+            );
+            let color = if g.glyph_type == GlyphType::Color {
+                // 彩色字形（Emoji）：保留自身 RGBA，不叠加全局 tint
+                Color::from(g.color)
+            } else {
+                Color::from(mul_color(color, g.color))
+            };
+            let transform = sprite_transform(g, self.render);
+            if self.cull
+                && let Some(cw) = self.clip_world {
+                    // 世界坐标 = transform 作用于 rect 四角（mesh_tl + local*mesh_wh）
+                    let local = [
+                        tl,
+                        Vec2::new(tl.x + g.size.x, tl.y),
+                        Vec2::new(tl.x, tl.y + g.size.y),
+                        tl + g.size,
+                    ];
+                    let aabb = Rect::from_point_slice(&transform.transform_points(&local));
+                    if !aabb.intersects(&cw) {
+                        continue;
+                    }
+                }
+            r2d.sprite(rect, &tex)
+                .tint(color)
+                .transform(transform)
+                .layer(Layer::from(layer + g.layer));
+        }
+    }
+
+    /// 渐变路径：逐字形动态 mesh（逐顶点颜色）。
+    fn draw_gradient(&self, r2d: &mut Render2D, gradient: &Gradient, layer: Layer) {
+        assert!(gradient.stops.len() >= 2, "Gradient 需要至少 2 个颜色停靠点");
+        if self.glyphs.is_empty() {
+            return;
+        }
+        if !self.block_visible() {
+            return;
+        }
+        let (mode, axis) = (gradient.mode, gradient.axis);
+        let f32_stops: Vec<(f32, [f32; 4])> =
+            gradient.stops.iter().map(|&(t, c)| (t, c.into())).collect();
+
+        // 渐变域（相对坐标，未含 delta）
+        let (mut frame_l, mut frame_r) = (f32::MAX, f32::MIN);
+        let (mut frame_t, mut frame_b) = (f32::MAX, f32::MIN);
+        let n = self.lines.len();
+        let mut line_l = vec![f32::MAX; n];
+        let mut line_r = vec![f32::MIN; n];
+        let mut line_t = vec![f32::MAX; n];
+        let mut line_b = vec![f32::MIN; n];
+        for g in self.glyphs {
+            frame_l = frame_l.min(g.top_left.x);
+            frame_r = frame_r.max(g.top_left.x + g.size.x);
+            frame_t = frame_t.min(g.top_left.y);
+            frame_b = frame_b.max(g.top_left.y + g.size.y);
+            line_l[g.line] = line_l[g.line].min(g.top_left.x);
+            line_r[g.line] = line_r[g.line].max(g.top_left.x + g.size.x);
+            line_t[g.line] = line_t[g.line].min(g.top_left.y);
+            line_b[g.line] = line_b[g.line].max(g.top_left.y + g.size.y);
+        }
+
+        // 按图集页分组（一个 mesh 只绑一张纹理）
+        let mut pages: Vec<(u64, Vec<usize>)> = Vec::new();
+        for (i, g) in self.glyphs.iter().enumerate() {
+            match pages.iter_mut().find(|(uid, _)| *uid == g.region.page_uid) {
+                Some((_, idxs)) => idxs.push(i),
+                None => pages.push((g.region.page_uid, vec![i])),
+            }
+        }
+
+        let delta = self.delta;
+        for (uid, idxs) in pages {
+            let Some(tex) = TEXTURES.get(uid) else { continue };
+            let page_size = self.page_size;
+            r2d.mesh_with(|sink| {
+                for &i in &idxs {
+                    let g = &self.glyphs[i];
+                    let tl = g.top_left + delta;
+                    let br = tl + g.size;
+                    // 剔除（文本局部 + 世界）：渐变域已算完，仅跳过提交。
+                    if self.clipped_out(g) {
+                        continue;
+                    }
+                    let tl_w = match self.render { Some(t) => t.transform_point(tl), None => tl };
+                    let tr_w = match self.render { Some(t) => t.transform_point(Vec2::new(br.x, tl.y)), None => Vec2::new(br.x, tl.y) };
+                    let bl_w = match self.render { Some(t) => t.transform_point(Vec2::new(tl.x, br.y)), None => Vec2::new(tl.x, br.y) };
+                    let br_w = match self.render { Some(t) => t.transform_point(br), None => br };
+                    if self.cull
+                        && let Some(cw) = self.clip_world {
+                            let aabb = Rect::from_point_slice(&[tl_w, tr_w, bl_w, br_w]);
+                            if !aabb.intersects(&cw) {
+                                continue;
+                            }
+                        }
+                    // (渐变域起, 渐变域止, TL角轴坐标, TR角轴坐标, BL角轴坐标, BR角轴坐标)
+                    let (s0, s1, t_tl, t_tr, t_bl, t_br) = match (axis, mode) {
+                        (GradientAxis::Horizontal, GradientMode::Glyph) => (tl.x, br.x, tl.x, br.x, tl.x, br.x),
+                        (GradientAxis::Horizontal, GradientMode::Line) => (
+                            line_l[g.line] + delta.x, line_r[g.line] + delta.x,
+                            tl.x, br.x, tl.x, br.x,
+                        ),
+                        (GradientAxis::Horizontal, GradientMode::Frame) => (
+                            frame_l + delta.x, frame_r + delta.x,
+                            tl.x, br.x, tl.x, br.x,
+                        ),
+                        (GradientAxis::Vertical, GradientMode::Glyph) => (tl.y, br.y, tl.y, tl.y, br.y, br.y),
+                        (GradientAxis::Vertical, GradientMode::Line) => (
+                            line_t[g.line] + delta.y, line_b[g.line] + delta.y,
+                            tl.y, tl.y, br.y, br.y,
+                        ),
+                        (GradientAxis::Vertical, GradientMode::Frame) => (
+                            frame_t + delta.y, frame_b + delta.y,
+                            tl.y, tl.y, br.y, br.y,
+                        ),
+                    };
+                    let uv0 = Vec2::new(
+                        g.region.tl_px.0 as f32 / page_size,
+                        g.region.tl_px.1 as f32 / page_size,
+                    );
+                    let uv1 = uv0 + Vec2::new(
+                        g.region.wh_px.0 as f32 / page_size,
+                        g.region.wh_px.1 as f32 / page_size,
+                    );
+                    let col = |c: f32| mul_color(sample_gradient(&f32_stops, frac_t(s0, s1, c)), g.color);
+                    let i0 = sink.push_vertex_uv_color(tl_w, uv0, col(t_tl));
+                    let i1 = sink.push_vertex_uv_color(tr_w, Vec2::new(uv1.x, uv0.y), col(t_tr));
+                    let i2 = sink.push_vertex_uv_color(bl_w, Vec2::new(uv0.x, uv1.y), col(t_bl));
+                    let i3 = sink.push_vertex_uv_color(br_w, uv1, col(t_br));
+                    sink.push_tri(i0, i1, i2);
+                    sink.push_tri(i1, i3, i2);
+                }
+            })
+            .tint(Color::WHITE)
+            .layer(layer)
+            .texture(&tex);
+        }
+    }
+}
+
+// ─── 排版 + 收集 ───────────────────────────────────────────────
 
 /// 把排版结果收集进 `glyphs` / `lines`（先 clear，复用容量），返回内容宽高与测量。
 ///
 /// `clip`（文本局部坐标，相对字形 `top_left`）：`Some` 时启用**收集期剔除**（轨道 A）——
 /// 行/字形与裁剪区无交集的跳过收集；坐标与测量不受影响（剔除只是"不收集"）。
 fn collect_glyphs(
-    locations: &HashMap<cosmic_text::CacheKey, GlyphLocation>,
+    locations: &std::collections::HashMap<cosmic_text::CacheKey, GlyphLocation>,
     buffer: &Buffer,
     visual_origin: Vec2,
     glyphs: &mut Vec<GlyphData>,
@@ -896,9 +1241,8 @@ fn collect_glyphs(
             if let Some(loc) = locations.get(&physical.cache_key) {
                 // 字形相对文本视觉原点的偏移：**全部操作数为整数**——`physical.x` /
                 // `loc.left` / `loc.top` 为整型，`line_y` 先 `ceil` 再减，`visual_origin`
-                // （[`Text::buffer_origin`]）同为整数。整数加减法不会产生小数误差累加，
-                // 结果 `tl` 恒为整数（下方 `debug_assert` 兜底），后续加法链（块偏移 +
-                // 字形偏移）的两侧也都是整数。
+                // （[`Text::buffer_origin`](crate::Text)）同为整数。整数加减法不会产生小数
+                // 误差累加，结果 `tl` 恒为整数（下方 `debug_assert` 兜底）。
                 let glyph_pos = Vec2::new(
                     physical.x as f32 + loc.left as f32,
                     run.line_y.ceil() - loc.top as f32,
@@ -951,413 +1295,9 @@ fn collect_glyphs(
         glyph_count: glyphs.len(),
     };
     (content_size, measure)
-}// ─── TextRender（阶段二：渲染配置，借用缓冲） ───────────────────
-
-/// 阶段二：渲染配置责任链。**借用** `Text` 内部默认缓冲或用户 `TextBuffer`，
-/// 通过 `TextLayout::into_render` / `into_render_with` 构造，无法反向转换。
-#[derive(Debug)]
-pub struct TextRender<'a> {
-    glyphs: &'a mut Vec<GlyphData>,
-    lines: &'a mut Vec<LineMeasureInfo>,
-    content_size: Vec2,
-    measure: MeasureInfo,
-    origin: Vec2,
-    offset: Vec2,
-    color: [f32; 4],
-    transform: Option<Transform2D>,
-    page_size: f32,
-    /// 文本局部裁剪（相对字形 `top_left`，**不含** origin/offset；`cull` 时绘制期剔除）。
-    clip: Option<Rect>,
-    /// 世界坐标裁剪（整块 + 逐字形保守剔除；`cull` 时生效）。
-    clip_world: Option<Rect>,
-    /// 剔除开关（默认 false）。
-    cull: bool,
 }
 
-impl TextRender<'_> {
-    /// 归一化原点（相对内容宽高，[0,1]；`(0,0)` 左上角，`(0.5,0.5)` 居中）。
-    #[inline]
-    pub fn origin(&mut self, norm: impl Into<Vec2>) -> &mut Self {
-        self.origin = norm.into();
-        self
-    }
-
-    /// 像素原点（相对内容左上角的偏移量；接受 `Vec2` 或 `(x, y)`）。
-    #[inline]
-    pub fn origin_px(&mut self, px: impl Into<Vec2>) -> &mut Self {
-        let px = px.into();
-        self.origin = Vec2::new(
-            if self.content_size.x > 0.0 { px.x / self.content_size.x } else { 0.0 },
-            if self.content_size.y > 0.0 { px.y / self.content_size.y } else { 0.0 },
-        );
-        self
-    }
-
-    /// 额外像素偏移（叠加在 origin 之后；接受 `Vec2` 或 `(x, y)`）。
-    #[inline]
-    pub fn offset(&mut self, px: impl Into<Vec2>) -> &mut Self {
-        self.offset = px.into();
-        self
-    }
-
-    /// 全局颜色（RGBA，默认白色）；最终字形颜色 = 全局色 × [`GlyphData::color`]。
-    #[inline]
-    pub fn color(&mut self, color: impl Into<[f32; 4]>) -> &mut Self {
-        self.color = color.into();
-        self
-    }
-
-    /// 渲染级变换（`None` = 单位；作用于整个文本块，旋转/缩放以文本锚点为原点）。
-    #[inline]
-    pub fn transform(&mut self, transform: impl Into<Option<Transform2D>>) -> &mut Self {
-        self.transform = transform.into();
-        self
-    }
-
-    /// 文本局部裁剪区域（相对字形 `top_left` 坐标，**不含** origin/offset）。
-    ///
-    /// 配合 [`Self::cull`]：`cull(true)` 时在**绘制期**剔除裁剪区外的字形
-    /// （对 `into_render` 已做收集期剔除的路径为兜底；`render_from` 路径由此获得剔除）。
-    #[inline]
-    pub fn clip(&mut self, clip: impl Into<Option<Rect>>) -> &mut Self {
-        self.clip = clip.into();
-        self
-    }
-
-    /// 世界坐标裁剪区域（**世界坐标**，含 origin/offset/transform）。
-    ///
-    /// 配合 [`Self::cull`]：`cull(true)` 时先做**整块剔除**（文本块世界 AABB 与裁剪区无交集
-    /// → 整个跳过），再对每个字形做**保守 AABB 剔除**（旋转/缩放后取包围盒，不误杀）。
-    #[inline]
-    pub fn clip_world(&mut self, clip: impl Into<Option<Rect>>) -> &mut Self {
-        self.clip_world = clip.into();
-        self
-    }
-
-    /// 是否启用剔除（默认 **false**，保持现状行为；与 [`Self::clip`] / [`Self::clip_world`] 配合）。
-    #[inline]
-    pub fn cull(&mut self, cull: bool) -> &mut Self {
-        self.cull = cull;
-        self
-    }
-
-    /// 文本块世界包围盒（`content_size` 四角经 `delta` 与渲染变换后的保守 AABB）。
-    #[inline]
-    fn block_world_rect(&self) -> Rect {
-        let delta = self.render_delta();
-        let c = self.content_size;
-        let pts = [
-            Vec2::new(0.0, 0.0) + delta,
-            Vec2::new(c.x, 0.0) + delta,
-            Vec2::new(0.0, c.y) + delta,
-            c + delta,
-        ];
-        match self.transform {
-            Some(t) => Rect::from_point_slice(&t.transform_points(&pts)),
-            None => Rect::from_point_slice(&pts),
-        }
-    }
-
-    /// 遍历并修改每个字形渲染记录（可改 `top_left` / `size` / `color` / `layer` / `transform` / `glyph_type`）。
-    #[inline]
-    pub fn map<F>(&mut self, mut f: F) -> &mut Self
-    where F: FnMut(&mut GlyphData) {
-        for g in self.glyphs.as_mut_slice() {
-            f(g);
-        }
-        self
-    }
-
-    /// 整体测量信息。
-    #[inline]
-    pub fn measure(&self) -> MeasureInfo { self.measure }
-    /// 内容宽高（行盒）。
-    #[inline]
-    pub fn content_size(&self) -> Vec2 { self.content_size }
-    /// 行信息切片。
-    #[inline]
-    pub fn lines(&self) -> &[LineMeasureInfo] { self.lines.as_slice() }
-    /// 字形记录切片。
-    #[inline]
-    pub fn glyphs(&self) -> &[GlyphData] { self.glyphs.as_slice() }
-    /// 字形图集页尺寸（像素；UV 换算用）。
-    #[inline]
-    pub fn page_size(&self) -> f32 { self.page_size }
-
-    /// origin / offset 解析后的叠加量（最终位置 = 字形相对坐标 + 此值）。
-    #[inline]
-    fn render_delta(&self) -> Vec2 {
-        Vec2::new(
-            -self.content_size.x * self.origin.x,
-            -self.content_size.y * self.origin.y,
-        ) + self.offset
-    }
-
-    /// 遍历每个字形调用闭包 `(measure, line, region, transform)`。
-    ///
-    /// 回调**不**携带纹理：字形所属图集页由 `region.page_uid` 标识，调用方自行经
-    /// `rjw_render::TEXTURES.get(page_uid)`（`rjw_atlas` → `rjw_render`）查找。
-    ///
-    /// `cull(true)` 且设置 `clip` / `clip_world` 时：先整块剔除，再逐字形剔除——
-    /// **被剔除字形不回调**（回调只收到可见字形）。
-    #[inline]
-    pub fn draw_with<F>(&self, mut callback: F)
-    where F: FnMut(&MeasureInfo, &LineMeasureInfo, &AtlasRegion, Transform2D)
-    {
-        let delta = self.render_delta();
-        let render = self.transform;
-        let lines = self.lines.as_slice();
-        if self.cull {
-            if let Some(cw) = self.clip_world {
-                if !self.block_world_rect().intersects(&cw) {
-                    return;
-                }
-            }
-        }
-        for g in self.glyphs.as_slice() {
-            let line = &lines[g.line];
-            let tl = g.top_left + delta;
-            if self.cull {
-                if let Some(c) = self.clip {
-                    if !Rect::new(g.top_left.x, g.top_left.y, g.size.x, g.size.y).intersects(&c) {
-                        continue;
-                    }
-                }
-                if let Some(cw) = self.clip_world {
-                    let tr = match g.transform {
-                        Some(t) => t,
-                        None => Transform2D::IDENTITY,
-                    }.with_move_by(tl);
-                    let tr = match render {
-                        Some(t) => tr.with_transform(&t),
-                        None => tr,
-                    };
-                    let local = [
-                        Vec2::ZERO,
-                        Vec2::new(g.size.x, 0.0),
-                        Vec2::new(0.0, g.size.y),
-                        g.size,
-                    ];
-                    let aabb = Rect::from_point_slice(&tr.transform_points(&local));
-                    if !aabb.intersects(&cw) {
-                        continue;
-                    }
-                }
-            }
-            let tr = match g.transform {
-                Some(t) => t,
-                None => Transform2D::IDENTITY,
-            }.with_move_by(tl);
-            let tr = match render {
-                Some(t) => tr.with_transform(&t),
-                None => tr,
-            };
-            callback(&self.measure, line, &g.region, tr);
-        }
-    }
-
-    /// 直接渲染字形精灵到 `Render2D`（feature = `rjw_2d_render`）。
-    ///
-    /// 每个字形的最终层级 = 传入的基础层 + [`GlyphData::layer`]；
-    /// 每个字形可带独立 [`GlyphData::transform`]（`None` = 单位变换）。
-    #[cfg(feature = "rjw_2d_render")]
-    #[inline]
-    pub fn draw_sprite2d(&self, r2d: &mut Render2D, layer: impl Into<Layer>) {
-        let delta = self.render_delta();
-        let base: f64 = layer.into().as_f64();
-        let render = self.transform;
-        if self.cull {
-            if let Some(cw) = self.clip_world {
-                if !self.block_world_rect().intersects(&cw) {
-                    return;
-                }
-            }
-        }
-        for g in self.glyphs.as_slice() {
-            let tl = g.top_left + delta;
-            if self.cull {
-                if let Some(c) = self.clip {
-                    if !Rect::new(g.top_left.x, g.top_left.y, g.size.x, g.size.y).intersects(&c) {
-                        continue;
-                    }
-                }
-            }
-            let Some(tex) = TEXTURES.get(g.region.page_uid) else { continue };
-            let rect = SpriteRect::with_uv_tex(
-                tl, g.size,
-                Vec2::new(g.region.tl_px.0 as f32, g.region.tl_px.1 as f32),
-                Vec2::new(g.region.wh_px.0 as f32, g.region.wh_px.1 as f32),
-                &tex,
-            );
-            let color = if g.glyph_type == GlyphType::Color {
-                // 彩色字形（Emoji）：保留自身 RGBA，不叠加全局 tint
-                Color::from(g.color)
-            } else {
-                Color::from(mul_color(self.color, g.color))
-            };
-            let layer = Layer::from(base + g.layer);
-            let transform = match (render, g.transform) {
-                (Some(rt), Some(gt)) => gt.with_transform(&rt),
-                (Some(rt), None) => rt,
-                (None, Some(gt)) => gt,
-                (None, None) => Transform2D::default(),
-            };
-            if self.cull {
-                if let Some(cw) = self.clip_world {
-                    // 世界坐标 = transform 作用于 rect 四角（mesh_tl + local*mesh_wh）
-                    let local = [
-                        tl,
-                        Vec2::new(tl.x + g.size.x, tl.y),
-                        Vec2::new(tl.x, tl.y + g.size.y),
-                        tl + g.size,
-                    ];
-                    let aabb = Rect::from_point_slice(&transform.transform_points(&local));
-                    if !aabb.intersects(&cw) {
-                        continue;
-                    }
-                }
-            }
-            r2d.sprite(rect, &tex)
-                .color(color)
-                .transform(transform)
-                .layer(layer);
-        }
-    }
-
-    /// 渐变渲染字形（动态 mesh，逐顶点颜色；feature = `rjw_2d_render`）。
-    ///
-    /// `axis` 选择渐变方向，`stops`：`(t ∈ [0,1], color)` 至少两项。按 `mode` 决定渐变域：
-    /// - [`GradientMode::Glyph`]：字形自身跨度；
-    /// - [`GradientMode::Line`]：整行跨度（同一行所有字形共享）；
-    /// - [`GradientMode::Frame`]：整个文本块跨度（跨行）。
-    ///
-    /// 逐字形 `layer` / `transform` 不影响渐变（渐变始终用字形 `top_left` / `size`）。
-    #[cfg(feature = "rjw_2d_render")]
-    pub fn draw_2d_gradient(
-        &self,
-        r2d: &mut Render2D,
-        layer: impl Into<Layer>,
-        mode: GradientMode,
-        axis: GradientAxis,
-        stops: &[(f32, Color)],
-    ) {
-        assert!(stops.len() >= 2, "draw_2d_gradient needs at least 2 stops");
-        let glyphs = self.glyphs.as_slice();
-        if glyphs.is_empty() {
-            return;
-        }
-        let layer: Layer = layer.into();
-        let delta = self.render_delta();
-        let render = self.transform;
-        // 整块剔除（世界）：不可见则整块跳过；渐变域仍基于全部字形（剔除不影响渐变域）。
-        if self.cull {
-            if let Some(cw) = self.clip_world {
-                if !self.block_world_rect().intersects(&cw) {
-                    return;
-                }
-            }
-        }
-        let f32_stops: Vec<(f32, [f32; 4])> = stops.iter().map(|&(t, c)| (t, c.into())).collect();
-
-        // 渐变域（相对坐标，未含 delta）
-        let (mut frame_l, mut frame_r) = (f32::MAX, f32::MIN);
-        let (mut frame_t, mut frame_b) = (f32::MAX, f32::MIN);
-        let n = self.lines.as_slice().len();
-        let mut line_l = vec![f32::MAX; n];
-        let mut line_r = vec![f32::MIN; n];
-        let mut line_t = vec![f32::MAX; n];
-        let mut line_b = vec![f32::MIN; n];
-        for g in glyphs {
-            frame_l = frame_l.min(g.top_left.x);
-            frame_r = frame_r.max(g.top_left.x + g.size.x);
-            frame_t = frame_t.min(g.top_left.y);
-            frame_b = frame_b.max(g.top_left.y + g.size.y);
-            line_l[g.line] = line_l[g.line].min(g.top_left.x);
-            line_r[g.line] = line_r[g.line].max(g.top_left.x + g.size.x);
-            line_t[g.line] = line_t[g.line].min(g.top_left.y);
-            line_b[g.line] = line_b[g.line].max(g.top_left.y + g.size.y);
-        }
-
-        // 按图集页分组（一个 mesh 只绑一张纹理）
-        let mut pages: Vec<(u64, Vec<usize>)> = Vec::new();
-        for (i, g) in glyphs.iter().enumerate() {
-            match pages.iter_mut().find(|(uid, _)| *uid == g.region.page_uid) {
-                Some((_, idxs)) => idxs.push(i),
-                None => pages.push((g.region.page_uid, vec![i])),
-            }
-        }
-
-        for (uid, idxs) in pages {
-            let Some(tex) = TEXTURES.get(uid) else { continue };
-            r2d.mesh_with(|sink| {
-                for &i in &idxs {
-                    let g = &glyphs[i];
-                    let tl = g.top_left + delta;
-                    let br = tl + g.size;
-                    // 剔除（文本局部 + 世界）：渐变域已算完，仅跳过提交。
-                    if self.cull {
-                        if let Some(c) = self.clip {
-                            if !Rect::new(g.top_left.x, g.top_left.y, g.size.x, g.size.y).intersects(&c) {
-                                continue;
-                            }
-                        }
-                    }
-                    let tl_w = match render { Some(t) => t.transform_point(tl), None => tl };
-                    let tr_w = match render { Some(t) => t.transform_point(Vec2::new(br.x, tl.y)), None => Vec2::new(br.x, tl.y) };
-                    let bl_w = match render { Some(t) => t.transform_point(Vec2::new(tl.x, br.y)), None => Vec2::new(tl.x, br.y) };
-                    let br_w = match render { Some(t) => t.transform_point(br), None => br };
-                    if self.cull {
-                        if let Some(cw) = self.clip_world {
-                            let aabb = Rect::from_point_slice(&[tl_w, tr_w, bl_w, br_w]);
-                            if !aabb.intersects(&cw) {
-                                continue;
-                            }
-                        }
-                    }
-                    // (渐变域起, 渐变域止, TL角轴坐标, TR角轴坐标, BL角轴坐标, BR角轴坐标)
-                    let (s0, s1, t_tl, t_tr, t_bl, t_br) = match (axis, mode) {
-                        (GradientAxis::Horizontal, GradientMode::Glyph) => (tl.x, br.x, tl.x, br.x, tl.x, br.x),
-                        (GradientAxis::Horizontal, GradientMode::Line) => (
-                            line_l[g.line] + delta.x, line_r[g.line] + delta.x,
-                            tl.x, br.x, tl.x, br.x,
-                        ),
-                        (GradientAxis::Horizontal, GradientMode::Frame) => (
-                            frame_l + delta.x, frame_r + delta.x,
-                            tl.x, br.x, tl.x, br.x,
-                        ),
-                        (GradientAxis::Vertical, GradientMode::Glyph) => (tl.y, br.y, tl.y, tl.y, br.y, br.y),
-                        (GradientAxis::Vertical, GradientMode::Line) => (
-                            line_t[g.line] + delta.y, line_b[g.line] + delta.y,
-                            tl.y, tl.y, br.y, br.y,
-                        ),
-                        (GradientAxis::Vertical, GradientMode::Frame) => (
-                            frame_t + delta.y, frame_b + delta.y,
-                            tl.y, tl.y, br.y, br.y,
-                        ),
-                    };
-                    let uv0 = Vec2::new(
-                        g.region.tl_px.0 as f32 / self.page_size,
-                        g.region.tl_px.1 as f32 / self.page_size,
-                    );
-                    let uv1 = uv0 + Vec2::new(
-                        g.region.wh_px.0 as f32 / self.page_size,
-                        g.region.wh_px.1 as f32 / self.page_size,
-                    );
-                    let col = |c: f32| mul_color(sample_gradient(&f32_stops, frac_t(s0, s1, c)), g.color);
-                    let i0 = sink.push_vertex_uv_color(tl_w, uv0, col(t_tl));
-                    let i1 = sink.push_vertex_uv_color(tr_w, Vec2::new(uv1.x, uv0.y), col(t_tr));
-                    let i2 = sink.push_vertex_uv_color(bl_w, Vec2::new(uv0.x, uv1.y), col(t_bl));
-                    let i3 = sink.push_vertex_uv_color(br_w, uv1, col(t_br));
-                    sink.push_tri(i0, i1, i2);
-                    sink.push_tri(i1, i3, i2);
-                }
-            })
-            .color(Color::WHITE)
-            .layer(layer)
-            .texture(&tex);
-        }
-    }
-}// ─── 内部工具函数 ───────────────────────────────────────────────
+// ─── 内部工具函数 ───────────────────────────────────────────────
 
 #[inline]
 fn glyph_type_of(content: SwashContent) -> GlyphType {
@@ -1382,7 +1322,7 @@ fn cluster_of(s: &str) -> ArrayVec<u8, GLYPH_CLUSTER_CAP> {
 }
 
 #[inline]
-fn effective_line_height(size: f32, line_height: Option<f32>, line_space: Option<LineSpace>) -> f32 {
+pub(crate) fn effective_line_height(size: f32, line_height: Option<f32>, line_space: Option<LineSpace>) -> f32 {
     let v = match (line_height, line_space) {
         (Some(lh), _) => lh,
         (None, Some(LineSpace::Px(px))) => size * 1.2 + px,
@@ -1465,6 +1405,69 @@ mod tests {
         let c = cluster_of(&long);
         assert_eq!(c.len(), GLYPH_CLUSTER_CAP);
         assert_eq!(std::str::from_utf8(c.as_slice()).unwrap(), &long[..GLYPH_CLUSTER_CAP]);
+    }
+
+    /// `TextStyle` 默认与旧 `Style::default()` 逐位一致（字号 14 / 左对齐 / 无颜色覆盖）。
+    #[test]
+    fn text_style_default_matches_old_style() {
+        let s = TextStyle::default();
+        assert_eq!(s.size, 14.0);
+        assert_eq!(s.align, Align::Left);
+        assert!(s.line_height.is_none() && s.line_space.is_none());
+        assert!(s.color.is_none() && s.origin.is_none() && s.offset.is_none());
+        assert!(s.transform.is_none());
+        assert_eq!(s.attrs.as_attrs(), Attrs::new());
+        // `new()` ≡ `default()`
+        let n = TextStyle::new();
+        assert_eq!(n.size, s.size);
+        assert_eq!(n.align, s.align);
+    }
+
+    /// 样式克隆继承：`base.clone().size(..)` 只改差异。
+    #[test]
+    fn text_style_clone_inherits() {
+        let base = TextStyle::new().font_family("SimHei").size(16.0).align(Align::Center);
+        let warn = base.clone().size(20.0).color([1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(warn.size, 20.0);
+        assert_eq!(warn.align, Align::Center);
+        assert_eq!(base.size, 16.0);
+        assert_eq!(warn.attrs.as_attrs(), base.attrs.as_attrs());
+    }
+
+    /// 定位语言：`at` / `center` / `anchor` / `offset` 的换算与旧 `origin`+`offset` 等价。
+    #[test]
+    fn block_delta_matches_old_origin_offset() {
+        let content = Vec2::new(100.0, 20.0);
+        // 旧：delta = pos - content * origin（origin 归一化）
+        let old = |pos: Vec2, origin: Vec2| pos - Vec2::new(content.x * origin.x, content.y * origin.y);
+        // `at` = 左上角（anchor 默认 (0,0)）
+        assert_eq!(block_delta(content, Vec2::new(5.0, 6.0), Vec2::ZERO, Vec2::ZERO), old(Vec2::new(5.0, 6.0), Vec2::ZERO));
+        // `center` = (0.5,0.5)
+        assert_eq!(
+            block_delta(content, Vec2::new(5.0, 6.0), Vec2::splat(0.5), Vec2::ZERO),
+            old(Vec2::new(5.0, 6.0), Vec2::splat(0.5))
+        );
+        // `anchor` 任意归一化点
+        let a = Vec2::new(0.0, 1.0);
+        assert_eq!(block_delta(content, Vec2::new(5.0, 6.0), a, Vec2::ZERO), old(Vec2::new(5.0, 6.0), a));
+        // `offset` 在锚点换算之后叠加（= 旧 origin + offset 组合）
+        assert_eq!(
+            block_delta(content, Vec2::new(5.0, 6.0), Vec2::splat(0.5), Vec2::new(1.0, -2.0)),
+            old(Vec2::new(5.0, 6.0), Vec2::splat(0.5)) + Vec2::new(1.0, -2.0)
+        );
+    }
+
+    #[cfg(feature = "rjw_2d_render")]
+    #[test]
+    fn gradient_named_constructors() {
+        let stops = [(0.0, Color::BLACK), (1.0, Color::WHITE)];
+        assert_eq!(Gradient::glyph_h(&stops).mode, GradientMode::Glyph);
+        assert_eq!(Gradient::glyph_v(&stops).axis, GradientAxis::Vertical);
+        assert_eq!(Gradient::line_h(&stops).mode, GradientMode::Line);
+        assert_eq!(Gradient::line_v(&stops).axis, GradientAxis::Vertical);
+        assert_eq!(Gradient::frame_h(&stops).mode, GradientMode::Frame);
+        assert_eq!(Gradient::frame_v(&stops).axis, GradientAxis::Vertical);
+        assert_eq!(Gradient::line_h(&stops).stops.len(), 2);
     }
 
     #[cfg(feature = "rjw_2d_render")]

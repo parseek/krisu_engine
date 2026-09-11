@@ -8,32 +8,45 @@
 //! | 排序（索引数组重排） | [`crate::sort`]（[`SortPolicy`] / [`SortMode`]） |
 //! | 剔除（索引数组过滤） | [`crate::cull`]（[`Culler`] / [`Cull`]） |
 //! | 全局默认状态 | [`Render2D::states`] / [`Render2D::set_states`]（`RStates` 唯一状态语言） |
-//! | 提交 | [`Render2D::render`] / [`Render2D::record`] / [`Render2D::encode`] / [`Render2D::acquire_frame`] |
+//! | 提交（录进帧 / pass） | [`Render2D::render`] / [`Render2D::record`] / [`Render2D::record_to`] |
+//! | 帧 / pass 生命周期 | `rjw_render::{RenderContext::begin_frame, RenderFrame, PassScope}` |
 //! | 资源 | [`Render2D::create_texture`] / [`Render2D::register_mesh`] / [`Render2D::texture_layout`] |
 //!
 //! # 每帧流程
 //!
 //! ```text
-//! set_mvp / set_cull / set_sort_mode（可选）
-//!   → sprite/... 入口录制命令（链式 .layer().color()...）
-//!   → render(&ClearConfig)：prepare() 排序 + 剔除 + 分页 → draw() → submit → present
+//! set_camera / set_mvp / set_viewport / set_cull / set_sort_mode（可选）
+//!   → sprite/... 入口录制命令（链式 .layer().tint()...）
+//!   → record(&mut frame, &ClearConfig)：prepare() 排序 + 剔除 + 分页 → draw()
+//!   → render(&mut ctx, &ClearConfig)：= begin_frame + record + present（一行糖）
 //! ```
+//!
+//! **多画面 / 多视口**：一个画面 = 一次 `record` = 一个 pass（`set_camera` 同时带入该画面的
+//! mvp 与屏幕矩形，绘制时自动 `set_viewport` / `set_scissor_rect`）；
+//! 若要让多个渲染器共用同一个 pass（省一次 Load/Store，共用深度附件），用
+//! `frame.begin_pass(..)` + [`rjw_render::PassScope::record`] 多次提交。
 //!
 //! 坐标系（与 `rjw_transform::Camera2D` 一致）：原点在视口中心、X+ 右、Y+ 下。
 
 use std::{collections::HashMap, sync::Arc};
 
-use rjw_render::{ArcTextureWrapped, MeshData, MESHES, TEXTURES, TextureWrapped};
-use rjw_transform::Camera2D;
+use rjw_render::{
+    ArcTextureWrapped, MeshData, MeshId, PassBuilder, PassContext, PassRecorder, TextureWrapped,
+    MESHES, TEXTURES,
+};
+#[cfg(feature = "rjw_atlas")]
+use rjw_atlas::AtlasSprite;
+use rjw_transform::{Camera2D, Rect};
 
 use crate::command::{DrawCommand, DrawCommandQueue, Layer};
 use crate::cull::{self, Cull, Culler};
+use crate::debug_draw::{DebugPainter, DebugStyle};
 use crate::data::{
-    Index, MeshSink, MeshStorage, QUAD_TRI_INDICIES, SpriteRect, TriIndicies, VertexP3U2C4,
+    Index, MeshSink, MeshStorage, QUAD_TRI_INDICIES, SpriteRect, TriIndices, VertexP3U2C4,
 };
 use crate::draw::{Custom, Draw2D, Mesh, Sprite, StaticMesh};
 use crate::draw_page::{
-    DEPTH_FORMAT, DrawOp, DrawPage, InstanceData, MAX_INSTANCES_PER_DRAW, MAX_MESH_VERTS,
+    DrawOp, DrawPage, InstanceData, MAX_INSTANCES_PER_DRAW, MAX_MESH_VERTS,
 };
 use crate::rstates::RStates;
 use crate::sort::{SortKey, SortMode, SortPolicy};
@@ -51,26 +64,6 @@ pub type MeshBuilder<'a> = Draw2D<'a, Mesh>;
 pub type StaticMeshBuilder<'a> = Draw2D<'a, StaticMesh>;
 /// `custom` 返回的 Builder。
 pub type CustomBuilder<'a> = Draw2D<'a, Custom>;
-
-// ─── Clear 配置 ───────────────────────────────────────────────
-
-/// 清屏配置：`None` = 保留旧内容。
-#[derive(Debug, Clone, Copy)]
-pub struct ClearConfig {
-    pub color: Option<wgpu::Color>,
-    pub depth: Option<f32>,
-    pub stencil: Option<u32>,
-}
-
-impl Default for ClearConfig {
-    fn default() -> Self {
-        Self {
-            color: Some(wgpu::Color::BLACK),
-            depth: None,
-            stencil: None,
-        }
-    }
-}
 
 // ─── 合批中间项 ───────────────────────────────────────────────
 
@@ -96,17 +89,26 @@ struct BatchItem {
 // ─── Render2D ─────────────────────────────────────────────────
 
 pub struct Render2D {
-    surface: &'static wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// 颜色附件格式（= surface 格式；构造期固定）。
+    format: wgpu::TextureFormat,
+    /// 深度 / 模板附件格式（构造期固定；**不进管线缓存 key**）。
+    depth_format: wgpu::TextureFormat,
     tex_bind_group_layout: wgpu::BindGroupLayout,
     white_texture: ArcTextureWrapped,
     mesh_storage: MeshStorage,
     command_queue: DrawCommandQueue,
     draw_page: DrawPage,
-    depth_view: Option<wgpu::TextureView>,
-    depth_size: (u32, u32),
-    mvp: glam::Mat4,
+    /// 本画面的 VP（由 [`Render2D::camera`] / [`Render2D::submit`] 设定；
+    /// 提交时经 [`rjw_render::PassRecorder::view_projection`] 交给**帧级 VP 槽环**）。
+    vp: glam::Mat4,
+    /// 本画面的屏幕矩形（像素、左上原点）：`Some` ⇒ 绘制时 `set_viewport` + `set_scissor_rect`；
+    /// `None`（默认）= 全屏、不调用（与旧行为逐位等价、零开销）。多画面用
+    /// [`Render2D::camera`] 或 [`Render2D::viewport`] 设定。
+    viewport: Option<Rect>,
+    /// scissor 覆盖（`None` = 跟随 [`Self::viewport`]；防止旋转相机 / 大几何越界串味）。
+    scissor: Option<Rect>,
 
     /// 排序模式（[`Render2D::set_sort_mode`]，默认 [`SortMode::LayerAndStates`]）。
     sort_mode: SortMode,
@@ -132,7 +134,7 @@ pub struct Render2D {
     buf_instances: Vec<InstanceData>,
     buf_ops: Vec<DrawOp>,
     buf_all_verts: Vec<VertexP3U2C4>,
-    buf_all_tris: Vec<TriIndicies>,
+    buf_all_tris: Vec<TriIndices>,
     buf_padded: Vec<u8>,
     buf_custom_draws: Vec<Arc<dyn CustomDraw>>,
     /// 排序键常驻缓冲（每帧复用，零堆分配）。
@@ -140,59 +142,33 @@ pub struct Render2D {
 }
 
 impl Render2D {
+    /// 从 [`rjw_render::RenderContext`] 构造（取 `Gpu` 能力对象 + 格式）。
+    ///
+    /// **不持有 surface / VP**：取帧与 present 走 `RenderContext`（唯一取帧权威）；
+    /// VP 由帧级槽环按 pass 提供（见 [`Self::submit`]）。
     pub fn new(render: &rjw_render::RenderContext) -> Self {
-        let device = render.device().clone();
-        let queue = render.queue().clone();
+        let gpu = render.gpu();
+        let device = gpu.device();
+        let queue = gpu.queue();
         let surface_format = render.format();
-        let surface: &'static wgpu::Surface<'static> =
-            unsafe { std::mem::transmute(render.surface()) };
+        let depth_format = render.depth_format();
 
-        let vp_bl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Render2D: VP bind group layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let tex_bl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Render2D: Texture bind group layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+        // 纹理 / VP bind group layout 由 `Gpu` 统一提供（子系统间可复用 bind group）。
+        let vp_bl = gpu.vp_layout().clone();
+        let tex_bl = gpu.texture_layout().clone();
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Render2D: Default Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("sprite.wgsl").into()),
         });
         let draw_page = DrawPage::new(
-            &device,
+            device,
             &vp_bl,
             &tex_bl,
             shader,
             surface_format,
+            depth_format,
             MAX_INSTANCES_PER_DRAW,
-            glam::Mat4::IDENTITY,
         );
         // 注册四边形为静态网格（Sprite 与 StaticMesh 共用实例化绘制路径）。
         let quad_mesh_id = MESHES.register(Arc::new(MeshData::from_buffers(
@@ -201,8 +177,8 @@ impl Render2D {
             QUAD_TRI_INDICIES.len() as u32,
         )));
         let white_texture = Arc::new(TextureWrapped::from_rgba8(
-            &device,
-            &queue,
+            device,
+            queue,
             "Render2D: White Texture",
             &[255, 255, 255, 255],
             1,
@@ -218,17 +194,18 @@ impl Render2D {
         culler.set_viewport(cull::viewport_world_rect(&glam::Mat4::IDENTITY));
 
         Self {
-            surface,
-            device,
-            queue,
+            device: device.clone(),
+            queue: queue.clone(),
+            format: surface_format,
+            depth_format,
             tex_bind_group_layout: tex_bl,
             white_texture,
             mesh_storage: MeshStorage::default(),
             command_queue: DrawCommandQueue::default(),
             draw_page,
-            depth_view: None,
-            depth_size: (0, 0),
-            mvp: glam::Mat4::IDENTITY,
+            vp: glam::Mat4::IDENTITY,
+            viewport: None,
+            scissor: None,
             sort_mode: SortMode::LayerAndStates,
             sorter: None,
             culler,
@@ -248,14 +225,70 @@ impl Render2D {
         }
     }
 
-    // ── 相机 / 排序 / 剔除 / 全局状态 ───────────────────────
+    // ── 画面（多视口） / 排序 / 剔除 / 全局状态 ─────────────
 
-    /// 设置 VP（视图投影）矩阵（每帧渲染前调用）；同时刷新 `Cull::Viewport` 的视口矩形。
-    pub fn set_mvp(&mut self, vp: glam::Mat4) -> &mut Self {
-        self.mvp = vp;
-        self.culler.set_viewport(cull::viewport_world_rect(&vp));
-        self.draw_page.update_vp(&self.queue, vp);
+    /// 以 2D 相机设定**本画面**：VP（= `cam.vp_matrix()`）与屏幕矩形（= `cam.region`）。
+    ///
+    /// 这是"一个画面 = 一次 [`Self::submit`]"的准备步骤；[`Self::submit`] 会自动调用它。
+    /// 相机**由调用方持有**（`Render2D` 不存储相机）；VP 只在提交那一刻被读取 ⇒
+    /// 没有「先设相机还是先改姿态」的隐式顺序契约。
+    pub fn camera(&mut self, cam: &Camera2D) -> &mut Self {
+        self.vp = cam.vp_matrix();
+        self.culler.set_viewport(cull::viewport_world_rect(&self.vp));
+        self.viewport = Some(cam.region.normalized());
         self
+    }
+
+    /// 设定本画面的屏幕矩形（像素、左上原点；UI 等"屏幕固定"渲染用）。
+    ///
+    /// 绘制时 `set_viewport` 并把 scissor 同步为该矩形；矩形会按目标尺寸钳制 / 取整。
+    pub fn viewport(&mut self, rect: Rect) -> &mut Self {
+        self.viewport = Some(rect.normalized());
+        self
+    }
+
+    /// 恢复默认：全屏、无 scissor、出厂渲染状态（零开销，等价单画面旧行为）。
+    pub fn reset(&mut self) -> &mut Self {
+        self.viewport = None;
+        self.scissor = None;
+        self.default_states = RStates::default();
+        self.culler = Culler::new(Cull::Off);
+        self
+    }
+
+    /// 覆盖 scissor 矩形（`None` = 跟随 [`Self::viewport`]）。
+    pub fn scissor(&mut self, rect: Option<Rect>) -> &mut Self {
+        self.scissor = rect.map(|r| r.normalized());
+        self
+    }
+
+    /// 当前画面矩形（`None` = 全屏）。
+    #[inline]
+    pub fn current_viewport(&self) -> Option<Rect> {
+        self.viewport
+    }
+
+    // ── 格式 / 附件需求 ─────────────────────────────────────
+
+    /// 颜色附件格式（= surface 格式，构造期固定）。
+    #[inline]
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+
+    /// 深度 / 模板附件格式（构造期固定；**不进管线缓存 key**）。
+    #[inline]
+    pub fn depth_format(&self) -> wgpu::TextureFormat {
+        self.depth_format
+    }
+
+    /// 当前录制的命令里是否有声明 depth / stencil 状态者 ⇒ **需要深度附件**。
+    ///
+    /// 注：正常路径**不需要**调用方判断——[`PassBuilder`] 在写入时自动推导。
+    /// 本方法保留为诊断 / 自定义 pass 组合用。
+    #[inline]
+    pub fn will_use_depth_stencil(&self) -> bool {
+        self.command_queue.requires_depth_stencil()
     }
 
     /// 命令排序模式（默认 [`SortMode::LayerAndStates`]）。
@@ -264,15 +297,15 @@ impl Render2D {
     /// - [`SortMode::LayerOnly`]：仅按 layer 稳定排序（同层保持录制顺序），UI 适用；
     /// - [`SortMode::None`]：完全按录制顺序（相邻同状态仍合批）。
     #[inline]
-    pub fn set_sort_mode(&mut self, mode: SortMode) -> &mut Self {
+    pub fn sort(&mut self, mode: SortMode) -> &mut Self {
         self.sort_mode = mode;
         self
     }
 
-    /// 自定义排序策略（覆盖 [`Self::set_sort_mode`]；传 `None` 恢复内置模式）。
+    /// 自定义排序策略（覆盖 [`Self::sort`]）。
     #[inline]
-    pub fn set_sorter(&mut self, sorter: Option<Box<dyn SortPolicy>>) -> &mut Self {
-        self.sorter = sorter;
+    pub fn sort_custom(&mut self, sorter: Box<dyn SortPolicy>) -> &mut Self {
+        self.sorter = Some(sorter);
         self
     }
 
@@ -284,21 +317,17 @@ impl Render2D {
 
     /// 剔除模式（**单一入口**，无隐式联动）：
     /// [`Cull::Off`] / [`Cull::Viewport`] / [`Cull::Rect`] / [`Cull::Fn`]。
+    ///
+    /// 以相机剔除：`r2d.cull(Cull::from(&cam))`。
     #[inline]
-    pub fn set_cull(&mut self, cull: impl Into<Cull>) -> &mut Self {
+    pub fn cull(&mut self, cull: impl Into<Cull>) -> &mut Self {
         self.culler.set(cull.into());
         self
     }
 
-    /// 以 2D 相机剔除（`None` = 关闭；等价 `set_cull(Cull::from(&cam))`）。
-    #[inline]
-    pub fn set_cull_camera(&mut self, cam: Option<&Camera2D>) -> &mut Self {
-        self.set_cull(cam.map(Cull::from).unwrap_or(Cull::Off))
-    }
-
     /// 当前剔除模式。
     #[inline]
-    pub fn cull(&self) -> &Cull {
+    pub fn cull_mode(&self) -> &Cull {
         self.culler.mode()
     }
 
@@ -321,66 +350,21 @@ impl Render2D {
     }
 
     /// 设置全局默认渲染状态（**唯一状态入口**）：
-    /// `r2d.set_states(RStates::new().blend(Additive).depth_test(true))`。
+    /// `r2d.states(RStates::new().blend(Additive).depth_test(true))`。
     #[inline]
-    pub fn set_states(&mut self, states: RStates) -> &mut Self {
+    pub fn states_mut(&mut self, states: RStates) -> &mut Self {
         self.default_states = states;
         self
     }
 
-    /// 重置全局默认状态为出厂默认（全零 bitfield）。
-    #[inline]
-    pub fn reset_states(&mut self) -> &mut Self {
-        self.default_states = RStates::default();
-        self
-    }
-
-    // ── 资源 ────────────────────────────────────────────────
+    // ── 资源（低层逃生口；happy path 一律走 `Gfx::{texture,mesh}`） ──
 
     /// 纹理 bind group layout（自建 bind group 的下游用：`rjw_text` / `rjw_ui` 等）。
+    ///
+    /// 与 `Gfx::texture_layout()` 是同一份 layout（同一设备 → 可互相复用 bind group）。
     #[inline]
     pub fn texture_layout(&self) -> &wgpu::BindGroupLayout {
         &self.tex_bind_group_layout
-    }
-
-    /// 创建 RGBA8 纹理并注册进全局 `TEXTURES`
-    /// （`data.len()` 必须等于 `w * h * 4`，否则 panic）。
-    pub fn create_texture(
-        &mut self,
-        label: &str,
-        data: &[u8],
-        w: u32,
-        h: u32,
-    ) -> ArcTextureWrapped {
-        assert_eq!(
-            data.len(),
-            (w as usize) * (h as usize) * 4,
-            "RGBA8 data length mismatch"
-        );
-        let tex = Arc::new(TextureWrapped::from_rgba8(
-            &self.device,
-            &self.queue,
-            label,
-            data,
-            w,
-            h,
-        ));
-        TEXTURES.register(tex.clone());
-        tex
-    }
-
-    /// 注册已有纹理进全局 `TEXTURES`。
-    #[inline]
-    pub fn register_texture(&self, tex: ArcTextureWrapped) {
-        TEXTURES.register(tex);
-    }
-
-    /// 注册静态网格到全局 `MESHES`，返回可复用 `mesh_id`。
-    ///
-    /// 相同内容的网格应**复用同一个** `Arc<MeshData>` 注册，否则无法合批。
-    #[inline]
-    pub fn register_mesh(&self, mesh: Arc<MeshData>) -> u64 {
-        MESHES.register(mesh)
     }
 
     /// 1×1 白色纹理（纯色绘制用；`solid` 内部即用它）。
@@ -389,25 +373,27 @@ impl Render2D {
         &self.white_texture
     }
 
+    /// 设备（低层逃生口：自建缓冲 / 管线）。
     #[inline]
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
 
+    /// 队列（低层逃生口）。
     #[inline]
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
 
-    /// 当前 VP 矩阵。
+    /// 当前 VP 矩阵（本画面的；未设相机时为 [`glam::Mat4::IDENTITY`]）。
     #[inline]
-    pub fn mvp(&self) -> glam::Mat4 {
-        self.mvp
+    pub fn current_vp(&self) -> glam::Mat4 {
+        self.vp
     }
 
     // ── 录制入口（画什么）：数据版 ──────────────────────────
 
-    /// 贴纹理精灵：`r2d.sprite(rect, &tex).color(..).transform(..).layer(..)`。
+    /// 贴纹理精灵：`r2d.sprite(rect, &tex).tint(..).transform(..).layer(..)`。
     #[inline]
     pub fn sprite(
         &mut self,
@@ -422,15 +408,45 @@ impl Render2D {
         )
     }
 
-    /// 纯色精灵（内部用 1×1 白纹理）：`r2d.solid(rect).color(..)`。
+    /// 纯色精灵（内部用 1×1 白纹理）：`r2d.solid(rect).tint(..)`。
     #[inline]
     pub fn solid(&mut self, rect: impl Into<SpriteRect>) -> SpriteBuilder<'_> {
         let uid = self.white_texture.uid;
         Draw2D::sprite(&mut self.command_queue, &mut self.mesh_storage, rect.into(), uid)
     }
 
+    /// **图集直达**：把 `DynamicAtlas::sprite(&handle)` 的产物一次提交。
+    ///
+    /// 取代「`TEXTURES.get(page_uid)` + 手算像素→归一化 UV + `SpriteRect::with_uv_tex`」三步：
+    ///
+    /// ```ignore
+    /// if let Some(spr) = atlas.sprite(&handle) {
+    ///     f.draw().region(spr).tint(Color::WHITE).layer(0.0);
+    /// }
+    /// ```
+    ///
+    /// 初始 mesh 左上角在原点、尺寸 = 图集区域尺寸；用 `.at(..)` / `.transform(..)` 摆位。
+    pub fn region(&mut self, sprite: AtlasSprite) -> SpriteBuilder<'_> {
+        let region = sprite.region;
+        let tex_w = (sprite.texture.width as f32).max(1.0);
+        let tex_h = (sprite.texture.height as f32).max(1.0);
+        let (uw, uh) = (region.wh_px.0 as f32, region.wh_px.1 as f32);
+        let rect = SpriteRect {
+            mesh_tl: glam::Vec2::ZERO,
+            mesh_wh: glam::Vec2::new(uw, uh),
+            uv_tl: glam::Vec2::new(region.tl_px.0 as f32 / tex_w, region.tl_px.1 as f32 / tex_h),
+            uv_wh: glam::Vec2::new(uw / tex_w, uh / tex_h),
+        };
+        Draw2D::sprite(
+            &mut self.command_queue,
+            &mut self.mesh_storage,
+            rect,
+            sprite.texture.uid,
+        )
+    }
+
     /// 四边形段（顶点由调用者提供，顺序 **TL, TR, BL, BR**）：
-    /// `r2d.quads(&verts, &tex).transform(tf).color(tint).layer(l)`。
+    /// `r2d.quads(&verts, &tex).transform(tf).tint(tint).layer(l)`。
     #[inline]
     pub fn quads(
         &mut self,
@@ -463,7 +479,7 @@ impl Render2D {
     // ── 录制入口（画什么）：网格 / 多边形 / 流式 ────────────
 
     /// 显式顶点 + 三角形索引（世界坐标；默认白纹理）：
-    /// `r2d.mesh(&verts, &tris).color(..).transform(..).layer(..)`。
+    /// `r2d.mesh(&verts, &tris).tint(..).transform(..).layer(..)`。
     #[inline]
     pub fn mesh(&mut self, vertices: &[glam::Vec2], tri_indices: &[u16]) -> MeshBuilder<'_> {
         Draw2D::mesh(
@@ -485,23 +501,9 @@ impl Render2D {
         Draw2D::mesh_with(&mut self.command_queue, &mut self.mesh_storage, f, None)
     }
 
-    /// 预分配流式构造网格（已知顶点 / 三角形数时的零重分配快路径）。
-    #[inline]
-    pub fn mesh_with_cap<F>(&mut self, max_verts: usize, max_tris: usize, f: F) -> MeshBuilder<'_>
-    where
-        F: FnOnce(&mut [VertexP3U2C4], &mut [TriIndicies]) -> (usize, usize),
-    {
-        Draw2D::mesh_with_cap(
-            &mut self.command_queue,
-            &mut self.mesh_storage,
-            max_verts,
-            max_tris,
-            f,
-            None,
-        )
-    }
-
-    /// 多边形（**fan 三角化**：首顶点为中心）：`r2d.polygon(&verts).color(..).layer(..)`。
+    /// 多边形（**fan 三角化**：首顶点为中心）：`r2d.polygon(&verts).tint(..).layer(..)`。
+    ///
+    /// 需要 UV 的多边形用 [`Self::polygon_with`]（`p.vertex_uv(..)`）。
     #[inline]
     pub fn polygon(&mut self, vertices: &[glam::Vec2]) -> MeshBuilder<'_> {
         Draw2D::polygon(
@@ -509,18 +511,6 @@ impl Render2D {
             &mut self.mesh_storage,
             vertices,
             None,
-            None,
-        )
-    }
-
-    /// 带 UV 的多边形（`vertices` 与 `uvs` 等长；fan 三角化）。
-    #[inline]
-    pub fn polygon_uv(&mut self, vertices: &[glam::Vec2], uvs: &[glam::Vec2]) -> MeshBuilder<'_> {
-        Draw2D::polygon(
-            &mut self.command_queue,
-            &mut self.mesh_storage,
-            vertices,
-            Some(uvs),
             None,
         )
     }
@@ -536,21 +526,23 @@ impl Render2D {
     }
 
     /// 静态网格实例（`MESHES` 注册表 + 实例化合批）：
-    /// `r2d.static_mesh(id, &tex).color(..).transform(tf).layer(..)`。
+    /// `r2d.static_mesh(id, &tex).tint(..).transform(tf).layer(..)`。
+    ///
+    /// `id` 由 `Gfx::mesh(..)`（或 `MESHES.register`）产出——类型化句柄，不再收裸 `u64`。
     #[inline]
     pub fn static_mesh(
         &mut self,
-        mesh_id: u64,
+        mesh_id: MeshId,
         texture: &ArcTextureWrapped,
     ) -> StaticMeshBuilder<'_> {
         debug_assert!(
-            MESHES.contains_uid(mesh_id),
-            "mesh {mesh_id} is not registered in MESHES"
+            MESHES.contains_uid(mesh_id.uid()),
+            "mesh {mesh_id:?} is not registered in MESHES"
         );
         Draw2D::static_mesh(
             &mut self.command_queue,
             &mut self.mesh_storage,
-            mesh_id,
+            mesh_id.uid(),
             texture.uid,
         )
     }
@@ -566,12 +558,24 @@ impl Render2D {
         Draw2D::custom(&mut self.command_queue, &mut self.mesh_storage, idx)
     }
 
+    // ── 录制入口（画什么）：调试图元 ────────────────────────
+
+    /// 调试图元：`r2d.debug(DebugStyle::new(Color::RED).width(2.0)).line(a, b);`
+    ///
+    /// 返回的 [`DebugPainter`] 借用本渲染器（独占），其上一个 `debug(..)` 段内的图元
+    /// 共享同一份 [`DebugStyle`]（颜色 / 线宽 / 层级 / 圆分段数）——同一风格的连续图元
+    /// 只写一次样式。几何与层级语义见 [`crate::debug_draw`]。
+    #[inline]
+    pub fn debug(&mut self, style: impl Into<DebugStyle>) -> DebugPainter<'_> {
+        DebugPainter::new(self, style.into())
+    }
+
     // ── 提交（何时画） ─────────────────────────────────────
 
-    /// 清空本帧录制内容（命令队列 / 动态网格 / 外部绘制句柄）。
+    /// 清空已录制内容（命令队列 / 动态网格 / 外部绘制句柄）。
     ///
-    /// 三个提交出口（[`Self::render`] / [`Self::record`] / [`Self::encode`]）都以此收尾，
-    /// 契约一致：**提交即清帧**。
+    /// 所有出口（[`Self::render`] / [`Self::submit`]）都以此收尾，契约一致：
+    /// **提交即清帧**（下一次 `submit` 从空队列开始 = 下一个画面）。
     #[inline]
     fn clear_frame(&mut self) {
         self.command_queue.clear();
@@ -579,122 +583,44 @@ impl Render2D {
         self.buf_custom_draws.clear();
     }
 
-    /// 全流程提交：`acquire_frame` → `prepare` → 绘制 → submit → `present`。
+    /// **丢弃**未提交的录制（命令队列 / 动态网格 / 外部绘制句柄）。
     ///
-    /// 取帧失败（超时 / 丢失）时仅清帧并返回，不 panic。
-    pub fn render(&mut self, clear: &ClearConfig) -> &mut Self {
-        let Some((st, view)) = self.acquire_frame() else {
+    /// 用于「无帧帧」或应用主动放弃本帧渲染时：录制不会跨帧累积。
+    #[inline]
+    pub fn discard(&mut self) {
+        self.clear_frame();
+    }
+
+    /// 全流程一行糖（单画面）：取帧 → 用当前相机提交 → present。
+    ///
+    /// 取帧失败（最小化 / 遮挡 / 超时 / 丢失）时仅清帧并返回，不 panic。
+    /// 相机由 [`Self::camera`] 预先设定（未设 = 单位 VP + 全屏）。
+    pub fn render(
+        &mut self,
+        render: &mut rjw_render::RenderContext,
+        clear: impl Into<rjw_render::Clear>,
+    ) -> &mut Self {
+        let clear = clear.into();
+        let Some(mut frame) = render.acquire_frame() else {
             self.clear_frame();
             return self;
         };
-        self.prepare();
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render2D: encoder"),
-            });
-        let nd = clear.depth.is_some() || clear.stencil.is_some();
-        let size = self
-            .surface
-            .get_configuration()
-            .map(|c| (c.width, c.height))
-            .unwrap_or((1, 1));
-        if nd {
-            self.ensure_depth(size.0, size.1);
-        }
-        let dv = if nd { self.depth_view.as_ref() } else { None };
+        let vp = self.view_projection();
         {
-            let co = color_ops(clear.color);
-            let dsa = depth_attachment(dv, clear);
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render2D: RenderPass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: co,
-                })],
-                depth_stencil_attachment: dsa,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-            self.draw(&mut pass);
+            let mut pass = frame.pass(clear);
+            let _ = vp; // VP 由 PassRecorder 契约提供
+            pass.record(self);
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
-        self.queue.present(st);
-        self.clear_frame();
+        frame.present();
         self
     }
 
-    /// 把当前队列**只录制进用户自建的 `wgpu::RenderPass`**（不编码 / 不提交）。
+    /// 把当前队列提交为**一个画面**（= 一个 pass，使用 `cam` 的 VP 与屏幕矩形），随后清帧。
     ///
-    /// 适合离屏渲染 / 自定义 pass 组合；录制后清帧（与 [`Self::render`] 一致）。
-    pub fn record(&mut self, pass: &mut wgpu::RenderPass<'_>) {
-        self.prepare();
-        self.draw(pass);
-        self.clear_frame();
-    }
-
-    /// 把当前队列**只编码为 `wgpu::CommandBuffer`**（不提交 / 不 present）。
-    ///
-    /// - `target`：渲染目标纹理视图（离屏纹理 / surface view 均可）；
-    /// - `depth`：可选外部深度/模板视图；传 `None` 且 `clear` 需要深度时，
-    ///   自动按 `target` 尺寸创建 / 复用内部深度纹理。
-    ///
-    /// 编码后清帧（与 [`Self::render`] / [`Self::record`] 一致）。
-    pub fn encode(
-        &mut self,
-        clear: &ClearConfig,
-        target: &wgpu::TextureView,
-        depth: Option<&wgpu::TextureView>,
-    ) -> wgpu::CommandBuffer {
-        self.prepare();
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render2D: command buffer encoder"),
-            });
-        let nd = clear.depth.is_some() || clear.stencil.is_some();
-        if nd && depth.is_none() {
-            let size = target.texture().size();
-            self.ensure_depth(size.width, size.height);
-        }
-        let dv = if nd { depth.or(self.depth_view.as_ref()) } else { None };
-        {
-            let co = color_ops(clear.color);
-            let dsa = depth_attachment(dv, clear);
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render2D: command buffer pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: co,
-                })],
-                depth_stencil_attachment: dsa,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-            self.draw(&mut pass);
-        }
-        let cb = encoder.finish();
-        self.clear_frame();
-        cb
-    }
-
-    /// 取当前表面帧（`None` = 取帧失败 / 丢失，调用方应跳过本帧）。
-    pub fn acquire_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
-        let t = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            _ => return None,
-        };
-        let v = t
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        Some((t, v))
+    /// 多画面 = 多次调用（各自 `cam`），每次一个独立的 VP 槽 ⇒ 互不干扰（修 B1）。
+    pub fn submit<'f>(&'f mut self, pass: &mut PassBuilder<'f>, cam: &Camera2D) {
+        let _ = self.camera(cam);
+        pass.record(self);
     }
 
     // ── prepare：排序（索引数组）→ 剔除（索引数组）→ 合批 → 上传 ──
@@ -941,7 +867,7 @@ impl Render2D {
                     if vn != 0 && tn != 0 {
                         let rb = (dyn_accum_verts as i64) - (vert.start as i64);
                         for t in &self.mesh_storage.tri_indices[tri_index.clone()] {
-                            self.buf_all_tris.push(TriIndicies(
+                            self.buf_all_tris.push(TriIndices(
                                 Index((t.0.0 as i64 + rb) as u16),
                                 Index((t.1.0 as i64 + rb) as u16),
                                 Index((t.2.0 as i64 + rb) as u16),
@@ -970,7 +896,7 @@ impl Render2D {
                     if vn != 0 && tn != 0 {
                         let rb = (dyn_accum_verts as i64) - (vert.start as i64);
                         for t in &self.mesh_storage.tri_indices[tri_index.clone()] {
-                            self.buf_all_tris.push(TriIndicies(
+                            self.buf_all_tris.push(TriIndices(
                                 Index((t.0.0 as i64 + rb) as u16),
                                 Index((t.1.0 as i64 + rb) as u16),
                                 Index((t.2.0 as i64 + rb) as u16),
@@ -998,7 +924,7 @@ impl Render2D {
         // ── 上传实例缓冲 ──
         if !self.buf_instances.is_empty() {
             let pc =
-                (self.buf_instances.len() + MAX_INSTANCES_PER_DRAW - 1) / MAX_INSTANCES_PER_DRAW;
+                self.buf_instances.len().div_ceil(MAX_INSTANCES_PER_DRAW);
             self.draw_page.ensure_instance_pages(&self.device, pc);
             let mut pi = 0;
             let mut s = 0;
@@ -1096,7 +1022,29 @@ impl Render2D {
         pass.set_bind_group(1, &bg, &[]);
     }
 
-    fn draw(&mut self, pass: &mut wgpu::RenderPass<'_>) {
+    /// 应用本画面的 viewport / scissor（像素、左上原点；按目标尺寸钳制并取整）。
+    ///
+    /// - `viewport = None`（默认 / [`Render2D::reset`]）⇒ 不调用，wgpu 默认即全目标
+    ///   （与单画面旧行为逐位等价、零开销）；
+    /// - scissor 默认与视口一致：旋转相机 / 大几何画出矩形之外时，防止画面互相串味。
+    fn apply_viewport(&self, pass: &mut wgpu::RenderPass<'_>, target_size: (u32, u32)) {
+        let Some(v) = self.viewport else {
+            return;
+        };
+        let Some((vp, sc)) = clamp_viewport(v, self.scissor, target_size) else {
+            return;
+        };
+        pass.set_viewport(vp.0, vp.1, vp.2, vp.3, 0.0, 1.0);
+        pass.set_scissor_rect(sc.0, sc.1, sc.2, sc.3);
+    }
+
+    /// 把 `prepare()` 的合批结果写进 pass。
+    ///
+    /// `ctx` 提供 pass 目标尺寸（视口钳制用）与**本 recorder 专属的 VP 槽**
+    /// （bind group + 动态偏移；一帧内多画面互不干扰）。
+    fn draw(&mut self, pass: &mut wgpu::RenderPass<'_>, ctx: PassContext<'_>) {
+        let target_size = ctx.target_size;
+        self.apply_viewport(pass, target_size);
         if self.buf_ops.is_empty() {
             return;
         }
@@ -1123,11 +1071,14 @@ impl Render2D {
                     let count = instance_range.end - instance_range.start;
                     if count != 0 {
                         let mesh = MESHES.get(mesh_id).expect("mesh not registered");
-                        let pipeline = self
-                            .draw_page
-                            .get_or_create_pipeline(&self.device, rstates);
+                        let pipeline = self.draw_page.get_or_create_pipeline(
+                            &self.device,
+                            rstates,
+                            self.depth_format,
+                            ctx.has_depth_stencil,
+                        );
                         pass.set_pipeline(pipeline);
-                        pass.set_bind_group(0, &self.draw_page.vp_bind_group, &[]);
+                        pass.set_bind_group(0, ctx.vp_bind_group, &[ctx.vp_offset]);
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         pass.set_vertex_buffer(
                             1,
@@ -1161,11 +1112,14 @@ impl Render2D {
                     );
                     let count = instance_range.end - instance_range.start;
                     if count != 0 {
-                        let pipeline = self
-                            .draw_page
-                            .get_or_create_pipeline(&self.device, rstates);
+                        let pipeline = self.draw_page.get_or_create_pipeline(
+                            &self.device,
+                            rstates,
+                            self.depth_format,
+                            ctx.has_depth_stencil,
+                        );
                         pass.set_pipeline(pipeline);
-                        pass.set_bind_group(0, &self.draw_page.vp_bind_group, &[]);
+                        pass.set_bind_group(0, ctx.vp_bind_group, &[ctx.vp_offset]);
                         pass.set_vertex_buffer(0, self.draw_page.mesh_vb.slice(..));
                         pass.set_vertex_buffer(
                             1,
@@ -1191,67 +1145,108 @@ impl Render2D {
         }
     }
 
-    fn ensure_depth(&mut self, w: u32, h: u32) {
-        if self
-            .depth_view
-            .as_ref()
-            .is_some_and(|_| self.depth_size == (w.max(1), h.max(1)))
-        {
-            return;
-        }
-        let t = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth-stencil"),
-            size: wgpu::Extent3d {
-                width: w.max(1),
-                height: h.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        self.depth_view = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
-        self.depth_size = (w.max(1), h.max(1));
+}
+
+// ─── PassRecorder：把队列录进任意 pass（同 pass 多次提交的支持点）──
+
+impl PassRecorder for Render2D {
+    #[inline]
+    fn uses_depth_stencil(&self) -> bool {
+        self.will_use_depth_stencil()
+    }
+
+    #[inline]
+    fn view_projection(&self) -> rjw_render::Matrix4x4 {
+        self.vp.to_cols_array_2d()
+    }
+
+    fn record_into(&mut self, pass: &mut wgpu::RenderPass<'_>, ctx: PassContext<'_>) {
+        self.prepare();
+        self.draw(pass, ctx);
+        self.clear_frame();
     }
 }
 
-// ─── Pass 附件辅助（render / encode 共用） ─────────────────────
+// ─── 视口换算（纯函数：便于单测） ──────────────────────────────
 
-/// 颜色附件操作（`None` = 保留旧内容）。
-fn color_ops(color: Option<wgpu::Color>) -> wgpu::Operations<wgpu::Color> {
-    match color {
-        Some(c) => wgpu::Operations {
-            load: wgpu::LoadOp::Clear(c),
-            store: wgpu::StoreOp::Store,
-        },
-        None => wgpu::Operations {
-            load: wgpu::LoadOp::Load,
-            store: wgpu::StoreOp::Store,
-        },
-    }
-}
+/// 把画面矩形换算成 `set_viewport` / `set_scissor_rect` 的参数：
+/// 按目标尺寸钳制 + 取整；矩形与目标不相交（宽或高 < 1px）时返回 `None`（不设置）。
+///
+/// `(viewport, scissor)` 的 wgpu 原始形态：`viewport = (x, y, w, h)` 浮点、
+/// `scissor = (x, y, w, h)` 无符号整数。
+pub(crate) type ViewportScissor = ((f32, f32, f32, f32), (u32, u32, u32, u32));
 
-/// 深度/模板附件（`clear` 未要求清除或视图为空时返回 `None`）。
-fn depth_attachment<'a>(
-    view: Option<&'a wgpu::TextureView>,
-    clear: &ClearConfig,
-) -> Option<wgpu::RenderPassDepthStencilAttachment<'a>> {
-    if clear.depth.is_none() && clear.stencil.is_none() {
+/// 把画面矩形与裁剪矩形夹到渲染目标范围内（含 DPI / 越界钳制 / 空矩形判定）。
+///
+/// 返回 `(viewport(x, y, w, h), scissor(x, y, w, h))`。
+pub(crate) fn clamp_viewport(
+    viewport: Rect,
+    scissor: Option<Rect>,
+    target_size: (u32, u32),
+) -> Option<ViewportScissor> {
+    let (tw, th) = (target_size.0 as f32, target_size.1 as f32);
+    let v = viewport.normalized();
+    let x = v.x.clamp(0.0, tw);
+    let y = v.y.clamp(0.0, th);
+    let w = v.w.clamp(0.0, tw - x);
+    let h = v.h.clamp(0.0, th - y);
+    if w < 1.0 || h < 1.0 {
         return None;
     }
-    let view = view?;
-    Some(wgpu::RenderPassDepthStencilAttachment {
-        view,
-        depth_ops: clear.depth.map(|d| wgpu::Operations {
-            load: wgpu::LoadOp::Clear(d),
-            store: wgpu::StoreOp::Store,
-        }),
-        stencil_ops: clear.stencil.map(|s| wgpu::Operations {
-            load: wgpu::LoadOp::Clear(s),
-            store: wgpu::StoreOp::Store,
-        }),
-    })
+    let sc = scissor.unwrap_or(Rect::new(x, y, w, h)).normalized();
+    let sx = sc.x.clamp(0.0, tw).round() as u32;
+    let sy = sc.y.clamp(0.0, th).round() as u32;
+    let sw = sc.w.clamp(0.0, tw - sx as f32).round().max(1.0) as u32;
+    let sh = sc.h.clamp(0.0, th - sy as f32).round().max(1.0) as u32;
+    Some(((x, y, w, h), (sx, sy, sw, sh)))
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::*;
+
+    #[test]
+    fn splits_screen_without_clamping() {
+        // 1280×720 的左半屏 / 右半屏：视口与 scissor 一致、数值不变。
+        let l = clamp_viewport(Rect::new(0.0, 0.0, 640.0, 720.0), None, (1280, 720)).unwrap();
+        assert_eq!(l.0, (0.0, 0.0, 640.0, 720.0));
+        assert_eq!(l.1, (0, 0, 640, 720));
+        let r = clamp_viewport(Rect::new(640.0, 0.0, 640.0, 720.0), None, (1280, 720)).unwrap();
+        assert_eq!(r.0, (640.0, 0.0, 640.0, 720.0));
+        assert_eq!(r.1, (640, 0, 640, 720));
+    }
+
+    #[test]
+    fn clamps_to_target_bounds() {
+        // 左上越界：原点钳到 (0,0)，尺寸保留（在目标内时不缩小）。
+        let c = clamp_viewport(Rect::new(-40.0, -10.0, 400.0, 300.0), None, (1280, 720)).unwrap();
+        assert_eq!(c.0, (0.0, 0.0, 400.0, 300.0));
+        // 右下越界：尺寸被钳到剩余空间（80×20）。
+        let f = clamp_viewport(Rect::new(1200.0, 700.0, 400.0, 400.0), None, (1280, 720)).unwrap();
+        assert_eq!(f.0, (1200.0, 700.0, 80.0, 20.0));
+    }
+
+    #[test]
+    fn none_when_fully_outside_or_degenerate() {
+        assert!(clamp_viewport(Rect::new(2000.0, 0.0, 100.0, 100.0), None, (1280, 720)).is_none());
+        assert!(clamp_viewport(Rect::new(0.0, 0.0, 0.5, 0.5), None, (1280, 720)).is_none());
+    }
+
+    #[test]
+    fn negative_size_is_normalized() {
+        let n = clamp_viewport(Rect::new(100.0, 100.0, -40.0, -30.0), None, (1280, 720)).unwrap();
+        assert_eq!(n.0, (60.0, 70.0, 40.0, 30.0));
+    }
+
+    #[test]
+    fn scissor_override_wins() {
+        let (vp, sc) = clamp_viewport(
+            Rect::new(0.0, 0.0, 640.0, 720.0),
+            Some(Rect::new(16.0, 16.0, 200.0, 100.0)),
+            (1280, 720),
+        )
+        .unwrap();
+        assert_eq!(vp, (0.0, 0.0, 640.0, 720.0));
+        assert_eq!(sc, (16, 16, 200, 100));
+    }
 }

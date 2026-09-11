@@ -10,7 +10,7 @@
 //! - **Tkinter 风格几何管理器**：[`PackSide`] 堆叠（`pack_at`）、均匀网格（`grid_at`）、
 //!   绝对定位（`*_at`）。
 //! - **屏幕空间**：坐标一律为屏幕像素（左上角原点、Y+ 向下）；内部经视口
-//!   （[`rjw_transform::Viewport`]：大小 + 位置）的屏幕固定变换绘制，命中测试
+//!   （[`rjw_transform::Rect`]：屏幕矩形）的屏幕固定变换绘制，命中测试
 //!   直接在屏幕像素进行（旋转/缩放的世界相机不影响 UI——UI 恒为 identity）。
 //! - **Debug UI / DebugDraw**：`debug_layout` 开关为每个控件/容器的布局矩形与命中
 //!   区域画描边（调试 `rjw_ui` 自身）；[`Ui::debug_line`] / [`Ui::debug_rect_outline`] /
@@ -50,7 +50,7 @@
 //!   裁剪分层（**强制层** = ScrollView 可视区 / Clip 沙箱，所有绘制含 noclip 都服从；
 //!   **软层** = 控件自身内容边界，自洽控件可跳过）、可用宽度（[`Ui::avail_w`]）、
 //!   命中过滤（Clip 沙箱外命中失效并入 `hit_abs`）。**ScrollView**（[`Ui::scroll_at`]、
-//!   文本编辑框）与严格窗口（[`Ui::window_at_strict`]）共用底座。
+//!   文本编辑框）与严格窗口（[`Ui::window`] + `Placement::Clip`）共用底座。
 //! - **滚动容器（ScrollView）**：[`Ui::scroll_at`]——内容在可视区内堆叠 + 滚轮 /
 //!   滚动条（拖 thumb、点轨道翻页）滚动，可视区外**强制裁剪**；滚动偏移持久于
 //!   [`UiState::scrolls`]（**物理像素**——内部计算一律物理，DPI 只在 API 边界换算；
@@ -102,7 +102,7 @@
 //!     g.button("slot_1", "B");
 //!     g.button("slot_2", "C");
 //! });
-//! ui.finish(&viewport, &mut r2d);
+//! ui.finish(&mut r2d);
 //! ```
 //!
 //! # 模块
@@ -118,6 +118,13 @@
 //! - [`edit`]：文本编辑纯逻辑（编辑状态机 / 词边界 / 省略号 / 剪贴板）
 //! - [`view`]：**View 沙箱**（裁剪分层 / 可用宽度 / 命中过滤；`ViewMode`）
 //! - [`widgets`]：`Widget` trait + 尺寸契约 + 属性化 builder（非宏添加控件）
+
+// 结构性复杂度豁免（**仅内部实现**，不在公开 API 面上）：
+// `rjw_ui` 的实现是"布局 / 命中 / 绘制"三段式的坐标数学，参数表
+// （`x, y, w, h, id, frame, depth, ...`）本就是这些原语的天然形状；为它们包一层
+// `struct` 只会把参数搬运到构造点，降低调用点可读性。公开面（`ui.window(..)` 等
+// 入口）不受影响：那部分的参数已按 R1（≤2 参数）+ 枚举状态糖收敛。
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod draw;
 pub mod edit;
@@ -136,12 +143,11 @@ pub mod widgets;
 pub use draw::{GradientAxis, Metric, Position, Size, TextAlign};
 pub use focus::FocusKind;
 pub use id::{IdAbsolute, IdRelative, IdStack};
-pub use proc::ProcTextures;
 pub use hit::{hit_test, InteractEvents};
-pub use layout::PackSide;
-pub use state::{ButtonState, CheckboxState, UiState, UiStats, WidgetState};
+pub use layout::{Child, PackSide};
+pub use state::{ButtonState, CheckboxState, TextFocus, UiState, UiStats, WidgetState};
 pub use style::{ButtonStyle, CheckboxStyle, ComboStyle, DividerStyle, InputStyle, LabelStyle, ModalStyle, PanelStyle, SliderStyle, Theme};
 pub use input::{KeyboardSnapshot, MouseSnapshot};
-pub use ui::{Anchor, Grid, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Ui, UiAdd, UiCursor, UiInit, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
+pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Placement, Resize, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
 pub use view::{ViewCtx, ViewMode};
 pub use widgets::{Button, Checkbox, Divider, FontModal, Label, NumberInput, Response, Slider, Widget, WidgetId};

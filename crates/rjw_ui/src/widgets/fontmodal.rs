@@ -9,7 +9,7 @@
 use glam::Vec2;
 
 use crate::ui::Ui;
-use crate::{PackSide, UiAdd};
+use crate::{Child, PackSide, UiAdd};
 
 /// 字体切换模态对话框。
 pub struct FontModal<'a> {
@@ -44,7 +44,7 @@ impl FontModal<'_> {
         // 预览示例（字体不存在时 rjw_text 回落默认）
         let mut ok = false;
         let mut cancel = false;
-        ui.modal_at_w("font_modal", Vec2::new(460.0, 220.0), width, |m| {
+        ui.modal("font_modal").pos(Vec2::new(460.0, 220.0)).width(width).show(|m| {
             // 内容区宽 = 窗口**内容可用宽**——`avail_w()` 已扣除窗口内边距
             // （`Frame::fixed_avail_w = w − pad_total×2`，`pad_total = padding + border_w`），
             // **不要再减 padding**（旧实现重复扣减导致预览框/按钮右缘比内容区窄 2×padding，
@@ -62,10 +62,10 @@ impl FontModal<'_> {
             let inner_w = (content_w - 12.0).max(0.0);
             let th = {
                 let ui = m.ui_mut();
-                let fam = (!name.is_empty()).then(|| name.as_str());
+                let fam = (!name.is_empty()).then_some(name.as_str());
                 ui.text_size_wrap(&example, psize, fam, inner_w).y
             };
-            let pbox = m.ui_mut().child_rect(content_w, th + 12.0);
+            let pbox = m.ui_mut().child_rect(content_w, th + 12.0, Child::Expand);
             {
                 let ui = m.ui_mut();
                 let st = &ui.theme.input;
@@ -74,7 +74,7 @@ impl FontModal<'_> {
                 let buf = ui.wrap_buffer(
                     &example,
                     psize,
-                    (!name.is_empty()).then(|| name.as_str()),
+                    (!name.is_empty()).then_some(name.as_str()),
                     inner_w,
                 );
                 ui.push_text_rect(
@@ -109,7 +109,7 @@ impl FontModal<'_> {
                 },
             );
             // pack_at 不占父光标：占一个与行同高的子项，窗口高度自然结算
-            m.ui_mut().child_rect(0.0, row.y);
+            m.ui_mut().child_rect(0.0, row.y, Child::Expand);
         });
         if ok {
             let name = self.input.trim().to_owned();

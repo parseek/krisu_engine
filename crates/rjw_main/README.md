@@ -1,12 +1,16 @@
 # rjw_main
 
 中文：
-`rjw_main` 是应用入口：基于 winit `ApplicationHandler` 的事件循环，统一管理主窗口、计时器、键盘与鼠标，并在每帧调用用户实现的 `App` trait。
+`rjw_main` 是**平台底座**：把 winit（窗口 / 事件循环类型）、输入（键盘 / 鼠标）与计时统一重导出，并提供默认窗口标题。
+事件循环与窗口生命周期由 [`rjw_krusie`](https://crates.io/crates/rjw_krusie) 的 `runtime`（`Engine`，winit `ApplicationHandler` 实现）负责，
+游戏侧只实现 `rjw_krusie::App`。
 
 English：
-`rjw_main` is the app entry point: a winit `ApplicationHandler` event loop that manages the primary window, timer, keyboard and mouse, calling into the user `App` trait every frame.
+`rjw_main` is the **platform base layer**: it re-exports winit (window / event-loop types), input (keyboard / mouse) and timing,
+plus the default window title. The event loop and window lifecycle live in `rjw_krusie`'s `runtime`
+(an `Engine` implementing winit's `ApplicationHandler`); games only implement `rjw_krusie::App`.
 
-> 整套库入口：`use rjw_krusie::prelude::*;` 已含 `App` / `run_app` / `MainContext` / winit 骨架 / 输入 / 计时；
+> 整套库入口：`use rjw_krusie::prelude::*;` 已含运行时骨架（`App` / `run` / `Ctx` / `Frame`）/ 输入 / 计时；
 > 低层（`Window` / `Size` / `PRIMARY_WINDOW_TITLE`…）走 `rjw_krusie::main::*`。
 
 ---
@@ -14,42 +18,58 @@ English：
 ## 功能特性 / Features
 
 中文：
-- `App` trait：`on_init` / `about_to_wait` / `on_resized` / `primary_window_attrib`。
-- `MainContext`：`timer`（`DeltaTimer`）、`keyboard`（`KeyboardInput`）、`mouse`（`MouseInput`）、`primary_window()`、`request_exit()`。
-- `run_app(app)`：一行启动；`ControlFlow::Poll` 循环，帧末自动清理输入边沿（`end_frame()`）。
-- 重导出 `winit` 常用类型与 `KeyCode` / `MouseButton` 等。
+- 重导出 winit：`Window` / `WindowAttributes` / `EventLoop` / `ActiveEventLoop` / `WindowEvent` / `DeviceEvent` / `KeyCode` / `MouseButton` 与 `dpi` 类型。
+- 重导出 `rjw_time::DeltaTimer`、`rjw_keyboard::KeyboardInput`（+ `KeyState`）、`rjw_mouse::MouseInput`（+ `ScrollDelta`）。
+- `PRIMARY_WINDOW_TITLE`（`LazyLock<String>`，取当前可执行文件名）/ `PRIMARY_WINDOW_TITLE_DEFAULT`。
 
 English：
-- `App` trait: `on_init` / `about_to_wait` / `on_resized` / `primary_window_attrib`.
-- `MainContext`: `timer` (`DeltaTimer`), `keyboard` (`KeyboardInput`), `mouse` (`MouseInput`), `primary_window()`, `request_exit()`.
-- `run_app(app)`: one-line startup; `ControlFlow::Poll` loop with automatic input edge cleanup (`end_frame()`).
-- Re-exports common `winit` types plus `KeyCode` / `MouseButton` etc.
+- Re-exports winit: `Window` / `WindowAttributes` / `EventLoop` / `ActiveEventLoop` / `WindowEvent` / `DeviceEvent` / `KeyCode` / `MouseButton` and `dpi` types.
+- Re-exports `rjw_time::DeltaTimer`, `rjw_keyboard::KeyboardInput` (+ `KeyState`), `rjw_mouse::MouseInput` (+ `ScrollDelta`).
+- `PRIMARY_WINDOW_TITLE` (`LazyLock<String>`, from the executable name) / `PRIMARY_WINDOW_TITLE_DEFAULT`.
+
+> **旧 API 已删除**（`docs/API_DESIGN.md` §8.9）：`rjw_main::{App, MainContext, MainHandler, run_app}`
+> 与运行时的 `Engine` 职责重复且零调用。请改用 `rjw_krusie::{App, run, Ctx, Frame}`。
 
 ---
 
 ## 示例代码 / Example
 
 ```rust
-use rjw_main::*;
+// 游戏侧：只实现 rjw_krusie 的 App
+use rjw_krusie::prelude::*;
 
 struct MyApp;
 
 impl App for MyApp {
-    fn on_init(&mut self, ctx: &mut MainContext) {
-        // 创建 RenderContext / Render2D / 资源...
+    fn config(&self) -> AppConfig {
+        AppConfig::new("my app").size(1280.0, 720.0)
     }
-    fn about_to_wait(&mut self, ctx: &mut MainContext) {
-        if ctx.keyboard.get(KeyCode::Escape).down_edge() {
-            ctx.request_exit();
+
+    fn update(&mut self, ctx: &mut Ctx) {
+        if ctx.key(KeyCode::Escape).down_edge() {
+            ctx.exit();
         }
-        let dt = ctx.timer.dt().get_f32();
-        // ... 更新逻辑 + 渲染 ...
+        let Some(mut f) = ctx.frame() else { return };
+        // ... 录制绘制 + f.submit(&mut cam, clear) ...
     }
 }
 
 fn main() -> Result<(), EventLoopError> {
-    run_app(MyApp)
+    run(MyApp)
 }
+```
+
+平台底座本身的用法（一般不必直接依赖）：
+
+```rust
+use rjw_main::{KeyboardInput, KeyCode, MouseInput, DeltaTimer};
+
+let mut keys = KeyboardInput::default();
+let mut mouse = MouseInput::default();
+let mut timer = DeltaTimer::default();
+let _ = keys.key(KeyCode::Space).down_edge();
+let _ = mouse.pos_px();
+timer.per_frame();
 ```
 
 ---

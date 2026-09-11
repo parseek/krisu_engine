@@ -77,6 +77,24 @@ impl From<f32> for Layer {
     }
 }
 
+impl From<i32> for Layer {
+    fn from(value: i32) -> Self {
+        Self((value as f64).into())
+    }
+}
+
+impl From<u32> for Layer {
+    fn from(value: u32) -> Self {
+        Self((value as f64).into())
+    }
+}
+
+impl From<i64> for Layer {
+    fn from(value: i64) -> Self {
+        Self((value as f64).into())
+    }
+}
+
 impl Layer {
     /// 获取层级数值（f64）。
     #[inline]
@@ -142,6 +160,15 @@ impl DrawCommandQueue {
         self.order.is_empty()
     }
 
+    /// 本批命令是否需要深度 / 模板附件（任一命令声明 depth / stencil 状态）。
+    ///
+    /// 附件是 **pass 级**的：渲染器在开 pass 之前用它决定 `need_depth_stencil`。
+    pub(crate) fn requires_depth_stencil(&self) -> bool {
+        self.states
+            .iter()
+            .any(|s| s.rstates.is_some_and(|r| r.uses_depth_stencil()))
+    }
+
     /// 取出索引数组（所有权转移，便于在此期间继续借用队列自身）。
     #[inline]
     pub(crate) fn take_order(&mut self) -> Vec<usize> {
@@ -192,5 +219,47 @@ impl DrawCommandQueue {
         self.order
             .iter()
             .map(|&i| (&self.commands[i], self.layers[i], &self.states[i]))
+    }
+}
+
+// ─── 单元测试（无 GPU 依赖） ──────────────────────────────────
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn push_sprite(q: &mut DrawCommandQueue, rstates: Option<RStates>) {
+        q.push(
+            DrawCommand::Sprite2D {
+                rect: SpriteRect::new((0.0, 0.0), (1.0, 1.0)),
+                color: rjw_color::Color::WHITE,
+                transform: Transform2D::IDENTITY,
+            },
+            Layer::from(0.0),
+            States { rstates, texture_uid: None },
+        );
+    }
+
+    /// 附件需求由**命令状态**驱动：任一命令声明 depth / stencil ⇒ 需要深度附件。
+    #[test]
+    fn requires_depth_stencil_is_state_driven() {
+        let mut q = DrawCommandQueue::default();
+        assert!(!q.requires_depth_stencil(), "空队列不需要附件");
+
+        push_sprite(&mut q, None);
+        assert!(!q.requires_depth_stencil(), "无状态（继承全局默认）不需要");
+
+        push_sprite(&mut q, Some(RStates::default()));
+        assert!(!q.requires_depth_stencil(), "默认状态不声明深度");
+
+        push_sprite(&mut q, Some(RStates::new().depth_test(true)));
+        assert!(q.requires_depth_stencil(), "出现 depth_test ⇒ 需要附件");
+    }
+
+    #[test]
+    fn stencil_state_also_requires_attachment() {
+        let mut q = DrawCommandQueue::default();
+        push_sprite(&mut q, Some(RStates::new().stencil_test(true)));
+        assert!(q.requires_depth_stencil());
     }
 }

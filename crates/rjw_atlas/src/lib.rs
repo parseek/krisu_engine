@@ -2,7 +2,7 @@
 //!
 //! - `DynamicAtlas<K=String>`：Guillotine 空闲矩形打包器，运行时插入/踢出/compact 去碎片重排/自动新建页
 //!   + TOML 批量导入 + 自动复活；`compact()` 重排后 `generation()` 递增，缓存区域者据此刷新。
-//!   `K` 泛型键（默认 `String`），`String` 特化支持 TOML 导入/导出 + 便捷方法。
+//!     `K` 泛型键（默认 `String`），`String` 特化支持 TOML 导入/导出 + 便捷方法。
 //! - `StaticAtlas<K=String>`：从 TOML 反序列化预排布图集（`spr.toml`），泛型与 `DynamicAtlas` 一致。
 //! - `DynamicAtlas` / `StaticAtlas` 均实现 `Index` / `IndexMut`：`atlas[&key]` 直接读写区域。
 //! - `AtlasRegion`：图集内精灵坐标（像素左上角 + 尺寸 + 原点偏移 + 页 uid）。
@@ -17,7 +17,7 @@ use std::{
     sync::Arc,
 };
 
-use rjw_render::{ArcTextureWrapped, TextureWrapped, TEXTURES};
+use rjw_render::{ArcTextureWrapped, Gpu, Rgba8, TextureWrapped, TEXTURES};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -30,15 +30,96 @@ pub const DEFAULT_LIFETIME: u32 = 200;
 
 #[derive(Clone, Debug)]
 pub struct AtlasConfig {
+    /// 最多页数（超出后插入失败）。
     pub max_pages: usize,
+    /// 条目之间的内边距（像素）。
     pub padding: u32,
+    /// 寿命（帧）：`tick()` 每帧递减，归零且无人引用则逐出（可复活）。
     pub lifetime: u32,
+    /// 单页尺寸（像素）。
+    pub page_size: u32,
 }
 
 impl Default for AtlasConfig {
     fn default() -> Self {
-        Self { max_pages: 8, padding: 0, lifetime: DEFAULT_LIFETIME }
+        Self { max_pages: 8, padding: 0, lifetime: DEFAULT_LIFETIME, page_size: DEFAULT_PAGE_SIZE }
     }
+}
+
+/// 一次插入的可选参数（取代旧 `insert` 的 `origin_px` / `clamp_margin` 裸参数与
+/// `insert_permanent` / `insert_ex_origin` / `insert_no_clamp` 等 4 个变体方法）。
+#[derive(Clone, Copy, Debug)]
+pub struct InsertOpts {
+    /// 原点（像素，精灵旋转/锚点用）。
+    pub origin_px: (u32, u32),
+    /// 是否在 UV 外围扩 1px（防止采样透色；默认开启）。
+    pub clamp_margin: bool,
+    /// 是否常驻（`true` = 不参与 LRU 逐出，也不参与全量去碎片重排）。
+    pub permanent: bool,
+}
+
+impl Default for InsertOpts {
+    fn default() -> Self {
+        Self { origin_px: (0, 0), clamp_margin: true, permanent: false }
+    }
+}
+
+impl InsertOpts {
+    /// 默认参数。
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 设置原点（像素）。
+    #[inline]
+    pub fn origin(mut self, origin_px: (u32, u32)) -> Self {
+        self.origin_px = origin_px;
+        self
+    }
+
+    /// 关闭 UV 外围扩展（纹理已自带边距时用）。
+    #[inline]
+    pub fn no_clamp(mut self) -> Self {
+        self.clamp_margin = false;
+        self
+    }
+
+    /// 常驻（不逐出 / 不参与全量重排）。
+    #[inline]
+    pub fn permanent(mut self) -> Self {
+        self.permanent = true;
+        self
+    }
+}
+
+/// 图集内可**直接绘制**的产物：区域（UV）+ 页纹理。
+///
+/// 由 `DynamicAtlas::sprite(&handle)` 产出，交给 `Render2D::region(..)` 即可一次提交
+/// （取代「`TEXTURES.get(page_uid)` + 手算像素 UV + `SpriteRect::with_uv_tex`」三步）。
+#[derive(Clone)]
+pub struct AtlasSprite {
+    /// 区域（像素左上角 + 尺寸 + 原点 + 页 uid）。
+    pub region: AtlasRegion,
+    /// 所在页纹理。
+    pub texture: ArcTextureWrapped,
+}
+
+/// 图集统计（内省）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AtlasStats {
+    /// 页数。
+    pub pages: usize,
+    /// 单页尺寸。
+    pub page_size: u32,
+    /// 全部页的空闲面积（像素²）。
+    pub total_free: u64,
+    /// 单页最大空闲矩形面积（像素²）。
+    pub largest_free: u64,
+    /// 碎片度（0..1，越大越碎）。
+    pub fragmentation_percent: u32,
+    /// 去碎片重排世代号。
+    pub generation: u64,
 }
 
 // ─── AtlasRegion / RegionRef ──────────────────────────────────
@@ -102,7 +183,7 @@ struct FreeRect { x: u32, y: u32, w: u32, h: u32 }
 /// - **整宽矩形**（`w == page_size`，即某行/新页的行矩形）→ **水平切分**：下方保留整宽行，
 ///   保证下一行始终可放宽字形（即使行内字形高度交错）；
 /// - 其余矩形 → 沿剩余较长方向（`rh >= rw` 水平 / `rw > rh` 竖直）切分，保持随机负载密度。
-/// 并合并相邻空闲矩形。
+///   并合并相邻空闲矩形。
 #[derive(Clone)]
 struct Guillotine {
     segments: Vec<FreeRect>,
@@ -257,14 +338,16 @@ impl AtlasPage {
 
 // ─── 纹理再生 / 源数据 ────────────────────────────────────────
 
-/// 纹理再生器：精灵被图集踢出后，可通过此 trait 重新生成 RGBA 数据。
-pub trait TextureRegenerator: Send + Sync {
+/// 精灵**源**：精灵被图集逐出后，可通过此 trait 重新生成 RGBA 数据（配合
+/// [`DynamicAtlas::insert_dynamic`] 实现自动复活）。
+pub trait SpriteSource: Send + Sync {
+    /// 重新生成 RGBA 像素与尺寸。
     fn generate(&self) -> (Vec<u8>, u32, u32);
 }
 
 enum SourceData {
     Inline(Vec<u8>, u32, u32),
-    Dynamic(Box<dyn TextureRegenerator>),
+    Dynamic(Box<dyn SpriteSource>),
 }
 
 impl SourceData {
@@ -329,21 +412,87 @@ pub struct DynamicAtlas<K = String> {
 
 /// 通用泛型方法（所有 K）。
 impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
-    pub fn new(
-        device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout,
-        config: AtlasConfig, page_size: u32,
+    /// 以 `Gpu` 能力对象 + 配置构造（**happy path**：不再手穿 device/queue/layout/page_size）。
+    ///
+    /// ```ignore
+    /// let mut atlas = DynamicAtlas::new(gfx, AtlasConfig { max_pages: 4, padding: 1, ..Default::default() });
+    /// ```
+    pub fn new(gpu: &Gpu, config: AtlasConfig) -> Self {
+        let device = gpu.device().clone();
+        let queue = gpu.queue().clone();
+        let layout = gpu.texture_layout().clone();
+        let page_size = config.page_size;
+        let page = AtlasPage::new(&device, &queue, &layout, page_size);
+        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout, next_region_id: 1, by_id: HashMap::new(), white: None, white_alloc: None }
+    }
+
+    /// **低层构造**（逃生口）：已有 `device` / `queue` / 纹理 layout 时用。
+    ///
+    /// 等价于 [`Self::new`]，但绕过 `Gpu`。给尚未迁移到 `&Gpu` 的内部消费者使用
+    /// （当前是 `rjw_ui::ProcTextures`；P3 收敛后会删除本入口）。
+    pub fn from_raw(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        config: AtlasConfig,
     ) -> Self {
         let device = device.clone();
         let queue = queue.clone();
         let layout = layout.clone();
+        let page_size = config.page_size;
         let page = AtlasPage::new(&device, &queue, &layout, page_size);
         Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout, next_region_id: 1, by_id: HashMap::new(), white: None, white_alloc: None }
+    }
+
+    /// 便捷插入：`insert(key, Rgba8::new(&rgba, (w, h)))`（默认 clamp_margin、非常驻、原点 0）。
+    #[inline]
+    pub fn insert(&mut self, key: K, px: Rgba8<'_>) -> Option<AtlasRegion> {
+        self.insert_with(key, px, InsertOpts::default())
+    }
+
+    /// 带参数的插入（原点 / clamp_margin / 常驻）。
+    pub fn insert_with(&mut self, key: K, px: Rgba8<'_>, opts: InsertOpts) -> Option<AtlasRegion> {
+        let (w, h) = px.size;
+        assert_eq!(
+            px.data.len() as u32,
+            w * h * 4,
+            "DynamicAtlas::insert: RGBA8 数据长度与 {w}x{h} 不匹配"
+        );
+        if opts.permanent {
+            if let Some(e) = self.entries.get_mut(&key) { e.lifetime = self.config.lifetime; return Some(e.region); }
+            self.tombstones.remove(&key);
+            return self.insert_inner(key, px.data, w, h, opts.origin_px, opts.clamp_margin);
+        }
+        self.insert_with_source(
+            key,
+            px.data,
+            w,
+            h,
+            opts.origin_px,
+            opts.clamp_margin,
+            SourceData::Inline(px.data.to_vec(), w, h),
+        )
+    }
+
+    /// **动态源**插入：纹理可在被逐出后按 [`SpriteSource`] 重新生成（自动复活）。
+    pub fn insert_dynamic(
+        &mut self,
+        key: K,
+        size: (u32, u32),
+        regen: Box<dyn SpriteSource>,
+    ) -> Option<AtlasRegion> {
+        let (w, h) = size;
+        let (rgba, _rw, _rh) = regen.generate();
+        debug_assert_eq!(_rw, w);
+        debug_assert_eq!(_rh, h);
+        self.insert_with_source(key, &rgba, w, h, (0, 0), true, SourceData::Dynamic(regen))
     }
 
     /// **WHITE 基础纹理**（1×1，`clamp_margin` 防采样透色）——与 `K` 无关的内置条目：
     /// 首次分配，之后每次调用返回**当前** region（compact 重排后 UV 自动跟随）。
     /// 同一页面纹理可供 UI 实心填充与字形**合批**（省去图形↔文字的纹理状态切换）。
-    pub fn insert_white(&mut self) -> AtlasRegion {
+    pub fn white(&mut self) -> AtlasRegion {
+
         if let Some(r) = self.white {
             return r;
         }
@@ -390,7 +539,7 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
     }
 
     /// 获取条目的稳定句柄（RAII 引用计数：drop 自动释放；被引用条目不逐出）。
-    pub fn acquire(&mut self, key: &K) -> Option<RegionRef> {
+    pub fn handle(&mut self, key: &K) -> Option<RegionRef> {
         let e = self.entries.get_mut(key)?;
         e.lifetime = self.config.lifetime;
         Some(RegionRef {
@@ -400,17 +549,33 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         })
     }
 
+    /// 把句柄解析成**可直接绘制**的「区域 + 页纹理」（重排后仍取最新 UV）。
+    ///
+    /// 取代「`TEXTURES.get(page_uid)` + 手算像素 UV + `SpriteRect::with_uv_tex`」三步：
+    ///
+    /// ```ignore
+    /// if let Some(spr) = atlas.sprite(&handle) { r2d.region(spr).layer(0.0); }
+    /// ```
+    pub fn sprite(&self, handle: &RegionRef) -> Option<AtlasSprite> {
+        let region = self.resolve_by_id(handle.region_id())?;
+        let texture = TEXTURES.get(region.page_uid)?;
+        Some(AtlasSprite { region, texture })
+    }
+
     /// 去碎片重排世代号（每次搬动条目 +1；未搬动则不变）。
     pub fn generation(&self) -> u64 { self.generation }
 
+    /// 当前 Region 的页纹理 uid（低层）。
     pub fn texture_uid_of(&self, key: &K) -> Option<u64> { self.entries.get(key).map(|e| e.region.page_uid) }
 
-    pub fn get(&mut self, key: &K) -> Option<&AtlasRegion> {
+    /// 按 key 取区域（会刷新寿命；名字即语义：**不是**只读查询）。
+    pub fn region(&mut self, key: &K) -> Option<&AtlasRegion> {
         if let Some(e) = self.entries.get_mut(key) { e.lifetime = self.config.lifetime; Some(&e.region) }
         else { None }
     }
 
-    pub fn get_or_revive(&mut self, key: &K) -> Option<&AtlasRegion> {
+    /// 按 key 取区域；已逐出则按源**复活**后返回。
+    pub fn region_or_revive(&mut self, key: &K) -> Option<&AtlasRegion> {
         if self.entries.contains_key(key) {
             let e = self.entries.get_mut(key).unwrap();
             e.lifetime = self.config.lifetime;
@@ -422,30 +587,7 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         Some(&self.entries[key].region)
     }
 
-    pub fn insert(
-        &mut self, key: K, rgba: &[u8], w: u32, h: u32, origin_px: (u32, u32), clamp_margin: bool,
-    ) -> Option<AtlasRegion> {
-        self.insert_with_source(key, rgba, w, h, origin_px, clamp_margin, SourceData::Inline(rgba.to_vec(), w, h))
-    }
-
-    pub fn insert_dyn(
-        &mut self, key: K, w: u32, h: u32, origin_px: (u32, u32), clamp_margin: bool,
-        regen: Box<dyn TextureRegenerator>,
-    ) -> Option<AtlasRegion> {
-        let (rgba, _rw, _rh) = regen.generate();
-        debug_assert_eq!(_rw, w);
-        debug_assert_eq!(_rh, h);
-        self.insert_with_source(key, &rgba, w, h, origin_px, clamp_margin, SourceData::Dynamic(regen))
-    }
-
-    pub fn insert_permanent(
-        &mut self, key: K, rgba: &[u8], w: u32, h: u32, origin_px: (u32, u32), clamp_margin: bool,
-    ) -> Option<AtlasRegion> {
-        if let Some(e) = self.entries.get_mut(&key) { e.lifetime = self.config.lifetime; return Some(e.region); }
-        self.tombstones.remove(&key);
-        self.insert_inner(key, rgba, w, h, origin_px, clamp_margin)
-    }
-
+    #[allow(clippy::too_many_arguments, reason = "内部插入原语：rgba/尺寸/原点/clamp/来源 全部是必要事实")]
     fn insert_with_source(
         &mut self, key: K, rgba: &[u8], w: u32, h: u32, origin_px: (u32, u32), clamp_margin: bool, source: SourceData,
     ) -> Option<AtlasRegion> {
@@ -503,17 +645,20 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         None
     }
 
-    pub fn end_frame(&mut self) {
+    /// 帧末寿命推进（**引擎每渲染帧调用一次**）：无引用且寿命归零的条目转墓碑（可复活）；
+    /// 有源条目寿命递减。
+    ///
+    /// 旧名 `end_frame` 全仓零调用 ⇒ 寿命 / 复活形同虚设；改名 `tick` 并由 runtime 驱动。
+    pub fn tick(&mut self) {
         let mut to_tomb: Vec<(K, Tombstone)> = Vec::new();
         let mut remove_keys: Vec<K> = Vec::new();
         for (k, e) in &self.entries {
             // 被外部 RegionRef 引用的条目保活（keepalive strong_count > 1），不逐出。
-            if e.lifetime == 0 && Arc::strong_count(&e.keepalive) == 1 {
-                if let Some(src) = &e.source {
+            if e.lifetime == 0 && Arc::strong_count(&e.keepalive) == 1
+                && let Some(src) = &e.source {
                     to_tomb.push((k.clone(), Tombstone { source: src.clone_inline(), origin_px: e.region.origin_px, clamp_margin: e.clamp_margin }));
                     remove_keys.push(k.clone());
                 }
-            }
         }
         for k in &remove_keys {
             if let Some(e) = self.entries.remove(k) {
@@ -525,7 +670,25 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         if !self.entries.is_empty() || self.dirty { self.dirty = true; }
     }
 
+    /// 去碎片整理（也可手动调用；分配失败时内部会自动尝试）。
     pub fn compact(&mut self) { self.compact_inner(); }
+
+    /// 内省统计（页数 / 空闲 / 碎片度 / 世代）。
+    pub fn stats(&self) -> AtlasStats {
+        let total_free: u64 = self.pages.iter().map(|p| p.allocator.free_area()).sum();
+        let largest_free: u64 = self.pages.iter().map(|p| p.allocator.largest_free_area()).max().unwrap_or(0);
+        let capacity = (self.pages.len() as u64) * (self.page_size as u64) * (self.page_size as u64);
+        let used = capacity.saturating_sub(total_free);
+        let fragmentation_percent = (100u64 * total_free).checked_div(used).unwrap_or(0).min(100) as u32;
+        AtlasStats {
+            pages: self.pages.len(),
+            page_size: self.page_size,
+            total_free,
+            largest_free,
+            fragmentation_percent,
+            generation: self.generation,
+        }
+    }
 
     /// 去碎片整理：优先尝试**全量重排**（所有带源条目按面积降序重排到最少页，真正消除碎片）；
     /// 若存在无法搬动的无源条目（永久精灵）则退回按页重建空闲矩形（配合 [`Guillotine::from_occupied`]）。
@@ -539,13 +702,11 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
             let mut occupied: Vec<_> = self.entries.values().filter(|e| e.region.page_uid == page.texture.uid)
                 .map(|e| (e.alloc_tl.0, e.alloc_tl.1, e.alloc_wh.0, e.alloc_wh.1)).collect();
             // white 内置条目占位（同页时）——防止后续分配覆盖
-            if let Some((tx, ty, tw, th)) = self.white_alloc {
-                if let Some(r) = self.white {
-                    if r.page_uid == page.texture.uid {
+            if let Some((tx, ty, tw, th)) = self.white_alloc
+                && let Some(r) = self.white
+                    && r.page_uid == page.texture.uid {
                         occupied.push((tx, ty, tw, th));
                     }
-                }
-            }
             page.allocator = Guillotine::from_occupied(ps, &occupied, 0);
         }
         self.dirty = false;
@@ -609,7 +770,7 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         while self.pages.len() < allocators.len() {
             self.pages.push(AtlasPage::new(&self.device, &self.queue, &self.layout, self.page_size));
         }
-        for (it, (pi, x, y)) in items.into_iter().zip(slots.into_iter()) {
+        for (it, (pi, x, y)) in items.into_iter().zip(slots) {
             let page = &self.pages[pi];
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo { texture: page.texture.raw_texture(), mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
@@ -644,31 +805,25 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
             e.lifetime = it.lifetime;
         }
         self.pages.truncate(allocators.len());
-        for (page, sky) in self.pages.iter_mut().zip(allocators.into_iter()) {
+        for (page, sky) in self.pages.iter_mut().zip(allocators) {
             page.allocator = sky;
         }
         self.generation += 1;
         true
     }
 
+    /// 页数（诊断；统计见 [`Self::stats`]）。
     pub fn page_count(&self) -> usize { self.pages.len() }
+
+    /// 单页尺寸（像素）。
     pub fn page_size(&self) -> u32 { self.page_size }
-
-    pub fn total_free(&self) -> u64 { self.pages.iter().map(|p| p.allocator.free_area()).sum() }
-    pub fn largest_free(&self) -> u64 { self.pages.iter().map(|p| p.allocator.largest_free_area()).max().unwrap_or(0) }
-
-    pub fn fragmentation(&self) -> f32 {
-        let total = self.total_free();
-        if total == 0 { return 0.0; }
-        let largest = self.largest_free();
-        if largest == 0 { return 1.0; }
-        1.0 - (largest as f32) / (total as f32)
-    }
 }
 
-// ─── String 特化方法（向后兼容） ────────────────────────────────
+// ─── String 特化方法 ──────────────────────────────────────────
 
 impl DynamicAtlas<String> {
+    /// 从 TOML 批量导入（按名字插入；`rgba_provider` 给出整张纹理的 RGBA 与尺寸）。
+    #[cfg(feature = "toml")]
     pub fn load_toml(
         &mut self, toml_str: &str,
         mut rgba_provider: impl FnMut(&str) -> Option<(Vec<u8>, u32, u32)>,
@@ -680,7 +835,8 @@ impl DynamicAtlas<String> {
                 .ok_or_else(|| AtlasLoadError::TexNotFound(entry.tex.clone()))?;
             let sub_rgba = crop_rgba(&full_rgba, tex_w as usize, entry.lt[0] as usize, entry.lt[1] as usize,
                 entry.wh[0] as usize, entry.wh[1] as usize);
-            match self.insert_ex(name, &sub_rgba, entry.wh[0], entry.wh[1]) {
+            let px = Rgba8::new(&sub_rgba, (entry.wh[0], entry.wh[1]));
+            match self.insert(name.clone(), px) {
                 Some(_) => count += 1,
                 None => return Err(AtlasLoadError::AtlasFull),
             }
@@ -688,7 +844,8 @@ impl DynamicAtlas<String> {
         Ok(count)
     }
 
-    #[cfg(feature = "serde")]
+    /// 导出为 TOML。
+    #[cfg(feature = "toml")]
     pub fn export_toml(&self) -> Result<String, toml::ser::Error> {
         let mut data = SpriteAtlasToml { entries: HashMap::new() };
         for (name, e) in &self.entries {
@@ -700,21 +857,6 @@ impl DynamicAtlas<String> {
         toml::to_string(&data)
     }
 
-    pub fn insert_ex(&mut self, name: &str, rgba: &[u8], w: u32, h: u32) -> Option<AtlasRegion> {
-        self.insert(name.to_string(), rgba, w, h, (0, 0), true)
-    }
-
-    pub fn insert_ex_permanent(&mut self, name: &str, rgba: &[u8], w: u32, h: u32) -> Option<AtlasRegion> {
-        self.insert_permanent(name.to_string(), rgba, w, h, (0, 0), true)
-    }
-
-    pub fn insert_ex_origin(&mut self, name: &str, rgba: &[u8], w: u32, h: u32, origin_px: (u32, u32)) -> Option<AtlasRegion> {
-        self.insert(name.to_string(), rgba, w, h, origin_px, true)
-    }
-
-    pub fn insert_no_clamp(&mut self, name: &str, rgba: &[u8], w: u32, h: u32) -> Option<AtlasRegion> {
-        self.insert(name.to_string(), rgba, w, h, (0, 0), false)
-    }
 }
 
 // ─── Index / IndexMut ─────────────────────────────────────────
@@ -1127,7 +1269,7 @@ mod guillotine_tests {
         let page = 1024u32;
         let mut sky = Guillotine::new(page);
         let mut placed = Vec::new();
-        let mut seed = 0x5DE_ECE_66u32;
+        let mut seed = 0x5DEE_CE66u32;
         let mut failed = 0usize;
 
         fn next(seed: &mut u32) -> u32 {

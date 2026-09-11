@@ -6,7 +6,7 @@ use rjw_color::Color;
 use rjw_transform::Transform2D;
 use wgpu::util::DeviceExt;
 
-use crate::data::{QUAD_TRI_INDICIES, QUAD_VERTS, SpriteRect, TriIndicies, VertexP3U2C4};
+use crate::data::{QUAD_TRI_INDICIES, QUAD_VERTS, SpriteRect, TriIndices, VertexP3U2C4};
 use crate::rstates::RStates;
 
 // ─── 常量 ─────────────────────────────────────────────────────
@@ -14,8 +14,11 @@ use crate::rstates::RStates;
 /// 实例化上限：单次 `draw_indexed` 的实例数量
 pub const MAX_INSTANCES_PER_DRAW: usize = 8192;
 
-/// 深度/模板纹理格式
-pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
+/// 深度 / 模板纹理格式（帧级常量，默认值见 [`rjw_render::DEFAULT_DEPTH_FORMAT`]）。
+///
+/// 实际使用的格式由 `RenderConfig::depth_format` 决定，经 `Render2D::new` →
+/// `DrawPage` 传入管线烘焙；**不进管线缓存 key**（构造期固定）。
+pub const DEPTH_FORMAT: wgpu::TextureFormat = rjw_render::DEFAULT_DEPTH_FORMAT;
 
 /// Mesh 顶点数上限（u16 索引）
 pub(crate) const MAX_MESH_VERTS: usize = u16::MAX as usize;
@@ -148,13 +151,6 @@ impl InstanceData {
     }
 }
 
-/// 全局 VP（视图投影）矩阵
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-pub(crate) struct VPBuffer {
-    vp: [[f32; 4]; 4],
-}
-
 /// 统一绘制操作：`prepare()` 阶段已 resolve `rstates` 为 `RStates::raw()`，
 /// `draw()` 直接用于管线缓存查找。
 #[derive(Debug, Clone, PartialEq)]
@@ -192,12 +188,14 @@ pub(crate) enum DrawOp {
 }
 
 /// GPU 缓冲页 + 管线缓存 + 身份实例缓冲
+///
+/// **不再持有 VP**：VP uniform 与 bind group 由帧级 VP 槽环（`rjw_render::RenderFrame`）
+/// 管理，`record_into` 经 `PassContext` 拿到 bind group + 动态偏移（修 B1：
+/// 一帧内多画面不再共享单一 offset-0 uniform）。
 pub(crate) struct DrawPage {
     pub(crate) quad_vb: wgpu::Buffer,
     pub(crate) quad_ib: wgpu::Buffer,
     pub(crate) instance_pages: Vec<wgpu::Buffer>,
-    pub(crate) vp_buffer: wgpu::Buffer,
-    pub(crate) vp_bind_group: wgpu::BindGroup,
 
     // ── Mesh 动态缓冲 ──
     pub(crate) mesh_vb: wgpu::Buffer,
@@ -209,7 +207,7 @@ pub(crate) struct DrawPage {
     pipeline_layout: wgpu::PipelineLayout,
     shader: wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
-    pipeline_cache: HashMap<u64, wgpu::RenderPipeline>,
+    pipeline_cache: HashMap<(u64, bool), wgpu::RenderPipeline>,
 }
 
 impl DrawPage {
@@ -219,8 +217,8 @@ impl DrawPage {
         tex_bind_group_layout: &wgpu::BindGroupLayout,
         shader: wgpu::ShaderModule,
         surface_format: wgpu::TextureFormat,
+        depth_format: wgpu::TextureFormat,
         max_instances: usize,
-        vp: glam::Mat4,
     ) -> Self {
         let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("Render2D: Quad vb (Capacity {})", QUAD_VERTS.len())),
@@ -238,22 +236,6 @@ impl DrawPage {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })];
-        let vp_data = VPBuffer {
-            vp: vp.to_cols_array_2d(),
-        };
-        let vp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Render2D: VP buffer"),
-            contents: bytemuck::bytes_of(&vp_data),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let vp_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Render2D: VP bind group"),
-            layout: vp_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: vp_buffer.as_entire_binding(),
-            }],
-        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render2D: Unified pipeline layout"),
@@ -266,7 +248,9 @@ impl DrawPage {
             &pipeline_layout,
             &shader,
             surface_format,
+            depth_format,
             RStates::default(),
+            false,
         );
 
         let mesh_vb = device.create_buffer(&wgpu::BufferDescriptor {
@@ -283,14 +267,13 @@ impl DrawPage {
         });
 
         let mut pipeline_cache = HashMap::with_capacity(8);
-        pipeline_cache.insert(RStates::default().raw(), default_pipeline.clone());
+        // 预置「无深度附件 + 出厂状态」管线（最常见的 pass 形态）。
+        pipeline_cache.insert((RStates::default().raw(), false), default_pipeline.clone());
 
         Self {
             quad_vb,
             quad_ib,
             instance_pages,
-            vp_buffer,
-            vp_bind_group,
             mesh_vb,
             mesh_ib,
             mesh_capacity_verts: 0,
@@ -302,14 +285,23 @@ impl DrawPage {
         }
     }
 
-    /// 获取或创建管线（按 RStates::raw() 缓存）。
+    /// 获取或创建管线（按 `(RStates::raw(), 是否声明深度附件)` 缓存）。
+    ///
+    /// `depth_format` 为**帧级常量**（`RenderConfig::depth_format`，构造期固定）：
+    /// 不进缓存 key；同一 `DrawPage` 内格式恒定（换格式请新建 `Render2D`）。
+    ///
+    /// `pass_has_depth`：本 pass 是否绑定了深度 / 模板附件。绑定与否决定了管线**必须**
+    /// 声明的附件集合——同 pass 内既有用深度的命令、又有不用深度的命令时，
+    /// 后者也要用 [`RStates::declared_depth_stencil`] 声明同格式附件。
     pub(crate) fn get_or_create_pipeline(
         &mut self,
         device: &wgpu::Device,
         raw: u64,
+        depth_format: wgpu::TextureFormat,
+        pass_has_depth: bool,
     ) -> &wgpu::RenderPipeline {
         use std::collections::hash_map::Entry;
-        match self.pipeline_cache.entry(raw) {
+        match self.pipeline_cache.entry((raw, pass_has_depth)) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
                 let rst = RStates::from_raw(raw);
@@ -318,7 +310,9 @@ impl DrawPage {
                     &self.pipeline_layout,
                     &self.shader,
                     self.surface_format,
+                    depth_format,
                     rst,
+                    pass_has_depth,
                 );
                 e.insert(pipeline)
             }
@@ -330,7 +324,9 @@ impl DrawPage {
         pipeline_layout: &wgpu::PipelineLayout,
         shader: &wgpu::ShaderModule,
         surface_format: wgpu::TextureFormat,
+        depth_format: wgpu::TextureFormat,
         rst: RStates,
+        pass_has_depth: bool,
     ) -> wgpu::RenderPipeline {
         let vertex_layout_quad = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<VertexP3U2C4>() as wgpu::BufferAddress,
@@ -359,7 +355,10 @@ impl DrawPage {
         };
 
         let blend = rst.to_blend();
-        let depth_stencil = rst.to_depth_stencil();
+        let depth_stencil = rst.to_depth_stencil_with(depth_format).or_else(|| {
+            // pass 绑定了附件但本条命令不用深度 ⇒ 仍须声明同格式附件（否则 wgpu 校验失败）。
+            pass_has_depth.then(|| RStates::declared_depth_stencil(depth_format))
+        });
 
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render2D: Unified pipeline"),
@@ -394,14 +393,6 @@ impl DrawPage {
             multiview_mask: None,
             cache: None,
         })
-    }
-
-    /// 更新 VP 缓冲（写整个矩阵）。
-    pub(crate) fn update_vp(&self, queue: &wgpu::Queue, vp: glam::Mat4) {
-        let vp_data = VPBuffer {
-            vp: vp.to_cols_array_2d(),
-        };
-        queue.write_buffer(&self.vp_buffer, 0, bytemuck::bytes_of(&vp_data));
     }
 
     pub(crate) fn ensure_instance_pages(&mut self, device: &wgpu::Device, count: usize) {
@@ -465,7 +456,7 @@ impl DrawPage {
         }
         if tris > self.mesh_capacity_indices {
             let new_cap = (self.mesh_capacity_indices.max(1) * 2).max(tris);
-            let size = (std::mem::size_of::<TriIndicies>() * new_cap) as u64;
+            let size = (std::mem::size_of::<TriIndices>() * new_cap) as u64;
             self.mesh_ib = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("Render2D: Mesh_ib (Capacity {new_cap})")),
                 size: size.max(4),

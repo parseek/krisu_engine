@@ -14,7 +14,7 @@
 //! # let (mut r2d, tex, rect): (Render2D, rjw_2d_render::ArcTextureWrapped, rjw_2d_render::SpriteRect) = unimplemented!();
 //! use rjw_2d_render::{BlendMode, Color};
 //! r2d.sprite(rect, &tex)
-//!     .color(Color::WHITE)
+//!     .tint(Color::WHITE)
 //!     .layer(10.0)
 //!     .blend(BlendMode::Additive);
 //! ```
@@ -28,10 +28,10 @@ use rjw_render::ArcTextureWrapped;
 use rjw_transform::Transform2D;
 
 use crate::command::{DrawCommand, DrawCommandQueue, Layer, States};
-use crate::data::{Index, MeshSink, MeshStorage, SpriteRect, TriIndicies, VertexP3U2C4};
+use crate::data::{Index, MeshSink, MeshStorage, SpriteRect, TriIndices, VertexP3U2C4};
 use crate::rstates::{
-    AddressMode, BlendDesc, BlendMode, CompareFunc, CullMode, DepthState, FilterMode, RStates,
-    RasterState, SamplerDesc, StencilState,
+    AddressMode, BlendDesc, BlendMode, CullMode, DepthState, FilterMode, RStates, RasterState,
+    SamplerDesc, StencilState,
 };
 
 // ─── 外部绘制 trait ───────────────────────────────────────────
@@ -53,12 +53,16 @@ impl<F: Fn(&mut wgpu::RenderPass<'_>) + Send + Sync> CustomDraw for F {
 // ─── Kind 标记 ────────────────────────────────────────────────
 
 /// Sprite kind（贴纹理 / 纯色四边形，实例化合批）。
+#[doc(hidden)]
 pub enum Sprite {}
 /// Mesh kind（动态顶点段：`mesh` / `mesh_with` / `polygon` / `quads`）。
+#[doc(hidden)]
 pub enum Mesh {}
 /// StaticMesh kind（`MESHES` 注册表网格 + 实例化合批）。
+#[doc(hidden)]
 pub enum StaticMesh {}
 /// Custom kind（原生 wgpu 绘制调用注入）。
+#[doc(hidden)]
 pub enum Custom {}
 
 /// `color()` 的作用位置（每个入口决定，调用者无需关心）。
@@ -74,8 +78,9 @@ pub(crate) enum ColorMode {
 
 /// Kind 行为：如何把当前 Builder 状态落成一条 [`DrawCommand`]。
 ///
-/// 引擎内部使用；自定义绘制请用 [`Render2D::custom`](crate::Render2D::custom) +
-/// [`CustomDraw`]。
+/// 引擎内部机制（类型级标记，用户通过 `Render2D` 的入口方法间接使用）；
+/// 自定义绘制请用 [`Render2D::custom`](crate::Render2D::custom) + [`CustomDraw`]。
+#[doc(hidden)]
 pub trait DrawKind: Sized + 'static {
     #[doc(hidden)]
     fn commit(b: &mut Draw2D<'_, Self>);
@@ -105,7 +110,7 @@ pub struct Draw2D<'a, K: DrawKind> {
     /// 整段实例色（`ColorMode::Instance` 时生效）→ `DrawCommand::MeshStyled`。
     tint: Option<Color>,
     transform: Transform2D,
-    /// 显式模型矩阵（`.model(..)`）优先于 `transform`。
+    /// 显式模型矩阵（`.matrix(..)`）优先于 `transform`。
     model: Option<glam::Mat4>,
     /// `None` = 继承渲染器全局默认状态（`Render2D::states()`）。
     states: Option<RStates>,
@@ -169,12 +174,14 @@ impl<K: DrawKind> Draw2D<'_, K> {
         self
     }
 
-    /// 颜色。作用位置由入口决定（**对调用者透明**）：
+    /// 着色。作用位置由入口决定（**对调用者透明**）：
     /// - `sprite` / `solid` / `static_mesh`：实例色（默认 `WHITE`）；
     /// - `mesh` / `mesh_with` / `polygon`：**逐顶点色**（默认 `WHITE`，保持动态段可合批）；
-    /// - `quads` / `quads_with`：**整段实例色**（顶点自带色 × 该色，等价旧 `add_quads_styled` 的 tint）。
+    /// - `quads` / `quads_with`：**整段实例色**（顶点自带色 × 该色）。
+    ///
+    /// 名字统一为 `tint`（旧名 `color` 语义随 kind 变，已按 `docs/API_DESIGN.md` R6 收敛）。
     #[inline]
-    pub fn color(mut self, color: Color) -> Self {
+    pub fn tint(mut self, color: Color) -> Self {
         self.color = color;
         match self.color_mode {
             ColorMode::Vertex => {
@@ -198,8 +205,10 @@ impl<K: DrawKind> Draw2D<'_, K> {
     }
 
     /// 平移（`transform` 便捷糖；接受 `Vec2` 或 `(x, y)`）。
+    ///
+    /// 名字为 `at`（旧名 `pos` 与 `Transform2D` 的字段/构建器同义异名，已收敛）。
     #[inline]
-    pub fn pos(mut self, pos: impl Into<Vec2>) -> Self {
+    pub fn at(mut self, pos: impl Into<Vec2>) -> Self {
         self.transform.pos = pos.into();
         self.model = None;
         self
@@ -221,9 +230,11 @@ impl<K: DrawKind> Draw2D<'_, K> {
         self
     }
 
-    /// 直接给出**列主序模型矩阵**（跳过 `Transform2D` 推导；覆盖 `.transform/.pos/.rot/.scale`）。
+    /// 直接给出**列主序模型矩阵**（跳过 `Transform2D` 推导；覆盖 `.transform/.at/.rot/.scale`）。
+    ///
+    /// 名字统一为 `matrix`（旧名 `model` 语义与字段重名，已按 `docs/API_DESIGN.md` §8.3 收敛）。
     #[inline]
-    pub fn model(mut self, model: glam::Mat4) -> Self {
+    pub fn matrix(mut self, model: glam::Mat4) -> Self {
         self.model = Some(model);
         self
     }
@@ -260,28 +271,18 @@ impl<K: DrawKind> Draw2D<'_, K> {
         self.with_states(|s| s.cull(mode))
     }
 
-    /// 深度测试开关（`states` 便捷糖）。
+    /// 深度状态（`states` 便捷糖）：接受 [`DepthState`]（或 `bool` 便捷：`true` = 只测试）。
     #[inline]
-    pub fn depth(self, test: bool) -> Self {
-        self.with_states(|s| s.depth_test(test))
+    pub fn depth(self, state: impl Into<DepthState>) -> Self {
+        let d = state.into();
+        self.with_states(|s| s.depth_test(d.test).depth_write(d.write).depth_compare(d.compare))
     }
 
-    /// 深度测试 + 写入 + 比较函数（`states` 便捷糖）。
+    /// 模板状态（`states` 便捷糖）：接受 [`StencilState`]（或 `bool` 便捷：`true` = 只测试）。
     #[inline]
-    pub fn depth_full(self, test: bool, write: bool, compare: CompareFunc) -> Self {
-        self.with_states(|s| s.depth_test(test).depth_write(write).depth_compare(compare))
-    }
-
-    /// 模板测试开关（`states` 便捷糖）。
-    #[inline]
-    pub fn stencil(self, test: bool) -> Self {
-        self.with_states(|s| s.stencil_test(test))
-    }
-
-    /// 模板测试 + 写入 + 比较函数（`states` 便捷糖）。
-    #[inline]
-    pub fn stencil_full(self, test: bool, write: bool, compare: CompareFunc) -> Self {
-        self.with_states(|s| s.stencil_test(test).stencil_write(write).stencil_compare(compare))
+    pub fn stencil(self, state: impl Into<StencilState>) -> Self {
+        let d = state.into();
+        self.with_states(|s| s.stencil_test(d.test).stencil_write(d.write).stencil_compare(d.compare))
     }
 
     /// 批量设置 Blit 描述符（`states` 便捷糖）。
@@ -300,18 +301,6 @@ impl<K: DrawKind> Draw2D<'_, K> {
     #[inline]
     pub fn raster_state(self, s: RasterState) -> Self {
         self.with_states(|st| st.raster_state(s))
-    }
-
-    /// 批量设置深度状态（`states` 便捷糖）。
-    #[inline]
-    pub fn depth_state(self, d: DepthState) -> Self {
-        self.with_states(|s| s.depth_state(d))
-    }
-
-    /// 批量设置模板状态（`states` 便捷糖）。
-    #[inline]
-    pub fn stencil_state(self, d: StencilState) -> Self {
-        self.with_states(|s| s.stencil_state(d))
     }
 
     /// 组合：把状态从 `None`（继承）落到 `Some(..)` 上。
@@ -375,14 +364,20 @@ impl DrawKind for StaticMesh {
 impl DrawKind for Mesh {
     fn commit(b: &mut Draw2D<'_, Self>) {
         let (vert, tri_index, tint) = (b.vert.clone(), b.tri.clone(), b.tint);
-        let model = b.model;
-        let mat_idx = match model {
-            Some(m) => {
-                let i = b.queue.matrices.len();
-                b.queue.matrices.push(m);
-                Some(i)
-            }
-            None => None,
+        // **变换必须落地**：Mesh 命令只有 `mat_idx`（没有 transform 字段），所以这里
+        // 无论如何都要写一条矩阵——`.matrix(m)` 优先，否则由 `.transform(tf)` 推导。
+        //
+        // ⚠ 旧实现只取 `b.model`（`None` ⇒ `InstanceData::identity()`）⇒ **`.transform(..)`
+        // 对 mesh / polygon / quads 被静默忽略**：世界层里"顶点已是世界坐标"的用法看不出
+        // 问题，但 `rjw_ui` 的窗口四边形是**窗口局部顶点 + 屏幕固定变换**——
+        // 变换一丢，所有窗口都画在 UI 空间原点（= 屏幕左上角，"位置恒为 (0,0)"）。
+        let model = b
+            .model
+            .unwrap_or_else(|| crate::cull::transform2d_model(&b.transform));
+        let mat_idx = {
+            let i = b.queue.matrices.len();
+            b.queue.matrices.push(model);
+            Some(i)
         };
         // 整段实例色（`quads` 的 tint）→ 已提前合批段，自成一整段不参与跨段合批；
         // 逐顶点色（`mesh` / `polygon`）→ 普通动态段，可与其他段合批。
@@ -427,7 +422,7 @@ impl<K: DrawKind> Drop for Draw2D<'_, K> {
 /// 顶点坐标为 **`Draw2D::transform` 的局部坐标**（默认即世界坐标）。
 pub struct PolygonSink<'a> {
     verts: &'a mut Vec<VertexP3U2C4>,
-    tris: &'a mut Vec<TriIndicies>,
+    tris: &'a mut Vec<TriIndices>,
     /// 本段起始全局顶点号（三角化 / 索引重定位用）。
     base: u32,
     color: [f32; 4],
@@ -435,7 +430,7 @@ pub struct PolygonSink<'a> {
 }
 
 impl PolygonSink<'_> {
-    /// 追加一个顶点（UV 为 0；逐顶点色取入口默认色，可由 `.color()` 整段覆盖）。
+    /// 追加一个顶点（UV 为 0；逐顶点色取入口默认色，可由 `.tint()` 整段覆盖）。
     #[inline]
     pub fn vertex(&mut self, pos: impl Into<Vec2>) -> u16 {
         let c = self.color;
@@ -493,7 +488,7 @@ impl PolygonSink<'_> {
         }
         let b = self.base;
         for i in 0..(n - 2) {
-            self.tris.push(TriIndicies(
+            self.tris.push(TriIndices(
                 Index(b as u16),
                 Index((b + i as u32 + 1) as u16),
                 Index((b + i as u32 + 2) as u16),
@@ -509,7 +504,7 @@ impl PolygonSink<'_> {
 /// 顶点坐标为 **`Draw2D::transform` 的局部坐标**。
 pub struct QuadSink<'a> {
     verts: &'a mut Vec<VertexP3U2C4>,
-    tris: &'a mut Vec<TriIndicies>,
+    tris: &'a mut Vec<TriIndices>,
     color: [f32; 4],
     quads: u32,
 }
@@ -571,12 +566,12 @@ impl QuadSink<'_> {
         debug_assert!(g + 4 <= u16::MAX as u32, "quad vertex count exceeds u16");
         let local = (self.quads) as u16;
         self.verts.extend_from_slice(&q);
-        self.tris.push(TriIndicies(
+        self.tris.push(TriIndices(
             Index(g as u16),
             Index((g + 1) as u16),
             Index((g + 3) as u16),
         ));
-        self.tris.push(TriIndicies(
+        self.tris.push(TriIndices(
             Index((g + 3) as u16),
             Index((g + 2) as u16),
             Index(g as u16),
@@ -599,7 +594,7 @@ impl QuadSink<'_> {
 
 // ─── 入口构造（由 `Render2D` 的入口方法调用） ─────────────────
 
-/// 顶点默认色（未调用 `.color()` 时的逐顶点色）。
+/// 顶点默认色（未调用 `.tint()` 时的逐顶点色）。
 #[inline]
 fn white() -> [f32; 4] {
     Color::WHITE.into()
@@ -672,7 +667,7 @@ impl<'a> Draw2D<'a, Mesh> {
     ) -> Self {
         assert!(
             !vertices.is_empty()
-                && tri_indices.len() % 3 == 0
+                && tri_indices.len().is_multiple_of(3)
                 && tri_indices.iter().all(|&i| (i as usize) < vertices.len()),
             "mesh: vertices must be non-empty and tri_indices a valid multiple of 3"
         );
@@ -687,7 +682,7 @@ impl<'a> Draw2D<'a, Mesh> {
             });
         }
         for c in tri_indices.chunks_exact(3) {
-            mesh.tri_indices.push(TriIndicies(
+            mesh.tri_indices.push(TriIndices(
                 Index((c[0] as u32 + vs as u32) as u16),
                 Index((c[1] as u32 + vs as u32) as u16),
                 Index((c[2] as u32 + vs as u32) as u16),
@@ -721,50 +716,6 @@ impl<'a> Draw2D<'a, Mesh> {
         let (ve, te) = (mesh.vertices.len(), mesh.tri_indices.len());
         Self::mesh_from(queue, mesh, vs..ve, ts..te, ColorMode::Vertex, tex_uid)
     }
-    /// 预分配流式构造网格（`Render2D::mesh_with_cap`）：
-    /// 已知顶点/三角形数量时直接写预分配切片，零重分配。
-    pub(crate) fn mesh_with_cap<F>(
-        queue: &'a mut DrawCommandQueue,
-        mesh: &'a mut MeshStorage,
-        max_verts: usize,
-        max_tris: usize,
-        f: F,
-        tex_uid: Option<u64>,
-    ) -> Self
-    where
-        F: FnOnce(&mut [VertexP3U2C4], &mut [TriIndicies]) -> (usize, usize),
-    {
-        assert!(max_verts > 0 && max_verts <= crate::draw_page::MAX_MESH_VERTS);
-        let vo = mesh.vertices.len();
-        let io = mesh.tri_indices.len();
-        let ca = white();
-        mesh.vertices
-            .resize(vo + max_verts, VertexP3U2C4::default());
-        mesh.tri_indices
-            .resize(io + max_tris, TriIndicies::default());
-        let (uv, ut) = {
-            let vs = &mut mesh.vertices[vo..vo + max_verts];
-            let ts = &mut mesh.tri_indices[io..io + max_tris];
-            f(vs, ts)
-        };
-        mesh.vertices.truncate(vo + uv);
-        mesh.tri_indices.truncate(io + ut);
-        for v in &mut mesh.vertices[vo..vo + uv] {
-            v.color = ca;
-        }
-        if ut != 0 {
-            let b = vo as u32;
-            for t in &mut mesh.tri_indices[io..io + ut] {
-                *t = TriIndicies(
-                    Index((t.0.0 as u32 + b) as u16),
-                    Index((t.1.0 as u32 + b) as u16),
-                    Index((t.2.0 as u32 + b) as u16),
-                );
-            }
-        }
-        Self::mesh_from(queue, mesh, vo..vo + uv, io..io + ut, ColorMode::Vertex, tex_uid)
-    }
-
     /// 多边形（fan 三角化：首个顶点为中心；`Render2D::polygon` / `polygon_uv`）。
     pub(crate) fn polygon(
         queue: &'a mut DrawCommandQueue,
@@ -790,7 +741,7 @@ impl<'a> Draw2D<'a, Mesh> {
             });
         }
         for i in 0..n.saturating_sub(2) {
-            mesh.tri_indices.push(TriIndicies(
+            mesh.tri_indices.push(TriIndices(
                 Index(vs as u16),
                 Index((vs + i + 1) as u16),
                 Index((vs + i + 2) as u16),
@@ -833,7 +784,7 @@ impl<'a> Draw2D<'a, Mesh> {
         tex_uid: u64,
     ) -> Self {
         assert!(
-            vertices.len() % 4 == 0,
+            vertices.len().is_multiple_of(4),
             "quads: vertex count must be a multiple of 4 (one quad = 4 vertices)"
         );
         let vs = mesh.vertices.len();
@@ -842,12 +793,12 @@ impl<'a> Draw2D<'a, Mesh> {
         for i in (0..vertices.len()).step_by(4) {
             let b = (vs + i) as u32;
             // Quad 标准索引：TL,TR,BL,BR → 三角形 (0,1,3) + (3,2,0)
-            mesh.tri_indices.push(TriIndicies(
+            mesh.tri_indices.push(TriIndices(
                 Index(b as u16),
                 Index((b + 1) as u16),
                 Index((b + 3) as u16),
             ));
-            mesh.tri_indices.push(TriIndicies(
+            mesh.tri_indices.push(TriIndices(
                 Index((b + 3) as u16),
                 Index((b + 2) as u16),
                 Index(b as u16),
@@ -905,18 +856,68 @@ mod tests {
         (cmd, layer, states.rstates, states.texture_uid)
     }
 
-    /// `mesh` + `.color()` → 写**逐顶点色**（保持普通 `Mesh` 命令，可参与动态段合批）。
+    /// **回归**：`.transform(tf)` 必须对 **mesh / polygon / quads** 生效。
+    ///
+    /// 旧实现只在 `.matrix(m)` 时写 `mat_idx`，`.transform(tf)` 对 Mesh 系被**静默忽略**
+    /// ⇒ 顶点按"已是世界坐标"处理。世界层用法看不出问题（顶点本来就是世界坐标），
+    /// 但 `rjw_ui` 的窗口四边形是**窗口局部顶点 + 屏幕固定变换**：变换一丢，
+    /// 所有窗口都画在 UI 空间原点（屏幕左上角）——"引擎里位置对、视觉恒为 (0,0)"。
+    #[test]
+    fn mesh_transform_is_baked_into_matrix() {
+        let (mut q, mut m) = scratch();
+        let quad = [VertexP3U2C4 { color: [1.0; 4], ..Default::default() }; 4];
+
+        // quads + `.transform(..)`：命令必须带矩阵，且矩阵 == transform2d_model(tf)
+        let tf = Transform2D::IDENTITY.with_pos(Vec2::new(30.0, 40.0));
+        Draw2D::quads(&mut q, &mut m, &quad, 3).transform(tf);
+        let (cmd, ..) = only(&q);
+        let mat_idx = match cmd {
+            DrawCommand::Mesh { mat_idx, .. } => mat_idx.expect("`.transform(..)` 必须落到 mat_idx"),
+            other => panic!("应为 Mesh，实际 {other:?}"),
+        };
+        assert_eq!(
+            q.matrices[mat_idx],
+            crate::cull::transform2d_model(&tf),
+            "矩阵应等于 transform2d_model(tf)（含平移）"
+        );
+
+        // 不设变换 ⇒ 单位矩阵（与旧行为一致：顶点即世界坐标）
+        let (mut q2, mut m2) = scratch();
+        Draw2D::quads(&mut q2, &mut m2, &quad, 3);
+        let (cmd2, ..) = only(&q2);
+        let mi2 = match cmd2 {
+            DrawCommand::Mesh { mat_idx, .. } => mat_idx.expect("也应带单位矩阵"),
+            other => panic!("应为 Mesh，实际 {other:?}"),
+        };
+        assert_eq!(q2.matrices[mi2], glam::Mat4::IDENTITY);
+
+        // `mesh` / `polygon` 同理；`.matrix(m)` 优先于 `.transform(tf)`
+        let (mut q3, mut m3) = scratch();
+        let verts = [Vec2::ZERO, Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)];
+        let manual = glam::Mat4::from_translation(glam::Vec3::new(5.0, 6.0, 0.0));
+        Draw2D::mesh(&mut q3, &mut m3, &verts, &[0, 1, 2], None)
+            .transform(Transform2D::IDENTITY.with_pos(Vec2::new(99.0, 99.0)))
+            .matrix(manual);
+        let (cmd3, ..) = only(&q3);
+        let mi3 = match cmd3 {
+            DrawCommand::Mesh { mat_idx, .. } => mat_idx.expect("mat_idx"),
+            other => panic!("应为 Mesh，实际 {other:?}"),
+        };
+        assert_eq!(q3.matrices[mi3], manual, "`.matrix(m)` 优先于 `.transform(tf)`");
+    }
+
+    /// `mesh` + `.tint()` → 写**逐顶点色**（保持普通 `Mesh` 命令，可参与动态段合批）。
     #[test]
     fn mesh_color_writes_vertex_colors() {
         let (mut q, mut m) = scratch();
         let verts = [Vec2::ZERO, Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)];
         Draw2D::mesh(&mut q, &mut m, &verts, &[0, 1, 2], Some(9))
-            .color(Color::RED)
+            .tint(Color::RED)
             .layer(2.0);
 
         let red: [f32; 4] = Color::RED.into();
         assert_eq!(m.vertices.len(), 3);
-        assert_eq!(m.vertices[0].color, red, "顶点色应被 .color() 写入");
+        assert_eq!(m.vertices[0].color, red, "顶点色应被 .tint() 写入");
         assert_eq!(m.tri_indices.len(), 1);
 
         let (cmd, layer, states, tex) = only(&q);
@@ -926,16 +927,16 @@ mod tests {
         assert_eq!(states, None, "未链式设置状态 → None（继承全局默认）");
     }
 
-    /// `quads` + `.color()` → **整段实例色**（`MeshStyled`），顶点自带色不被改写。
+    /// `quads` + `.tint()` → **整段实例色**（`MeshStyled`），顶点自带色不被改写。
     #[test]
     fn quads_color_becomes_instance_tint() {
         let (mut q, mut m) = scratch();
         let white: [f32; 4] = Color::WHITE.into();
         let quad = [VertexP3U2C4 { color: white, ..Default::default() }; 4];
-        Draw2D::quads(&mut q, &mut m, &quad, 3).color(Color::CYAN);
+        Draw2D::quads(&mut q, &mut m, &quad, 3).tint(Color::CYAN);
 
         let cyan: [f32; 4] = Color::CYAN.into();
-        assert_eq!(m.vertices[0].color, white, "调用者顶点色不被 .color() 改写");
+        assert_eq!(m.vertices[0].color, white, "调用者顶点色不被 .tint() 改写");
         assert_eq!(m.tri_indices.len(), 2, "一个四边形 = 2 个三角形");
 
         let (cmd, _, _, tex) = only(&q);
@@ -965,12 +966,12 @@ mod tests {
         assert_eq!((t1.0.0, t1.1.0, t1.2.0), (0, 2, 3));
     }
 
-    /// `.model(mat)` → 走 `*Matrix` 变体（并把矩阵写入队列的 matrices 池）。
+    /// `.matrix(mat)` → 走 `*Matrix` 变体（并把矩阵写入队列的 matrices 池）。
     #[test]
-    fn model_selects_matrix_variant() {
+    fn matrix_selects_matrix_variant() {
         let (mut q, mut m) = scratch();
         Draw2D::sprite(&mut q, &mut m, SpriteRect::default(), 1)
-            .model(glam::Mat4::from_translation(glam::Vec3::new(5.0, 6.0, 0.0)));
+            .matrix(glam::Mat4::from_translation(glam::Vec3::new(5.0, 6.0, 0.0)));
         let (cmd, _, _, _) = only(&q);
         assert!(matches!(cmd, DrawCommand::Sprite2DMatrix { mat_idx: 0, .. }));
         assert_eq!(q.matrices.len(), 1);

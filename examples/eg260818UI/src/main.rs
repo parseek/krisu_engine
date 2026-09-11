@@ -1,9 +1,9 @@
 //! eg260818UI —— `rjw_ui` 示例：DOM 风格自动布局 + Tkinter 几何管理器（pack / grid / place）。
 //!
 //! 展示：
-//! - **独立 UI 渲染**：UI 录制到**单独 Render2D**（`set_sort_mode(SortMode::None)`：关闭 Render2D
-//!   排序，UI 自行管理绘制顺序——窗口按 z 提交、窗口内"背景/图形 → 文字"），与世界合并
-//!   提交（世界 `encode` → UI `encode` → 一次 present）
+//! - **独立 UI 层**：`rjw_krusie::runtime` 各持一个世界层与一个 UI 层渲染器（UI 层排序由
+//!   运行时关闭——`SortMode::None`，UI 自行管理绘制顺序：窗口按 z 提交、窗口内
+//!   "背景/图形 → 文字"），两层的录制进**同一个 pass**（一次 `f.submit(..)` 提交 + present）
 //! - **Window 容器**：可重叠 + 点击置顶（焦点 z-order）+ 可拖拽；同一 layer 内
 //!   "背景/图形 → 文字"顺序绘制（不做元素重叠处理）
 //! - **pack**：左侧主菜单（标题 / 按钮 / 滑块 / 勾选框 / 单选组）垂直堆叠
@@ -21,23 +21,27 @@
 //!
 //! # 代码组织
 //!
-//! 为避免 `UiApp` 结构体 / `new()` / `about_to_wait()` 过于杂乱，把演示状态与各区域
+//! 为避免 `UiApp` 结构体 / `new()` / `update()` 过于杂乱，把演示状态与各区域
 //! 绘制按**模块拆成独立 struct**，每个 struct 自持状态并提供一个 `ui(&mut self, &mut Ui, …)`
-//! 方法（`about_to_wait` 依次调用）：
+//! 方法（`update()` 内的 `f.ui(..)` 闭包里依次调用）：
 //! - [`TopBar`]：顶部状态栏（FPS / 点击次数标签 + 字体按钮 + 玩家名输入框 + 字体 Modal）；
 //! - [`Menu`]：左侧主菜单（pack：按钮 / 滑块 / 数字条 / 勾选框 / 下拉 / 布局约束 / 水平行）；
 //! - [`Inventory`]：可拖拽面板 + 3 列背包 grid；
 //! - [`Windows`]：可重叠 / 置顶 / 拖拽窗口 + 整窗 FX + 可调整大小文本输入框；
 //! - [`RightPanel`]：右侧窗口诊断 + 滚动列表 + flex 权重 + 底部说明。
 //!
-//! 跨模块共享的全局状态（点击计数、渲染基础设施、性能测量、`--auto-drag` / `--script-pos`
+//! 运行时（`rjw_krusie::runtime`）接管驱动/生命周期：窗口、渲染上下文、世界层与 UI 层
+//! 渲染器、每帧 `Ui::begin` / 输入快照 / 主题 / DPI / `Ui::finish`。应用侧只剩
+//! `config` / `init` / `update`（+ 可选的 `resized`）。
+//!
+//! 跨帧共享的全局状态（点击计数、相机、性能测量、`--auto-drag` / `--script-pos`
 //! 开关）仍留在 [`UiApp`]，需要时以 `&mut` 参数传给各模块的 `ui()`。
 
 use std::time::Instant;
 
 use rjw_krusie::prelude::*;
-
-const LAYER_UI: f64 = 10_000_000.0;
+// prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
+use rjw_krusie::ui::{FontModal, IdAbsolute, Label, PanelStyle};
 
 /// 顶部状态栏模块：FPS / 点击次数标签 + 字体按钮（打开 Modal）+ 玩家名输入框 + 字体 Modal。
 struct TopBar {
@@ -111,7 +115,7 @@ struct Menu {
     difficulty: String,
     /// combo 选中索引（难度下拉框）。
     diff_idx: Option<u32>,
-    /// 本帧是否请求重置 UI 状态（`ui.finish()` 后由 `about_to_wait` 统一处理）。
+    /// 本帧是否请求重置 UI 状态（`Frame::ui` 闭包末尾由 `update` 统一处理）。
     reset_requested: bool,
 }
 
@@ -132,8 +136,8 @@ impl Menu {
     }
 
     /// 左侧主菜单。`clicks` 为共享的点击计数（`&mut` 传入，各模块累加）。
-    /// 注意：闭包内不可触碰应用 `UiState`（已被 `ui` 借用），重置请求记录到
-    /// `self.reset_requested`，由 `about_to_wait` 在 `ui.finish()` 后统一处理。
+    /// 注意：闭包内不可触碰 `UiState`（已被 `ui` 借用），重置请求记录到
+    /// `self.reset_requested`，由 `update` 在 `Frame::ui` 闭包末尾统一处理。
     fn ui(&mut self, ui: &mut Ui, clicks: &mut u32) {
         ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {
             p.label("主菜单");
@@ -321,7 +325,7 @@ impl Windows {
                 w.label("分割线下方");
             });
         // 窗口 B（覆盖在 A 之上）：输入框 + 多行 TextArea。
-        ui.window_at("win_b", self.win_b_pos, |w| {
+        ui.window("win_b").pos(self.win_b_pos).show(|w| {
             w.label("窗口 B（覆盖在 A 之上）");
             // 性能测量：auto_drag 时每帧变化的标签（强制窗口内容每帧变化 → 重建路径）。
             w.label(&format!("帧序号 {}", self.auto_tick % 1000));
@@ -337,8 +341,11 @@ impl Windows {
                 w.text_area_nw("win_b_note_area", &mut self.win_b_note_area);
             }
         });
-        // 严格裁剪窗口（window_at_strict）：内容超出窗口被强制裁剪（Clip 沙箱）。
-        ui.window_at_strict("strict_win", Vec2::new(560.0, 460.0), |w| {
+        // 严格裁剪窗口（Placement::Clip）：内容超出窗口被强制裁剪（Clip 沙箱）。
+        ui.window("strict_win")
+            .pos(Vec2::new(560.0, 460.0))
+            .placement(Placement::Clip)
+            .show(|w| {
             w.label("严格裁剪窗口（内容超出被裁）");
             w.add(Label::new(
                 "这一段文字足够长，会超出严格窗口的可视区——超出部分被强制裁剪，\
@@ -353,7 +360,7 @@ impl Windows {
         let mut g = 1.0;
         let mut b = 1.0;
         let mut a = 1.0;
-        ui.window_at("chishi", vec2(155., 32.), |w| {
+        ui.window("chishi").pos(vec2(155., 32.)).show(|w| {
             w.label("赤石");
             w.add(NumberInput::new("chisN1", &mut self.cshi_num).step(0.1));
             self.cshi_num = w.slider("sb", 0.0..=360., self.cshi_num);
@@ -391,14 +398,14 @@ impl Windows {
             Rect::new(880.0, 638.0, 240.0, 50.0),
             &mut self.win_b_note_area,
             Vec2::new(140.0, 32.0),
-            true,
+            Resize::Both,
         );
         ui.resizable_text_input_at(
             "res_input",
             Rect::new(880.0, 696.0, 240.0, 26.0),
             &mut self.win_b_note,
             100.0,
-            true,
+            Resize::Horizontal,
         );
     }
 }
@@ -414,8 +421,9 @@ impl RightPanel {
         Self { list_sel: None }
     }
 
-    /// 右侧区 UI。`prev_press` / `prev_blocked` 为上一帧窗口诊断数据（须在 `Ui::begin`
-    /// **之前**从 `UiState` 读取——begin 会借用 ui_state）。
+    /// 右侧区 UI。`prev_press` / `prev_blocked` 为上一帧窗口诊断数据（须在
+    /// **本帧 UI 录制之前**从 `ui.state()` 读取——值由上一帧 `Ui::finish` 写入，
+    /// 本帧 `finish` 才覆盖）。
     fn ui(&mut self, ui: &mut Ui, clicks: &mut u32, prev_press: &str, prev_blocked: u32) {
         // 窗口诊断面板：实时显示窗口叠放与点击解析。
         let order: String = ui
@@ -464,21 +472,23 @@ impl RightPanel {
         });
         // 底部说明（锚定视口左下角——不再被窗口遮挡）。
         let hint = "Tab/方向键 遍历焦点 · 输入框拖选文本 + Ctrl+C/V/X · 双击按词选择 · Enter 换行（多行） · 滚轮滚动（指针在框内） · Esc 收起/失焦（再按退出） · R 重置";
-        let (hint_fs, hint_ff) = (ui.theme.label.font_size, ui.theme.label.font_family.clone());
+        let (hint_fs, hint_ff) = (ui.theme().label.font_size, ui.theme().label.font_family.clone());
         let hint_size = ui.text_size(hint, hint_fs, hint_ff.as_deref());
         let hint_pos = ui.anchor_pos(Anchor::BottomLeft, hint_size, Vec2::new(16.0, 16.0));
         ui.label_at(hint_pos, hint);
     }
 }
 
-/// 应用主体：渲染基础设施 + 跨模块全局状态 + 各 UI 模块（见文件顶部「代码组织」）。
+/// 应用主体：相机 + 跨模块全局状态 + 各 UI 模块（见文件顶部「代码组织」）。
+///
+/// 旧的 `render` / `render2d` / `render2d_ui` / `font` / `viewport` 字段已删除：
+/// 渲染上下文、世界层与 UI 层渲染器、文本子系统、画面矩形全部由运行时持有
+/// （`Ctx` / `Frame` / `Gfx`），应用不再直接管理它们。
 struct UiApp {
-    render: Option<RenderContext>,
-    render2d: Option<Render2D>,
-    render2d_ui: Option<Render2D>,
+    /// 世界层相机（`f.submit` 会写入当前画面矩形；identity 位姿 = 世界原点居中）。
+    cam: Camera2D,
+    /// 文本子系统（`init` 里用 `Gfx::text()` 建；UI 由运行时驱动，应用侧不再用它绘制）。
     font: Option<Text>,
-    viewport: Viewport,
-    ui_state: UiState,
     // 跨模块共享 / 全局状态
     /// 点击计数（各 UI 模块以 `&mut u32` 累加，顶部状态栏显示）。
     clicks: u32,
@@ -487,6 +497,11 @@ struct UiApp {
     auto_drag: bool,
     /// --script-pos：位置责任链演示——脚本驱动 win_a 摆动（优先级 -10，拖拽优先）。
     script_pos: bool,
+    /// --ui-dump：每帧打印 UI 引擎状态（`Ui::debug_dump`，Rust 侧调试）。
+    ui_dump: bool,
+    /// --sim-drag：**脚本化鼠标**拖动 win_b（`Frame::debug_inject_mouse`）——
+    /// 无鼠标环境复现「窗口拖动」（见 docs/DEBUGGING.md）。
+    sim_drag: bool,
     /// 帧统计聚合（每 `PERF_PRINT_EVERY` 帧打印一次）。
     perf: PerfAgg,
     // 各 UI 模块
@@ -499,22 +514,15 @@ struct UiApp {
 
 impl UiApp {
     fn new() -> Self {
-        let mut ui_state = UiState::new();
-        // 默认选中"普通"难度（单选组值 = 控件**绝对 ID**；顶层无前缀 = 原样）
-        ui_state
-            .radio_groups
-            .insert("diff".to_owned(), IdAbsolute::from("diff_normal"));
         Self {
-            render: None,
-            render2d: None,
-            render2d_ui: None,
+            cam: Camera2D::default(),
             font: None,
-            viewport: Viewport::new(Vec2::new(1280.0, 720.0), Vec2::ZERO),
-            ui_state,
             clicks: 0,
             drag_t0: Instant::now(),
             auto_drag: false,
             script_pos: false,
+            ui_dump: false,
+            sim_drag: false,
             perf: PerfAgg::new(),
             top: TopBar::new(),
             menu: Menu::new(),
@@ -574,6 +582,7 @@ impl PerfAgg {
         }
     }
 
+    /// 累计一帧（`s` = 本帧 `Ui::finish` 写入的 UI 阶段统计；须在 `f.ui(..)` 闭包内取）。
     #[allow(clippy::too_many_arguments)]
     fn add(
         &mut self,
@@ -636,11 +645,11 @@ impl PerfAgg {
 }
 
 /// 世界层：几个背景方块（在 UI 之下）。与 `UiApp` 无关，故为自由函数（避免 `&mut self`
-/// 与 `&mut self.render2d` 的字段借用冲突）。
+/// 与 `f.draw()` 的字段借用冲突）。
 fn render_world(r2d: &mut Render2D) {
     let world_tf = Transform2D::default();
     r2d.solid(SpriteRect::new((-640.0, -360.0), (1280.0, 720.0)))
-    .color(Color::rgba_u8(30, 36, 48, 255))
+    .tint(Color::rgba_u8(30, 36, 48, 255))
     .transform(world_tf)
     .layer(0.0);
     for i in 0..6 {
@@ -649,106 +658,27 @@ fn render_world(r2d: &mut Render2D) {
             (x, -280.0 + (i % 2) as f32 * 160.0),
             (160.0, 90.0),
         ))
-        .color(Color::rgba_u8(40 + i * 20, 60, 90, 255))
+        .tint(Color::rgba_u8(40 + i * 20, 60, 90, 255))
         .transform(world_tf)
         .layer(1.0);
     }
 }
 
-/// 合并提交：世界 → UI → 一次 present，并累计 / 打印帧统计。
-/// 自由函数：只借入 `self` 的若干**不重叠字段**（render2d / render2d_ui / perf），
-/// 避免整 `&mut self` 与这些字段借用冲突。
-fn submit_frame(
-    r2d: &mut Render2D,
-    r2d_ui: &mut Render2D,
-    perf: &mut PerfAgg,
-    ui_stats: &UiStats,
-    t_frame: Instant,
-    fps: f64,
-) {
-    let t_render = Instant::now();
-    let Some((surface_tex, view)) = r2d.acquire_frame() else {
-        return;
-    };
-    let begin_us = t_render.elapsed().as_secs_f64() * 1e6;
-    let t_enc = Instant::now();
-    let cb_world = r2d.encode(
-        &ClearConfig {
-            color: Some(wgpu::Color { r: 0.09, g: 0.11, b: 0.16, a: 1.0 }),
-            depth: None,
-            stencil: None,
-        },
-        &view,
-        None,
-    );
-    let cb_ui = r2d_ui.encode(
-        &ClearConfig { color: None, depth: None, stencil: None },
-        &view,
-        None,
-    );
-    let encode_us = t_enc.elapsed().as_secs_f64() * 1e6;
-    let t_sub = Instant::now();
-    r2d.queue().submit([cb_world, cb_ui]);
-    let submit_us = t_sub.elapsed().as_secs_f64() * 1e6;
-    let t_pr = Instant::now();
-    r2d.queue().present(surface_tex);
-    let present_us = t_pr.elapsed().as_secs_f64() * 1e6;
-    let render_us = begin_us + encode_us + submit_us + present_us;
-    // 性能统计：整帧 / 渲染（细分）/ UI 各阶段（每 PERF_PRINT_EVERY 帧打印一次）
-    let frame_us = t_frame.elapsed().as_secs_f64() * 1e6;
-    perf.add(ui_stats, frame_us, render_us, begin_us, encode_us, submit_us, present_us);
-    if perf.frames >= PERF_PRINT_EVERY {
-        perf.flush(fps);
-    }
-}
-
 impl App for UiApp {
-    fn primary_window_attrib(&self) -> WindowAttributes {
-        WindowAttributes::default()
-            .with_title("eg260818UI — rjw_ui 示例")
-            .with_inner_size(LogicalSize::new(1280.0, 720.0))
+    fn config(&self) -> AppConfig {
+        AppConfig::new("eg260818UI — rjw_ui 示例").size(1280.0, 720.0)
     }
 
-    fn on_init(&mut self, ctx: &mut MainContext) {
-        let window = ctx.primary_window().expect("window");
-        self.render = Some(RenderContext::new(window, &RenderConfig::default()));
-        let render = self.render.as_ref().unwrap();
-        let render2d = Render2D::new(render);
-        // 独立 UI 渲染器：**必须关闭 Render2D 排序**（set_sort_mode(SortMode::None)）——
-        // UI 自行管理绘制顺序：`finish` 按（窗口 z 升序 → 窗口内图形组 → 字形文字组）提交，
-        // 每窗口 `layer = base + z*1.0` 仅作兜底；Render2D 按提交顺序原样绘制。
-        // ⚠ 不要用 SortMode::LayerAndStates：它会在同一 layer 内**按纹理 uid
-        // 重排**，字形图集页先于程序化纹理页（圆角/渐变）注册 → 圆角/渐变会盖住文字。
-        let mut render2d_ui = Render2D::new(render);
-        render2d_ui.set_sort_mode(SortMode::None);
-        let font = Text::new(render2d.device(), render2d.queue(), render2d.texture_layout());
-        let (w, h) = render.size();
-        let viewport = Viewport::new(Vec2::new(w as f32, h as f32), Vec2::ZERO);
-        self.render2d = Some(render2d);
-        self.render2d_ui = Some(render2d_ui);
-        self.font = Some(font);
-        self.viewport = viewport;
+    fn init(&mut self, gfx: &Gfx) {
+        // 文本子系统（长期资源）由 `Gfx` 建：取代旧的
+        // `Text::new(r2d.device(), r2d.queue(), r2d.texture_layout())`。
+        // 其余长期资源（RenderContext / 世界层与 UI 层 Render2D / 画面矩形）由运行时持有，
+        // 应用不再自建（UI 层排序已由运行时关闭，无需 `set_sort_mode(SortMode::None)`）。
+        self.font = Some(gfx.text());
     }
 
-    fn on_resized(&mut self, _ctx: &mut MainContext, width: u32, height: u32) {
-        if let Some(r) = &mut self.render {
-            r.resize(width, height);
-        }
-        self.viewport = Viewport::new(Vec2::new(width as f32, height as f32), Vec2::ZERO);
-    }
-
-    fn about_to_wait(&mut self, ctx: &mut MainContext) {
+    fn update(&mut self, ctx: &mut Ctx) {
         let t_frame = Instant::now();
-        // ── 应用快捷键：**输入框聚焦时屏蔽**（capturing_text）——
-        //    输入 `R` / `Esc` 不会被当作重置 / 退出。
-        if !self.ui_state.capturing_text() {
-            if ctx.keyboard.get(KeyCode::Escape).down_edge() {
-                ctx.request_exit();
-            }
-            if ctx.keyboard.get(KeyCode::KeyR).down_edge() {
-                reset_ui_state(&mut self.ui_state);
-            }
-        }
 
         // 帧时间基准（FX 动画 / --auto-drag 用）。
         let t = self.drag_t0.elapsed().as_secs_f64();
@@ -757,84 +687,170 @@ impl App for UiApp {
             self.windows.tick_auto(t);
         }
 
-        let Some(r2d) = &mut self.render2d else {
+        // 无帧不执行渲染代码（本帧也不录制 UI）。
+        let Some(mut f) = ctx.frame() else {
             return;
         };
-        r2d.set_mvp(self.viewport.vp_matrix());
-        let font = self.font.as_mut().unwrap();
 
-        // ── 世界层：几个背景方块（在 UI 之下） ─────────────────
-        render_world(r2d);
+        // ── 调试：脚本化鼠标（`--sim-drag`）────────────────────────
+        // 复现"窗口拖动"：第 20 帧在 win_b 标题栏按下，随后每帧右移 6px（物理像素），
+        // 第 80 帧释放。**不需要真实鼠标**——引擎合成的边沿与真实设备一致。
+        if self.sim_drag {
+            let n = f.frames();
+            let start = Vec2::new(1180.0, 200.0); // win_b 标题栏附近（origin ≈ 1140,180）
+            match n {
+                20 => f.debug_inject_mouse(start, true),
+                21..=79 => {
+                    let dx = (n - 20) as f32 * 6.0;
+                    f.debug_inject_mouse(Vec2::new(start.x + dx, start.y + dx * 0.5), true)
+                }
+                _ => {}
+            }
+        }
 
-        // ── UI 层：录制到独立 Render2D（关闭排序） ─────────────
-        let r2d_ui = self.render2d_ui.as_mut().unwrap();
-        r2d_ui.set_mvp(self.viewport.vp_matrix());
-        let window = ctx.primary_window().expect("window");
-        // 窗口诊断（调试机制）：`UiState` 的跨帧诊断数据须在 `Ui::begin` **之前**读取
-        // （begin 会借用 ui_state）——上一帧 finish 写入的值本帧显示。
-        let prev_press = self
-            .ui_state
-            .last_press_window()
-            .map(|(id, z)| format!("{id} (z{z})"))
-            .unwrap_or_else(|| "无".to_owned());
-        let prev_blocked = self.ui_state.occluded_hits();
+        // ── 世界层：几个背景方块（在 UI 之下）─────────────────
+        // 阶段计时（沿用旧 `[perf]` 的细分口径，因新驱动不再暴露 Frame 取用/pass 边界，
+        // 以可达的边界重新划分）：`begin` = 世界层录制，`encode` = UI 帧
+        // （`Ui::begin` → `Ui::finish` 的录制/布局/提交队列），`submit` = `f.submit`，
+        // `present` = `f.present`；四段不重叠，合计 = `render` 总耗时。
+        let t_world = Instant::now();
+        render_world(f.draw());
+        let begin_us = t_world.elapsed().as_secs_f64() * 1e6;
+
         // 主题按所选字体构建（FontModal 确定后写入 font_name；空 = 系统默认）。
         // with 责任链：全局字体族级联到全部文本子样式 + 全局圆角。
+        // ⚠ 主题须在 `f.ui(..)` **之前**构建：闭包借用 `self`，闭包内不能构造它。
         let theme = if self.top.font_name().is_empty() {
             Theme::dark()
         } else {
             Theme::dark().with_font_family(self.top.font_name())
         }
         .with_radius(8.0);
-        let mut ui = Ui::begin(window, font, &mut self.ui_state)
-            .capture(&ctx.mouse, &ctx.keyboard)
-            .theme(theme)
-            .base_layer(LAYER_UI)
-            // DPI 缩放：控件坐标/字号按逻辑像素，内部换算物理像素
-            .scale_factor(ctx.scale_factor().unwrap_or(1.0))
-            .build();
 
-        // ── 位置责任链演示（--script-pos）：脚本让窗口 A 沿正弦摆动 ──
-        // 处理器优先级 -10（< 0）：**用户拖拽优先**——拖住 A 时脚本让位、窗口跟手，
-        // 松开后停在放置处；不拖时脚本每帧驱动位置（脚本"动画"，拖动"覆盖"）。
-        if self.script_pos {
-            let t0 = self.drag_t0; // Instant: Copy，闭包只捕获时间基准（不借 self）
-            ui.pos_handler(-10, move |id| {
-                if id == "win_a" {
-                    let t = t0.elapsed().as_secs_f64();
-                    Some(Vec2::new(
-                        560.0 + 260.0 * (t * 0.5).sin() as f32,
-                        240.0 + 120.0 * (t * 0.9).cos() as f32,
-                    ))
-                } else {
-                    None
+        // 性能统计（`f.ui` 前复制的上一帧值；闭包内每帧覆盖）。
+        let mut ui_stats = UiStats::default();
+        // 本帧点击计数（顶部状态栏显示）；UI 模块内累加，帧末写回 `self.clicks`。
+        let mut clicks = self.clicks;
+        // --script-pos：`Instant` 为 `Copy`——先复制出时间基准，闭包只捕获它（不借 `self`）。
+        let script_pos = self.script_pos;
+        // --ui-dump：每帧打印 UI 引擎状态（Rust 侧诊断，见 docs/DEBUGGING.md）。
+        let ui_dump = self.ui_dump;
+        let t0 = self.drag_t0;
+        let fps = f.fps();
+        // `Esc` 退出请求：`Frame` 借用了 `ctx`，闭包内不能再借 `ctx`（`f.ui` 与
+        // `ctx.exit()` 的借用冲突）——先记标记，闭包结束后再请求退出。
+        let mut exit_requested = false;
+
+        // ── UI 层：录制 + 提交由运行时接管（`Ui::begin` / 输入快照 / 主题 / DPI /
+        //    `Ui::finish(&region, r2d_ui)`）；UI 渲染器排序已关闭。 ────────────
+        let t_ui = Instant::now();
+        f.ui(theme, |ui| {
+            // ── 应用快捷键：**文本输入框聚焦时屏蔽**（`UiState::text_focus()`）——
+            //    输入 `R` / `Esc` 不会被当作重置 / 退出。
+            //    与旧 `capturing_text()`（任何控件持焦点都为真）不同：只有**文本控件**
+            //    持焦点才屏蔽快捷键（按钮/滑块 Tab 焦点不吞应用按键）。
+            //    新驱动下没有「`Ui::begin` 之前」的 `UiState` 取用口，故快捷键判定放在
+            //    闭包内、经 `Ui::state()` 读取（输入快照在 `Ui::begin` 时已捕获，
+            //    `down_edge` 语义与旧版一致）。
+            if ui.state().text_focus().is_none() {
+                if ui.key_down_edge(KeyCode::Escape) {
+                    exit_requested = true;
                 }
-            });
+                if ui.key_down_edge(KeyCode::KeyR) {
+                    reset_ui_state(ui.state_mut());
+                }
+            }
+            // 窗口诊断（调试机制）：值由**上一帧** `Ui::finish` 写入、本帧 `finish` 覆盖
+            // （`last_press_window` / `occluded_hits` 跨帧保留）——须在「本帧 UI 模块录制
+            // 之前」从 `ui.state()` 读取。`f.ui(..)` 的闭包是唯一能拿到 `UiState` 的地方，
+            // 故由旧版「`Ui::begin` 之前读」改为「闭包开头读」；显示内容与旧版一致。
+            let prev_press = ui
+                .state()
+                .last_press_window()
+                .map(|(id, z)| format!("{id} (z{z})"))
+                .unwrap_or_else(|| "无".to_owned());
+            let prev_blocked = ui.state().occluded_hits();
+
+            // ── 位置责任链演示（--script-pos）：脚本让窗口 A 沿正弦摆动 ──
+            // 处理器优先级 -10（< 0）：**用户拖拽优先**——拖住 A 时脚本让位、窗口跟手，
+            // 松开后停在放置处；不拖时脚本每帧驱动位置（脚本"动画"，拖动"覆盖"）。
+            if script_pos {
+                ui.pos_handler(-10, move |id| {
+                    if id == "win_a" {
+                        let t = t0.elapsed().as_secs_f64();
+                        Some(Vec2::new(
+                            560.0 + 260.0 * (t * 0.5).sin() as f32,
+                            240.0 + 120.0 * (t * 0.9).cos() as f32,
+                        ))
+                    } else {
+                        None
+                    }
+                });
+            }
+
+            // ── 各 UI 模块依次录制（互不重叠字段借用，顺序与屏幕布局无关） ──
+            self.top.ui(ui, fps, clicks);
+            self.menu.ui(ui, &mut clicks);
+            self.inventory.ui(ui);
+            self.windows.ui(ui, &mut clicks, t);
+            self.right.ui(ui, &mut clicks, &prev_press, prev_blocked);
+
+            // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
+            // 不被本帧后录的窗口盖住——见 modal_at 文档）。
+            self.top.show_font_modal(ui);
+
+            // 性能统计（**闭包末尾、本帧 `Ui::finish` 之前**读到的正是上一帧 finish 写入
+            // 的 UI 各阶段耗时——与旧版「`ui.finish()` 之后读 `ui_state.stats`」等价：
+            // 那时读到的同样是上一帧的统计，本次 `finish` 才会覆盖它）。
+            ui_stats = ui.state().stats.clone();
+
+            // ── 引擎状态诊断（`--ui-dump`）：Rust 侧调试用 —— 打印每个窗口的
+            //    id / z / **本帧提交原点** / 尺寸 / 拖拽状态 / 持久位置 + 鼠标 / 焦点。
+            //    排查"位置 / 层级 / 拖拽"问题时**先看这份状态**（见 docs/DEBUGGING.md）。
+            if ui_dump {
+                eprintln!("{}", ui.debug_dump());
+            }
+
+            // 重置请求（按钮点击 / `R` 键）：须在**全部录制之后**执行——
+            // `UiState::reset` 清空控件状态与窗口缓存，此时本帧命令已录好、下次
+            // `begin_frame` 前无读取者（与旧版「`ui.finish()` 后重置」等价）。
+            if self.menu.reset_requested {
+                self.menu.reset_requested = false;
+                reset_ui_state(ui.state_mut());
+            }
+        });
+        let encode_us = t_ui.elapsed().as_secs_f64() * 1e6;
+        self.clicks = clicks;
+
+        // ── 提交：世界层与 UI 层进同一个 pass（清色 + 一次 present）──────
+        // `f.submit` 负责写入画面矩形 → 取 VP → 开 pass → 提交世界与 UI → 编码提交；
+        // `f.present()` 呈现（可省略：`Frame` 析构自动呈现）。
+        let t_sub = Instant::now();
+        f.submit(
+            &mut self.cam,
+            Clear::color(Color::rgb(0.09, 0.11, 0.16)),
+        );
+        let submit_us = t_sub.elapsed().as_secs_f64() * 1e6;
+        let t_present = Instant::now();
+        f.present();
+        let present_us = t_present.elapsed().as_secs_f64() * 1e6;
+
+        // 性能统计：整帧 / 渲染（细分）/ UI 各阶段（每 PERF_PRINT_EVERY 帧打印一次）
+        let render_us = begin_us + encode_us + submit_us + present_us;
+        let frame_us = t_frame.elapsed().as_secs_f64() * 1e6;
+        self.perf
+            .add(&ui_stats, frame_us, render_us, begin_us, encode_us, submit_us, present_us);
+        if self.perf.frames >= PERF_PRINT_EVERY {
+            self.perf.flush(fps);
         }
 
-        // ── 各 UI 模块依次录制（互不重叠字段借用，顺序与屏幕布局无关） ──
-        self.top.ui(&mut ui, ctx.timer.get_fps(), self.clicks);
-        self.menu.ui(&mut ui, &mut self.clicks);
-        self.inventory.ui(&mut ui);
-        self.windows.ui(&mut ui, &mut self.clicks, t);
-        self.right.ui(&mut ui, &mut self.clicks, &prev_press, prev_blocked);
-
-        // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
-        // 不被本帧后录的窗口盖住——见 modal_at 文档）。
-        self.top.show_font_modal(&mut ui);
-
-        ui.finish(&self.viewport, r2d_ui);
-
-        // 重置请求（ui 借用已随 finish 结束，可安全触碰 ui_state）
-        if self.menu.reset_requested {
-            reset_ui_state(&mut self.ui_state);
-            self.menu.reset_requested = false;
+        // 退出请求（`Esc`；输入框聚焦时已在闭包内屏蔽）：本帧照常收尾，帧末退出循环。
+        // ⚠ 须在 `f` 最后一次使用之后——`Frame` 借用了 `ctx`（且有 `Drop`，借用活到
+        //    其作用域末尾），`f.drop()` 之后才能再取 `ctx`。
+        drop(f);
+        if exit_requested {
+            ctx.exit();
         }
-        // 性能统计（上一帧 finish 写入的 UI 各阶段耗时）
-        let ui_stats = self.ui_state.stats.clone();
-
-        // ── 合并提交：世界 → UI → 一次 present ────────────────
-        submit_frame(r2d, r2d_ui, &mut self.perf, &ui_stats, t_frame, ctx.timer.get_fps());
     }
 }
 
@@ -843,13 +859,11 @@ fn parse_pos_arg(args: &[String], key: &str, default: Vec2) -> Vec2 {
     let mut out = default;
     let mut i = 0;
     while i < args.len() {
-        if args[i] == key && i + 1 < args.len() {
-            if let Some((x, y)) = args[i + 1].split_once(',') {
-                if let (Ok(x), Ok(y)) = (x.trim().parse(), y.trim().parse()) {
+        if args[i] == key && i + 1 < args.len()
+            && let Some((x, y)) = args[i + 1].split_once(',')
+                && let (Ok(x), Ok(y)) = (x.trim().parse(), y.trim().parse()) {
                     out = Vec2::new(x, y);
                 }
-            }
-        }
         i += 1;
     }
     out
@@ -862,12 +876,18 @@ fn main() -> Result<(), EventLoopError> {
     app.windows.win_b_pos = parse_pos_arg(&args, "--win-b", app.windows.win_b_pos);
     app.auto_drag = args.iter().any(|a| a == "--auto-drag");
     app.script_pos = args.iter().any(|a| a == "--script-pos");
-    run_app(app)
+    app.ui_dump = args.iter().any(|a| a == "--ui-dump");
+    app.sim_drag = args.iter().any(|a| a == "--sim-drag");
+    run(app)
 }
 
 /// 重置 UI 状态并恢复默认选中"普通"难度。
+///
+/// UI 状态现由运行时持有（`Ctx::ui_layer`），应用经 `Ui::state_mut()` 在
+/// `Frame::ui` 闭包内取用——本函数改为就地传入 `&mut UiState`。
 fn reset_ui_state(state: &mut UiState) {
     state.reset();
+    // 默认选中"普通"难度（单选组值 = 控件**绝对 ID**；顶层无前缀 = 原样）
     state
         .radio_groups
         .insert("diff".to_owned(), IdAbsolute::from("diff_normal"));

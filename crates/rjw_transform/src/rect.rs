@@ -74,12 +74,20 @@ impl Rect {
         p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h
     }
 
-    /// 区间相交（容忍负宽高；边沿接触视为相交）。
+    /// 面积正相交（容忍负宽高；**半开区间**：边沿接触不算相交，接触判定用 [`Self::touches`]）。
     #[inline]
     pub fn intersects(&self, other: &Rect) -> bool {
         let a = self.normalized();
         let b = other.normalized();
         a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+    }
+
+    /// 是否接触或相交（闭区间；边沿贴边算接触）。
+    #[inline]
+    pub fn touches(&self, other: &Rect) -> bool {
+        let a = self.normalized();
+        let b = other.normalized();
+        a.x <= b.x + b.w && b.x <= a.x + a.w && a.y <= b.y + b.h && b.y <= a.y + a.h
     }
 
     /// 完全包含（容忍负宽高；`other` 归一化后判定）。
@@ -127,6 +135,89 @@ impl Rect {
             (self.h - by * 2.0).max(0.0),
         )
     }
+
+    // ── 画面 / 视口辅助（Rect 是被唯一承认的「屏幕矩形」类型，见 API_DESIGN §5） ──
+
+    /// 左上角（= `min` 的别名，语义上更贴近「屏幕位置」）。
+    #[inline]
+    pub fn pos(&self) -> Vec2 {
+        self.min()
+    }
+
+    /// 尺寸 `(w, h)`。
+    #[inline]
+    pub fn size(&self) -> Vec2 {
+        Vec2::new(self.w, self.h)
+    }
+
+    /// 宽高任一为 0 视为空。
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        let r = self.normalized();
+        r.w <= 0.0 || r.h <= 0.0
+    }
+
+    /// 在自身内部**再挖一个矩形**（`inner` 相对自身左上角的像素偏移）。
+    ///
+    /// 用于分屏 / 画中画：`window_rect.inset(Rect::new(x, y, w, h))`。
+    #[inline]
+    pub fn inset(&self, inner: Rect) -> Rect {
+        Rect::new(self.x + inner.x, self.y + inner.y, inner.w, inner.h)
+    }
+
+    /// 左半幅（宽度取半，`x` 不变）。
+    #[inline]
+    pub fn left_half(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w * 0.5, self.h)
+    }
+
+    /// 右半幅（宽度取半，`x` 右移半宽）。
+    #[inline]
+    pub fn right_half(&self) -> Rect {
+        Rect::new(self.x + self.w * 0.5, self.y, self.w * 0.5, self.h)
+    }
+
+    /// 上半幅（高度取半，`y` 不变）。
+    #[inline]
+    pub fn top_half(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w, self.h * 0.5)
+    }
+
+    /// 下半幅（高度取半，`y` 下移半高）。
+    #[inline]
+    pub fn bottom_half(&self) -> Rect {
+        Rect::new(self.x, self.y + self.h * 0.5, self.w, self.h * 0.5)
+    }
+}
+
+impl From<(f32, f32, f32, f32)> for Rect {
+    /// `(x, y, w, h)`。
+    #[inline]
+    fn from(value: (f32, f32, f32, f32)) -> Self {
+        Self::new(value.0, value.1, value.2, value.3)
+    }
+}
+
+impl From<[f32; 4]> for Rect {
+    /// `[x, y, w, h]`。
+    #[inline]
+    fn from(value: [f32; 4]) -> Self {
+        Self::new(value[0], value[1], value[2], value[3])
+    }
+}
+
+impl From<Rect> for [f32; 4] {
+    #[inline]
+    fn from(r: Rect) -> Self {
+        [r.x, r.y, r.w, r.h]
+    }
+}
+
+impl From<Rect> for (f32, f32, f32, f32) {
+    #[inline]
+    fn from(r: Rect) -> Self {
+        (r.x, r.y, r.w, r.h)
+    }
 }
 
 #[cfg(test)]
@@ -160,7 +251,7 @@ mod tests {
 
     #[test]
     fn transform_is_conservative_for_rotation() {
-        let t = Transform2D::IDENTITY.with_pos(Vec2::new(100.0, 0.0)).with_rot(0.785398); // 45°
+        let t = Transform2D::IDENTITY.with_pos(Vec2::new(100.0, 0.0)).with_rot(std::f32::consts::FRAC_PI_4); // 45°
         let r = Rect::new(0.0, 0.0, 10.0, 10.0).transform(&t);
         // 旋转后包围盒应包含所有原角点的新位置
         for c in [Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(0.0, 10.0), Vec2::new(10.0, 10.0)] {
@@ -180,5 +271,42 @@ mod tests {
         assert_eq!(Rect::new(0.0, 0.0, 5.0, 5.0).shrink(-3.0), Rect::new(0.0, 0.0, 5.0, 5.0));
         // 非方矩形
         assert_eq!(Rect::new(1.0, 2.0, 20.0, 8.0).shrink(1.5), Rect::new(2.5, 3.5, 17.0, 5.0));
+    }
+
+    #[test]
+    fn touches_includes_edges_intersects_excludes_them() {
+        let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let edge = Rect::new(10.0, 0.0, 5.0, 5.0);
+        assert!(!a.intersects(&edge), "半开区间：贴边不算相交");
+        assert!(a.touches(&edge), "闭区间：贴边算接触");
+    }
+
+    #[test]
+    fn tuple_and_array_conversions_roundtrip() {
+        let r = Rect::new(1.0, 2.0, 3.0, 4.0);
+        assert_eq!(Rect::from((1.0, 2.0, 3.0, 4.0)), r);
+        assert_eq!(Rect::from([1.0, 2.0, 3.0, 4.0]), r);
+        let t: (f32, f32, f32, f32) = r.into();
+        assert_eq!(t, (1.0, 2.0, 3.0, 4.0));
+        let a: [f32; 4] = r.into();
+        assert_eq!(a, [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn splits_and_inset_cover_window_layout() {
+        let window = Rect::new(0.0, 0.0, 1280.0, 720.0);
+        assert_eq!(window.left_half(), Rect::new(0.0, 0.0, 640.0, 720.0));
+        assert_eq!(window.right_half(), Rect::new(640.0, 0.0, 640.0, 720.0));
+        assert_eq!(window.top_half(), Rect::new(0.0, 0.0, 1280.0, 360.0));
+        assert_eq!(window.bottom_half(), Rect::new(0.0, 360.0, 1280.0, 360.0));
+        // 画中画：相对窗口的 (900, 12, 280, 240)
+        assert_eq!(
+            window.inset(Rect::new(900.0, 12.0, 280.0, 240.0)),
+            Rect::new(900.0, 12.0, 280.0, 240.0)
+        );
+        assert_eq!(window.pos(), Vec2::ZERO);
+        assert_eq!(window.size(), Vec2::new(1280.0, 720.0));
+        assert!(!window.is_empty());
+        assert!(Rect::new(0.0, 0.0, 0.0, 10.0).is_empty());
     }
 }

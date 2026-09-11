@@ -1,6 +1,6 @@
 [package]
 name = "rjw_main"
-version = "0.1.1"
+version = "0.3.0"
 edition = "2024"
 authors = ["KrisuRJW <Cmd1loica99@163.com>"]
 description = "App entry point: winit event loop, MainContext with timer/keyboard/mouse, and the App trait."
@@ -12,6 +12,6 @@ categories = ["game-engines"]
 
 [dependencies]
 winit = "0.30.13"
-rjw_time = { path = "../rjw_time", version = "0.1.0" }
-rjw_keyboard = { path = "../rjw_keyboard", version = "0.1.1" }
-rjw_mouse = { path = "../rjw_mouse", version = "0.1.2" }
+rjw_time = { path = "../rjw_time", version = "0.3.0" }
+rjw_keyboard = { path = "../rjw_keyboard", version = "0.3.0" }
+rjw_mouse = { path = "../rjw_mouse", version = "0.3.0" }

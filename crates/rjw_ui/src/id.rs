@@ -135,7 +135,7 @@ impl IdStack {
     ///
     /// - 栈空（顶层）：`Borrowed(label)`——**零拷贝零分配**；
     /// - 嵌套：拼接一次 `format!("{prefix}/{label}")`。
-    pub fn id_for<'s, 'l>(&'s mut self, id_relative: IdRelative<'l>) -> IdAbsolute<'l> {
+    pub fn id_for<'l>(&mut self, id_relative: IdRelative<'l>) -> IdAbsolute<'l> {
         if self.segs.is_empty() {
             // 直接取字段：`id_relative.0` 是 `&'l str`（Copy），保留 label 生命周期。
             IdAbsolute(Cow::Borrowed(id_relative.0))

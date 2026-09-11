@@ -19,12 +19,14 @@
 ## ✨ 特性
 
 - 🎨 **Batch2D 批渲染**（`rjw_2d_render`）：Sprite/Mesh **统一管线** + RStates 渲染状态 bitfield（u64），按 (layer, states) 排序
-- 🚪 **统一入口**（`rjw_krusie`）：`use rjw_krusie::prelude::*;` **一行起步**（应用骨架 + 绘制 + 相机 + 文本 + UI），低层/冲突名走 `rjw_krusie::<模块>::…`
-- 🔗 **Builder 责任链**：`add_sprite2d(...).blend(Additive).depth_test(true)` 按对象定制渲染状态；不链式 = 全局默认
+- 🚪 **统一入口 + 模块化运行时**（`rjw_krusie`）：`use rjw_krusie::prelude::*;` 一行起步；窗口 / 帧 / 相机视口 / 清屏 / 提交 / present 由 `App` + `Ctx` + `Frame` 接管，低层/冲突名走 `rjw_krusie::<模块>::…`
+- 🔗 **Builder 责任链**：按对象定制渲染状态（`.blend(BlendMode::Additive)` / `.depth(DepthState::test_write(..))` / `.states(RStates)`）；不链式 = 全局默认
 - 🎛️ **渲染状态 RStates**：Blend（含 Inverse/Subtract/Min/Max/Disabled 9 种模式）/ Sampler / Cull+Raster / Depth / Stencil 6 域 bitfield，三级控制（全局默认 → 单条绘制 → 批量描述符）
 - 📦 **实例缓冲页池**：单帧精灵数量可远超单批上限（8192），自动分页绘制，不阻塞帧、无运行时扩张
-- 🎥 **2D 正交相机**（`rjw_transform::Camera2D`）：中心原点、Y+ 向下、VP 矩阵直接透传、屏幕↔世界坐标互转
-- 📐 **变换系统**（`Transform2D`）：位置/缩放/旋转、父子组合、命中检测
+- 🎥 **相机 = 矩形区域 + 2D 变换**（`Camera2D { region, transform }`）：中心原点、Y+ 向下、VP 矩阵直接透传、屏幕↔世界互转；`Viewport` 已并入 `Rect`
+- 🖼️ **多画面**：一个画面 = 一次 `Frame::submit(相机, clear)`；每个画面独占一个帧级 VP 槽（动态偏移绑定），互不串味
+- 🌅 **无帧也跑逻辑**：取不到表面（最小化/遮挡/超时）时 `Ctx::frame()` 返回 `None`，应用用 `let Some(mut f) = ctx.frame() else { return };` 守卫渲染代码；后台按 `Background` 退避不空转
+- 📐 **变换系统**（`Transform2D`）：位置/缩放/旋转、父子组合（`compose` / `compose_inverse`）、命中检测
 - ⌨️ **输入**：键盘（`KeyState` 边沿：pressed / down_edge / true_edge）+ 鼠标（位置/增量/滚轮/按钮）
 - 🎞️ **程序化纹理**：无需外部资源，运行时生成草地/水面/树冠/角色等
 - 🕹️ **综合 RPG 示例**（`eg260731RPG`）：波次敌人、多地形大地图、自动 y-sort 纵深感、相机跟踪居中、高 DPI 适配
@@ -33,22 +35,29 @@
 
 | crate | 职责 |
 |---|---|
-| `rjw_krusie` | ★ **统一入口**（聚合，无实现）：`rjw_krusie::prelude::*` 一行起步 + `main`/`gpu`/`render2d`/`transform`/`color`/`atlas`/`text`/`ui`/`tilemap`/`collision` 命名空间 |
-| `rjw_main` | 入口 `run_app(App)`、事件循环、窗口、`MainContext`（键盘/鼠标/计时） |
-| `rjw_render` | 底层 `RenderContext`、纹理 `TextureWrapped`、wgpu 重导出 |
+| `rjw_krusie` | ★ **统一入口（聚合 + 模块化运行时）**：`rjw_krusie::prelude::*` 一行起步；`rjw_krusie::runtime`（`App`/`Ctx`/`Frame`/`Gfx`/`AppConfig`）+ `main`/`gpu`/`render2d`/`transform`/`color`/`atlas`/`text`/`ui`/`tilemap`/`collision` 命名空间 |
+| `rjw_main` | 平台底座：winit / 输入 / 计时重导出 + 默认窗口标题（事件循环在 `rjw_krusie::runtime`） |
+| `rjw_render` | 底层 `RenderContext`/`Gpu`/`Clear`/`RenderFrame`/`PassBuilder`/`FrameSource`、纹理与静态网格注册表、wgpu 重导出 |
 | `rjw_2d_render` | ★ 2D 批渲染器 `Render2D`、`RStates`、Builder 责任链、`SpriteRect`、`Mesh`、分页实例缓冲、**统一管线缓存** |
 | `rjw_atlas` | ★ 运行时图集：DynamicAtlas（Guillotine 空闲矩形 + 寿命 + clamp_margin）+ StaticAtlas（TOML） |
 | `rjw_text` | ★ 文本渲染（cosmic-text 排版 + swash 字形光栅化 + DynamicAtlas 缓存） |
 | `rjw_ui` | ★ UI：hybrid 模式（立即外观 + ID 持久状态）+ DOM 风格自动尺寸 + Tkinter 布局（pack/grid/place），含按钮/滑块/勾选/单选/输入框 |
-| `rjw_transform` | `Transform2D` + `Camera2D`（正交投影、坐标转换） |
+| `rjw_transform` | `Transform2D` + `Camera2D { region, transform }`（矩形区域 + 2D 变换、正交投影、坐标转换）+ `Rect` |
 | `rjw_color` | `Color`(f32) / `ColorF64`(f64) + 常用常量 |
-| `rjw_keyboard` / `rjw_keystate` | 键盘输入（含 `get_chars` 字符输入）与边沿状态机 |
-| `rjw_mouse` | 鼠标状态 |
+| `rjw_keyboard` / `rjw_keystate` | 键盘输入（含 `chars()` 字符输入）与边沿状态机（`KeyState`） |
+| `rjw_mouse` | 鼠标状态（位置/位移/滚轮/按键） |
 | `rjw_time` | `DeltaTimer`（帧间隔 dt / FPS） |
+| `rjw_typed_registry` | 泛型线程安全注册表 `TypedRegistry<T>` + `HasUid`（纹理 / 网格全局表） |
 
 ## 🚀 快速开始
 
 ```bash
+# 最小完整应用（重设计后的「一行起步」范例）
+cargo run -p egHello
+
+# 冒烟：跑满 N 帧自动退出（任何示例都支持）
+cargo run -p egHello -- --frames 120
+
 # 运行综合 RPG 示例
 cargo run -p eg260731RPG
 
@@ -71,7 +80,8 @@ cargo check --workspace
 
 ## 📖 文档
 
-- **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** —— API 参考手册（免读源码版）：`Color` / `Transform2D` / `Camera2D`（含 `walk_xy` 等） / `SpriteRect` / `Render2D` / `ClearConfig` 的函数定义、用法与简单示例
+- **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** —— API 参考手册（免读源码版）：`Color` / `Transform2D` / `Camera2D` / `SpriteRect` / `Render2D` / `Clear` 的函数定义、用法与简单示例
+- **[docs/DEBUGGING.md](docs/DEBUGGING.md)** —— **调试指南（Rust 代码级）**：`Ui::debug_dump()` 状态快照与速查表、`--ui-dump` / `--sim-drag` 脚本化复现交互、`RUST_LOG` / 冒烟 harness、`.vscode` CodeLLDB 断点调试（附 LLDB / cdb 命令），图形层抓帧仅作兜底
 - **[docs/ENGINE_GUIDE.md](docs/ENGINE_GUIDE.md)** —— 引擎「使用 + 维护」指南（人机皆宜）
   - 坐标系（**Camera2D：中心原点、Y+ 向下**）等易混淆概念
   - KeyState 边沿语义（`pressed` vs `down_edge`）

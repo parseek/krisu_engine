@@ -1,6 +1,9 @@
-//! 静态网格数据：`MeshData` + 全局注册表 `MESHES`。
+//! 静态网格数据：`MeshData` + 全局注册表 `MESHES` + 类型化句柄 [`MeshId`]。
 //!
 //! `MeshData` 包装已上传到 GPU 的顶点/索引缓冲，供 2D 渲染器静态实例化合并绘制。
+//!
+//! 用户路径（happy path）：[`crate::Gpu::mesh`] → [`MeshId`] → `Render2D::static_mesh(id, &tex)`。
+//! 低层路径：手动建缓冲后 `MeshData::from_buffers` + `MESHES.register`。
 
 use std::sync::LazyLock;
 
@@ -8,10 +11,58 @@ use crate::registry::{HasUid, TypedRegistry};
 
 static NEXT_MESH_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// 静态网格：GPU 顶点/索引缓冲 + 全局唯一 uid。
+/// 静态网格的**类型化句柄**（取代裸 `u64`：不再能和非网格 id 混用）。
 ///
-/// 用户通过 [`MeshData::from_buffers`]（或便捷方法 [`MeshData::from_pod`]）创建后
-/// 用 `MESHES.register` / `Render2D::register_mesh` 注册，获得可复用的 `mesh_id`。
+/// 句柄本身不持有资源；资源在全局 [`MESHES`] 注册表里，uid 与 [`MeshData::uid`] 对应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MeshId(u64);
+
+impl MeshId {
+    #[inline]
+    pub const fn new(uid: u64) -> Self {
+        Self(uid)
+    }
+
+    #[inline]
+    pub const fn uid(self) -> u64 {
+        self.0
+    }
+}
+
+impl HasUid for MeshId {
+    #[inline]
+    fn uid(&self) -> u64 {
+        self.0
+    }
+}
+
+impl From<MeshId> for u64 {
+    #[inline]
+    fn from(id: MeshId) -> Self {
+        id.0
+    }
+}
+
+/// 从 CPU 数据创建静态网格的参数对象（让 [`crate::Gpu::mesh`] 保持 1 参入口）。
+#[derive(Debug, Clone, Copy)]
+pub struct MeshSpec<'a, T> {
+    /// 调试标签（同时进 GPU 缓冲 label）。
+    pub label: &'a str,
+    /// 顶点数据（须为 `bytemuck::Pod`，布局与 2D 渲染管线 `VertexP3U2C4` 兼容）。
+    pub vertices: &'a [T],
+    /// u16 索引。
+    pub indices: &'a [u16],
+}
+
+impl<'a, T> MeshSpec<'a, T> {
+    /// 构造 POD 网格参数。
+    #[inline]
+    pub fn pod(label: &'a str, vertices: &'a [T], indices: &'a [u16]) -> Self {
+        Self { label, vertices, indices }
+    }
+}
+
+/// 静态网格：GPU 顶点/索引缓冲 + 全局唯一 uid。
 pub struct MeshData {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
@@ -28,7 +79,7 @@ impl HasUid for MeshData {
 }
 
 impl MeshData {
-    /// 直接包装已创建的 GPU 缓冲。
+    /// 直接包装已创建的 GPU 缓冲（低层入口）。
     ///
     /// - `vertex_buffer`：顶点缓冲（与 2D 渲染管线 `VertexP3U2C4` 布局兼容）
     /// - `index_buffer`：u16 索引缓冲
@@ -48,10 +99,7 @@ impl MeshData {
         }
     }
 
-    /// 便捷构造：从 CPU 数据创建顶点/索引缓冲。
-    ///
-    /// `T` 需为 `bytemuck::Pod`（例如 `[f32; 3]` + UV + 颜色的组合顶点）。
-    /// 索引使用 `u16`。
+    /// 便捷构造：从 CPU 数据创建顶点/索引缓冲（低层入口；happy path 用 [`crate::Gpu::mesh`]）。
     pub fn from_pod<T: bytemuck::Pod>(
         device: &wgpu::Device,
         vertices: &[T],
@@ -59,8 +107,11 @@ impl MeshData {
         label: &str,
     ) -> Self {
         use wgpu::util::DeviceExt;
+        // 先取本网格的 uid，再用于 label——保证「label 里的编号 == 返回的 uid」（旧实现用
+        // `NEXT_MESH_UID.load` 未 fetch_add，label 与真实 uid 差 1）。
+        let uid = NEXT_MESH_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let label_prefix = if cfg!(debug_assertions) {
-            format!("MeshData #{:0>4} ", NEXT_MESH_UID.load(std::sync::atomic::Ordering::Relaxed))
+            format!("MeshData #{uid:0>4} ")
         } else {
             "MeshData ".to_string()
         };
@@ -74,12 +125,20 @@ impl MeshData {
             contents: bytemuck::cast_slice(indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        Self::from_buffers(vertex_buffer, index_buffer, indices.len() as u32)
+        Self {
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len() as u32,
+            uid,
+        }
     }
 }
 
+/// 静态网格注册表类型。
+pub type MeshRegistry = TypedRegistry<MeshData>;
+
 /// 全局静态网格注册表。
-pub static MESHES: LazyLock<TypedRegistry<MeshData>> = LazyLock::new(TypedRegistry::default);
+pub static MESHES: LazyLock<MeshRegistry> = LazyLock::new(TypedRegistry::default);
 
 #[cfg(test)]
 mod tests {
@@ -94,7 +153,6 @@ mod tests {
 
     #[test]
     fn typed_registry_works_for_mesh() {
-        // 不构造真实 GPU 缓冲（无 device），仅验证注册表与 MeshData 类型组合。
         let r = TypedRegistry::<Dummy>::default();
         assert!(!r.contains_uid(1));
         assert!(!r.contains_name("nope"));
@@ -103,9 +161,16 @@ mod tests {
 
     #[test]
     fn mesh_uid_is_monotonic() {
-        // 无法构造 MeshData（需 GPU buffer），改测 uid 计数器递增即可。
         let a = NEXT_MESH_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let b = NEXT_MESH_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         assert!(b > a);
+    }
+
+    #[test]
+    fn mesh_id_newtype_roundtrip() {
+        let id = MeshId::new(42);
+        assert_eq!(id.uid(), 42);
+        assert_eq!(u64::from(id), 42);
+        assert_eq!(id, MeshId::new(42));
     }
 }

@@ -112,6 +112,7 @@ pub struct SizeConstraints {
 
 /// **控件膨胀模式**（内容尺寸相对父级空间的行为）。见 [`Widget::expansion`]。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Expansion {
     /// 内容按自身尺寸（clamp min/max），**不撑大父级**——内容可能溢出父级，
     /// 由控件用 noclip 绘制 / 省略自洽（如装饰性分隔线）。
@@ -121,14 +122,10 @@ pub enum Expansion {
     /// 无可用空间时退化为 [`Expansion::UnlimitedExpansion`]。
     LimitedInParent,
     /// 内容自然尺寸（clamp min/max），**撑大父级**（默认，DOM 语义）。
+    #[default]
     UnlimitedExpansion,
 }
 
-impl Default for Expansion {
-    fn default() -> Self {
-        Self::UnlimitedExpansion
-    }
-}
 
 /// **控件 trait**：新控件 = 实现此 trait 的 builder 结构体（普通 Rust，无宏）。
 ///
@@ -156,16 +153,6 @@ pub trait Widget {
     /// 决定内容是否撑大父级 / 是否限制在父级可用空间内（见 [`Expansion`]）。
     fn expansion(&self) -> Expansion {
         Expansion::UnlimitedExpansion
-    }
-
-    /// **可选拖拽缩放范围** `(min, max)`（逻辑像素；默认 `None` = 不可缩放）。
-    ///
-    /// 声明后控件应在 `size()` 中优先读持久尺寸（`ui.state().sizes`，首次 = 内容
-    /// 自然尺寸），并在 `ui()` 里调用 [`Ui::resize_handle`](crate::ui::Ui::resize_handle)
-    /// 处理右下角缩放柄并写回 [`UiState::sizes`](crate::state::UiState::sizes)。内置
-    /// `window_at_w` / `window_at_strict_w` 已演示该模式（宽度缩放）。
-    fn resizable(&self) -> Option<(Vec2, Vec2)> {
-        None
     }
 }
 

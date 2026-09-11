@@ -33,7 +33,7 @@ ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {
     let vol = p.slider("vol", 0.0..=1.0, 0.6);
 });
 
-ui.finish(&viewport, r2d); // 视口/渲染器在此延迟传入（UI 无需相机，仅视口大小+位置）
+ui.finish(r2d); // 只传渲染器（UI 无需相机/视口参数；屏幕固定变换由本 Render2D 的 MVP 决定）
 // r2d 提交（UI 的 Render2D 必须 set_sort_mode(SortMode::None)；set_mvp 用 viewport.vp_matrix()）
 ```
 
@@ -49,8 +49,7 @@ ui.finish(&viewport, r2d); // 视口/渲染器在此延迟传入（UI 无需相�
 | `scroll_at` | 垂直滚动容器（滚轮/滚动条 + 可视区裁剪） | `ui.scroll_at(pos, view, id, \|s\| …)` |
 | `list_at` | 选择列表（scroll + 逐项回调） | `ui.list_at(pos, view, id, n, sel, \|s,i,sel\| …)` |
 | `panel_at` / `drag_panel_at` | 面板（背景+边框，可拖拽） | `ui.panel_at(pos, \|p\| …)` |
-| `window_at` | 可重叠窗口（z-order + 点击置顶 + 可拖拽） | `ui.window_at(id, pos, \|w\| …)` |
-| `window` builder | 窗口统一入口（`.width` 固定宽 / `.strict` 裁剪 / `.style` 逐窗样式） | `ui.window(id).pos(..).width(..).strict().style(..).show(\|w\| …)` |
+| `window` builder | **窗口唯一入口**（`.width` 固定宽 / `.placement(Placement::Clip)` 裁剪 / `.level(Level)` 是否置顶 / `.style` 逐窗样式） | `ui.window(id).pos(..).width(..).placement(..).style(..).show(\|w\| …)` |
 | `panel` builder | 面板统一入口（`.drag(id)` 可拖拽 / `.style` 覆盖） | `ui.panel().pos(..).drag(id).show(\|p\| …)` |
 | `modal` builder | 模态对话框统一入口（`.width` 固定宽） | `ui.modal(id).pos(..).width(..).show(\|m\| …)` |
 
@@ -98,9 +97,10 @@ ui.add_at(Vec2::new(400.0, 40.0), Label::new("HUD"));
 
 ## 4. 窗口系统
 
-- **容器责任链 builder**：`ui.window(id).pos(..).width(..).strict().style(..).show(..)` /
+- **容器责任链 builder**：`ui.window(id).pos(..).width(..).placement(..).style(..).show(..)` /
   `ui.panel().pos(..).drag(id).show(..)` / `ui.modal(id).pos(..).width(..).show(..)`——
-  统一旧 `window_at*` / `panel_at` / `modal_at*` 的选项组合（后者保留，薄委托）；
+  统一旧 `window_at*` / `modal_at*` 的选项组合（v0.3 起旧入口**已删除**，
+  绝对定位的 `panel_at` / `drag_panel_at` 保留为薄委托）；
 - **z-order**：点击窗口置顶（z+1）；重叠区域只有**最上层**窗口可交互（点击穿透已修复）；
 - **拖拽**：按住窗口/面板移动 ≥ 3 物理像素进入拖拽（纯点击不拖拽，子控件正常响应）；
 - **位置责任链**（`Ui::pos_handler`）：脚本/动画提供者（优先级降序）→ 用户拖拽状态

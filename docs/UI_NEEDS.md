@@ -22,7 +22,7 @@ UI模块的需求：
 * ✅ 多行文本的 ScrollBar（内容超出可视区显示垂直滚动条：拖 thumb / 点轨道翻页 / 滚轮；滚动条条带按下不建立文本选择）
 * ✅ 单行文本会滚动被文字光标卡住（滚动跟随仅"光标移动"时执行——打字/方向键/点击/拖选；滚轮自由滚动后不被光标拉回）
 * ✅ 即使鼠标指针已经离开文本框控件，滚动仍然有效（滚轮 gating 加 `hit`：指针离开输入框/ScrollView 可视区后不再滚动；拖选 edge-scroll 不受影响）
-* ✅ 对于 Resizable 窗口，缩小宽度后，Label 等**所有控件**需要处理超过框后字符（Label 默认在父级可用宽内**自动换行**、`.ellipsis()` 显式“…”省略；Button/勾选/下拉文本自动省略；`window_at`/`window_at_w` 默认 Expand 语义，新增 `window_at_strict` 严格裁剪）
+* ✅ 对于 Resizable 窗口，缩小宽度后，Label 等**所有控件**需要处理超过框后字符（Label 默认在父级可用宽内**自动换行**、`.ellipsis()` 显式“…”省略；Button/勾选/下拉文本自动省略；`ui.window(id)` 默认 `Placement::Expand` 语义，`Placement::Clip` 严格裁剪）
 * ✅ 文本框双击“扩散式”选择（双击选中“词”——CJK 单字成词/空白分隔/字母数字连续段；按住拖拽按词边界扩散）
 * ✅ 分割线（`p.divider()` 占光标 / `ui.divider_at` / `Divider` widget；`Theme.divider` 样式）
 * 
@@ -30,7 +30,7 @@ UI模块的需求：
 
 Widget：
 * ✅ 设置可选的 min、max 大小，可以设置 DisableAutoExpansion, LimitedInParent, UnlimitedExpansion（`SizeConstraints{min_w,max_w,min_h,max_h}` 四字段全 `Option<f32>` + `Expansion` 三模式；`Ui::add` 统一 clamp/调整）
-* ✅ 可选的允许用户拖拽在可选的范围内缩放（`Ui::resize_handle` 通用原语 + `Widget::resizable()` 声明 + `UiState::sizes` 持久尺寸；`window_at_w` 宽度缩放已基于它）
+* ✅ 可选的允许用户拖拽在可选的范围内缩放（`Ui::resize_handle` 通用原语 + `Resize` 枚举（`None`/`Horizontal`/`Both`，v0.3 起取代 `Widget::resizable()` 裸布尔）+ `UiState::sizes` 持久尺寸；`ui.window(id).width(w)` 宽度缩放、`resizable_text_input_at` / `resizable_text_area_at` 均基于它）
 * ✅ Widget 输入数据由父级换算、过滤（父级负责局部坐标换算 `abs_base`、窗口遮挡、`press_claimed` 拖拽占用；Clip 沙箱外命中失效并入 `hit_abs`）
 * ✅ 绘制方面提供服从内容裁剪的绘制方法和不服从裁剪的方法（`push_text_rect_noclip` 等：不附加软层、内容自洽；**仍服从 ScrollView 强制层**——父级强制裁切躲不掉，无 Scroll 的普通容器本无强制层）
 * ✅ min_width、max_width、min_height、max_height 皆是 `Option<f32>`（`SizeConstraints` 四字段）

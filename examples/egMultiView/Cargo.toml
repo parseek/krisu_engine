@@ -1,0 +1,9 @@
+[package]
+name = "egMultiView"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+glam = "0.33.2"
+rjw_krusie = { path = "../../crates/rjw_krusie" }
+env_logger = "0.11"

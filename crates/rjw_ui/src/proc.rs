@@ -14,10 +14,12 @@
 //! 控件样式集成见 [`crate::style`]（`PanelStyle::radius` / `ButtonStyle::radius` 等）。
 
 use glam::Vec2;
-use rjw_atlas::{AtlasConfig, AtlasRegion, DynamicAtlas};
+use rjw_atlas::{AtlasConfig, AtlasRegion, DynamicAtlas, InsertOpts};
 use rjw_color::Color;
 use rjw_render::wgpu;
 use rjw_transform::Rect;
+
+use crate::draw::GradientAxis;
 
 /// 圆角矩形纹理尺寸（px；9-patch 用，四角 + 拉伸边）。
 pub const ROUNDED_TEX_SIZE: u32 = 32;
@@ -83,10 +85,12 @@ pub fn rounded_rect_rgba(size: u32, radius: f32, color: Color) -> Vec<u8> {
     out
 }
 
-/// 线性渐变纹理（`w × h` RGBA）：`vertical = true` 时颜色沿 y（0 = 顶部），否则沿 x。
+/// 线性渐变纹理（`w × h` RGBA）：`axis` = [`GradientAxis::Vertical`] 时颜色沿 y
+/// （0 = 顶部），否则沿 x（0 = 左侧）。
 ///
 /// `stops`：`(t ∈ [0,1], color)` 至少一项；t 超出范围 clamp。纯函数（可单测）。
-pub fn gradient_rgba(w: u32, h: u32, vertical: bool, stops: &[(f32, Color)]) -> Vec<u8> {
+pub fn gradient_rgba(w: u32, h: u32, axis: GradientAxis, stops: &[(f32, Color)]) -> Vec<u8> {
+    let vertical = axis == GradientAxis::Vertical;
     let n = (if vertical { h } else { w }).max(1) as f32;
     let mut out = vec![0u8; (w * h * 4) as usize];
     for i in 0..(w * h) as usize {
@@ -137,8 +141,8 @@ fn lerp_color(a: Color, b: Color, k: f32) -> Color {
 }
 
 /// 渐变停靠点的稳定 key（图集缓存键；含颜色值，改变停靠即换纹理）。
-pub(crate) fn gradient_key(vertical: bool, stops: &[(f32, Color)]) -> String {
-    let mut s = String::from(if vertical { "grad_v_" } else { "grad_h_" });
+pub(crate) fn gradient_key(axis: GradientAxis, stops: &[(f32, Color)]) -> String {
+    let mut s = String::from(if axis == GradientAxis::Vertical { "grad_v_" } else { "grad_h_" });
     for (i, (t, c)) in stops.iter().enumerate() {
         if i > 0 {
             s.push('_');
@@ -244,12 +248,12 @@ impl ProcTextures {
         layout: &wgpu::BindGroupLayout,
     ) -> &mut DynamicAtlas<String> {
         self.atlas.get_or_insert_with(|| {
-            DynamicAtlas::new(
+            // 低层入口（UI 尚未迁移到 `&Gpu`；P3 收敛后改用 `DynamicAtlas::new(gfx, cfg)`）。
+            DynamicAtlas::from_raw(
                 device,
                 queue,
                 layout,
                 AtlasConfig { max_pages: 4, padding: 1, ..Default::default() },
-                2048,
             )
         })
     }
@@ -264,8 +268,12 @@ impl ProcTextures {
         let a = self.atlas(device, queue, layout);
         let key = "white".to_string();
         let region = a
-            .insert_permanent(key.clone(), &WHITE_RGBA, 1, 1, (0, 0), true)
-            .or_else(|| a.get(&key).copied())?;
+            .insert_with(
+                key.clone(),
+                rjw_render::Rgba8::new(&WHITE_RGBA, (1, 1)),
+                InsertOpts::new().permanent(),
+            )
+            .or_else(|| a.region(&key).copied())?;
         Some((region.page_uid, region))
     }
 
@@ -283,42 +291,39 @@ impl ProcTextures {
         let r = radius.clamp(0.0, ROUNDED_TEX_SIZE as f32 * 0.5 - 1.0).max(0.0);
         // 半径量化 key 用位模式（`r as u32` 会截断：非整数半径共享同一 key → 纹理串味）。
         let key = format!("rounded_r{:x}", r.to_bits());
+        let rgba = rounded_rect_rgba(ROUNDED_TEX_SIZE, r, Color::WHITE);
         let a = self.atlas(device, queue, layout);
         let region = a
-            .insert_permanent(
+            .insert_with(
                 key.clone(),
-                &rounded_rect_rgba(ROUNDED_TEX_SIZE, r, Color::WHITE),
-                ROUNDED_TEX_SIZE,
-                ROUNDED_TEX_SIZE,
-                (0, 0),
-                true,
+                rjw_render::Rgba8::new(&rgba, (ROUNDED_TEX_SIZE, ROUNDED_TEX_SIZE)),
+                InsertOpts::new().permanent(),
             )
-            .or_else(|| a.get(&key).copied())?;
+            .or_else(|| a.region(&key).copied())?;
         Some((region.page_uid, region))
     }
 
-    /// 线性渐变纹理（主轴 [`GRADIENT_TEX_LEN`] 级；`vertical` 沿 y 否则沿 x）。
+    /// 线性渐变纹理（主轴 [`GRADIENT_TEX_LEN`] 级；`axis` 决定沿 y / 沿 x）。
     pub fn gradient(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
-        vertical: bool,
+        axis: GradientAxis,
         stops: &[(f32, Color)],
     ) -> Option<(u64, AtlasRegion)> {
-        let key = gradient_key(vertical, stops);
+        let key = gradient_key(axis, stops);
+        let vertical = axis == GradientAxis::Vertical;
         let (w, h) = if vertical { (1, GRADIENT_TEX_LEN) } else { (GRADIENT_TEX_LEN, 1) };
+        let rgba = gradient_rgba(w, h, axis, stops);
         let a = self.atlas(device, queue, layout);
         let region = a
-            .insert_permanent(
+            .insert_with(
                 key.clone(),
-                &gradient_rgba(w, h, vertical, stops),
-                w,
-                h,
-                (0, 0),
-                true,
+                rjw_render::Rgba8::new(&rgba, (w, h)),
+                InsertOpts::new().permanent(),
             )
-            .or_else(|| a.get(&key).copied())?;
+            .or_else(|| a.region(&key).copied())?;
         Some((region.page_uid, region))
     }
 
@@ -344,7 +349,7 @@ mod tests {
         let corner = &rgba[0..4];
         assert_eq!(corner[3], 0, "圆角外角点应透明");
         // 沿边的中点（16, 0）：在圆角半径内 → 不透明。
-        let edge = &rgba[((0 * size + 16) * 4) as usize..((0 * size + 16) * 4 + 4) as usize];
+        let edge = &rgba[(16 * 4) as usize..(16 * 4 + 4) as usize];
         assert_eq!(edge[3], 255, "边中点应在圆内（半径 8 > x=16 距离）");
     }
 
@@ -353,7 +358,7 @@ mod tests {
         let w = 1;
         let h = 64;
         let stops = [(0.0, Color::BLACK), (1.0, Color::WHITE)];
-        let rgba = gradient_rgba(w, h, true, &stops);
+        let rgba = gradient_rgba(w, h, GradientAxis::Vertical, &stops);
         assert_eq!(rgba.len(), (w * h * 4) as usize);
         // 顶行 = 黑，底行 ≈ 白（t = 63/64 ≈ 0.984 → ~251）。
         assert_eq!(&rgba[0..3], &[0, 0, 0], "顶部应为黑");
@@ -370,10 +375,10 @@ mod tests {
 
     #[test]
     fn gradient_key_changes_with_stops() {
-        let a = gradient_key(true, &[(0.0, Color::BLACK), (1.0, Color::WHITE)]);
-        let b = gradient_key(true, &[(0.0, Color::BLACK), (1.0, Color::RED)]);
+        let a = gradient_key(GradientAxis::Vertical, &[(0.0, Color::BLACK), (1.0, Color::WHITE)]);
+        let b = gradient_key(GradientAxis::Vertical, &[(0.0, Color::BLACK), (1.0, Color::RED)]);
         assert_ne!(a, b, "停靠点颜色不同 → key 应不同（换纹理）");
-        let c = gradient_key(false, &[(0.0, Color::BLACK), (1.0, Color::WHITE)]);
+        let c = gradient_key(GradientAxis::Horizontal, &[(0.0, Color::BLACK), (1.0, Color::WHITE)]);
         assert_ne!(a, c, "方向不同 → key 应不同");
     }
 
@@ -413,7 +418,7 @@ mod tests {
         // 圆角处出现整条透明缝 / 圆弧破损。修复后按像素半区选圆心，与半径整数性无关。
         let size = 32;
         let rgba = rounded_rect_rgba(size, 7.5, Color::WHITE);
-        let a = |x: usize, y: usize| rgba[((y * size as usize + x) * 4 + 3) as usize];
+        let a = |x: usize, y: usize| rgba[(y * size as usize + x) * 4 + 3];
         // 四角外角点仍透明。
         assert_eq!(a(0, 0), 0, "圆角外角点应透明");
         // 中心像素不透明。

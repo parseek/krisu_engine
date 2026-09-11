@@ -1,6 +1,6 @@
 [package]
 name = "rjw_collision"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["KrisuRJW <Cmd1loica99@163.com>"]
 description = "Lightweight 2D collision primitives (AABB) built on rjw_transform Rect/Transform2D."
@@ -10,5 +10,5 @@ keywords = ["collision", "aabb", "2d"]
 categories = ["game-development"]
 
 [dependencies]
-rjw_transform = { path = "../rjw_transform", version = "0.1.1" }
+rjw_transform = { path = "../rjw_transform", version = "0.3.0" }
 glam = "0.33.2"

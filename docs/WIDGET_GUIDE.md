@@ -91,7 +91,7 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }   // 可选拖拽缩放范�
   （Label 换行 / 省略、Button 省略、TextArea 滚动）；
 - `DisableAutoExpansion`：不撑大父级（内容溢出由控件用 noclip 自洽）。
 - 拖拽缩放：`Ui::resize_handle(id, handle, current, min, cursor)` 通用原语 +
-  `UiState::sizes` 持久尺寸（`window_at_w` 宽度缩放即基于它）。
+  `UiState::sizes` 持久尺寸（`ui.window(id).width(w)` 宽度缩放即基于它）。
 
 ---
 
@@ -245,7 +245,7 @@ if ui.add(TagButton::new("t1", "标签").bg(Color::ORANGE)).clicked() { … }
 ## 7. 裁剪分层与 noclip 绘制（已落地）
 
 - **强制层（硬裁剪）**：ScrollView 可视区 / Clip 沙箱（`Ui::view_at(…, ViewMode::Clip)`、
-  `window_at_strict`）。`UiDraw.clip` 恒为该层，**所有绘制（含 noclip 变体）都服从**；
+  `Placement::Clip`）。`UiDraw.clip` 恒为该层，**所有绘制（含 noclip 变体）都服从**；
 - **软层（内容裁剪）**：控件自身内容边界，由调用方显式传参（`push_text_rect` 的局部
   `clip`、文本框内容区）。内容自洽的控件（自动换行 / "…"省略 / 滚动）用
   `push_*_noclip` **跳过软层**——但 ScrollView 强制裁切躲不掉（反例：无 Scroll 的

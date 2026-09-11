@@ -60,15 +60,15 @@ pub(crate) fn clipboard_shortcuts(
 ) {
     // **必须按住 Ctrl（或 Cmd）才生效**——否则直接打字 a/c/v/x 会误触发
     // 全选 / 复制 / 粘贴 / 剪切（不按 Ctrl 时它们只是普通字符）。
-    let ctrl = kb.get(KeyCode::ControlLeft).pressed()
-        || kb.get(KeyCode::ControlRight).pressed();
+    let ctrl = kb.key(KeyCode::ControlLeft).pressed()
+        || kb.key(KeyCode::ControlRight).pressed();
     if !ctrl {
         return;
     }
-    let c_down = kb.get(KeyCode::KeyC).down_edge();
-    let v_down = kb.get(KeyCode::KeyV).down_edge();
-    let x_down = kb.get(KeyCode::KeyX).down_edge();
-    let a_down = kb.get(KeyCode::KeyA).down_edge();
+    let c_down = kb.key(KeyCode::KeyC).down_edge();
+    let v_down = kb.key(KeyCode::KeyV).down_edge();
+    let x_down = kb.key(KeyCode::KeyX).down_edge();
+    let a_down = kb.key(KeyCode::KeyA).down_edge();
     if a_down {
         // Ctrl+A：全选
         ws.sel_anchor = Some(0);
@@ -90,8 +90,8 @@ pub(crate) fn clipboard_shortcuts(
             }
         }
     }
-    if v_down {
-        if let Some(text) = clipboard_get() {
+    if v_down
+        && let Some(text) = clipboard_get() {
             let text = if filter_newlines {
                 text.replace(['\r', '\n'], "")
             } else {
@@ -111,7 +111,6 @@ pub(crate) fn clipboard_shortcuts(
                 ws.sel_anchor = None;
             }
         }
-    }
 }
 
 /// **一帧内对文本输入执行编辑**（单行 / 多行共用）：剪贴板（Ctrl+C/V/X/A）→
@@ -131,37 +130,36 @@ pub(crate) fn apply_frame_edits(
     ime_owns_keys: bool,
 ) {
     // 剪贴板：Ctrl+C/V/X/A（单行过滤换行，多行保留）。
-    let ctrl = kb.get(KeyCode::ControlLeft).pressed()
-        || kb.get(KeyCode::ControlRight).pressed();
+    let ctrl = kb.key(KeyCode::ControlLeft).pressed()
+        || kb.key(KeyCode::ControlRight).pressed();
     clipboard_shortcuts(kb, ws, value, !multiline);
     // 编辑操作（字符 / IME 上屏 / 退格 / 删除 / 多行 Enter）前若存在选择 → 先删除选择
     // ⚠ Ctrl 组合（C/V/X）按下时 `get_chars` 会带出 'c'/'v'/'x'——
     // 剪贴板分支已处理，字符必须过滤（否则 Ctrl+C 留下 'c'、Ctrl+V 多出 'v'）。
-    let edit_pending = (!kb.get_chars().is_empty() && !ctrl)
-        || !kb.get_ime_commits().is_empty()
-        || (kb.get(KeyCode::Backspace).down_edge() && !ime_owns_keys)
-        || (kb.get(KeyCode::Delete).down_edge() && !ime_owns_keys)
-        || (multiline && kb.get(KeyCode::Enter).down_edge());
+    let edit_pending = (!kb.chars().is_empty() && !ctrl)
+        || !kb.ime_commits().is_empty()
+        || (kb.key(KeyCode::Backspace).down_edge() && !ime_owns_keys)
+        || (kb.key(KeyCode::Delete).down_edge() && !ime_owns_keys)
+        || (multiline && kb.key(KeyCode::Enter).down_edge());
     // 选择删除是否已**消费**本次 Backspace/Delete——避免"选择 + 退格"时
     // 选择删完又执行独立退格，多删选择前一个字符（ABCDE 选 BCD 退格连 A 一起删）。
     let mut sel_consumed = false;
-    if edit_pending {
-        if let Some((lo, hi)) = sel_range(ws.sel_anchor, ws.caret) {
+    if edit_pending
+        && let Some((lo, hi)) = sel_range(ws.sel_anchor, ws.caret) {
             delete_range(value, lo, hi);
             ws.caret = lo;
             ws.sel_anchor = None;
             sel_consumed = true;
         }
-    }
     // IME 上屏文本（中文输入法等）：优先级高于普通字符
-    for commit in kb.get_ime_commits() {
+    for commit in kb.ime_commits() {
         insert_str_at(value, ws.caret, commit);
         ws.caret = (ws.caret + commit.chars().count()).min(value.chars().count());
     }
     // 普通字符输入 / 编辑（Ctrl 组合不产生文本；多行过滤 '\n'——换行统一由
     // 调用方 Enter 处理）。
     if !ctrl {
-        for ch in kb.get_chars() {
+        for ch in kb.chars() {
             if multiline && (*ch == '\n' || *ch == '\r') {
                 continue;
             }
@@ -169,10 +167,10 @@ pub(crate) fn apply_frame_edits(
             ws.caret = (ws.caret + 1).min(value.chars().count());
         }
     }
-    if kb.get(KeyCode::Backspace).down_edge() && !ime_owns_keys && !sel_consumed {
+    if kb.key(KeyCode::Backspace).down_edge() && !ime_owns_keys && !sel_consumed {
         ws.caret = remove_before(value, ws.caret);
     }
-    if kb.get(KeyCode::Delete).down_edge() && !ime_owns_keys && !sel_consumed {
+    if kb.key(KeyCode::Delete).down_edge() && !ime_owns_keys && !sel_consumed {
         remove_at(value, ws.caret);
     }
 }
@@ -473,7 +471,7 @@ pub fn ellipsize<'a>(
             k = mid;
             lo = mid + 1;
         } else {
-            hi = mid.checked_sub(1).unwrap_or(0);
+            hi = mid.saturating_sub(1);
         }
     }
     if k == 0 {
@@ -771,8 +769,10 @@ mod tests {
         // IME 占用退格：不本地删（ime_owns_keys）
         let mut v2 = String::from("abc");
         let kb = KeyboardSnapshot::default().with_key(KeyCode::Backspace, KEY_STATE_DOWN_EDGE);
-        let mut ws2 = WidgetState::default();
-        ws2.caret = 3;
+        let mut ws2 = WidgetState {
+            caret: 3,
+            ..Default::default()
+        };
         apply_frame_edits(&kb, &mut ws2, &mut v2, false, true);
         assert_eq!(v2, "abc", "IME 组合中退格交 IME 系统");
         // 多行：字符过滤 '\n'（换行由调用方 Enter 处理）；单行不过滤
@@ -788,10 +788,12 @@ mod tests {
     #[test]
     fn caret_horiz_shift_select_and_clear() {
         use crate::state::WidgetState;
-        let mut ws = WidgetState::default();
-        ws.caret = 2;
-        // 无 Shift：移动并清除选择
-        ws.sel_anchor = Some(0);
+        let mut ws = WidgetState {
+            caret: 2,
+            // 无 Shift：移动并清除选择
+            sel_anchor: Some(0),
+            ..Default::default()
+        };
         caret_horiz(&mut ws, "hello", 1, false);
         assert_eq!(ws.caret, 3);
         assert_eq!(ws.sel_anchor, None, "无 Shift 取消选择");

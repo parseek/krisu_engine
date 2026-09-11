@@ -1,12 +1,17 @@
 //! 文本渲染：基于 `cosmic-text` 排版 + `swash` 字形光栅化 + `DynamicAtlas` 字形缓存。
 //!
-//! - `Text`：持有字体系统（cosmic-text `FontSystem`）、字形缓存图集（key=`cosmic_text::CacheKey`）。
+//! **唯一一条文本链**（契约 §8.4）：`Text::label(..)` → [`Label`] → 终点
+//! （`draw` / `draw_with` / `measure` / `into_buffer`）。
+//!
+//! - `Text`：持有字体系统（cosmic-text `FontSystem`）、字形缓存图集（key=`cosmic_text::CacheKey`）、
+//!   全局默认样式 [`TextStyle`]（`style()` / `style_mut()`）与复用缓冲。
+//! - 唯一样式类型 [`TextStyle`]（owned / `Clone` / 可存字段）；唯一定位语言 `at` / `center` /
+//!   `anchor` / `offset`；剔除默认开启（`.no_cull()`）。
 //! - 性能：**LRU 排版缓存**（[`MAX_LAYOUT_CACHE`]）按 O(1) 签名预过滤命中同一输入，返回共享
 //!   `Arc<Buffer>`（不深拷贝）；空格等无图字形（`no_image`）只判定一次；字形图集去碎片重排后自动同步区域。
-//! - `measure` / `measure_buffer`：排版内容宽高（GUI 布局用）。
-//! - `draw_text(buffer, callback)` / `draw_label_with(..., callback)`：字形回调遍历，不绑定渲染器。
-//! - `draw_label` / `draw_label_ex`：一行文本直接渲染到 `Render2D`（feature = `rjw_2d_render`，默认开启）。
-//! - 责任链：`text(..).size(..)...try_stack().origin(..).draw_with(..)`（[`TextLayout`] / [`TextRender`]）。
+//! - **UI 稳定集成面**（非 happy path，语义不变）：[`Text::buffer`] / [`Text::label_from`] /
+//!   [`Text::geometry`] / [`Text::measure_buffer`] / [`Text::lines`] / [`Text::white_region`] /
+//!   [`Text::user_texture`]。
 
 mod chain;
 pub use chain::*;
@@ -18,13 +23,7 @@ use std::sync::Arc;
 
 pub use cosmic_text::{Align, Attrs, AttrsOwned, Buffer, Family, FontSystem, Metrics, Shaping};
 use glam::Vec2;
-#[cfg(feature = "rjw_2d_render")]
-use rjw_2d_render::{Layer, Render2D, SpriteRect};
 use rjw_atlas::{AtlasConfig, AtlasRegion, DynamicAtlas};
-#[cfg(feature = "rjw_2d_render")]
-use rjw_color::Color;
-#[cfg(feature = "rjw_2d_render")]
-use rjw_render::TEXTURES;
 #[cfg(feature = "rjw_2d_render")]
 pub use cosmic_text;
 use swash::scale::{
@@ -35,13 +34,27 @@ use swash::zeno::{Angle, Format, Transform, Vector};
 
 pub const DEFAULT_GLYPH_ATLAS_SIZE: u32 = 1024;
 
-/// 视觉行（自动换行后的一行）：字节范围 + 行顶/行宽（见 [`Text::visual_lines`]）。
+/// 视觉行（自动换行后的一行）：字节范围 + 行顶/行宽（见 [`Text::lines`]）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VisualLine {
     pub byte_start: usize,
     pub byte_end: usize,
     pub top: f32,
     pub width: f32,
+}
+
+/// 排版几何（**UI 稳定集成面**，非 happy path）：内容尺寸 + 首行行盒顶 + 字形图集页尺寸。
+///
+/// `content_size`（[`Text::measure_buffer`] 的结果，已取整）与 `first_line_top`
+/// （行盒顶相对文本视觉原点，**整数像素**）均为 UI 垂直对齐所需；`page_size` 为 UV 换算用。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextGeometry {
+    /// 排版内容宽高（行盒，已取整）
+    pub content_size: Vec2,
+    /// 首行行盒顶（相对文本视觉原点；整数像素）
+    pub first_line_top: f32,
+    /// 字形图集页尺寸（像素；UV 换算用）
+    pub page_size: f32,
 }
 
 // ─── GlyphLocation ─────────────────────────────────────────────
@@ -67,7 +80,7 @@ pub const MAX_LAYOUT_CACHE: usize = 128;
 /// Debug 构建（`cfg!(debug_assertions)`）恒缓存——Debug 整形慢 10-100 倍，缓存是刚需；
 /// Release 下大文本多为动态/低频（日志、聊天、终端），缓存必然 miss 且挤占 LRU/内存，
 /// 而 Release 整形又足够快，故跳过。静态大文本请由用户保存 `Arc<Buffer>` 后经
-/// [`Text::render_from`] 走责任链渲染（存一次、每帧复用）。
+/// [`Text::label_from`] 直接进入文本链（存一次、每帧复用），或用 [`Label::cache`] 策略管理。
 pub const LARGE_TEXT_CACHE_LIMIT: usize = 512;
 
 /// Release 下 `len` 字节的文本是否值得缓存。
@@ -326,6 +339,8 @@ pub struct Text {
     locations: HashMap<cosmic_text::CacheKey, GlyphLocation>,
     /// 无法产生像素的字形（空格 / 缺字体 / swash 渲染失败）：避免每帧重复光栅化。
     no_image: std::collections::HashSet<cosmic_text::CacheKey>,
+    /// 全局默认样式（[`Self::style`] / [`Self::style_mut`]；[`Label`] 从中继承）。
+    style: TextStyle,
     buf: TextBuffer,
     /// 排版结果缓存（LRU）：同一 (文本, 字号, 行高, 对齐, attrs) 跨帧复用，跳过重复整形。
     layout_cache: LayoutCache,
@@ -334,16 +349,26 @@ pub struct Text {
 }
 
 impl Text {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) -> Self {
+    /// 以 `Gpu` 能力对象构造（取代旧 `(device, queue, layout)` 三件套手动穿线）。
+    ///
+    /// ```ignore
+    /// let font = Text::new(gfx);           // 运行时路径
+    /// let font = Text::new(render.gpu());  // 低层路径
+    /// ```
+    pub fn new(gpu: &rjw_render::Gpu) -> Self {
         let mut glyph_cache = DynamicAtlas::new(
-            device, queue, layout,
-            AtlasConfig { max_pages: 4, padding: 1, ..Default::default() },
-            DEFAULT_GLYPH_ATLAS_SIZE,
+            gpu,
+            AtlasConfig {
+                max_pages: 4,
+                padding: 1,
+                page_size: DEFAULT_GLYPH_ATLAS_SIZE,
+                ..Default::default()
+            },
         );
         // **WHITE 基础纹理**（1×1，clamp_margin=true）预置进字形图集：
         // UI 实心填充（背景/边框/光标）可与此页字形**同纹理合批**（省去图形↔文字的
-        // 纹理状态切换）；字形本体用 `insert_no_clamp`（避免 clamp margin 挤压）。
-        glyph_cache.insert_white();
+        // 纹理状态切换）；字形本体不带 clamp margin（避免边界二次挤压）。
+        glyph_cache.white();
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_system_fonts();
         Self {
@@ -352,10 +377,92 @@ impl Text {
             glyph_cache,
             locations: HashMap::new(),
             no_image: std::collections::HashSet::new(),
+            style: TextStyle::default(),
             buf: TextBuffer::default(),
             layout_cache: LayoutCache::new(),
             atlas_generation: 0,
         }
+    }
+
+    /// 全局默认样式（只读；[`Label`] 从它继承）。
+    #[inline]
+    pub fn style(&self) -> &TextStyle { &self.style }
+
+    /// 全局默认样式（可变；改动影响之后构造的所有 [`Label`]）。
+    #[inline]
+    pub fn style_mut(&mut self) -> &mut TextStyle { &mut self.style }
+
+    /// 起链：文本 → [`Label`]（不绑定渲染器；终点用 `draw_to(r2d, layer)` 或 `draw_with`）。
+    ///
+    /// ```ignore
+    /// let size = text.label("HP 100").size(16.0).measure();
+    /// text.label("HP 100").size(16.0).at(pos).draw_to(r2d, 10.0);
+    /// ```
+    #[cfg(feature = "rjw_2d_render")]
+    #[inline]
+    pub fn label<'t>(&'t mut self, text: impl Into<TextStorage>) -> Label<'t> {
+        Label::new(self, text.into())
+    }
+
+    /// **UI 稳定集成面**：从已排版 `Arc<Buffer>` 直接进入文本链（**不重新整形**）。
+    ///
+    /// 取代旧 `Text::render_from(&Buffer)`：静态大文本 / UI 自持缓冲每帧复用同一布局，
+    /// 跳过整形与 LRU 查找；`Label::draw_to` / `draw_with` 语义与 [`Self::label`] 完全一致。
+    #[cfg(feature = "rjw_2d_render")]
+    #[inline]
+    pub fn label_from<'t>(&'t mut self, buffer: &'t Arc<Buffer>) -> Label<'t> {
+        Label::new(self, TextStorage::from("")).bind_buffer(buffer)
+    }
+
+    /// **UI 稳定集成面**：排版缓冲（`wrap <= 0` = 不换行，用宽裕默认宽度）。
+    ///
+    /// 取代旧 `Text::create_buffer_wrap(..)`：样式（family / 字号 / 行高 / 对齐）来自
+    /// [`TextStyle`]，缓存策略显式给出（UI 用 [`CachePolicy::User`] 自持缓冲）。
+    pub fn buffer(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        wrap: f32,
+        policy: CachePolicy,
+    ) -> Arc<Buffer> {
+        let lh = effective_line_height(style.size, style.line_height, style.line_space);
+        let attrs = style.attrs.as_attrs();
+        self.create_buffer_wrap(text, attrs, style.size, lh, style.align, wrap, policy)
+    }
+
+    /// **UI 稳定集成面**：排版几何（内容尺寸 / 首行行盒顶 / 图集页尺寸，见 [`TextGeometry`]）。
+    ///
+    /// 只光栅化各视觉行的首字形（`buffer_origin` 所需），不做整块收集；与完整收集路径
+    /// （[`Label`]）得到一致的视觉原点与行盒顶。
+    pub fn geometry(&mut self, buffer: &Buffer) -> TextGeometry {
+        for run in buffer.layout_runs() {
+            if let Some(g) = run.glyphs.first() {
+                let cache_key = g.physical((0.0, 0.0), 1.0).cache_key;
+                if !self.locations.contains_key(&cache_key) && !self.no_image.contains(&cache_key) {
+                    self.rasterize_and_pack(cache_key);
+                }
+            }
+        }
+        self.sync_atlas_regions();
+        let visual_origin = self.buffer_origin(buffer);
+        let first_line_top = match buffer.layout_runs().next() {
+            Some(run) => run.line_top.ceil() - visual_origin.y,
+            None => 0.0,
+        };
+        TextGeometry {
+            content_size: Text::measure_buffer(buffer),
+            first_line_top,
+            page_size: self.glyph_cache.page_size() as f32,
+        }
+    }
+
+    /// 帧末推进字形图集寿命（**引擎每渲染帧调用一次**；用户不必手动调用）。
+    ///
+    /// 旧实现里 `DynamicAtlas::end_frame` 全仓零调用 ⇒ 寿命 / 自动复活形同虚设；
+    /// 现在由运行时驱动。
+    #[inline]
+    pub fn tick(&mut self) {
+        self.glyph_cache.tick();
     }
 
     /// 字形图集内的 **WHITE 基础纹理** region（1×1，`clamp_margin`）——
@@ -363,24 +470,23 @@ impl Text {
     /// 图形与文字同纹理、可合批。每次调用都会刷新该条目的寿命并返回**最新**
     /// region（图集重排后 UV 自动跟随）。返回 `None` 仅当图集满页（1×1 不会）。
     pub fn white_region(&mut self) -> Option<AtlasRegion> {
-        Some(self.glyph_cache.insert_white())
+        Some(self.glyph_cache.white())
     }
 
-    /// 往**字形图集**插入用户自定义纹理（如 UI 圆角矩形 9-patch）——与字形 / WHITE
-    /// 纹理**同页同纹理**，UI 绘制时可合批（省去图形↔文字的纹理状态切换）。
+    /// **UI 稳定集成面**：往**字形图集**插入用户自定义纹理（如 UI 圆角矩形 9-patch）
+    /// ——与字形 / WHITE 纹理**同页同纹理**，UI 绘制时可合批（省去图形↔文字的纹理状态切换）。
     ///
     /// `id` 为**定长去重键**（调用方编码，如圆角半径整数；同 `id` 复用同一 region）。
     /// `clamp_margin` 防采样透色（UI 图形边缘用）。**永久保留**（不参与 LRU 逐出）。
     /// 返回 `None` 仅当图集满页。
-    pub fn insert_user_texture(
-        &mut self,
-        id: u64,
-        rgba: &[u8],
-        w: u32,
-        h: u32,
-    ) -> Option<AtlasRegion> {
-        self.glyph_cache
-            .insert_permanent(AtlasKey::Custom(id), rgba, w, h, (0, 0), true)
+    ///
+    /// 取代旧 `Text::insert_user_texture(id, rgba, w, h)`（像素改为 [`rjw_render::Rgba8`]）。
+    pub fn user_texture(&mut self, id: u64, px: rjw_render::Rgba8<'_>) -> Option<AtlasRegion> {
+        self.glyph_cache.insert_with(
+            AtlasKey::Custom(id),
+            px,
+            rjw_atlas::InsertOpts::new().permanent(),
+        )
     }
 
     /// 若字形图集发生过“去碎片重排”（[`rjw_atlas::DynamicAtlas::generation`] 变化），
@@ -395,11 +501,10 @@ impl Text {
         self.atlas_generation = generation;
         let keys: Vec<cosmic_text::CacheKey> = self.locations.keys().copied().collect();
         for key in keys {
-            if let Some(region) = self.glyph_cache.get(&AtlasKey::Glyph(key)) {
-                if let Some(loc) = self.locations.get_mut(&key) {
+            if let Some(region) = self.glyph_cache.region(&AtlasKey::Glyph(key))
+                && let Some(loc) = self.locations.get_mut(&key) {
                     loc.region = *region;
                 }
-            }
         }
     }
 
@@ -411,7 +516,7 @@ impl Text {
         self.no_image.clear();
     }
 
-    /// 排版文本为共享 `Arc<Buffer>`（cosmic-text），内容随后经 [`Self::draw_text`] 等遍历。
+    /// 排版文本为共享 `Arc<Buffer>`（cosmic-text）。
     ///
     /// 相同输入（文本 / 字号 / 行高 / 对齐 / attrs）会命中内部排版缓存：**O(1) 签名预过滤**
     /// 后返回共享的 [`Arc<Buffer>`]（不深拷贝排版结果）。缓存达到 [`MAX_LAYOUT_CACHE`] 时按 LRU
@@ -419,21 +524,12 @@ impl Text {
     ///
     /// 缓存启用规则（见 [`LARGE_TEXT_CACHE_LIMIT`]）：**Debug 恒缓存**；**Release 仅缓存
     /// ≤ 512 字节的小文本**——大文本（多为动态/低频）不入缓存、每帧直接整形。静态大文本请
-    /// 保存本方法返回的 `Arc<Buffer>`，每帧经 [`Text::render_from`] 走责任链渲染（存一次、复用）。
+    /// 保存本方法返回的 `Arc<Buffer>`，每帧经 [`Text::label_from`] 进入文本链（存一次、复用）。
     ///
     /// 返回值为共享只读布局；需要修改的调用方用 [`Arc::make_mut`]（仅当缓存仍持有时才深拷贝）。
-    pub fn create_buffer(
-        &mut self, text: &str, attrs: Attrs<'_>, size: f32, line_height: f32, align: Align,
-    ) -> Arc<Buffer> {
-        self.create_buffer_policy(text, attrs, size, line_height, align, CachePolicy::Auto)
-    }
-
-    /// 同 [`Self::create_buffer`]，但排版缓存策略由调用方指定（默认 [`CachePolicy::Auto`] 即上述规则）。
     ///
-    /// - [`CachePolicy::Always`]：强制进 LRU（含大文本）；
-    /// - [`CachePolicy::Never`] / [`CachePolicy::User`]：不写 LRU，每帧重新整形
-    ///   （`User` 语义：配合 [`Text::render_from`] / [`TextLayout::into_render_with`] 由用户持缓冲）。
-    pub fn create_buffer_policy(
+    /// 内部入口（[`Label`] 的排版路径）；公开面请用 [`Text::label`] / [`Text::buffer`]。
+    fn create_buffer_policy(
         &mut self, text: &str, attrs: Attrs<'_>, size: f32, line_height: f32, align: Align,
         policy: CachePolicy,
     ) -> Arc<Buffer> {
@@ -444,7 +540,10 @@ impl Text {
     /// 同 [`Self::create_buffer_policy`]，但**排版宽度**由调用方指定（`wrap_width` 物理像素）：
     /// 文本超出宽度自动**换行**（多行；cosmic-text 按词/字换行）。`wrap_width <= 0` 等价于
     /// 默认（不换行的宽裕值）。宽度参与排版缓存键（不同宽度各自缓存）。
-    pub fn create_buffer_wrap(
+    ///
+    /// 内部入口（[`Text::buffer`] 的排版路径）。
+    #[allow(clippy::too_many_arguments, reason = "排版参数表是 cosmic-text 的原生形状，拆 struct 只搬运参数")]
+    fn create_buffer_wrap(
         &mut self, text: &str, attrs: Attrs<'_>, size: f32, line_height: f32, align: Align,
         wrap_width: f32, policy: CachePolicy,
     ) -> Arc<Buffer> {
@@ -488,70 +587,6 @@ impl Text {
             self.layout_cache.insert(key, arc.clone());
         }
         arc
-    }
-
-    /// 统一字形遍历内核：先确保全部字形已渲染入图集，再逐个回调。
-    ///
-    /// `callback(region, world_pos, world_size)`：
-    /// - `world_pos` — 字形精灵**左上角**坐标（已含 bearing），相对文本**视觉原点**
-    ///   （第一个字形 bearing 恢复后的左上角），再叠加 `base` 偏移。
-    /// - `world_size` — 字形精灵像素宽高。
-    fn visit_glyphs<F>(&mut self, buffer: &Buffer, base: Vec2, clip: Option<Rect>, mut callback: F)
-    where F: FnMut(&AtlasRegion, Vec2, Vec2)
-    {
-        // pass 1：确保所有字形已渲染/打包（buffer_origin 依赖 bearing 数据）
-        for run in buffer.layout_runs() {
-            for glyph in run.glyphs.iter() {
-                let cache_key = glyph.physical((0.0, 0.0), 1.0).cache_key;
-                if !self.locations.contains_key(&cache_key) && !self.no_image.contains(&cache_key) {
-                    self.rasterize_and_pack(cache_key);
-                }
-            }
-        }
-        // 光栅化过程中图集可能触发去碎片重排（搬动字形），同步各字形区域。
-        self.sync_atlas_regions();
-        let origin = self.buffer_origin(buffer);
-        // pass 2：逐个字形回调（精灵左上角 = 排版位置 + bearing 偏移）；
-        // `clip`（相对文本视觉原点的局部坐标）为 Some 时跳过区外字形。
-        for run in buffer.layout_runs() {
-            let line_y = run.line_y;
-            for glyph in run.glyphs.iter() {
-                let physical = glyph.physical((0.0, 0.0), 1.0);
-                if let Some(loc) = self.locations.get(&physical.cache_key) {
-                    // 字形相对文本视觉原点的偏移：**全部操作数为整数**——
-                    // `physical.x` / `loc.left` / `loc.top` 为整型，`line_y` 先取整，
-                    // `origin`（[`Self::buffer_origin`]）同为整数。整数加减法无小数
-                    // 误差累加；最终再 `ceil` 只吸收外部 `base`（世界放置）的小数。
-                    let glyph_pos = Vec2::new(
-                        physical.x as f32 + loc.left as f32,
-                        line_y.ceil() - loc.top as f32,
-                    );
-                    let world_tl = base + glyph_pos - origin;
-                    let glyph_size = Vec2::new(loc.region.wh_px.0 as f32, loc.region.wh_px.1 as f32);
-                    let tl = world_tl - base; // 相对文本视觉原点
-                    if !glyph_in_clip(clip, tl, glyph_size) {
-                        continue;
-                    }
-                    callback(&loc.region, world_tl.ceil(), glyph_size);
-                }
-            }
-        }
-    }
-
-    /// 遍历已排版 `Buffer` 中的每个字形，`callback(region, world_pos, world_size)`。
-    /// `world_pos` 是字形精灵的**左上角**坐标（已含 bearing），相对文本视觉原点。
-    pub fn draw_text<F>(&mut self, buffer: &Buffer, callback: F)
-    where F: FnMut(&AtlasRegion, Vec2, Vec2)
-    {
-        self.visit_glyphs(buffer, Vec2::ZERO, None, callback);
-    }
-
-    /// 同 [`Self::draw_text`]，但 `clip`（相对文本视觉原点的局部坐标）为 `Some` 时
-    /// 跳过裁剪区外的字形（回调只收到可见字形）。
-    pub fn draw_text_clipped<F>(&mut self, buffer: &Buffer, clip: Option<Rect>, callback: F)
-    where F: FnMut(&AtlasRegion, Vec2, Vec2)
-    {
-        self.visit_glyphs(buffer, Vec2::ZERO, clip, callback);
     }
 
     /// 内部：渲染+打包一个 swash 字形，写入 DynamicAtlas。
@@ -602,9 +637,11 @@ impl Text {
             }
         }
 
-        // 写入 DynamicAtlas（使用 insert_no_clamp 避免边界 padding 二次挤压）
-        if let Some(region) = self.glyph_cache.insert(
-            AtlasKey::Glyph(cache_key), &rgba, w, h, (0, 0), false
+        // 写入 DynamicAtlas（`no_clamp`：字形自带 bearing，避免边界二次挤压）
+        if let Some(region) = self.glyph_cache.insert_with(
+            AtlasKey::Glyph(cache_key),
+            rjw_render::Rgba8::new(&rgba, (w, h)),
+            rjw_atlas::InsertOpts::new().no_clamp(),
         ) {
             self.locations.insert(cache_key, GlyphLocation {
                 region,
@@ -613,73 +650,6 @@ impl Text {
                 content: image.content,
             });
         }
-    }
-
-    /// 回调版标签渲染：不绑定 `Render2D`，GUI 可自定义每个字形的绘制方式。
-    ///
-    /// 回调签名与 [`Self::draw_text`] 一致：`(region, world_pos, world_size)`，
-    /// `world_pos` 是字形精灵**左上角**的世界坐标（已含 bearing）。
-    ///
-    /// `origin` 以内容宽高为单位，归一化到 [0,1]（`(0,0)` 左上角，`(0.5,0.5)` 居中）。
-    /// 返回内容宽高。
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_label_with<F>(
-        &mut self, text: &str, size: f32, line_height: f32,
-        pos: impl Into<Vec2>, family: &str, align: Align, origin: impl Into<Vec2>,
-        callback: F,
-    ) -> Vec2
-    where F: FnMut(&AtlasRegion, Vec2, Vec2)
-    {
-        let (pos, origin) = (pos.into(), origin.into());
-        let attrs = if family.is_empty() {
-            Attrs::new()
-        } else {
-            Attrs::new().family(Family::Name(family))
-        };
-        let buf = self.create_buffer(text, attrs, size, line_height, align);
-        let content_size = Text::measure_buffer(&buf);
-        let offset = Vec2::new(content_size.x * origin.x, content_size.y * origin.y);
-        self.visit_glyphs(&buf, pos - offset, None, callback);
-        content_size
-    }
-
-    /// 简化便捷方法：一键渲染文本精灵（feature = `rjw_2d_render`，默认开启）。
-    ///
-    /// `pos` — 文本左上角世界坐标。
-    /// `family` 支持自定义 family（如 `"SimHei"`）；传空字符串或无效名时自动回退到系统字体。
-    #[cfg(feature = "rjw_2d_render")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_label(
-        &mut self, r2d: &mut Render2D, text: &str, color: Color,
-        size: f32, line_height: f32, pos: impl Into<Vec2>, family: &str, align: Align, layer: impl Into<Layer> + Clone,
-    ) -> Vec2 {
-        self.draw_label_ex(r2d, text, color, size, line_height, pos, family, align, layer, Vec2::ZERO)
-    }
-
-    /// 扩展版：`origin` 以内容宽高为单位，归一化到 [0,1]。
-    /// `origin = (0,0)` 为左上角，`origin = (0.5,0.5)` 为中心点。
-    ///
-    /// 依赖默认 feature `rjw_2d_render`；不想要渲染绑定时改用 [`Self::draw_label_with`]。
-    #[cfg(feature = "rjw_2d_render")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_label_ex(
-        &mut self, r2d: &mut Render2D, text: &str, color: Color,
-        size: f32, line_height: f32, pos: impl Into<Vec2>, family: &str, align: Align, layer: impl Into<Layer> + Clone,
-        origin: impl Into<Vec2>,
-    ) -> Vec2 {
-        self.draw_label_with(text, size, line_height, pos, family, align, origin, |region, world_tl, wh| {
-            let Some(tex) = TEXTURES.get(region.page_uid) else {
-                return;
-            };
-            // 默认绘制：rjw_2d_render 直接方法（纹理像素尺寸自动取自 tex）
-            let rect = SpriteRect::with_uv_tex(
-                world_tl, wh,
-                Vec2::new(region.tl_px.0 as f32, region.tl_px.1 as f32),
-                Vec2::new(region.wh_px.0 as f32, region.wh_px.1 as f32),
-                &tex,
-            );
-            r2d.sprite(rect, &tex).color(color).layer(layer.clone());
-        })
     }
 
     /// 排版内容宽高（完整行盒，未滚动）：宽 = max(`line_w`)，高 = max(`line_top + line_height`) − min(`line_top`)。
@@ -701,22 +671,16 @@ impl Text {
         Vec2::new(w.ceil(), (bottom - top).ceil())
     }
 
-    /// 排版 + 测量一步到位：返回内容宽高，供 GUI 布局使用（widget 尺寸）。
-    pub fn measure(
-        &mut self, text: &str, attrs: Attrs<'_>, size: f32, line_height: f32, align: Align,
-    ) -> Vec2 {
-        let buffer = self.create_buffer(text, attrs, size, line_height, align);
-        Text::measure_buffer(&buffer)
-    }
-
-    /// 已排版 Buffer 的**视觉行**（自动换行后）列表——每个 `LayoutRun` 对应一个视觉行
-    /// （同一原文本行按宽度换行后拆成多行；每行含 `glyphs` 的字节范围）。
+    /// **UI 稳定集成面**：已排版 Buffer 的**视觉行**（自动换行后）列表——每个 `LayoutRun`
+    /// 对应一个视觉行（同一原文本行按宽度换行后拆成多行；每行含 `glyphs` 的字节范围）。
     ///
     /// 供 GUI 的**光标 / 点击 / 选择定位**与显示对齐（换行后按视觉行，而非原 `\n` 逻辑行）：
     /// - `byte_start` / `byte_end`：该行覆盖的**字节**范围（相对 `Buffer` 文本）；
     /// - `top`：行顶（相对文本视觉原点，物理像素）；
     /// - `width`：行宽（物理像素）。
-    pub fn visual_lines(buffer: &Buffer) -> Vec<VisualLine> {
+    ///
+    /// 取代旧 `Text::visual_lines`（语义与实现不变）。
+    pub fn lines(buffer: &Buffer) -> Vec<VisualLine> {
         // 原文本行 → 全文起始字节偏移（每行 text + 结尾字符）。字形 glyph 的
         // start/end 是**相对原文本行**的偏移，须加行偏移才是全文字节范围。
         let mut line_offsets: Vec<usize> = Vec::new();
@@ -752,7 +716,7 @@ impl Text {
     /// 计算文本的第一个视觉字形的左上角（bearing 恢复后），用于对齐。
     ///
     /// **整数不变量**：返回坐标均为**整数像素**（y 轴对 `line_y` 先 `ceil` 再减整型
-    /// bearing）——与 [`Self::visit_glyphs`] / [`collect_glyphs`] 的字形坐标一致，
+    /// bearing）——与 `collect_glyphs` 的字形坐标一致，
     /// 保证后续所有加减法操作数都是整数（无小数误差累加、无亚像素摆放）。
     fn buffer_origin(&self, buffer: &Buffer) -> Vec2 {
         for run in buffer.layout_runs() {
@@ -776,8 +740,8 @@ impl Text {
         Vec2::ZERO
     }
 
+    /// 字形图集（低层；示例/诊断读 `page_count` 等）。
     pub fn glyph_cache(&self) -> &DynamicAtlas<AtlasKey> { &self.glyph_cache }
-    pub fn page_size(&self) -> u32 { self.glyph_cache.page_size() }
 }
 
 #[cfg(test)]
@@ -835,7 +799,7 @@ mod tests {
         buf.set_size(Some(70.0), None);
         buf.set_text(text, &Attrs::new(), Shaping::Advanced, Some(Align::Left));
         buf.shape_until_scroll(&mut fs, false);
-        let lines = Text::visual_lines(&buf);
+        let lines = Text::lines(&buf);
         assert!(lines.len() >= 2, "70px 宽度下应换行成 ≥2 视觉行，实际 {}", lines.len());
         // 首行从 0 开始，末行到文本末尾
         assert_eq!(lines.first().map(|l| l.byte_start), Some(0));
@@ -853,7 +817,7 @@ mod tests {
         b2.set_size(Some(1024.0), None);
         b2.set_text("ab\ncd", &Attrs::new(), Shaping::Advanced, Some(Align::Left));
         b2.shape_until_scroll(&mut fs, false);
-        let l2 = Text::visual_lines(&b2);
+        let l2 = Text::lines(&b2);
         assert_eq!(l2.len(), 2);
         assert_eq!(l2[0].byte_end, 2, "第一逻辑行 'ab' 字节范围 [0,2)");
         assert_eq!(l2[1].byte_start, 3, "第二逻辑行 'cd' 从 3 起（跳过 \\n）");

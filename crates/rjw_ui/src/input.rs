@@ -6,10 +6,11 @@
 //!
 //! - 录制 UI 的阶段**不依赖设备存在**（可先建 `Ui`、喂输入、最后绘制）；
 //! - 不调用 `capture` = 空输入（headless：纯布局 / 纯绘制，无交互）；
-//! - 设备本身仍由 `rjw_main` 每帧喂事件并在帧末 `end_frame()` 结算边沿，
+//! - 设备本身仍由 `rjw_main` 每帧喂事件并在帧末 `next_frame()` 结算边沿，
 //!   快照拿到的是**完整一帧**的键/鼠状态（边沿值已结算）。
 //!
-//! 快照的方法名与设备类型对齐，`Ui` 内部调用点无需改动。
+//! 快照的方法名与设备类型**一致**（`key` / `chars` / `ime_*` / `pos_px` / `button` /
+//! `wheel`），`Ui` 内部调用点与设备路径同名同义。
 
 use rjw_keystate::{KeyState, KEY_STATE_RELEASED};
 use rjw_keyboard::key_code::key_code_index;
@@ -47,45 +48,45 @@ impl KeyboardSnapshot {
     /// 从设备拷贝本帧状态（含 IME 组合 / 上屏 / 输入字符）。
     pub fn capture(kb: &KeyboardInput) -> Self {
         let mut keys = [KEY_STATE_RELEASED; 256];
-        for (k, s) in kb.get_keys_iter() {
+        for (k, s) in kb.keys() {
             keys[key_code_index(k)] = s;
         }
         Self {
             keys,
-            chars: kb.get_chars().to_vec(),
-            ime_commits: kb.get_ime_commits().to_vec(),
-            ime_preedit: kb.get_ime_preedit().map(|s| s.to_owned()),
-            ime_preedit_caret: kb.get_ime_preedit_caret(),
+            chars: kb.chars().to_vec(),
+            ime_commits: kb.ime_commits().to_vec(),
+            ime_preedit: kb.ime_preedit().map(|s| s.to_owned()),
+            ime_preedit_caret: kb.ime_preedit_caret(),
         }
     }
 
     /// 按键状态（未按下的键 = [`KeyState::default`]：全 false）。
     #[inline]
-    pub fn get(&self, key_code: KeyCode) -> KeyState {
+    pub fn key(&self, key_code: KeyCode) -> KeyState {
         self.keys[key_code_index(key_code)]
     }
 
     /// 本帧输入的字符（非 IME 路径，如英文/数字直接输入）。
     #[inline]
-    pub fn get_chars(&self) -> &[char] {
+    pub fn chars(&self) -> &[char] {
         &self.chars
     }
 
     /// 本帧 IME 上屏的文本。
     #[inline]
-    pub fn get_ime_commits(&self) -> &[String] {
+    pub fn ime_commits(&self) -> &[String] {
         &self.ime_commits
     }
 
     /// 当前 IME 组合串（拼音等未上屏文本）。
     #[inline]
-    pub fn get_ime_preedit(&self) -> Option<&str> {
+    pub fn ime_preedit(&self) -> Option<&str> {
         self.ime_preedit.as_deref()
     }
 
     /// IME 组合串内光标位置。
     #[inline]
-    pub fn get_ime_preedit_caret(&self) -> Option<usize> {
+    pub fn ime_preedit_caret(&self) -> Option<usize> {
         self.ime_preedit_caret
     }
 }
@@ -105,18 +106,21 @@ impl MouseSnapshot {
     /// 从设备拷贝本帧状态（位置为物理屏幕坐标；按钮含本帧边沿）。
     pub fn capture(m: &MouseInput) -> Self {
         Self {
-            pos: m.get_mouse_position(),
+            pos: (m.pos_px().x as f64, m.pos_px().y as f64),
             in_window: m.in_window(),
-            left: m.get(MouseButton::Left),
-            right: m.get(MouseButton::Right),
-            middle: m.get(MouseButton::Middle),
-            wheel: m.get_mouse_wheel_delta(),
+            left: m.button(MouseButton::Left),
+            right: m.button(MouseButton::Right),
+            middle: m.button(MouseButton::Middle),
+            wheel: match m.wheel() {
+                rjw_mouse::ScrollDelta::Line(d) => d,
+                rjw_mouse::ScrollDelta::Pixel(d) => d,
+            },
         }
     }
 
-    /// 鼠标物理屏幕坐标。
+    /// 鼠标**物理屏幕坐标**（像素）。
     #[inline]
-    pub fn get_mouse_position(&self) -> (f64, f64) {
+    pub fn pos_px(&self) -> (f64, f64) {
         self.pos
     }
 
@@ -128,7 +132,7 @@ impl MouseSnapshot {
 
     /// 指定按键状态。
     #[inline]
-    pub fn get(&self, button: MouseButton) -> KeyState {
+    pub fn button(&self, button: MouseButton) -> KeyState {
         match button {
             MouseButton::Left => self.left,
             MouseButton::Right => self.right,
@@ -139,7 +143,7 @@ impl MouseSnapshot {
 
     /// 本帧滚轮累计增量（物理像素；y 向上为正）。
     #[inline]
-    pub fn get_mouse_wheel_delta(&self) -> (f64, f64) {
+    pub fn wheel(&self) -> (f64, f64) {
         self.wheel
     }
 }

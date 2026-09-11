@@ -11,40 +11,56 @@ English：
 ## 功能特性 / Features
 
 中文：
-- `DynamicAtlas<K = String>`：运行时插入 / 踢出 / 自动复活（tombstone）/ compact / 自动新建页；`K` 泛型键。
+- `DynamicAtlas<K = String>`：运行时插入 / 逐出 / 自动复活（tombstone）/ compact / 自动新建页；`K` 泛型键。
+- **构造与插入收参数**：`DynamicAtlas::new(gfx, AtlasConfig)`（页尺寸进配置）；插入只有两个入口
+  `insert(key, Rgba8)` 与 `insert_with(key, Rgba8, InsertOpts)`（原点 / `no_clamp` / `permanent` 走选项），
+  动态源用 `insert_dynamic(key, size, SpriteSource)`。
 - 打包器：`Guillotine` 空闲矩形列表（best-fit + 古莱丁切分），按行堆放，混合尺寸也不会碎片化到“页未满却开新页”。
 - 去碎片重排：`compact()` 把带源条目全量重排到最少页并重传纹理；`generation()` 世代号供缓存区域者刷新。
-- 寿命管理：`get()` 刷新寿命，`end_frame()` 到期转墓碑，`get_or_revive()` 自动重插。
-- `TextureRegenerator`：被踢出精灵可通过生成器按需重新光栅化。
+- 寿命管理：`region()` 刷新寿命，**`tick()`**（引擎每渲染帧调用）到期转墓碑，`region_or_revive()` 自动重插。
+- `SpriteSource`：被逐出精灵可通过生成器按需重新光栅化（原 `TextureRegenerator`）。
+- **绘制直达**：`atlas.sprite(&handle)` 产出 `AtlasSprite`（区域 + 页纹理），交给 `Render2D::region(..)` 一次提交。
+- `AtlasStats`（`stats()`）：页数 / 空闲 / 碎片度 / 世代，内省用。
 - `StaticAtlas<K = String>`：从 TOML（`spr.toml`）反序列化静态精灵表；泛型与 `DynamicAtlas` 一致。
 - `Index` / `IndexMut`：`DynamicAtlas` 与 `StaticAtlas` 均支持 `atlas[&key]` 直接读写区域。
-- TOML 导入 / 导出（`serde` feature，默认开启）。
-- `clamp_margin`：纹理边缘扩张 1px，避免线性过滤出血。
+- TOML 导入 / 导出（feature `toml`，默认开启）。
+- `clamp_margin`：纹理边缘扩张 1px，避免线性过滤出血（`InsertOpts::no_clamp()` 关闭）。
 
 English：
 - `DynamicAtlas<K = String>`: runtime insert / evict / auto-revive (tombstone) / compact / auto new page; generic key `K`.
-- Packer: `Guillotine` free-rect list (best-fit + guillotine split), row-based stacking that avoids fragmenting into narrow columns.
-- Defragmentation: `compact()` re-packs all source-backed entries into the fewest pages and re-uploads textures; `generation()` bumps for cached-region holders.
-- Lifetime management: `get()` refreshes lifetime, `end_frame()` moves expired entries to tombstones, `get_or_revive()` re-inserts automatically.
-- `TextureRegenerator`: evicted sprites can be re-rasterized on demand through a generator.
-- `StaticAtlas<K = String>`: deserializes a static sprite sheet from TOML (`spr.toml`); generic like `DynamicAtlas`.
-- `Index` / `IndexMut`: both `DynamicAtlas` and `StaticAtlas` support `atlas[&key]` to read/write regions directly.
-- TOML import / export (`serde` feature, enabled by default).
-- `clamp_margin`: expands texture edges by 1px to avoid linear-filter bleeding.
+- **Fewer parameters**: `DynamicAtlas::new(gfx, AtlasConfig)` (page size lives in the config); insertion is just
+  `insert(key, Rgba8)` / `insert_with(key, Rgba8, InsertOpts)` (`origin` / `no_clamp` / `permanent` as options),
+  with `insert_dynamic(key, size, SpriteSource)` for regenerable sources.
+- Packer: `Guillotine` free-rect list (best-fit + guillotine split), row-based stacking.
+- Defragmentation: `compact()` re-packs source-backed entries into the fewest pages; `generation()` bumps for cached-region holders.
+- Lifetime: `region()` refreshes, **`tick()`** (called by the engine every rendered frame) tombstones expired entries, `region_or_revive()` re-inserts.
+- **Draw-ready**: `atlas.sprite(&handle)` yields `AtlasSprite` (region + page texture) for `Render2D::region(..)`.
+- `AtlasStats` via `stats()`; `Index`/`IndexMut`; TOML under feature `toml`.
 
 ---
 
 ## 示例代码 / Example
 
 ```rust
-use rjw_atlas::{AtlasConfig, DynamicAtlas};
+use rjw_atlas::{AtlasConfig, DynamicAtlas, InsertOpts};
+use rjw_render::Rgba8;
 
-let mut atlas = DynamicAtlas::new(device, queue, layout, AtlasConfig::default(), 2048);
-if let Some(region) = atlas.insert_ex("player", &rgba, 64, 64) {
-    // 绘制时使用 region.tl_px / region.wh_px / region.page_uid
-    let r = atlas["player"]; // 等价 Index：&AtlasRegion
+// `gfx` = rjw_krusie::runtime::Gfx（或任何 `&Gpu`）
+let mut atlas = DynamicAtlas::new(gfx, AtlasConfig { max_pages: 4, padding: 1, page_size: 1024, ..Default::default() });
+
+// 插入（默认 clamp_margin、非常驻）；要常驻 / 指定原点 / 关边距用 InsertOpts
+let region = atlas.insert("player".to_string(), Rgba8::new(&rgba, (64, 64))).unwrap();
+let handle = atlas.handle("player").unwrap();                 // RAII 句柄（保活 + 重排后仍有效）
+atlas.insert_with("ui_white".to_string(), Rgba8::new(&[255, 255, 255, 255], (1, 1)),
+                  InsertOpts::new().permanent());
+
+// 绘制：区域 + 页纹理一次拿到
+if let Some(spr) = atlas.sprite(&handle) {
+    r2d.region(spr).tint(Color::WHITE).layer(0.0);
 }
-atlas.get_or_revive("player");
+
+atlas.tick();   // 引擎每渲染帧调用；用户侧手动驱动时自行调用
+let _ = region;
 ```
 
 ---

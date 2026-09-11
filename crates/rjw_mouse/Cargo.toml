@@ -1,6 +1,6 @@
 [package]
 name = "rjw_mouse"
-version = "0.1.2"
+version = "0.3.0"
 edition = "2024"
 authors = ["KrisuRJW <Cmd1loica99@163.com>"]
 description = "Winit-based mouse input manager with position, delta, wheel, and button state (with edge/true-edge)."
@@ -12,4 +12,5 @@ categories = ["game-engines", "hardware-support"]
 
 [dependencies]
 winit = "0.30.13"
-rjw_keystate = "0.1.0"
+rjw_keystate = { path = "../rjw_keystate", version = "0.3.0" }
+glam = "0.33.2"

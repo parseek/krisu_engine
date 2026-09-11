@@ -1,0 +1,51 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "check: workspace (all targets)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["check", "--workspace", "--all-targets"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$rustc"],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "test: workspace",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["test", "--workspace"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$rustc"],
+      "group": "test"
+    },
+    {
+      "label": "smoke: 全部示例（30 帧，检查「有画面」）",
+      "type": "shell",
+      "command": "pwsh",
+      "args": [
+        "-NoProfile",
+        "-Command",
+        "foreach ($p in @('egHello','eg260729','eg260731','eg260806CustomDraw','egMultiView','egDebugDraw','egTilemap','eg260810TextChain','eg260818UI','eg260731RPG')) { cargo build -q -p $p 2>$null; $o = & \"./target/debug/$p.exe\" --frames 30 2>&1 | Select-String 'krusie smoke'; \"$p :: $o\" }"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "debug: eg260818UI 脚本化拖动 + 状态打印",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["run", "-p", "eg260818UI", "--", "--sim-drag", "--ui-dump", "--frames", "90"],
+      "options": { "cwd": "${workspaceFolder}", "env": { "RUST_LOG": "rjw_ui=debug" } },
+      "problemMatcher": []
+    },
+    {
+      "label": "debug: trace 日志（egHello）",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["run", "-p", "egHello", "--", "--frames", "60"],
+      "options": { "cwd": "${workspaceFolder}", "env": { "RUST_LOG": "trace", "RUST_BACKTRACE": "1" } },
+      "problemMatcher": []
+    }
+  ]
+}

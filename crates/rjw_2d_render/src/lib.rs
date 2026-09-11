@@ -11,19 +11,21 @@
 //! | [`command`] | 命令队列（命令 + layer + states + 索引数组），不含策略 |
 //! | [`data`] | 几何/数据类型（`SpriteRect` / `VertexP3U2C4` / `MeshStorage` / `MeshSink`） |
 //! | [`draw_page`] | GPU 实例分页缓冲与统一管线缓存 |
-//! | [`debug_draw`] | 调试图元（线段 / 矩形框 / 圆 / 十字 / 网格） |
+//! | [`debug_draw`] | 调试图元（`DebugStyle` + `DebugPainter`：线段 / 矩形框 / 圆 / 十字 / 网格） |
 //!
 //! # 最小用法
 //!
 //! ```no_run
-//! # use rjw_2d_render::{ArcTextureWrapped, ClearConfig, Color, Render2D, SpriteRect};
-//! # use rjw_transform::Transform2D;
-//! # let (mut r2d, tex, vp): (Render2D, ArcTextureWrapped, glam::Mat4) = unimplemented!();
-//! r2d.set_mvp(vp);
+//! # use rjw_2d_render::{ArcTextureWrapped, Clear, Color, Render2D, SpriteRect};
+//! # use rjw_transform::{Camera2D, Rect, Transform2D};
+//! # use rjw_render::RenderContext;
+//! # let (mut r2d, mut ctx, tex, cam): (Render2D, RenderContext, ArcTextureWrapped, Camera2D) = unimplemented!();
+//! // 取一帧（`None` = 本帧不可呈现 ⇒ 跳过；逻辑可继续）
+//! let Some(mut frame) = ctx.acquire_frame() else { return };
 //!
 //! // 贴纹理精灵：入口 2 参，其余全在链上（默认 IDENTITY / WHITE / layer 0）
 //! r2d.sprite(SpriteRect::new((-50.0, -50.0), (100.0, 100.0)), &tex)
-//!     .color(Color::WHITE)
+//!     .tint(Color::WHITE)
 //!     .transform(Transform2D::IDENTITY.with_pos(glam::Vec2::new(10.0, 20.0)))
 //!     .layer(1.0);
 //!
@@ -33,12 +35,24 @@
 //!     p.vertex(glam::Vec2::new(40.0, 0.0));
 //!     p.vertex(glam::Vec2::new(20.0, 30.0));
 //! })
-//! .color(Color::CYAN);
+//! .tint(Color::CYAN);
 //!
-//! r2d.render(&ClearConfig::default());
+//! // 一个画面 = 一次 submit(相机, clear) = 一个 pass（深度附件需求自动推导）
+//! let mut pass = frame.pass(Clear::default());
+//! r2d.submit(&mut pass, &cam);
+//! drop(pass);
+//!
+//! frame.present();
 //! ```
 //!
-//! 坐标系（与 `rjw_transform::Camera2D` 一致）：原点在视口中心、X+ 为右、Y+ 为下。
+//! # 画面与相机
+//!
+//! - **相机由调用方持有**（`Render2D` 不含相机状态）：`submit(.., &cam)` 把画面矩形写回
+//!   `cam.region` 并读取 `cam.vp_matrix()`；
+//! - 一帧内多次 `frame.pass(..)` + `submit` = 多个画面，每个画面在**帧级 VP 槽环**里占
+//!   一个独立槽（动态偏移绑定），互不串味。见 `examples/egMultiView`。
+//!
+//! 坐标系（与 `rjw_transform::Camera2D` 一致）：原点在画面中心、X+ 为右、Y+ 为下。
 
 // ─── 模块声明 ─────────────────────────────────────────────────
 
@@ -56,16 +70,16 @@ pub mod sort;
 
 pub use command::Layer;
 pub use cull::{Cull, Culler, sprite_world_aabb, transform2d_model, viewport_world_rect};
-pub use data::{
-    Edges, Index, MeshSink, SpriteRect, SpriteRectPx, TriIndicies, Vertex, VertexP3U2C4,
-};
-pub use draw_page::MAX_INSTANCES_PER_DRAW;
+pub use data::{Edges, SpriteRect, Vertex, VertexP3U2C4};
+pub use draw_page::{DEPTH_FORMAT, MAX_INSTANCES_PER_DRAW};
 pub use draw::{
     Custom, CustomDraw, Draw2D, DrawKind, Mesh, PolygonSink, QuadSink, Sprite, StaticMesh,
 };
 pub use render2d::{
-    ClearConfig, CustomBuilder, MeshBuilder, Render2D, SpriteBuilder, StaticMeshBuilder,
+    CustomBuilder, MeshBuilder, Render2D, SpriteBuilder, StaticMeshBuilder,
 };
+// 帧 / pass 生命周期（实现于 rjw_render：帧级资源 + pass 边界）。
+pub use rjw_render::{Clear, PassBuilder, PassContext, PassRecorder, RenderFrame, RenderTarget};
 pub use rstates::{
     AddressMode, BlendDesc, BlendMode, CompareFunc, CullMode, DepthState, FilterMode,
     FrontFaceWinding, PolygonMode, RStates, RasterState, SamplerDesc, StencilState,
@@ -96,24 +110,26 @@ mod mesh_sink_tests {
         storage.vertices.resize(4, VertexP3U2C4::default());
         storage.tri_indices.clear();
 
-        let mut sink = data::MeshSink {
-            base: 4,
-            verts: &mut storage.vertices,
-            tris: &mut storage.tri_indices,
-            color_arr: [1.0, 0.0, 0.0, 1.0],
-        };
+        {
+            // 作用域结束即释放对 storage 的借用（`MeshSink` 无 `Drop`）。
+            let mut sink = data::MeshSink {
+                base: 4,
+                verts: &mut storage.vertices,
+                tris: &mut storage.tri_indices,
+                color_arr: [1.0, 0.0, 0.0, 1.0],
+            };
 
-        let a = sink.push_vertex(glam::Vec2::new(0.0, 0.0));
-        let b = sink.push_vertex(glam::Vec2::new(1.0, 0.0));
-        let c = sink.push_vertex(glam::Vec2::new(0.0, 1.0));
-        assert_eq!(
-            [a, b, c],
-            [0, 1, 2],
-            "push_vertex should return local indices"
-        );
+            let a = sink.push_vertex(glam::Vec2::new(0.0, 0.0));
+            let b = sink.push_vertex(glam::Vec2::new(1.0, 0.0));
+            let c = sink.push_vertex(glam::Vec2::new(0.0, 1.0));
+            assert_eq!(
+                [a, b, c],
+                [0, 1, 2],
+                "push_vertex should return local indices"
+            );
 
-        sink.push_tri(0, 1, 2);
-        drop(sink);
+            sink.push_tri(0, 1, 2);
+        }
 
         // 全局索引应 +4。
         assert_eq!(storage.tri_indices.len(), 1);
@@ -130,19 +146,21 @@ mod mesh_sink_tests {
     #[test]
     fn push_vertex_uv_color_sets_vertex_color() {
         let mut storage = data::MeshStorage::default();
-        let mut sink = data::MeshSink {
-            base: 0,
-            verts: &mut storage.vertices,
-            tris: &mut storage.tri_indices,
-            color_arr: [0.0, 1.0, 0.0, 1.0],
-        };
-        let idx = sink.push_vertex_uv_color(
-            glam::Vec2::new(10.0, 20.0),
-            glam::Vec2::new(0.25, 0.75),
-            [1.0, 0.0, 0.0, 0.5],
-        );
-        assert_eq!(idx, 0);
-        drop(sink);
+        {
+            // 作用域结束即释放借用（`MeshSink` 无 `Drop`）。
+            let mut sink = data::MeshSink {
+                base: 0,
+                verts: &mut storage.vertices,
+                tris: &mut storage.tri_indices,
+                color_arr: [0.0, 1.0, 0.0, 1.0],
+            };
+            let idx = sink.push_vertex_uv_color(
+                glam::Vec2::new(10.0, 20.0),
+                glam::Vec2::new(0.25, 0.75),
+                [1.0, 0.0, 0.0, 0.5],
+            );
+            assert_eq!(idx, 0);
+        }
         let v = storage.vertices[0];
         assert_eq!(v.pos, [10.0, 20.0, 0.0]);
         assert_eq!(v.uv, [0.25, 0.75]);
@@ -162,9 +180,7 @@ mod matrix_tests {
     const EPS: f32 = 1e-3;
 
     fn camera() -> Camera2D {
-        let mut c = Camera2D::new(glam::Vec2::new(W, H));
-        c.set_vp(glam::Vec2::new(W, H), glam::Vec2::ZERO);
-        c
+        Camera2D::full(glam::Vec2::new(W, H))
     }
 
     /// 构造与 `InstanceData::from_sprite` 相同的 2D model 矩阵（列主序）。
@@ -263,13 +279,13 @@ mod matrix_tests {
         let rect = SpriteRect::new(glam::Vec2::ZERO, (16.0, 16.0));
         let id = draw_page::InstanceData::from_sprite(&rect, Color::WHITE, tf);
         let expected = model_matrix(&tf).to_cols_array_2d();
-        for row in 0..4 {
-            for col in 0..4 {
+        for (row, exp_row) in expected.iter().enumerate() {
+            for (col, exp) in exp_row.iter().enumerate() {
                 assert!(
-                    (id.model[row][col] - expected[row][col]).abs() < EPS,
+                    (id.model[row][col] - exp).abs() < EPS,
                     "model mismatch at [{row}][{col}]: {} vs {}",
                     id.model[row][col],
-                    expected[row][col]
+                    exp
                 );
             }
         }
@@ -304,120 +320,94 @@ mod matrix_tests {
     }
 }
 
-/// `SpriteRectPx` 单元测试：像素 UV → 归一化换算、收缩 / 展开（Clamp）/ 越界（不 Clamp）行为。
+/// `SpriteRect` 像素 UV 单元测试：像素 → 归一化换算、链式收窄（世界 / 归一化 UV）。
 #[cfg(test)]
-mod sprite_rect_px_tests {
+mod pixel_uv_tests {
     use super::*;
 
     const EPS: f32 = 1e-4;
 
     /// 64×64 纹理的整张贴图精灵
-    fn px64() -> SpriteRectPx {
-        SpriteRectPx::new(glam::Vec2::ZERO, (32.0, 32.0), (64.0, 64.0))
+    fn px64() -> SpriteRect {
+        SpriteRect::with_uv_px(
+            glam::Vec2::ZERO,
+            (32.0, 32.0),
+            glam::Vec2::ZERO,
+            (64.0, 64.0),
+            (64.0, 64.0),
+        )
     }
 
     #[test]
-    fn new_maps_full_region() {
+    fn full_texture_px_maps_to_unit_uv() {
         let r = px64();
         assert_eq!(r.uv_tl, glam::Vec2::ZERO);
-        assert_eq!(r.uv_wh, glam::Vec2::splat(64.0));
-        let s: SpriteRect = r.into();
-        assert_eq!(s.uv_tl, glam::Vec2::ZERO);
-        assert!((s.uv_wh - glam::Vec2::ONE).length() < EPS);
-        // mesh 透传
-        assert_eq!(s.mesh_tl, r.mesh_tl);
-        assert_eq!(s.mesh_wh, r.mesh_wh);
+        assert!((r.uv_wh - glam::Vec2::ONE).length() < EPS);
+        // 世界矩形原样保留
+        assert_eq!(r.mesh_tl, glam::Vec2::ZERO);
+        assert_eq!(r.mesh_wh, glam::Vec2::splat(32.0));
     }
 
     #[test]
     fn pixel_subregion_normalizes_correctly() {
-        let r = SpriteRectPx::with_uv_px(
+        let r = SpriteRect::with_uv_px(
             (-16.0, -8.0),
             (32.0, 16.0),
             (16.0, 32.0),
             (64.0, 32.0),
             (256.0, 128.0),
         );
-        let s = r.to_sprite_rect();
-        assert!((s.uv_tl - glam::Vec2::new(16.0 / 256.0, 32.0 / 128.0)).length() < EPS);
-        assert!((s.uv_wh - glam::Vec2::new(64.0 / 256.0, 32.0 / 128.0)).length() < EPS);
+        assert!((r.uv_tl - glam::Vec2::new(16.0 / 256.0, 32.0 / 128.0)).length() < EPS);
+        assert!((r.uv_wh - glam::Vec2::new(64.0 / 256.0, 32.0 / 128.0)).length() < EPS);
     }
 
     #[test]
-    fn shrink_clamps_by_edge_without_flipping() {
+    fn uv_px_chain_touches_uv_only() {
+        let r = SpriteRect::new((10.0, 20.0), (32.0, 32.0))
+            .uv_px((8.0, 8.0), (16.0, 16.0), (64.0, 64.0));
+        assert_eq!(r.mesh_tl, glam::Vec2::new(10.0, 20.0));
+        assert_eq!(r.mesh_wh, glam::Vec2::splat(32.0));
+        assert!((r.uv_tl - glam::Vec2::splat(0.125)).length() < EPS);
+        assert!((r.uv_wh - glam::Vec2::splat(0.25)).length() < EPS);
+    }
+
+    #[test]
+    fn zero_texture_size_stays_finite() {
+        let r = SpriteRect::with_uv_px(
+            glam::Vec2::ZERO,
+            (1.0, 1.0),
+            glam::Vec2::ZERO,
+            (1.0, 1.0),
+            glam::Vec2::ZERO,
+        );
+        assert!(r.uv_tl.is_finite() && r.uv_wh.is_finite(), "{r:?}");
+    }
+
+    #[test]
+    fn shrink_narrows_world_rect_keeping_uv() {
         let r = px64();
         let s = r.shrink(8.0);
-        assert!((s.uv_tl.x - 8.0).abs() < EPS, "tl.x = {}", s.uv_tl.x);
-        assert!((s.uv_wh.x - 48.0).abs() < EPS, "wh.x = {}", s.uv_wh.x);
-        // 过窄：按边 clamp（左 → 上 → 右 → 下），尺寸到 0 且不翻转
-        let c = r.shrink(64.0);
-        assert_eq!(c.uv_wh.x, 0.0);
-        assert!((c.uv_tl.x - 64.0).abs() < EPS);
+        assert_eq!(s.mesh_tl, glam::Vec2::splat(8.0));
+        assert_eq!(s.mesh_wh, glam::Vec2::splat(16.0));
+        assert_eq!(s.uv_tl, r.uv_tl);
+        assert_eq!(s.uv_wh, r.uv_wh);
         // 分轴：左右各 4、上下各 2
         let xy = r.shrink((4.0, 2.0));
-        assert_eq!(xy.uv_tl, glam::Vec2::new(4.0, 2.0));
-        assert_eq!(xy.uv_wh, glam::Vec2::new(56.0, 60.0));
+        assert_eq!(xy.mesh_tl, glam::Vec2::new(4.0, 2.0));
+        assert_eq!(xy.mesh_wh, glam::Vec2::new(24.0, 28.0));
+        // 负值即外扩（不 clamp，越界由调用方负责）
+        let out = r.shrink(Edges::new().left(-4.0));
+        assert_eq!(out.mesh_tl.x, -4.0);
+        assert_eq!(out.mesh_wh.x, 36.0);
     }
 
     #[test]
-    fn expand_clamps_at_texture_bounds() {
-        // 子区 (0,16)-(48,32)，纹理 64×64
-        let r = SpriteRectPx::with_uv_px(
-            glam::Vec2::ZERO,
-            (32.0, 32.0),
-            (0.0, 16.0),
-            (48.0, 32.0),
-            (64.0, 64.0),
-        );
-        // 左：tl.x 已贴 0，无可展开
-        let e = r.expand(Edges::new().left(1000.0));
-        assert_eq!(e.uv_tl.x, 0.0);
-        assert!((e.uv_wh.x - 48.0).abs() < EPS);
-        // 右：0+48=48，剩 16px
-        let e = r.expand(Edges::new().right(1000.0));
-        assert!((e.uv_wh.x - 64.0).abs() < EPS, "wh.x = {}", e.uv_wh.x);
-        // 下：16+32=48，剩 16px
-        let e = r.expand(Edges::new().bottom(1000.0));
-        assert!((e.uv_wh.y - 48.0).abs() < EPS, "wh.y = {}", e.uv_wh.y);
-        assert_eq!(e.uv_tl.y, 16.0);
-        // 上：tl.y=16，可展开 16px
-        let e = r.expand(Edges::new().top(1000.0));
-        assert_eq!(e.uv_tl.y, 0.0);
-        assert!((e.uv_wh.y - 48.0).abs() < EPS);
-    }
-
-    #[test]
-    fn exceed_does_not_clamp() {
-        let r = px64();
-        let e = r.exceed(Edges::new().left(16.0).bottom(16.0));
-        assert_eq!(e.uv_tl, glam::Vec2::new(-16.0, 0.0));
-        assert_eq!(e.uv_wh, glam::Vec2::new(80.0, 80.0));
-        let e = r.exceed(Edges::new().top(8.0).right(8.0));
-        assert_eq!(e.uv_tl, glam::Vec2::new(0.0, -8.0));
-        assert_eq!(e.uv_wh, glam::Vec2::new(72.0, 72.0));
-    }
-
-    #[test]
-    fn shrink_single_side_clamps_to_zero() {
-        let r = px64();
-        let s = r.shrink(Edges::new().left(100.0));
-        assert_eq!(s.uv_wh.x, 0.0);
-        assert!((s.uv_tl.x - 64.0).abs() < EPS);
-        let s = r.shrink(Edges::new().right(100.0));
-        assert_eq!(s.uv_wh.x, 0.0);
-        assert_eq!(s.uv_tl.x, 0.0);
-        let s = r.shrink(Edges::new().bottom(100.0));
-        assert_eq!(s.uv_wh.y, 0.0);
-        assert_eq!(s.uv_tl.y, 0.0);
-    }
-
-    #[test]
-    fn shrink_mesh_mirrors_sprite_rect() {
-        let r = px64();
-        let s = r.shrink_mesh((4.0, 2.0));
-        assert!((s.mesh_wh - glam::Vec2::new(24.0, 28.0)).length() < EPS);
-        assert!((s.mesh_tl - glam::Vec2::new(4.0, 2.0)).length() < EPS);
-        // UV 不受影响
-        assert_eq!(s.uv_wh, glam::Vec2::splat(64.0));
+    fn shrink_uv_uses_normalized_units_keeping_mesh() {
+        let r = SpriteRect::with_uv((0.0, 0.0), (32.0, 32.0), (0.25, 0.5), (0.5, 0.25));
+        let s = r.shrink_uv(Edges::lrtb(0.125, 0.0, 0.0, 0.125));
+        assert!((s.uv_tl - glam::Vec2::new(0.375, 0.5)).length() < EPS, "{:?}", s.uv_tl);
+        assert!((s.uv_wh - glam::Vec2::new(0.375, 0.125)).length() < EPS, "{:?}", s.uv_wh);
+        assert_eq!(s.mesh_tl, r.mesh_tl);
+        assert_eq!(s.mesh_wh, r.mesh_wh);
     }
 }

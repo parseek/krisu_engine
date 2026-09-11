@@ -120,7 +120,7 @@ p.button("btn_max", "max 宽");   // 这个按钮宽 ≤ 120
 
 ### 3.6 固定宽 / 固定高（`fixed_w` / `fixed_h`）
 
-- `window_at_w`：设 `fixed_w` —— 子项宽度 **clamp 到容器固定宽**（内容按固定宽排布、
+- `ui.window(id).width(w)`：设 `fixed_w` —— 子项宽度 **clamp 到容器固定宽**（内容按固定宽排布、
   高度自然，如同 egui），`settle_size` 宽 = `fixed_w + 2*pad`；
 - `flex_at`：设 `fixed_h` —— 结算高度固定为 `total_h`（覆盖自然高度）。
 
@@ -162,7 +162,7 @@ ui.flex_at(vec2(880.0, 450.0), 150.0, &[1, 2, 1], |f, i| {
 ```rust
 ui.label_at(Vec2::new(16.0, 12.0), "FPS: 60");          // 顶部状态栏
 ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, …);     // 绝对定位一个 pack
-ui.window_at("win_b", pos, |w| { … });                   // 绝对定位一个窗口
+ui.window("win_b").pos(pos).show(|w| { … });             // 绝对定位一个窗口
 ```
 
 `add_at(pos, widget)` 同理。位置参数可用 `Logical` / `Physical` 单位（`Position`），
@@ -170,9 +170,10 @@ ui.window_at("win_b", pos, |w| { … });                   // 绝对定位一个
 
 ### 4.4 window / panel —— 可重叠 / 可拖拽容器
 
-- **window**（`ui.window(id)` / `ui.window_at`）：可重叠 + 点击置顶（焦点 z-order）+
-  可拖拽；内容顶点按**内容签名**缓存（移动窗口只改变换、不重建顶点）；`window_at_w`
-  右下角缩放柄改宽；`window_at_strict` 内容强制裁剪（Clip 沙箱）；
+- **window**（`ui.window(id)`，**唯一入口**）：可重叠 + 点击置顶（焦点 z-order）+
+  可拖拽；内容顶点按**内容签名**缓存（移动窗口只改变换、不重建顶点）；`.width(w)`
+  右下角缩放柄改宽；`.placement(Placement::Clip)` 内容强制裁剪（Clip 沙箱）；
+  `.level(Level)` 控制点击是否置顶；
 - **panel**（`ui.panel()` / `ui.drag_panel_at`）：背景 + 边框 + 内边距的容器；
 - 窗口 / 面板**自带命名空间边界**：内部子控件 ID 自动带 `id` 前缀。
 
@@ -225,7 +226,7 @@ ui.window_at("win_b", pos, |w| { … });                   // 绝对定位一个
 | grid | `grid_at` | 固定列数，单元格尺寸跨帧缓存 |
 | flex | `flex_at` | 固定总高，按权重等分高度 |
 | place | `*_at`（`label_at`/`pack_at`/`add_at`…） | 绝对定位，不占光标 |
-| window | `window_at` / `window` | 可重叠 / 置顶 / 拖拽 / 顶点缓存 / 可选缩放 |
+| window | `ui.window(id)` builder | 可重叠 / 置顶（`.level`）/ 拖拽 / 顶点缓存 / 可选缩放（`.width`）/ 裁剪（`.placement`） |
 | panel | `panel_at` / `drag_panel_at` | 背景 + 边框 + 内边距 |
 | scroll | `scroll_at` / `list_at` | 滚动容器（强制裁剪） |
 | row | `row(… )` | 水平等高管线，占一行 |
