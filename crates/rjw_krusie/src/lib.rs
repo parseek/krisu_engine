@@ -146,7 +146,8 @@ pub mod prelude {
     // ── UI（feature = ui）──
     #[cfg(feature = "ui")]
     pub use crate::ui::{
-        Anchor, Button, Checkbox, Child, Divider, Level, NumberInput, PackSide, Placement, Resize,
+        Anchor, Button, Checkbox, Child, ColorPicker, Divider, Level, NumberInput, PackSide,
+        Placement, Resize,
         Slider, Theme, Ui, UiAdd, UiState, UiStats, WindowClamp, WindowFx,
     };
 

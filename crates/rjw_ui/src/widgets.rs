@@ -14,8 +14,9 @@
 //!   [`button`]`::Button` / [`checkbox`]`::Checkbox` / [`divider`]`::Divider` /
 //!   [`slider`]`::Slider`——`Option` 覆盖字段 + 链式 setter，未设置的属性回落到全局
 //!   [`Theme`](crate::style::Theme)；
-//! - 内置**组合控件**：`numberinput`（[`NumberInput`]）/ `fontmodal`（[`FontModal`]），
-//!   由基础原语组合而成，同时是"跨 crate 自定义控件"的真实范例；
+//! - 内置**组合控件**：`numberinput`（[`NumberInput`]）/ `colorpicker`（[`ColorPicker`]）
+//!   / `fontmodal`（[`FontModal`]），由基础原语组合而成，同时是"跨 crate 自定义控件"
+//!   的真实范例；
 //! - 统一响应 [`Response`]（hover / pressed / clicked / released / toggled）；
 //! - 放置方式：[`Ui::add`](crate::ui::Ui::add)（容器内占光标）/
 //!   [`Ui::add_at`](crate::ui::Ui::add_at)（绝对定位）；容器包装（`Panel` / `Pack` /
@@ -33,6 +34,7 @@ use crate::ui::Ui;
 
 mod button;
 mod checkbox;
+mod colorpicker;
 mod divider;
 mod fontmodal;
 mod label;
@@ -41,6 +43,7 @@ mod slider;
 
 pub use button::Button;
 pub use checkbox::Checkbox;
+pub use colorpicker::{ColorPicker, color_hex, parse_hex};
 pub use divider::Divider;
 pub use fontmodal::FontModal;
 pub use label::Label;

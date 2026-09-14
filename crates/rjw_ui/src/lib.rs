@@ -173,7 +173,10 @@ pub use style::{
 pub use input::{KeyboardSnapshot, MouseSnapshot};
 pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Placement, Resize, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
 pub use view::{ViewCtx, ViewMode};
-pub use widgets::{Button, Checkbox, Divider, FontModal, Label, NumberInput, Response, Slider, Widget, WidgetId};
+pub use widgets::{
+    Button, Checkbox, ColorPicker, Divider, FontModal, Label, NumberInput, Response, Slider,
+    Widget, WidgetId, color_hex, parse_hex,
+};
 
 /// **UI 文本模块**（公开）：`rjw_ui` 里与文字渲染相关的全部公开面。
 ///

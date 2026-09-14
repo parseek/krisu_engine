@@ -41,7 +41,7 @@ use std::time::Instant;
 
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
-use rjw_krusie::ui::{CornerRadius, FontModal, IdAbsolute, Label, Palette};
+use rjw_krusie::ui::{ColorPicker, CornerRadius, FontModal, IdAbsolute, Label, Palette};
 
 /// 顶部状态栏模块：FPS / 点击次数标签 + 字体按钮（打开 Modal）+ 玩家名输入框 + 字体 Modal。
 struct TopBar {
@@ -519,12 +519,14 @@ struct ThemeTuner {
     bevel: f32,
     /// 全局边框宽（逻辑像素；0 = 无边框）。
     border_w: f32,
-    /// 表面基色（sRGB 0..1；整条 `surface*` 阶梯按通道比一起缩）。
-    bg: [f32; 3],
-    /// 描边色（sRGB 0..1）；`border_strong` 由它派生。
-    border: [f32; 3],
-    /// 强调色（sRGB 0..1）；hover / active 由它派生。
-    accent: [f32; 3],
+    /// 表面基色（整条 `surface*` 阶梯按**逐通道比**一起缩）。
+    bg: Color,
+    /// 描边色；`border_strong` 由它派生。
+    border: Color,
+    /// 强调色；hover / active 由它派生。
+    accent: Color,
+    /// 强调色的十六进制编辑缓冲（[`ColorPicker::with_hex`] 用；跨帧持有）。
+    accent_hex: String,
     /// 是否显示本窗口。
     open: bool,
 }
@@ -553,9 +555,10 @@ impl ThemeTuner {
             feather: 1.0,
             bevel: p.bevel,
             border_w: 1.0,
-            bg: rgb_of(p.surface),
-            border: rgb_of(p.border),
-            accent: rgb_of(p.accent),
+            bg: p.surface,
+            border: p.border,
+            accent: p.accent,
+            accent_hex: String::new(),
             // 默认打开：这是个"可调的窗口"，开着才能看见效果。
             open: true,
         }
@@ -566,9 +569,9 @@ impl ThemeTuner {
         let p = preset_palette(preset);
         self.preset = preset;
         self.bevel = p.bevel;
-        self.bg = rgb_of(p.surface);
-        self.border = rgb_of(p.border);
-        self.accent = rgb_of(p.accent);
+        self.bg = p.surface;
+        self.border = p.border;
+        self.accent = p.accent;
     }
 
     /// 按当前旋钮组装主题（`frame.ui(..)` 之前调用——闭包借用 `self`，闭包内不能构造）。
@@ -577,10 +580,11 @@ impl ThemeTuner {
         // 表面基色：按**逐通道比**缩放整条 `surface*` 阶梯 —— 既改亮度也改色相，
         // 同时保持"凹陷 / 面板 / 抬升 / 浮层 / 悬停 / 激活"之间的相对关系不塌。
         let base = rgb_of(p.surface);
+        let bg = rgb_of(self.bg);
         let f = [
-            self.bg[0] / base[0].max(0.02),
-            self.bg[1] / base[1].max(0.02),
-            self.bg[2] / base[2].max(0.02),
+            bg[0] / base[0].max(0.02),
+            bg[1] / base[1].max(0.02),
+            bg[2] / base[2].max(0.02),
         ];
         let sc = |c: rjw_krusie::color::Color| scale_rgb(c, f);
         p.surface_dim = sc(p.surface_dim);
@@ -589,14 +593,14 @@ impl ThemeTuner {
         p.surface_overlay = sc(p.surface_overlay);
         p.surface_hover = sc(p.surface_hover);
         p.surface_active = sc(p.surface_active);
-        p.surface = Color::rgba(self.bg[0], self.bg[1], self.bg[2], 1.0);
+        p.surface = self.bg;
         // 描边：常规 + 强描边（后者更亮，用于按钮 / 输入框 / 勾选框）。
-        p.border = Color::rgba(self.border[0], self.border[1], self.border[2], 1.0);
-        p.border_strong = scale_luma(p.border, 1.25);
+        p.border = self.border;
+        p.border_strong = scale_luma(self.border, 1.25);
         p.bevel = self.bevel;
-        p.accent = Color::rgba(self.accent[0], self.accent[1], self.accent[2], 1.0);
-        p.accent_hover = scale_luma(p.accent, 1.25);
-        p.accent_active = scale_luma(p.accent, 0.80);
+        p.accent = self.accent;
+        p.accent_hover = scale_luma(self.accent, 1.25);
+        p.accent_active = scale_luma(self.accent, 0.80);
         let mut t = Theme::themed(&p)
             .with_radius(self.radius)
             .with_feather(self.feather)
@@ -643,27 +647,21 @@ impl ThemeTuner {
                     w.label("微渐变");
                     self.bevel = w.slider("th_bevel", 0.0..=0.35, self.bevel);
                 });
+                // 三组颜色改用 [`ColorPicker`]：预览色块（内含 `#RRGGBB`）+ 逐通道滑条，
+                // 强调色额外开 Alpha 与十六进制输入（演示 `.alpha(true)` / `.with_hex(..)`）。
+                // 并排放一行，省纵向空间。
                 w.row(|w| {
-                    w.label("背景");
-                    self.bg[0] = w.slider("th_bgr", 0.0..=1.0, self.bg[0]);
-                    self.bg[1] = w.slider("th_bgg", 0.0..=1.0, self.bg[1]);
-                    self.bg[2] = w.slider("th_bgb", 0.0..=1.0, self.bg[2]);
-                });
-                w.row(|w| {
-                    w.label("边框");
-                    self.border[0] = w.slider("th_bdr", 0.0..=1.0, self.border[0]);
-                    self.border[1] = w.slider("th_bdg", 0.0..=1.0, self.border[1]);
-                    self.border[2] = w.slider("th_bdb", 0.0..=1.0, self.border[2]);
+                    w.add(ColorPicker::new("th_bg", &mut self.bg));
+                    w.add(ColorPicker::new("th_border", &mut self.border));
+                    w.add(
+                        ColorPicker::new("th_accent", &mut self.accent)
+                            .alpha(true)
+                            .with_hex(&mut self.accent_hex),
+                    );
                 });
                 w.row(|w| {
                     w.label("边框宽");
                     self.border_w = w.slider("th_bdw", 0.0..=5.0, self.border_w);
-                });
-                w.row(|w| {
-                    w.label("强调");
-                    self.accent[0] = w.slider("th_ar", 0.0..=1.0, self.accent[0]);
-                    self.accent[1] = w.slider("th_ag", 0.0..=1.0, self.accent[1]);
-                    self.accent[2] = w.slider("th_ab", 0.0..=1.0, self.accent[2]);
                 });
                 w.label(&format!(
                     "{} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 边框宽 {:.1}",
