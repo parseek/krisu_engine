@@ -41,7 +41,7 @@ use std::time::Instant;
 
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
-use rjw_krusie::ui::{FontModal, IdAbsolute, Label, Palette, PanelStyle};
+use rjw_krusie::ui::{FontModal, IdAbsolute, Label, Palette};
 
 /// 顶部状态栏模块：FPS / 点击次数标签 + 字体按钮（打开 Modal）+ 玩家名输入框 + 字体 Modal。
 struct TopBar {
@@ -74,62 +74,24 @@ impl TopBar {
     fn ui(&mut self, ui: &mut Ui, fps: f64, clicks: u32, tuner: &mut ThemeTuner) {
         ui.label_at(Vec2::new(16.0, 12.0), &format!("FPS: {fps:.0}"));
         ui.label_at(Vec2::new(16.0, 34.0), &format!("点击次数: {clicks}"));
-        // ── 外观演示：圆角 + 渐变（**零纹理、零着色器改动**）──
-        // 两者都是顶点色路径：圆角由 CPU 镶嵌成三角形（硬体 + 羽化边缘），
-        // 渐变由光栅化器对四角顶点色双线性插值。四角色各异 ⇒「圆角 + 渐变」共存。
-        self.show_look_demo(ui);
-        // 字体按钮（**pack 内自动尺寸**：随字体名变长自动变宽）打开 Modal。
-        ui.pack_at(Vec2::new(16.0, 150.0), PackSide::Top, |p| {
-            if p.button("font_btn", &format!("字体… {}", self.font_name)).clicked() {
-                self.font_modal_open = true;
-            }
-            if p.button("theme_btn", "主题调节…").clicked() {
-                tuner.open = !tuner.open;
-            }
+        // 字体按钮 +「主题调节…」开关。**放在同一 row 里**（而不是 pack 两行）：
+        // 主菜单（`Menu::ui`）从 `(16, 90)` 往下堆，这里占满 `y = 56..82` 一行正好
+        // 留出 8px 间隙；叠成两行会压到菜单上。
+        ui.pack_at(Vec2::new(16.0, 56.0), PackSide::Top, |p| {
+            p.row(|r| {
+                if r.button("font_btn", &format!("字体… {}", self.font_name)).clicked() {
+                    self.font_modal_open = true;
+                }
+                if r.button("theme_btn", "主题调节…").clicked() {
+                    tuner.open = !tuner.open;
+                }
+            });
         });
-        // 玩家名可拖动面板。
-        ui.drag_panel_at("name_panel", Vec2::new(200.0, 12.0), |p| {
+        // 玩家名可拖动面板（右移：上面那行按钮随字体名变长，别压到它）。
+        ui.drag_panel_at("name_panel", Vec2::new(430.0, 12.0), |p| {
             p.label("玩家名（可拖动）");
             p.text_input("name", &mut self.player_name);
         });
-    }
-
-    /// **外观演示区**（左上角，`y = 56 .. 148`）：两块显式原语样例，用来目视确认
-    /// 「两端色渐变」「圆角 + 羽化抗锯齿」——**两者都不生成纹理、不改着色器**：
-    /// 渐变是四角顶点色（光栅化器双线性插值），圆角是 CPU 镶嵌成三角形
-    /// （硬体 `alpha = 1` + 外环 `alpha = 0`，羽化宽由 `Theme::feather` 调）。
-    ///
-    /// 「圆角 + 渐变」的组合不需要额外演示：本示例主题是 `Theme::dark()` +
-    /// `.with_radius(8.0)`，而 `Theme::dark()` 的面板 / 按钮背景本身就是 `Brush`
-    /// 纵向微渐变 ⇒ 下方每个按钮、面板都是「圆角 + 渐变 + 圆角边框环带」。
-    fn show_look_demo(&self, ui: &mut Ui) {
-        // 1) 水平两端色渐变条（无圆角；`Gradient` 支持 `rotated` / 四角各异）。
-        ui.gradient_rect_at(
-            Vec2::new(16.0, 56.0),
-            Vec2::new(168.0, 24.0),
-            rjw_krusie::ui::Gradient::horizontal(Color::rgba_u8(90, 150, 240, 255), Color::rgba_u8(214, 96, 190, 255)),
-        );
-        // 2) 垂直两端色渐变条 + 小圆角（`Gradient::corners` 与 `rounded_rect_at`
-        //    是两个独立原语；二者共用的都是同一条顶点色路径）。
-        ui.gradient_rect_at(
-            Vec2::new(16.0, 84.0),
-            Vec2::new(168.0, 24.0),
-            rjw_krusie::ui::Gradient::vertical(Color::rgba_u8(70, 200, 160, 255), Color::rgba_u8(28, 60, 74, 255)),
-        );
-        // 3) 圆角矩形（纯色 + 8 逻辑 px 圆角 + 羽化边缘）。
-        ui.rounded_rect_at(
-            Vec2::new(16.0, 112.0),
-            Vec2::new(80.0, 28.0),
-            8.0,
-            Color::rgba_u8(210, 150, 60, 255),
-        );
-        // 4) 胶囊形（半径 > 半高 ⇒ clamp 成胶囊）+ 强圆角对照。
-        ui.rounded_rect_at(
-            Vec2::new(104.0, 112.0),
-            Vec2::new(80.0, 28.0),
-            999.0,
-            Color::rgba_u8(190, 80, 90, 255),
-        );
     }
 
     /// 字体 Modal（**帧末调用**：modal 的 z 每帧重写为当前最大，最后录制才能保证
@@ -347,11 +309,16 @@ impl Windows {
     /// 供 FX 动画与 auto_drag 用。
     fn ui(&mut self, ui: &mut Ui, clicks: &mut u32, t: f64) {
         // 窗口 A：固定宽（右下角缩放柄）+ 逐窗口样式 + 位置 clamp。
+        //
+        // 逐窗口覆盖**从当前主题派生**（`ui.theme().panel`）再改背景与圆角——
+        // 只覆盖想改的字段，边框 / 内边距等仍跟主题走。若写死 `PanelStyle::default()`
+        // 就是拿**浅色**默认当基底，切到深色主题后这个窗口会与其它窗口不一致。
+        let panel_a = ui.theme().panel.clone();
         ui.window("win_a")
             .pos(self.win_a_pos)
             .width(220.0)
             .style(
-                PanelStyle::default()
+                panel_a
                     .with_bg(Color::rgba_u8(40, 44, 62, 255))
                     .with_radius(8.0),
             )
@@ -603,9 +570,12 @@ impl ThemeTuner {
         if !self.open {
             return;
         }
+        // ⚠ **不设 `.style(..)`**：窗口继承当前主题的 `PanelStyle`，与其它窗口**完全一致**
+        // （背景刷 / 边框 / 圆角 / 内边距都跟着滑块实时变）。
+        // 早先这里写死 `PanelStyle::default()`——那是**浅色**基底，于是调节窗口自己是
+        // 一块浅灰板，跟满屏深色格不入，看着像"另一个主题的窗口"。
         ui.window("theme_tuner")
-            .pos(vec2(640.0, 440.0))
-            .style(PanelStyle::default().with_radius(10.0).with_padding(10.0))
+            .pos(vec2(280.0, 420.0))
             .show(|w| {
                 w.label("主题调节（实时）");
                 w.row(|w| {
@@ -651,7 +621,14 @@ impl ThemeTuner {
                     self.accent[1] = w.slider("th_ag", 0.0..=1.0, self.accent[1]);
                     self.accent[2] = w.slider("th_ab", 0.0..=1.0, self.accent[2]);
                 });
-                w.checkbox("th_open_hint", "调色板由 Palette 组装", true);
+                w.label(&format!(
+                    "预设 {} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 表面 ×{:.2}",
+                    ["dark", "light", "legacy"][self.preset.min(2) as usize],
+                    self.radius,
+                    self.feather,
+                    self.bevel,
+                    self.surface_gain,
+                ));
             });
     }
 }
