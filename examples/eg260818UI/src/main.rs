@@ -41,7 +41,7 @@ use std::time::Instant;
 
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
-use rjw_krusie::ui::{FontModal, IdAbsolute, Label, PanelStyle};
+use rjw_krusie::ui::{FontModal, IdAbsolute, Label, Palette, PanelStyle};
 
 /// 顶部状态栏模块：FPS / 点击次数标签 + 字体按钮（打开 Modal）+ 玩家名输入框 + 字体 Modal。
 struct TopBar {
@@ -71,17 +71,20 @@ impl TopBar {
     }
 
     /// 顶部 place 区：状态标签 + 字体按钮 + 玩家名可拖动面板。
-    fn ui(&mut self, ui: &mut Ui, fps: f64, clicks: u32) {
+    fn ui(&mut self, ui: &mut Ui, fps: f64, clicks: u32, tuner: &mut ThemeTuner) {
         ui.label_at(Vec2::new(16.0, 12.0), &format!("FPS: {fps:.0}"));
         ui.label_at(Vec2::new(16.0, 34.0), &format!("点击次数: {clicks}"));
         // ── 外观演示：圆角 + 渐变（**零纹理、零着色器改动**）──
-        // 两者都是顶点色路径：圆角由 CPU 镶嵌成三角形（硬体 + 1px 羽化带），
+        // 两者都是顶点色路径：圆角由 CPU 镶嵌成三角形（硬体 + 羽化边缘），
         // 渐变由光栅化器对四角顶点色双线性插值。四角色各异 ⇒「圆角 + 渐变」共存。
         self.show_look_demo(ui);
         // 字体按钮（**pack 内自动尺寸**：随字体名变长自动变宽）打开 Modal。
         ui.pack_at(Vec2::new(16.0, 150.0), PackSide::Top, |p| {
             if p.button("font_btn", &format!("字体… {}", self.font_name)).clicked() {
                 self.font_modal_open = true;
+            }
+            if p.button("theme_btn", "主题调节…").clicked() {
+                tuner.open = !tuner.open;
             }
         });
         // 玩家名可拖动面板。
@@ -94,7 +97,7 @@ impl TopBar {
     /// **外观演示区**（左上角，`y = 56 .. 148`）：两块显式原语样例，用来目视确认
     /// 「两端色渐变」「圆角 + 羽化抗锯齿」——**两者都不生成纹理、不改着色器**：
     /// 渐变是四角顶点色（光栅化器双线性插值），圆角是 CPU 镶嵌成三角形
-    /// （硬体 `alpha = 1` + 1 物理像素羽化带 `alpha = 0`）。
+    /// （硬体 `alpha = 1` + 外环 `alpha = 0`，羽化宽由 `Theme::feather` 调）。
     ///
     /// 「圆角 + 渐变」的组合不需要额外演示：本示例主题是 `Theme::dark()` +
     /// `.with_radius(8.0)`，而 `Theme::dark()` 的面板 / 按钮背景本身就是 `Brush`
@@ -526,6 +529,144 @@ impl RightPanel {
 /// 旧的 `render` / `render2d` / `render2d_ui` / `font` / `viewport` 字段已删除：
 /// 渲染上下文、世界层与 UI 层渲染器、文本子系统、画面矩形全部由运行时持有
 /// （`Ctx` / `Frame` / `Gfx`），应用不再直接管理它们。
+/// **主题调节窗口**：实时改调色板令牌 / 圆角 / 羽化 / 微渐变强度。
+///
+/// 主题每帧由 [`ThemeTuner::theme`] 重新组装（`Theme::themed(&Palette)`），所以拖动
+/// 滑块**当帧**就能看到整屏变化——顺带演示了「换肤 = 换一份 [`Palette`]」这条设计：
+/// 主题不是 11 个子样式的字面量，而是一份按**层次**命名的调色板 + 几个全局标量。
+///
+/// 用法：拖「圆角 / 羽化」看窗口与按钮的圆角与边缘软硬；拖「表面明度」找你要的暗度；
+/// 拖「强调 R/G/B」看焦点描边、滑轨填充、勾选填充、下拉菜单选中项一起变色。
+struct ThemeTuner {
+    /// 预设：0 = dark，1 = light，2 = legacy dark（改造前的旧配色，用于对照）。
+    preset: u8,
+    /// 全局圆角（逻辑像素；级联到 panel / button / input / checkbox / combo）。
+    radius: f32,
+    /// 边缘羽化宽（逻辑像素；0 = 硬边）。
+    feather: f32,
+    /// 表面微渐变强度（`Palette.bevel`）。
+    bevel: f32,
+    /// 表面基色明度增益（乘到全部 `surface*` 令牌上；< 1 更暗、> 1 更亮）。
+    surface_gain: f32,
+    /// 强调色（sRGB 0..1 的 RGB；hover / active 由它派生）。
+    accent: [f32; 3],
+    /// 是否显示本窗口。
+    open: bool,
+}
+
+impl ThemeTuner {
+    fn new() -> Self {
+        Self {
+            preset: 0,
+            radius: 8.0,
+            feather: 1.0,
+            bevel: 0.10,
+            surface_gain: 1.0,
+            accent: [0.43, 0.66, 1.0],
+            open: false,
+        }
+    }
+
+    /// 按当前旋钮组装主题（`frame.ui(..)` 之前调用——闭包借用 `self`，闭包内不能构造）。
+    fn theme(&self, font: &str) -> Theme {
+        let mut p = match self.preset {
+            1 => Palette::light(),
+            2 => Palette::legacy_dark(),
+            _ => Palette::dark(),
+        };
+        // 表面明度整体增益：一次改完一整条层次阶梯，不用逐个令牌调。
+        let g = self.surface_gain;
+        if (g - 1.0).abs() > 1e-4 {
+            let sc = |c: rjw_krusie::color::Color| scale_luma(c, g);
+            p.surface_dim = sc(p.surface_dim);
+            p.surface_sunken = sc(p.surface_sunken);
+            p.surface = sc(p.surface);
+            p.surface_raised = sc(p.surface_raised);
+            p.surface_overlay = sc(p.surface_overlay);
+            p.surface_hover = sc(p.surface_hover);
+            p.surface_active = sc(p.surface_active);
+        }
+        p.bevel = self.bevel;
+        p.accent = Color::rgba(self.accent[0], self.accent[1], self.accent[2], 1.0);
+        p.accent_hover = scale_luma(p.accent, 1.25);
+        p.accent_active = scale_luma(p.accent, 0.80);
+        let mut t = Theme::themed(&p)
+            .with_radius(self.radius)
+            .with_feather(self.feather);
+        if !font.is_empty() {
+            t = t.with_font_family(font);
+        }
+        t
+    }
+
+    fn ui(&mut self, ui: &mut Ui) {
+        if !self.open {
+            return;
+        }
+        ui.window("theme_tuner")
+            .pos(vec2(640.0, 440.0))
+            .style(PanelStyle::default().with_radius(10.0).with_padding(10.0))
+            .show(|w| {
+                w.label("主题调节（实时）");
+                w.row(|w| {
+                    w.label("预设:");
+                    if w.button("th_dark", "dark").clicked() {
+                        self.preset = 0;
+                        self.surface_gain = 1.0;
+                        self.bevel = 0.10;
+                        self.accent = [0.43, 0.66, 1.0];
+                    }
+                    if w.button("th_light", "light").clicked() {
+                        self.preset = 1;
+                        self.surface_gain = 1.0;
+                        self.bevel = 0.02;
+                        self.accent = [0.31, 0.55, 0.86];
+                    }
+                    if w.button("th_legacy", "legacy").clicked() {
+                        self.preset = 2;
+                        self.surface_gain = 1.0;
+                        self.bevel = 0.0;
+                        self.accent = [0.38, 0.59, 0.86];
+                    }
+                });
+                w.row(|w| {
+                    w.label("圆角");
+                    self.radius = w.slider("th_radius", 0.0..=24.0, self.radius);
+                });
+                w.row(|w| {
+                    w.label("羽化");
+                    self.feather = w.slider("th_feather", 0.0..=5.0, self.feather);
+                });
+                w.row(|w| {
+                    w.label("微渐变");
+                    self.bevel = w.slider("th_bevel", 0.0..=0.35, self.bevel);
+                });
+                w.row(|w| {
+                    w.label("表面");
+                    self.surface_gain = w.slider("th_gain", 0.4..=1.6, self.surface_gain);
+                });
+                w.row(|w| {
+                    w.label("强调");
+                    self.accent[0] = w.slider("th_ar", 0.0..=1.0, self.accent[0]);
+                    self.accent[1] = w.slider("th_ag", 0.0..=1.0, self.accent[1]);
+                    self.accent[2] = w.slider("th_ab", 0.0..=1.0, self.accent[2]);
+                });
+                w.checkbox("th_open_hint", "调色板由 Palette 组装", true);
+            });
+    }
+}
+
+/// 明度缩放（`k > 1` 变亮；alpha 不变，分量 clamp 到 [0,1]）。
+fn scale_luma(c: rjw_krusie::color::Color, k: f32) -> rjw_krusie::color::Color {
+    let a: [f32; 4] = c.into();
+    Color::from([
+        (a[0] * k).clamp(0.0, 1.0),
+        (a[1] * k).clamp(0.0, 1.0),
+        (a[2] * k).clamp(0.0, 1.0),
+        a[3],
+    ])
+}
+
 struct UiApp {
     /// 世界层相机（`f.submit` 会写入当前画面矩形；identity 位姿 = 世界原点居中）。
     cam: Camera2D,
@@ -552,6 +693,7 @@ struct UiApp {
     inventory: Inventory,
     windows: Windows,
     right: RightPanel,
+    theme_tuner: ThemeTuner,
 }
 
 impl UiApp {
@@ -571,6 +713,7 @@ impl UiApp {
             inventory: Inventory::new(),
             windows: Windows::new(),
             right: RightPanel::new(),
+            theme_tuner: ThemeTuner::new(),
         }
     }
 }
@@ -760,15 +903,10 @@ impl App for UiApp {
         render_world(f.draw());
         let begin_us = t_world.elapsed().as_secs_f64() * 1e6;
 
-        // 主题按所选字体构建（FontModal 确定后写入 font_name；空 = 系统默认）。
-        // with 责任链：全局字体族级联到全部文本子样式 + 全局圆角。
-        // ⚠ 主题须在 `f.ui(..)` **之前**构建：闭包借用 `self`，闭包内不能构造它。
-        let theme = if self.top.font_name().is_empty() {
-            Theme::dark()
-        } else {
-            Theme::dark().with_font_family(self.top.font_name())
-        }
-        .with_radius(8.0);
+        // 主题由 [`ThemeTuner`] 每帧组装（预设调色板 + 圆角 / 羽化 / 微渐变 / 强调色，
+        // 以及 FontModal 选定的字体族）。⚠ 须在 `f.ui(..)` **之前**构建：
+        // 闭包借用 `self`，闭包内不能构造它。
+        let theme = self.theme_tuner.theme(self.top.font_name());
 
         // 性能统计（`f.ui` 前复制的上一帧值；闭包内每帧覆盖）。
         let mut ui_stats = UiStats::default();
@@ -832,11 +970,12 @@ impl App for UiApp {
             }
 
             // ── 各 UI 模块依次录制（互不重叠字段借用，顺序与屏幕布局无关） ──
-            self.top.ui(ui, fps, clicks);
+            self.top.ui(ui, fps, clicks, &mut self.theme_tuner);
             self.menu.ui(ui, &mut clicks);
             self.inventory.ui(ui);
             self.windows.ui(ui, &mut clicks, t);
             self.right.ui(ui, &mut clicks, &prev_press, prev_blocked);
+            self.theme_tuner.ui(ui);
 
             // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
             // 不被本帧后录的窗口盖住——见 modal_at 文档）。

@@ -3274,7 +3274,7 @@ impl<'a> Ui<'a> {
                             let table = self.state.tess.table();
                             // 采样 UV 由 `push_rounded` 填成白纹理 region 中心
                             // （写错 `(0,0)` 会静默采到字形页左上角的字形像素）。
-                            quads.push_rounded(win, &table, local, *radius, c);
+                            quads.push_rounded(win, &table, local, *radius, self.theme.feather, c);
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
                 }
@@ -3303,7 +3303,15 @@ impl<'a> Ui<'a> {
                             // 圆角环带：只画一次边界，圆角处不会像"外圈实心 + 内圈实心"
                             // 那样把抗锯齿边缘混合两次。
                             let table = self.state.tess.table();
-                            quads.push_rounded_ring(win, &table, local, *radius, *width, *color);
+                            quads.push_rounded_ring(
+                                win,
+                                &table,
+                                local,
+                                *radius,
+                                *width,
+                                self.theme.feather,
+                                *color,
+                            );
                         } else {
                             for br in border_rects(&local, (*width).round()) {
                                 if br.w > 0.0 && br.h > 0.0 {

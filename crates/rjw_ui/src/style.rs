@@ -124,6 +124,13 @@ pub struct Theme {
     pub row_h: f32,
     /// pack / grid 默认子项间距（像素）。
     pub gap: f32,
+    /// **边缘羽化宽度**（**逻辑像素**；0 = 关闭，得到硬边）。
+    ///
+    /// 圆角矩形与圆角边框的抗锯齿靠"顶点 alpha 由 1 插值到 0"实现，梯度以几何边缘
+    /// 为中心（硬体内缩 `f/2`、外环外扩 `f/2`）⇒ **视觉尺寸不变**。
+    /// `1.0`（默认）≈ 标准 1px 抗锯齿；调大 = 更软的边（背景带一点朦胧感），
+    /// 调小 / 归零 = 完全硬边。由 [`Theme::scaled`] 按 DPI 预乘为物理像素。
+    pub feather: f32,
     /// **本主题的调色板**（换肤 / 回退 / 诊断用；由 [`Theme::themed`] 记录）。
     ///
     /// 手工改过子样式字段后它可能与实际颜色不一致——它记录的是"组装来源"，
@@ -1297,8 +1304,15 @@ impl Theme {
             combo: ComboStyle::themed(p),
             row_h: 26.0,
             gap: 6.0,
+            feather: crate::tess::DEFAULT_FEATHER,
             palette: *p,
         }
+    }
+
+    /// **边缘羽化宽度**（逻辑像素；0 = 硬边）。见 [`Theme::feather`] 字段文档。
+    pub fn with_feather(mut self, px: f32) -> Self {
+        self.feather = px.max(0.0);
+        self
     }
 
     /// **浅色主题**（= [`Default`]）：[`Palette::light`] 组装。
@@ -1457,6 +1471,8 @@ impl Theme {
         self.combo = self.combo.scaled(s);
         self.gap = m(self.gap);
         self.row_h = m(self.row_h);
+        // 羽化宽也按 DPI 物理化；但不取整（亚像素级软边，取整会让 0.5 逻辑像素消失）。
+        self.feather *= s;
         self
     }
 }

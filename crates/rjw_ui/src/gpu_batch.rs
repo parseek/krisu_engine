@@ -265,6 +265,7 @@ impl QuadCollector {
         table: &crate::tess::CornerTable,
         rect: Rect,
         radius: f32,
+        feather: f32,
         corners: [Color; 4],
     ) -> crate::tess::TessOutput {
         let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
@@ -274,11 +275,14 @@ impl QuadCollector {
             &mut g.verts,
             &mut g.tris,
             table,
-            crate::tess::RoundedRectSpec { rect, radius, corners, uv },
+            crate::tess::RoundedRectSpec { rect, radius, feather, corners, uv },
         )
     }
 
     /// **CPU 镶嵌的圆角边框（环带）**（图形组；白纹理 + 纯色）。
+    ///
+    /// `feather` 同 [`crate::tess::RoundedRectSpec::feather`]：边框的**内外两条边界**
+    /// 都会做羽化斜坡。
     pub(crate) fn push_rounded_ring(
         &mut self,
         win: u32,
@@ -286,6 +290,7 @@ impl QuadCollector {
         rect: Rect,
         radius: f32,
         width: f32,
+        feather: f32,
         color: Color,
     ) -> crate::tess::TessOutput {
         let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
@@ -298,6 +303,7 @@ impl QuadCollector {
             rect,
             radius,
             width,
+            feather,
             color,
             uv,
         )
@@ -685,8 +691,9 @@ mod batch_contract_tests {
         let table = TessCache::default().table();
 
         // 圆角矩形 + 圆角边框环带都会写入同一段几何。
-        q.push_rounded(1, &table, Rect::new(0.0, 0.0, 60.0, 36.0), 8.0, [Color::RED; 4]);
-        q.push_rounded_ring(1, &table, Rect::new(0.0, 0.0, 60.0, 36.0), 8.0, 1.0, Color::BLUE);
+        let f = crate::tess::DEFAULT_FEATHER;
+        q.push_rounded(1, &table, Rect::new(0.0, 0.0, 60.0, 36.0), 8.0, f, [Color::RED; 4]);
+        q.push_rounded_ring(1, &table, Rect::new(0.0, 0.0, 60.0, 36.0), 8.0, 1.0, f, Color::BLUE);
 
         let geom = q.quads.values().next().expect("至少一段几何");
         assert!(geom.verts.len() > 40, "应有镶嵌顶点");
@@ -701,10 +708,11 @@ mod batch_contract_tests {
         let g2 = q2.quads.values().next().expect("四边形");
         assert_eq!(g2.verts[0].uv, [tl.x, tl.y], "四边形左上角 = region 左上角");
         assert_eq!(g2.verts[3].uv, [tl.x + wh.x, tl.y + wh.y], "四边形右下角 = region 右下角");
-        // `RoundedRectSpec` 仍要求显式 UV：遗漏即编译错误。
+        // `RoundedRectSpec` 仍要求显式 UV 与羽化宽：遗漏即编译错误。
         let _ = RoundedRectSpec {
             rect: Rect::new(0.0, 0.0, 1.0, 1.0),
             radius: 0.0,
+            feather: 0.0,
             corners: [Color::WHITE; 4],
             uv: [1.0, 1.0],
         };

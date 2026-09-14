@@ -119,8 +119,8 @@ L2 的构造器只收 `&Gpu`，不收 `device/queue/layout` 三件套。
 | 概念 | 坍缩前（多个表达） | 坍缩后（唯一） |
 |---|---|---|
 | UI 几何 | 「每 4 顶点一组 = 一个四边形」的隐式约定（`Vec<VertexP3U2C4>`，索引由后端推） | `Geom { verts, tris }` + `UiBatch::indices`（`Tri = [u16; 3]`）——**三角形是唯一表达**，四边形只是它的退化情形。索引与顶点同源同段，拼接时由 `Geom::append` 平移 |
-| 圆角 | `rjw_ui::proc` 的 32×32 九宫格程序化纹理（进字形图集、顶点色 tint、半径取整、key = `r.to_bits()`）**已删** | `tess::push_rounded_rect`（CPU 镶嵌：单位弧表 + 步长抽样 + 1 物理像素羽化带）。**零纹理、零着色器改动**；半径不取整 |
-| 圆角边框 | 「外圈 border 色实心圆角 + 内圈 bg 色实心圆角」两块叠加（圆角处抗锯齿混合两次） | `tess::push_rounded_ring`（外/内轮廓之间的环带；内半径 `max(0, r - width)`，与 CSS 同规则） |
+| 圆角 | `rjw_ui::proc` 的 32×32 九宫格程序化纹理（进字形图集、顶点色 tint、半径取整、key = `r.to_bits()`）**已删** | `tess::push_rounded_rect`（CPU 镶嵌：单位弧表 + 步长抽样 + 沿整圈带状化的羽化边缘，含四条直边）。**零纹理、零着色器改动**；半径不取整 |
+| 圆角边框 | 「外圈 border 色实心圆角 + 内圈 bg 色实心圆角」两块叠加（圆角处抗锯齿混合两次） | `tess::push_rounded_ring`（外/内轮廓之间的环带，**含四条直边**，内外两条边界都羽化；内半径 `max(0, r - width)`，与 CSS 同规则；边框宽 ≥ 半边尺寸时退化成实心圆角矩形） |
 | 面板背景色 | 各子样式的裸 `Color` 字面量（11 处，随主题漂移） | `Brush { Solid, Vertical, Horizontal }` + `Palette` 层次令牌；`bevel_raised/sunken` 从**一个**表面色派生微渐变 |
 | 主题来源 | `Theme` 直接在 11 个子样式里写死深色 / 浅色 | `Theme::themed(&Palette)`；`Theme::{light,dark,dark_legacy}` 是它的三个预设。`Color: Into<Brush>` 让链式调用点不变 |
 | 绘制调用 | `Render2D::quads(vertices, texture)`（只能画四边形 + 需 `tint` 才成批） | `Render2D::mesh_indexed(vertices, indices, texture)`（`ColorMode::Instance`）；tint 仅在非白时抬到实例上，否则保留可跨段合批的普通 `Mesh` |
