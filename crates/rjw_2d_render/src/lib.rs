@@ -87,8 +87,11 @@ pub use rstates::{
 pub use sort::{SortKey, SortMode, SortPolicy};
 
 // 纹理 / 网格 / 注册表类型重导出（兼容旧路径并暴露静态网格 API）。
+// 注册表实例不再是全局 static：经 `Gpu::textures()/meshes()` 或
+// `Render2D::textures()/meshes()` 取得。
 pub use rjw_render::{
-    ArcTextureWrapped, HasUid, MeshData, MESHES, TextureWrapped, TypedRegistry,
+    ArcTextureWrapped, HasUid, MeshData, MeshRegistry, TextureRegistry, TextureWrapped,
+    TypedRegistry,
 };
 
 pub use rjw_color as color;

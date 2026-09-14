@@ -16,7 +16,6 @@
 //!
 //! 驱动层：`App::{config, init, update}` + `ctx.frame()` 守卫 + `f.submit(..)`。
 
-use rjw_krusie::gpu::TEXTURES;
 use rjw_krusie::prelude::*;
 use rjw_krusie::text::{
     Glyph, GlyphType, LineSpace, TextBuffer, TextStyle, cosmic_text,
@@ -41,11 +40,12 @@ impl App for ChainDemo {
         AppConfig::new("eg260810TextChain - rjw_text 唯一文本链").size(1280.0, 720.0)
     }
 
-    fn init(&mut self, gfx: &Gfx) {
+    fn init(&mut self, gfx: &Gfx) -> Result<(), AppInitError> {
         eprintln!("MARK: init");
         self.font = Some(gfx.text());
         // 相机默认即可（`Camera2D::default()`：zoom 1、世界原点居中）。
         self.cam.set_zoom(Vec2::ONE);
+        Ok(())
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
@@ -98,14 +98,14 @@ fn draw_chain_demos(t: &mut TextCtx<'_>, time: f32, half_w: f32, half_h: f32) {
             .size(16.0)
             .line_space(LineSpace::Multiple(1.4))
             .align(Align::Left)
-            .color(Color::WHITE);
+            .color(Color::CSS_WHITE);
         *t.style_mut() = base;
         t.label("eg260810TextChain — rjw_text 唯一文本链")
             .at(vec2(-half_w + 14.0, -half_h + 14.0))
             .draw(100.0);
         t.label("全局默认样式：TextCtx::style_mut() → Label 继承")
             .at(vec2(-half_w + 14.0, -half_h + 40.0))
-            .color(Color::YELLOW)
+            .color(Color::CSS_YELLOW)
             .draw(100.0);
     }
 
@@ -116,14 +116,14 @@ fn draw_chain_demos(t: &mut TextCtx<'_>, time: f32, half_w: f32, half_h: f32) {
         .weight(cosmic_text::Weight::BOLD)
         .line_space(LineSpace::Multiple(1.4))
         .align(Align::Left)
-        .color(Color::WHITE);
-    let warn = base.clone().size(20.0).color(Color::RED); // 克隆继承：只改差异
+        .color(Color::CSS_WHITE);
+    let warn = base.clone().size(20.0).color(Color::CSS_RED); // 克隆继承：只改差异
     let fancy = TextStyle::new()
         .font_family("SimHei")
         .size(18.0)
         .italic(true)
         .letter_spacing(2.0)
-        .color(Color::ORANGE);
+        .color(Color::CSS_ORANGE);
 
     t.label("TextStyle → Label::style(warn)：weight+color 继承")
         .style(warn)
@@ -140,7 +140,7 @@ fn draw_chain_demos(t: &mut TextCtx<'_>, time: f32, half_w: f32, half_h: f32) {
         .align(Align::Center)
         .anchor(vec2(0.5, 0.0))
         .at(vec2(0.0, -half_h + 125.0).round())
-        .color(Color::CYAN)
+        .color(Color::CSS_CYAN)
         .draw(99.0);
     t.label("A2) center()")
         .size(16.0)
@@ -151,11 +151,11 @@ fn draw_chain_demos(t: &mut TextCtx<'_>, time: f32, half_w: f32, half_h: f32) {
         .size(14.0)
         .at(vec2(-half_w + 14.0, -half_h + 152.0))
         .offset(vec2(24.0, 0.0))
-        .color(Color::GRAY)
+        .color(Color::CSS_GRAY)
         .draw(99.0);
 
     // ── 3. 渐变：Glyph / Line × 横向 ──
-    let stops_h = [(0.0, Color::RED), (0.5, Color::YELLOW), (1.0, Color::ORANGE)];
+    let stops_h = [(0.0, Color::CSS_RED), (0.5, Color::CSS_YELLOW), (1.0, Color::CSS_ORANGE)];
     t.label("B) Gradient::line_h")
         .size(22.0)
         .anchor(vec2(0.5, 0.0))
@@ -170,7 +170,7 @@ fn draw_chain_demos(t: &mut TextCtx<'_>, time: f32, half_w: f32, half_h: f32) {
         .draw(98.0);
 
     // ── 4. 多行 + 竖向渐变：Frame / Line 模式 ──
-    let stops_v = [(0.0, Color::CYAN), (1.0, Color::BLUE)];
+    let stops_v = [(0.0, Color::CSS_CYAN), (1.0, Color::CSS_BLUE)];
     t.label("C) 竖向渐变\nFrame 模式")
         .font_family("站酷快乐体2016修订版")
         .size(26.0)
@@ -183,7 +183,7 @@ fn draw_chain_demos(t: &mut TextCtx<'_>, time: f32, half_w: f32, half_h: f32) {
         .size(26.0)
         .align(Align::Center)
         .center(vec2(-half_w * 0.5, -half_h + 390.0))
-        .gradient(Gradient::line_v(&[(0.0, Color::CYAN), (1.0, Color::ALICEBLUE)]))
+        .gradient(Gradient::line_v(&[(0.0, Color::CSS_CYAN), (1.0, Color::CSS_ALICEBLUE)]))
         .draw(97.0);
 
     // ── 5. map：逐字形动画 + glyph_str / glyph_type / color_mut / translate ──
@@ -219,7 +219,7 @@ fn draw_chain_demos(t: &mut TextCtx<'_>, time: f32, half_w: f32, half_h: f32) {
             .clip(Rect::new(0.0, 0.0, 300.0, 60.0))
             .cache(CachePolicy::Always)
             .at(vec2(-half_w + 14.0, -half_h + 540.0).round())
-            .color(Color::GREEN)
+            .color(Color::CSS_GREEN)
             .draw(93.0);
         // 对照 1：`.no_cull()` 关闭剔除 → 12 行全部收集绘制（`CachePolicy::Never` 不入 LRU）。
         t.label(log.as_str())
@@ -229,7 +229,7 @@ fn draw_chain_demos(t: &mut TextCtx<'_>, time: f32, half_w: f32, half_h: f32) {
             .no_cull()
             .cache(CachePolicy::Never)
             .at(vec2(-half_w + 330.0, -half_h + 540.0).round())
-            .color(Color::GRAY)
+            .color(Color::CSS_GRAY)
             .draw(93.0);
         // 对照 2：`clip_world`（世界坐标裁剪；整块 + 逐字形保守剔除）。
         t.label(log.as_str())
@@ -259,7 +259,7 @@ fn draw_independent_demos(
         .center(vec2(half_w * 0.5, -half_h + 125.0))
         .draw_with(|g: &Glyph| {
             let region = g.region();
-            let Some(tex) = TEXTURES.get(region.page_uid) else { return };
+            let Some(tex) = r2d.textures().get(region.page_uid) else { return };
             // `g.transform()` = 世界变换（含字形位置）：ZERO 即字形左上角世界坐标。
             let pos = g.transform().transform_point(Vec2::ZERO) + vec2(0.0, 1.0);
             let w = region.wh_px.0 as f32;
@@ -298,13 +298,13 @@ fn draw_independent_demos(
         // 已排版缓冲直接进入唯一链（不重新整形）。
         font.label_from(&buf)
             .at(vec2(-half_w + 14.0, half_h - 60.0))
-            .color(Color::ALICEBLUE)
+            .color(Color::CSS_ALICEBLUE)
             .draw_to(r2d, 92.0);
         font.label(format!("lines() = {}, measure_buffer() = {:.0}×{:.0}", lines.len(), sz.x, sz.y))
             .font_family("SimHei")
             .size(14.0)
             .at(vec2(-half_w + 14.0, half_h - 40.0))
-            .color(Color::GRAY)
+            .color(Color::CSS_GRAY)
             .draw_to(r2d, 92.0);
     }
 
@@ -317,18 +317,18 @@ fn draw_independent_demos(
         let (ng, nl) = (scratch.glyphs.len(), scratch.lines.len());
         font.label_from(&buf)
             .at(vec2(-half_w + 14.0, half_h - 20.0))
-            .color(Color::GREEN)
+            .color(Color::CSS_GREEN)
             .draw_to(r2d, 94.0);
         font.label(format!("into_buffer: glyphs={ng} lines={nl}"))
             .font_family("SimHei")
             .size(12.0)
             .at(vec2(-half_w + 200.0, half_h - 20.0))
-            .color(Color::GRAY)
+            .color(Color::CSS_GRAY)
             .draw_to(r2d, 92.0);
     }
 }
 
-fn main() -> Result<(), EventLoopError> {
+fn main() -> Result<(), RunError> {
     env_logger::init();
     run(ChainDemo::default())
 }

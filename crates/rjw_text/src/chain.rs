@@ -32,8 +32,6 @@ use rjw_atlas::AtlasRegion;
 use rjw_2d_render::{Layer, Render2D, SpriteRect};
 #[cfg(feature = "rjw_2d_render")]
 use rjw_color::Color;
-#[cfg(feature = "rjw_2d_render")]
-use rjw_render::TEXTURES;
 use swash::scale::image::Content as SwashContent;
 pub use rjw_transform::{Rect, Transform2D};
 
@@ -1054,7 +1052,7 @@ impl Resolved<'_> {
             if self.clipped_out(g) {
                 continue;
             }
-            let Some(tex) = TEXTURES.get(g.region.page_uid) else { continue };
+            let Some(tex) = r2d.textures().get(g.region.page_uid) else { continue };
             let rect = SpriteRect::with_uv_tex(
                 tl,
                 g.size,
@@ -1133,7 +1131,7 @@ impl Resolved<'_> {
 
         let delta = self.delta;
         for (uid, idxs) in pages {
-            let Some(tex) = TEXTURES.get(uid) else { continue };
+            let Some(tex) = r2d.textures().get(uid) else { continue };
             let page_size = self.page_size;
             r2d.mesh_with(|sink| {
                 for &i in &idxs {
@@ -1245,7 +1243,7 @@ fn collect_glyphs(
                 // 误差累加，结果 `tl` 恒为整数（下方 `debug_assert` 兜底）。
                 let glyph_pos = Vec2::new(
                     physical.x as f32 + loc.left as f32,
-                    run.line_y.ceil() - loc.top as f32,
+                    run.line_y.ceil() - loc.top as f32 + physical.y as f32,
                 );
                 let tl = glyph_pos - visual_origin;
                 debug_assert!(

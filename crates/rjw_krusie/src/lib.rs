@@ -18,7 +18,7 @@
 //!     }
 //! }
 //!
-//! fn main() -> Result<(), EventLoopError> { run(Game) }
+//! fn main() -> Result<(), RunError> { run(Game) }
 //! ```
 //!
 //! # 三层结构
@@ -101,8 +101,8 @@ pub use runtime::App;
 pub mod prelude {
     // ── 运行时（应用骨架）──
     pub use crate::runtime::{
-        run, run_with, App, AppConfig, Background, Clear, Ctx, Escape, Frame, FrameSource, Gfx,
-        Never, RenderConfig, ViewportBorders, Vsync, WindowId,
+        run, run_with, App, AppConfig, AppInitError, Background, Clear, Ctx, Escape, Frame,
+        FrameSource, Gfx, Never, RenderConfig, RunError, ViewportBorders, Vsync, WindowId,
     };
 
     // ── 2D 绘制 ──

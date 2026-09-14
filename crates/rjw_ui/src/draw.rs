@@ -339,9 +339,140 @@ pub enum DebugShape {
     Grid { rect: Rect, spacing: f32, width: f32 },
 }
 
-/// 渐变方向（`Gradient` 绘制命令）——**与 `rjw_text::GradientAxis` 同一类型**（R13 简并：
-/// 同一概念只留一份定义，避免两个 crate 各有一个同名枚举）。
-pub use rjw_text::GradientAxis;
+/// **矩形渐变**（v0.3）：四角颜色 + 光栅化器双线性插值——**不需要纹理**。
+///
+/// # 为什么不用纹理
+///
+/// 旧实现把渐变烘成一张 1×64 / 64×1 的纹理塞进动态图集，再拉伸采样。那带来一串代价：
+/// 每帧一次 `String` 建 key（且 3 位小数精度会静默撞键）、`permanent` 条目让图集
+/// **永久无法 `repack_all`**、每次纹理切换多一次 draw call、而且**单轴纹理表达不了
+/// 四角各异的颜色**。
+///
+/// 顶点格式 [`VertexP3U2C4`](rjw_2d_render::VertexP3U2C4) 自带 4 分量顶点色，
+/// 光栅化器本就对顶点色做重心插值 ⇒ 一个 quad + 白纹理即可，**管线零改动**。
+///
+/// # 用法
+///
+/// ```ignore
+/// // 纯色（等价于 solid 的另一种写法）
+/// ui.gradient_rect_at(pos, size, Color::RED);
+/// // 上下 / 左右双色
+/// ui.gradient_rect_at(pos, size, Gradient::vertical(Color::RED, Color::BLUE));
+/// ui.gradient_rect_at(pos, size, Gradient::horizontal(Color::RED, Color::BLUE));
+/// // 任意角度（0° = 下→上，90° = 左→右；逆时针）
+/// ui.gradient_rect_at(pos, size, Gradient::rotated(Color::RED, Color::BLUE, 30.0f32.to_radians()));
+/// // 四角各异（1D 纹理做不到）
+/// ui.gradient_rect_at(pos, size, Gradient::corners(Color::RED, Color::YELLOW, Color::BLUE, Color::GREEN));
+/// ```
+///
+/// **不支持多段 stops**（3+ 颜色停靠点）：四角顶点色是双线性的，无法精确表达多段。
+/// 多段渐变请用 `rjw_text::Gradient`（作用于文字，本就支持多段）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gradient {
+    /// 左上角色。
+    pub tl: Color,
+    /// 右上角色。
+    pub tr: Color,
+    /// 左下角色。
+    pub bl: Color,
+    /// 右下角色。
+    pub br: Color,
+}
+
+impl From<Color> for Gradient {
+    /// 纯色（四角同色）——让 `gradient_rect_at(..)` 也能直接收 `Color`。
+    #[inline]
+    fn from(c: Color) -> Self {
+        Self::pure(c)
+    }
+}
+
+impl Gradient {
+    /// 纯色（四角同色；等价于实心填充）。
+    #[inline]
+    pub const fn pure(c: Color) -> Self {
+        Self { tl: c, tr: c, bl: c, br: c }
+    }
+
+    /// 上下双色：`top` 在上、`bottom` 在下。
+    #[inline]
+    pub const fn vertical(top: Color, bottom: Color) -> Self {
+        Self { tl: top, tr: top, bl: bottom, br: bottom }
+    }
+
+    /// 左右双色：`left` 在左、`right` 在右。
+    #[inline]
+    pub const fn horizontal(left: Color, right: Color) -> Self {
+        Self { tl: left, tr: right, bl: left, br: right }
+    }
+
+    /// 四角显式指定（双线性插值）。
+    ///
+    /// 顺序为**左上、右上、左下、右下**——与 `VertexP3U2C4` 的
+    /// `[TL, TR, BL, BR]` 顶点顺序一致。
+    #[inline]
+    pub const fn corners(tl: Color, tr: Color, bl: Color, br: Color) -> Self {
+        Self { tl, tr, bl, br }
+    }
+
+    /// 任意角度双色渐变：颜色沿 `angle` 方向从 `from` 过渡到 `to`。
+    ///
+    /// - **`0` = 下→上**（等价 [`Self::vertical`]，`from` 在下）；
+    /// - **`PI/2` = 左→右**（等价 [`Self::horizontal`]，`from` 在左）；
+    /// - 角度**逆时针**增大；
+    /// - 渐变轴过矩形中心，把四角投影到该轴上取 `t ∈ [0,1]`，因此**任意角度下
+    ///   两端的颜色都恰好落在矩形的两个极角上**（不会出现「只渐变了一半」）。
+    ///
+    /// `angle` 为 0 或非有限值时退化为 [`Self::vertical`]。
+    pub fn rotated(from: Color, to: Color, angle: f32) -> Self {
+        if !angle.is_finite() || angle == 0.0 {
+            return Self::vertical(from, to);
+        }
+        // 方向向量：0° → (0,-1)（屏幕坐标 Y+ 向下 ⇒ 指向「上」）；逆时针为正。
+        let (sin, cos) = angle.sin_cos();
+        let dir = [sin, -cos]; // (dx, dy)
+        // 四角在 direction 上的投影（矩形局部 0/1 坐标下等价于符号组合）。
+        let proj = |x: f32, y: f32| x * dir[0] + y * dir[1];
+        let corners = [
+            (0.0f32, 0.0f32), // TL
+            (1.0, 0.0),       // TR
+            (0.0, 1.0),       // BL
+            (1.0, 1.0),       // BR
+        ];
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for (x, y) in corners {
+            let p = proj(x, y);
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        let span = hi - lo;
+        let sample = |x: f32, y: f32| -> Color {
+            if span <= f32::EPSILON {
+                return from;
+            }
+            lerp_color(from, to, (proj(x, y) - lo) / span)
+        };
+        Self {
+            tl: sample(0.0, 0.0),
+            tr: sample(1.0, 0.0),
+            bl: sample(0.0, 1.0),
+            br: sample(1.0, 1.0),
+        }
+    }
+}
+
+/// 颜色线性插值（`k` 不 clamp——调用方负责；`Gradient` 的构造器与四角采样用）。
+#[inline]
+pub fn lerp_color(a: Color, b: Color, k: f32) -> Color {
+    let af: [f32; 4] = a.into();
+    let bf: [f32; 4] = b.into();
+    let mut o = [0f32; 4];
+    for i in 0..4 {
+        o[i] = af[i] + (bf[i] - af[i]) * k;
+    }
+    Color::from(o)
+}
 
 /// 绘制命令种类（记录式；`Ui::finish` 逐条提交到 `Render2D`）。
 #[derive(Clone, Debug)]
@@ -350,8 +481,8 @@ pub enum DrawKind {
     Solid(Color),
     /// **圆角矩形**（背景填充；`radius` 逻辑像素，9-patch 绘制，颜色顶点色 tint）。
     RoundedRect { color: Color, radius: f32 },
-    /// **线性渐变矩形**（`stops` 沿 `axis`；程序化纹理进动态 Atlas）。
-    Gradient { axis: GradientAxis, stops: Vec<(f32, Color)> },
+    /// **矩形渐变**（四角颜色；顶点色插值，**无纹理**）。
+    Rect(Gradient),
     /// 矩形边框（画在 rect 内缘）。
     Border { color: Color, width: f32 },
     /// 文本（绘制时经 `rjw_text` 责任链渲染）。
@@ -695,5 +826,123 @@ mod tests {
         assert_eq!(d.rect, Rect::new(880.0, 120.0, 20.0, 10.0));
         // clip：绝对坐标，**不得**再加一次偏移
         assert_eq!(d.clip, Some(Rect::new(880.0, 130.0, 240.0, 300.0)));
+    }
+}
+
+/// **`Gradient` 顶点色语义**（无纹理路径的契约）。
+///
+/// 这些测试是「渐变不依赖纹理」这一决定的守卫：四角颜色就是**全部**渲染输入，
+/// 因此每个构造器都必须能精确预测四角色。同时锁定 `rotated` 的角度约定
+/// （`0` = 下→上、`PI/2` = 左→右），它是最容易写反的地方。
+#[cfg(test)]
+mod gradient_tests {
+    use super::{Gradient, lerp_color};
+    use rjw_color::Color;
+
+    /// 比较颜色（逐分量，容差 `eps`）。
+    fn approx(a: Color, b: Color, eps: f32) -> bool {
+        let (af, bf): ([f32; 4], [f32; 4]) = (a.into(), b.into());
+        af.iter().zip(bf.iter()).all(|(x, y)| (x - y).abs() <= eps)
+    }
+
+    #[test]
+    fn pure_is_uniform() {
+        let g = Gradient::pure(Color::RED);
+        assert!(approx(g.tl, Color::RED, 0.0));
+        assert!(approx(g.tr, Color::RED, 0.0));
+        assert!(approx(g.bl, Color::RED, 0.0));
+        assert!(approx(g.br, Color::RED, 0.0));
+    }
+
+    /// `vertical(top, bottom)`：上两点 = top，下两点 = bottom。
+    #[test]
+    fn vertical_pairs_top_and_bottom() {
+        let g = Gradient::vertical(Color::RED, Color::BLUE);
+        assert!(approx(g.tl, Color::RED, 0.0), "左上 = top");
+        assert!(approx(g.tr, Color::RED, 0.0), "右上 = top");
+        assert!(approx(g.bl, Color::BLUE, 0.0), "左下 = bottom");
+        assert!(approx(g.br, Color::BLUE, 0.0), "右下 = bottom");
+    }
+
+    /// `horizontal(left, right)`：左两点 = left，右两点 = right。
+    #[test]
+    fn horizontal_pairs_left_and_right() {
+        let g = Gradient::horizontal(Color::RED, Color::BLUE);
+        assert!(approx(g.tl, Color::RED, 0.0), "左上 = left");
+        assert!(approx(g.bl, Color::RED, 0.0), "左下 = left");
+        assert!(approx(g.tr, Color::BLUE, 0.0), "右上 = right");
+        assert!(approx(g.br, Color::BLUE, 0.0), "右下 = right");
+    }
+
+    /// `corners(..)`：四角**原样**（含双线性不一致的情形——1D 纹理做不到）。
+    #[test]
+    fn corners_are_verbatim() {
+        let g = Gradient::corners(Color::RED, Color::GREEN, Color::BLUE, Color::YELLOW);
+        assert!(approx(g.tl, Color::RED, 0.0));
+        assert!(approx(g.tr, Color::GREEN, 0.0));
+        assert!(approx(g.bl, Color::BLUE, 0.0));
+        assert!(approx(g.br, Color::YELLOW, 0.0));
+    }
+
+    /// **角度约定**：`rotated(.., 0)` == `vertical`，`rotated(.., PI/2)` == `horizontal`。
+    /// 这条锁死「0° 是下→上而不是左→右」。
+    #[test]
+    fn rotation_cardinals_match_vertical_and_horizontal() {
+        let (a, b) = (Color::RED, Color::BLUE);
+        let v = Gradient::vertical(a, b);
+        let r0 = Gradient::rotated(a, b, 0.0);
+        assert!(approx(r0.tl, v.tl, 1e-6) && approx(r0.br, v.br, 1e-6), "0° 应等于 vertical");
+
+        let h = Gradient::horizontal(a, b);
+        let r90 = Gradient::rotated(a, b, std::f32::consts::FRAC_PI_2);
+        assert!(approx(r90.tl, h.tl, 1e-5), "90° 左上应 = left");
+        assert!(approx(r90.tr, h.tr, 1e-5), "90° 右上应 = right");
+    }
+
+    /// `rotated` 的两端颜色必须**恰好落在矩形的两个极角上**（不会「只渐变一半」）：
+    /// 存在一对角分别是纯 `from` 与纯 `to`。
+    #[test]
+    fn rotated_endpoints_reach_both_extremes() {
+        for angle in [0.3f32, 1.0, 2.0, 4.0, -0.7] {
+            let (from, to) = (Color::RED, Color::BLUE);
+            let g = Gradient::rotated(from, to, angle);
+            let corners = [g.tl, g.tr, g.bl, g.br];
+            let has_from = corners.iter().any(|c| approx(*c, from, 1e-4));
+            let has_to = corners.iter().any(|c| approx(*c, to, 1e-4));
+            assert!(has_from, "angle={angle}: 应有一角为纯 from");
+            assert!(has_to, "angle={angle}: 应有一角为纯 to");
+        }
+    }
+
+    /// 非有限角度 → 退化为 `vertical`（不产生 NaN 颜色）。
+    #[test]
+    fn rotated_non_finite_falls_back() {
+        let v = Gradient::vertical(Color::RED, Color::BLUE);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let g = Gradient::rotated(Color::RED, Color::BLUE, bad);
+            assert!(approx(g.tl, v.tl, 0.0) && approx(g.br, v.br, 0.0), "{bad} 应退化 vertical");
+        }
+    }
+
+    /// `Color: Into<Gradient>`（纯色）——让 `gradient_rect_at` 直接收 `Color`。
+    #[test]
+    fn color_converts_to_pure_gradient() {
+        let g: Gradient = Color::GREEN.into();
+        assert!(approx(g.tl, Color::GREEN, 0.0) && approx(g.br, Color::GREEN, 0.0));
+    }
+
+    /// `lerp_color` 端点与中点（`Gradient::rotated` 的采样基础）。
+    ///
+    /// 注意：4 个分量**都**参与插值——`BLACK`→`WHITE` 的 alpha 是 `1.0 → 1.0 = 1.0`，
+    /// 所以中点只有 RGB 是 0.5（这条测试曾因为误断言 alpha 也变 0.5 而失败）。
+    #[test]
+    fn lerp_color_endpoints_and_midpoint() {
+        assert!(approx(lerp_color(Color::BLACK, Color::WHITE, 0.0), Color::BLACK, 0.0));
+        assert!(approx(lerp_color(Color::BLACK, Color::WHITE, 1.0), Color::WHITE, 0.0));
+        let mid: [f32; 4] = lerp_color(Color::BLACK, Color::WHITE, 0.5).into();
+        for (i, v) in mid[..3].iter().enumerate() {
+            assert!((v - 0.5).abs() <= 1e-6, "RGB 分量 {i} 中点应为 0.5，实际 {v}");
+        }
+        assert!((mid[3] - 1.0).abs() <= 1e-6, "alpha 1→1 应保持 1.0，实际 {}", mid[3]);
     }
 }

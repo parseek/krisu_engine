@@ -23,7 +23,7 @@ use std::sync::Arc;
 use glam::Vec2;
 use rjw_atlas::{DynamicAtlas, RegionRef};
 use rjw_color::Color;
-use rjw_render::{MeshData, MeshId, MESHES, TEXTURES};
+use rjw_render::{MeshData, MeshId};
 use rjw_transform::{Rect, Transform2D};
 use rjw_2d_render::{Layer, Render2D, VertexP3U2C4};
 
@@ -154,6 +154,11 @@ pub struct TileMap {
     atlas_gen: Option<u64>,
     /// 每帧可见网格的复用缓冲（避免与 `r2d` 的可变借用冲突，且零分配）。
     draw_buf: Vec<(u64, MeshId, f32)>,
+    /// **待回收的网格句柄**：`clear()` 拿不到 `r2d`（注册表归所属 `RenderContext`），
+    /// 因此把注销推迟到下一次 `draw` —— 那时有 `r2d.meshes()` 可用。
+    ///
+    /// 旧实现直接调全局 `MESHES.remove`，在注册表实例化后不再可能。
+    pending_mesh_reap: Vec<MeshId>,
 }
 
 impl Default for TileMap {
@@ -175,6 +180,7 @@ impl TileMap {
             solid_dirty: Cell::new(true),
             atlas_gen: None,
             draw_buf: Vec::new(),
+            pending_mesh_reap: Vec::new(),
         }
     }
 
@@ -209,13 +215,21 @@ impl TileMap {
         &mut self.tiles
     }
 
+    /// 清空全部贴片与 chunk。
+    ///
+    /// 网格从**所属 `RenderContext` 的**网格注册表注销需要 `r2d`（本方法没有），
+    /// 因此句柄入队 [`Self::pending_mesh_reap`]，在下一次 [`Self::draw`] 开头统一注销。
     #[inline]
     pub fn clear(&mut self) {
-        for chunk in self.chunks.values_mut() {
-            for m in std::mem::take(&mut chunk.meshes) {
-                MESHES.remove(m.mesh_id.uid());
-            }
-        }
+        // 先把句柄收集进局部变量（`pending_mesh_reap` 与 `chunks` 都是 `self` 的字段，
+        // 直接在同一次 `values_mut()` 迭代里写会同时可变借用 `self`）。
+        let reaped: Vec<MeshId> = self
+            .chunks
+            .values_mut()
+            .flat_map(|chunk| std::mem::take(&mut chunk.meshes))
+            .map(|m| m.mesh_id)
+            .collect();
+        self.pending_mesh_reap.extend(reaped);
         self.tiles.clear();
         self.chunks.clear();
         self.mesh_dirty = true;
@@ -295,6 +309,13 @@ impl TileMap {
         atlas: &DynamicAtlas<K>,
         layer: impl Into<Layer>,
     ) {
+        // 先注销 `clear()` 排队的网格句柄——**必须在下面的提前 return 之前**：
+        // 「clear 之后此帧无贴片」时也要回收，否则网格永久驻留注册表。
+        if !self.pending_mesh_reap.is_empty() {
+            for mesh_id in self.pending_mesh_reap.drain(..) {
+                r2d.meshes().remove(mesh_id.uid());
+            }
+        }
         if self.tiles.is_empty() {
             return;
         }
@@ -322,7 +343,7 @@ impl TileMap {
 
         // ② 提交（可变借用 `r2d`）
         for &(page_uid, mesh_id, mesh_layer) in &self.draw_buf {
-            let Some(tex) = TEXTURES.get(page_uid) else { continue };
+            let Some(tex) = r2d.textures().get(page_uid) else { continue };
             r2d.static_mesh(mesh_id, &tex)
                 .tint(Color::WHITE)
                 .transform(map_t)
@@ -332,9 +353,17 @@ impl TileMap {
 
     /// 重建全部 chunk 的预生成顶点网格（注销旧 mesh → 按 (页, 层) 生成顶点 → 注册新 mesh）。
     fn rebuild_meshes<K: Hash + Eq + Clone>(&mut self, r2d: &mut Render2D, atlas: &DynamicAtlas<K>) {
-        for chunk in self.chunks.values_mut() {
-            for m in std::mem::take(&mut chunk.meshes) {
-                MESHES.remove(m.mesh_id.uid());
+        {
+            // 收集后统一注销：`r2d.meshes()` 是不可变借用，与 `self.chunks` 的可变借用
+            // 不冲突（`r2d` 与 `self` 是不同对象），但为清晰起见仍先收集。
+            let old: Vec<MeshId> = self
+                .chunks
+                .values_mut()
+                .flat_map(|chunk| std::mem::take(&mut chunk.meshes))
+                .map(|m| m.mesh_id)
+                .collect();
+            for mesh_id in old {
+                r2d.meshes().remove(mesh_id.uid());
             }
         }
         for (chunk_pos, chunk) in self.chunks.iter_mut() {
@@ -354,7 +383,7 @@ impl TileMap {
             for key in keys {
                 let (page_uid, layer_bits) = key;
                 let idxs = &buckets[&key];
-                let Some(tex) = TEXTURES.get(page_uid) else { continue };
+                let Some(tex) = r2d.textures().get(page_uid) else { continue };
                 let pw = tex.width as f32;
                 let ph = tex.height as f32;
                 let mut verts: Vec<VertexP3U2C4> = Vec::with_capacity(idxs.len() * 4);
@@ -372,6 +401,17 @@ impl TileMap {
                     let tl = tile.mesh_tl;
                     let wh = tile.mesh_wh;
                     let c: [f32; 4] = tile.tint.into();
+                    // **索引是 u16**：一个 (chunk, 页, 层) 段最多 65535 个顶点。
+                    // 旧实现直接 `verts.len() as u16` —— 超过后**静默回绕**，产出垃圾三角形。
+                    // 默认 chunk 1024px + 8px 瓦片 = 16384 quad（恰好越界），所以这是可达路径。
+                    assert!(
+                        verts.len() + 4 <= u16::MAX as usize,
+                        "tilemap: 单个 (chunk, 页, 层) 段的顶点数 {} 超过 u16 索引上限 {}——\
+                         请减小 `chunk_size` 或增大瓦片尺寸（一个 chunk 内同页同层的瓦片不能超过 {} 个）",
+                        verts.len() + 4,
+                        u16::MAX,
+                        (u16::MAX as usize) / 4
+                    );
                     let base = verts.len() as u16;
                     verts.push(VertexP3U2C4 { pos: [tl.x, tl.y, 0.0], uv: [u0, v0], color: c });
                     verts.push(VertexP3U2C4 { pos: [tl.x + wh.x, tl.y, 0.0], uv: [u0 + uw, v0], color: c });
@@ -384,7 +424,7 @@ impl TileMap {
                 }
                 let label = format!("tilemap chunk {chunk_pos:?} page {page_uid}");
                 let mesh = MeshData::from_pod(r2d.device(), &verts, &indices, &label);
-                let mesh_id = MeshId::new(MESHES.register(Arc::new(mesh)));
+                let mesh_id = MeshId::new(r2d.meshes().register(Arc::new(mesh)));
                 chunk.meshes.push(ChunkMesh { page_uid, mesh_id, layer: f32::from_bits(layer_bits) });
             }
         }

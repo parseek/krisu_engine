@@ -292,7 +292,7 @@ const LAYER_BACK: f32 = 0.0;
 const LAYER_MID: f32 = 1.0;
 const LAYER_TOP: f32 = 2.0;
 
-fn main() -> Result<(), EventLoopError> {
+fn main() -> Result<(), RunError> {
     env_logger::init();
     run(CustomDrawApp::default())
 }

@@ -44,6 +44,68 @@ impl Color {
     pub const fn rgb_one(value: f32) -> Self {
         Self::rgba(value, value, value, 1.0)
     }
+
+    #[inline]
+    pub const fn with_r(self, r: f32) -> Self {
+        Self { r, ..self }
+    }
+
+    #[inline]
+    pub const fn with_g(self, g: f32) -> Self {
+        Self { g, ..self }
+    }
+
+    #[inline]
+    pub const fn with_b(self, b: f32) -> Self {
+        Self { b, ..self }
+    }
+
+    #[inline]
+    pub const fn with_a(self, a: f32) -> Self {
+        Self { a, ..self }
+    }
+
+    #[inline]
+    pub fn map_uniform(self, f: impl Fn(f32) -> f32) -> Self {
+        Self {
+            r: f(self.r),
+            g: f(self.g),
+            b: f(self.b),
+            a: f(self.a),
+        }
+    }
+
+    #[inline]
+    pub fn map_r(self, f: impl Fn(f32) -> f32) -> Self {
+        Self {
+            r: f(self.r),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn map_g(self, f: impl Fn(f32) -> f32) -> Self {
+        Self {
+            g: f(self.g),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn map_b(self, f: impl Fn(f32) -> f32) -> Self {
+        Self {
+            b: f(self.b),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn map_a(self, f: impl Fn(f32) -> f32) -> Self {
+        Self {
+            a: f(self.a),
+            ..self
+        }
+    }
 }
 
 /// f64-precision color. Convenient for working with `wgpu::Color` and DVec3.
@@ -72,6 +134,68 @@ impl ColorF64 {
     #[inline]
     pub const fn rgb_one(value: f64) -> Self {
         Self::rgba(value, value, value, 1.0)
+    }
+
+    #[inline]
+    pub const fn with_r(self, r: f64) -> Self {
+        Self { r, ..self }
+    }
+
+    #[inline]
+    pub const fn with_g(self, g: f64) -> Self {
+        Self { g, ..self }
+    }
+
+    #[inline]
+    pub const fn with_b(self, b: f64) -> Self {
+        Self { b, ..self }
+    }
+
+    #[inline]
+    pub const fn with_a(self, a: f64) -> Self {
+        Self { a, ..self }
+    }
+
+    #[inline]
+    pub fn map_uniform(self, f: impl Fn(f64) -> f64) -> Self {
+        Self {
+            r: f(self.r),
+            g: f(self.g),
+            b: f(self.b),
+            a: f(self.a),
+        }
+    }
+
+    #[inline]
+    pub fn map_r(self, f: impl Fn(f64) -> f64) -> Self {
+        Self {
+            r: f(self.r),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn map_g(self, f: impl Fn(f64) -> f64) -> Self {
+        Self {
+            g: f(self.g),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn map_b(self, f: impl Fn(f64) -> f64) -> Self {
+        Self {
+            b: f(self.b),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn map_a(self, f: impl Fn(f64) -> f64) -> Self {
+        Self {
+            a: f(self.a),
+            ..self
+        }
     }
 }
 

@@ -99,7 +99,7 @@ L2 的构造器只收 `&Gpu`，不收 `device/queue/layout` 三件套。
 | 相机 | `Camera2D` / `Viewport`（identity 相机）/ `ViewCull` trait | `Camera2D { region, transform }` |
 | 缩放 | `Camera2D.zoom` 与 `Transform2D.scale` | `transform.scale`（`zoom()` 派生只读视图） |
 | 精灵矩形 | `SpriteRect` / `SpriteRectPx`（自带 `tex_wh`）/ 手写 `with_uv_tex` | `SpriteRect`（像素 UV 归并入 `with_uv_px`）+ `AtlasSprite` |
-| 纹理句柄 | `TextureWrapped` / `ArcTextureWrapped` / `TextureRegistry` / `TEXTURES` / 手查 `page_uid` | 公开句柄 `ArcTextureWrapped` + `Gfx::textures()` |
+| 纹理句柄 | `TextureWrapped` / `ArcTextureWrapped` / `TextureRegistry` / `TEXTURES` / 手查 `page_uid` | 公开句柄 `ArcTextureWrapped` + `Gfx::textures()`（**注册表每 `RenderContext` 私有**，`TEXTURES`/`MESHES` 全局 static 已删） |
 | UI 单位 | `Position<T>` / `Size<T>` / `Metric<T>` / 裸 `Vec2` | `Metric<T>`（`Pos`/`Size` 为别名） |
 | UI ID | `IdRelative` / `IdAbsolute` / `IdStack` / `WidgetId` | `Id`（内部栈与绝对键） |
 | 文本样式 | `Style` / `TextStyle` / `TextLayout` 三份同款 setter | `TextStyle` |
@@ -135,11 +135,23 @@ L2 的构造器只收 `&Gpu`，不收 `device/queue/layout` 三件套。
 
 **不进 prelude**（走命名空间 `rjw_krusie::<模块>::…`，或 `rjw_krusie::escape`）：
 `WindowAttributes`/`LogicalSize`/`PhysicalSize`/…（winit）、`RenderFrame`、`PassBuilder`、`PassRecorder`、`RenderContext`、
-`RenderConfig`、`Draw2D`/`SpriteBuilder`/…、`SortKey`/`SortPolicy`、`VertexP3U2C4`/`MeshData`/`MESHES`/`TEXTURES`、
-`Device`/`Queue`/`wgpu`、`DrawKind`、`Ctx::escape` 相关。
+`RenderConfig`、`Draw2D`/`SpriteBuilder`/…、`SortKey`/`SortPolicy`、`VertexP3U2C4`/`MeshData`（`MESHES`/`TEXTURES` 全局表已删除，注册表经 `Gpu` 取）、
+`Device`/`Queue`/`wgpu`、`DrawKind`、`Ctx::escape` 相关、`UiBackend`/`UiBatch`（UI 后端契约）。
 
 命名空间：`main`（winit 适配）· `gpu` · `render2d` · `transform` · `color` · `atlas` · `text` · `ui` · `tilemap` · `collision` · `escape`。
 保留原 crate 名别名（`rjw_krusie::rjw_2d_render` == `rjw_krusie::render2d`）。
+
+**crate 内命名空间**（不与上面的 `rjw_krusie::*` 混淆）：
+- `rjw_ui::backend`：UI 绘制后端契约（`UiBackend` / `UiBatch` / `UiBatchSource` / `RecordingBackend`）；
+- `rjw_ui::text`：**UI 文本模块**（公开）——`TextAlign` / `TextVAlign` / `text_block_offset` /
+  `text_cmd` + `edit` 的纯逻辑文本操作 + `rjw_text` 的形状层类型（`Align` / `TextStyle` /
+  `VisualLine` / `GradientAxis` …）。自定义控件与自建后端的公开入口。
+  条目均为**重导出**（定义仍在 `draw` / `edit` / `ui`）。
+
+**字形图集公开**：`rjw_text::Text::{glyph_cache, glyph_cache_mut, user_texture, white_region}`
+——UI 等消费者可把自定义纹理插进字形图集（同页 → 同纹理合批）。`AtlasKey` 两命名空间
+（`Glyph` / `Custom`）**必须分清**：消费者只写 `Custom`（推荐走 `user_texture`）。
+见 `docs/API_REFERENCE.md` §9.1。
 
 ---
 
@@ -155,9 +167,9 @@ L2 的构造器只收 `&Gpu`，不收 `device/queue/layout` 三件套。
 | 离屏 / 外部目标 | `RenderFrame::pass_to(RenderTarget, Clear)` |
 | 自定义控件 | `Ui::{child_rect, push_*, hit_abs, register_focus, key_click, claim_press, set_cursor, id_for}` |
 | 调试图元 | `Render2D::debug(DebugStyle)` → `DebugPainter` |
-| 注册表 | `Gfx::{textures, meshes}` |
+| 注册表 | `Gfx::{textures, meshes}`（`&TextureRegistry` / `&MeshRegistry`）与 `Gfx::{texture_registry, mesh_registry}`（`&Arc<..>`，供长生命周期持有者）；绘制期 `Render2D::{textures, meshes, gpu}` |
 | 资源 / 低级句柄 | `Render2D::{device, queue, texture_layout, white_texture}`（自建缓冲 / bind group）；`Gpu::{device, queue, texture_layout}` |
-| 图集低层构造 | `DynamicAtlas::from_raw(device, queue, layout, config)`（等价 `new(gfx, cfg)`；当前仅 `rjw_ui::ProcTextures` 用，P3 收敛后删除） |
+| UI 绘制后端 | `rjw_ui::{UiBackend, UiBatch, UiBatchSource, RecordingBackend}`；真实后端 `rjw_krusie::runtime::layers::ui_backend::Render2dUiBackend` |
 | 世界坐标调试图元 | `rjw_2d_render::debug_draw`（`DebugPainter`） |
 
 ---

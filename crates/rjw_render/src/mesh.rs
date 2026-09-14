@@ -1,11 +1,12 @@
-//! 静态网格数据：`MeshData` + 全局注册表 `MESHES` + 类型化句柄 [`MeshId`]。
+//! 静态网格数据：`MeshData` + 注册表 `MeshRegistry` + 类型化句柄 [`MeshId`]。
 //!
 //! `MeshData` 包装已上传到 GPU 的顶点/索引缓冲，供 2D 渲染器静态实例化合并绘制。
 //!
 //! 用户路径（happy path）：[`crate::Gpu::mesh`] → [`MeshId`] → `Render2D::static_mesh(id, &tex)`。
-//! 低层路径：手动建缓冲后 `MeshData::from_buffers` + `MESHES.register`。
-
-use std::sync::LazyLock;
+//! 低层路径：手动建缓冲后 `MeshData::from_buffers` + `Gpu::mesh_registry().register(..)`。
+//!
+//! **注册表归 [`Gpu`](crate::Gpu) 所有**（每 `RenderContext` 一份，不再是进程级
+//! `static`）：绘制期经 `Render2D::meshes()` 解析，构造期经 `Gpu::mesh_registry()`。
 
 use crate::registry::{HasUid, TypedRegistry};
 
@@ -13,7 +14,8 @@ static NEXT_MESH_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 
 /// 静态网格的**类型化句柄**（取代裸 `u64`：不再能和非网格 id 混用）。
 ///
-/// 句柄本身不持有资源；资源在全局 [`MESHES`] 注册表里，uid 与 [`MeshData::uid`] 对应。
+/// 句柄本身不持有资源；资源在所属 [`Gpu`](crate::Gpu) 的网格注册表里，
+/// uid 与 [`MeshData::uid`] 对应。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MeshId(u64);
 
@@ -135,14 +137,16 @@ impl MeshData {
 }
 
 /// 静态网格注册表类型。
+///
+/// 每个 `RenderContext`（经 [`Gpu`](crate::Gpu)）各持一份，因此**跨 `RenderContext`
+/// 互不可见**。`MeshData::uid` 仍由进程级计数器保证全局单调不复用，但
+/// **uid 相等不再蕴含「同一个网格」**。
 pub type MeshRegistry = TypedRegistry<MeshData>;
-
-/// 全局静态网格注册表。
-pub static MESHES: LazyLock<MeshRegistry> = LazyLock::new(TypedRegistry::default);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     struct Dummy;
     impl HasUid for Dummy {
@@ -172,5 +176,42 @@ mod tests {
         assert_eq!(id.uid(), 42);
         assert_eq!(u64::from(id), 42);
         assert_eq!(id, MeshId::new(42));
+    }
+
+    /// **注册表实例化** 的回归：两个 `MeshRegistry` 必须互不可见。
+    ///
+    /// 旧实现是进程级 `static MESHES` ⇒ 所有 `RenderContext` 共用一张表，
+    /// `Render2D::new` 每建一个渲染器就注册一个新的四边形网格与白纹理，
+    /// 后建的会**覆盖**先建的条目，使先建渲染器的 uid 指向别人的资源。
+    ///
+    /// 这里用 `Dummy`（无需 GPU）验证隔离语义：`Dummy` 的 uid 是调用方指定的，
+    /// 因此可以精确构造「同一 uid、不同实例」的局面。
+    #[test]
+    fn registries_are_isolated_and_same_uid_does_not_alias() {
+        struct Item(u64);
+        impl HasUid for Item {
+            fn uid(&self) -> u64 {
+                self.0
+            }
+        }
+
+        let a: TypedRegistry<Item> = TypedRegistry::default();
+        let b: TypedRegistry<Item> = TypedRegistry::default();
+
+        // 两个注册表各注册一个 **uid 相同** 但实例不同的条目。
+        let ia = Arc::new(Item(7));
+        let ib = Arc::new(Item(7));
+        assert_eq!(a.register(ia.clone()), 7);
+        assert_eq!(b.register(ib.clone()), 7);
+
+        // 各自解析到**自己的**那个实例（不是对方的）。
+        assert!(Arc::ptr_eq(&a.get(7).expect("a 有 uid 7"), &ia));
+        assert!(Arc::ptr_eq(&b.get(7).expect("b 有 uid 7"), &ib));
+
+        // 一边移除，另一边不受影响 —— 这正是实例化要保证的隔离性。
+        a.remove(7);
+        assert!(!a.contains_uid(7), "a 已移除");
+        assert!(b.contains_uid(7), "b 必须保留（旧全局单例下这里会一起消失）");
+        assert!(Arc::ptr_eq(&b.get(7).expect("b 仍有 uid 7"), &ib));
     }
 }

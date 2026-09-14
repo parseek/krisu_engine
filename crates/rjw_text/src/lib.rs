@@ -740,8 +740,33 @@ impl Text {
         Vec2::ZERO
     }
 
-    /// 字形图集（低层；示例/诊断读 `page_count` 等）。
-    pub fn glyph_cache(&self) -> &DynamicAtlas<AtlasKey> { &self.glyph_cache }
+    /// **字形图集**（只读；示例 / 诊断读 `page_count` / `stats` / `generation` 等）。
+    ///
+    /// 图集是**公开可用**的：UI 等消费者往里塞自定义纹理（与字形同页 → 同纹理合批）。
+    /// 要写入用 [`Self::glyph_cache_mut`] 或更安全的 [`Self::user_texture`]。
+    pub fn glyph_cache(&self) -> &DynamicAtlas<AtlasKey> {
+        &self.glyph_cache
+    }
+
+    /// **字形图集**（可变）——公开给 UI 等消费者做低级操作：
+    ///
+    /// - 插入自定义纹理：`glyph_cache_mut().insert_with(AtlasKey::Custom(id), px, opts)`
+    ///   （**推荐**优先用 [`Self::user_texture`]：它固定用 `AtlasKey::Custom` 命名空间 +
+    ///   `permanent()`，避免与你自己的 key 冲突、也避免被寿命机制逐出）；
+    /// - 查询：`region(&AtlasKey::Custom(id))` / `generation()` / `stats()`；
+    /// - 维护：`compact()`（去碎片重排）。
+    ///
+    /// # 注意
+    ///
+    /// 1. **不要用 `AtlasKey::Glyph(..)`**——那是 `rjw_text` 的内部字形命名空间，
+    ///    往里写会让你自己的条目被光栅化逻辑覆盖 / 误判。
+    /// 2. **不要手改 `white()` 对应的条目**——它是 UI 实心填充与字形合批的基础。
+    /// 3. 插入**非 permanent** 的条目会被 [`Self::tick`] 的寿命机制逐出；
+    ///    自己持有 region 的调用方请用 `permanent()` 或走 `handle()`（RAII 保活）。
+    /// 4. 图集重排后 `AtlasRegion` 会失效——用 `generation()` 变化判定并重新 `region()`。
+    pub fn glyph_cache_mut(&mut self) -> &mut DynamicAtlas<AtlasKey> {
+        &mut self.glyph_cache
+    }
 }
 
 #[cfg(test)]
@@ -1033,5 +1058,28 @@ mod tests {
         assert!(should_cache_with_policy(usize::MAX, CachePolicy::Always));
         assert!(!should_cache_with_policy(0, CachePolicy::Never));
         assert!(!should_cache_with_policy(0, CachePolicy::User));
+    }
+
+    /// `AtlasKey` 的两个命名空间**必须互不影响**——字形键由 `rjw_text` 独占，
+    /// UI 等消费者只走 `Custom`。这条约束是 `Text::glyph_cache_mut` 公开的前提：
+    /// 公开可变访问后，消费者能往里写，但不能污染 / 误撞字形命名空间。
+    #[test]
+    fn atlas_key_namespaces_are_distinct() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // 两个 Custom 键：同 id 相等、不同 id 不等（定长去重键的语义）。
+        assert_eq!(AtlasKey::Custom(7), AtlasKey::Custom(7));
+        assert_ne!(AtlasKey::Custom(7), AtlasKey::Custom(8));
+        // Custom 与 Glyph 绝不相等（即使用同一个 u64 语义值也无法构造同键）。
+        let ck = AtlasKey::Custom(7);
+        assert!(!matches!(ck, AtlasKey::Glyph(_)));
+
+        // 哈希可用（DynamicAtlas 以它作 key）。
+        let mut h1 = DefaultHasher::new();
+        AtlasKey::Custom(7).hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        AtlasKey::Custom(7).hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish(), "同键哈希必须稳定");
     }
 }

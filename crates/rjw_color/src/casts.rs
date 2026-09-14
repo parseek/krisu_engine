@@ -100,6 +100,20 @@ impl From<ColorF64> for Color {
     }
 }
 
+impl Color {
+    #[inline]
+    pub fn to_f64(self) -> ColorF64 {
+        self.into()
+    }
+}
+
+impl ColorF64 {
+    #[inline]
+    pub fn to_f32(self) -> Color {
+        self.into()
+    }
+}
+
 // ── ColorF64 ↔ wgpu::Color (feature = "wgpu") ────────────────
 
 #[cfg(feature = "wgpu")]

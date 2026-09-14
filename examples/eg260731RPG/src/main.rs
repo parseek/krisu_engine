@@ -11,7 +11,7 @@
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
-use rjw_krusie::gpu::{MeshData, TEXTURES, wgpu};
+use rjw_krusie::gpu::{MeshData, MeshRegistry, wgpu};
 use rjw_krusie::prelude::*;
 use rjw_krusie::render2d::VertexP3U2C4;
 
@@ -512,9 +512,9 @@ struct StaticTerrain {
 /// 构建单位圆扇面网格（中心 (0,0)、半径 1，世界坐标直通），供所有圆实例共享。
 ///
 /// 注：`Gfx` 只在 `App::init` 里存在（借用期不覆盖每帧重建），而静态地形会在 `map_rev`
-/// 变化时**帧内**重建，所以这里走低层注册路径（`MeshData::from_pod` + 全局 `MESHES`），
-/// 与 `Gfx::mesh` 内部完全等价。
-fn unit_circle_mesh(device: &wgpu::Device) -> MeshId {
+/// 变化时**帧内**重建——所以 `init` 期把 `device` 与**网格注册表句柄**一起存下来，
+/// 帧内经 `MeshData::from_pod` + `registry.register` 建网格（与 `Gfx::mesh` 等价）。
+fn unit_circle_mesh(device: &wgpu::Device, meshes: &MeshRegistry) -> MeshId {
     const SEGS: usize = 22;
     let mut verts = Vec::with_capacity(SEGS + 2);
     verts.push(VertexP3U2C4 {
@@ -535,12 +535,12 @@ fn unit_circle_mesh(device: &wgpu::Device) -> MeshId {
         idx.extend_from_slice(&[0, (i + 1) as u16, (i + 2) as u16]);
     }
     let mesh = MeshData::from_pod(device, &verts, &idx, "RPG static circle");
-    MeshId::new(rjw_krusie::gpu::MESHES.register(Arc::new(mesh)))
+    MeshId::new(meshes.register(Arc::new(mesh)))
 }
 
 impl StaticTerrain {
-    fn build(device: &wgpu::Device, map: &Map, rev: u64) -> Self {
-        let circle_mesh = unit_circle_mesh(device);
+    fn build(device: &wgpu::Device, meshes: &MeshRegistry, map: &Map, rev: u64) -> Self {
+        let circle_mesh = unit_circle_mesh(device, meshes);
         let circle_mesh_id = circle_mesh;
         let mut stone_insts = Vec::new();
         let mut flower_insts = Vec::new();
@@ -1059,7 +1059,10 @@ impl Tex {
         transform: Transform2D,
         layer: impl Into<Layer> + 'a,
     ) -> rjw_krusie::render2d::SpriteBuilder<'a> {
-        let tex_ref = TEXTURES.get(region.page_uid).unwrap();
+        let tex_ref = match r2d.textures().get(region.page_uid) {
+            Some(t) => t,
+            None => r2d.white_texture().clone(),
+        };
         let spr = SpriteRect::with_uv_tex(
             world_tl,
             world_wh,
@@ -1076,7 +1079,11 @@ impl Tex {
 
 // ── App ───────────────────────────────────────────────────────────
 struct RpgApp {
-    /// 底层设备（`init` 里取一次；静态地形重建需要在**取帧之前**也能建网格）。
+    /// 网格注册表（`init` 里取一次）。静态地形在 `map_rev` 变化时会**帧内**重建，
+    /// 而 `Gfx` 只在 `init` 期间存在——注册表是 `Arc` 共享句柄，脱离 `Gfx` 借用期后
+    /// 仍可注册网格。
+    meshes: Option<Arc<MeshRegistry>>,
+    /// 底层设备（`init` 里取一次；`MeshData::from_pod` 建缓冲需要它）。
     device: Option<Arc<wgpu::Device>>,
     cam: Camera2D,
     tex: Option<Tex>,
@@ -1087,6 +1094,7 @@ struct RpgApp {
 impl Default for RpgApp {
     fn default() -> Self {
         Self {
+            meshes: None,
             device: None,
             cam: Camera2D::default(),
             tex: None,
@@ -1100,13 +1108,16 @@ impl App for RpgApp {
         AppConfig::new("eg260731RPG").size(1280.0, 720.0)
     }
 
-    fn init(&mut self, gfx: &Gfx) {
-        // `wgpu::Device` 是共享句柄（`Clone` 共享同一底层设备），存一份供帧内重建静态网格用。
+    fn init(&mut self, gfx: &Gfx) -> Result<(), AppInitError> {
+        // 注册表是共享句柄（与 `Render2D` 用的是同一份）⇒ 存一份即可在帧内建网格。
+        self.meshes = Some(gfx.mesh_registry().clone());
+        // `wgpu::Device` 是共享句柄（`Clone` 共享同一底层设备），`MeshData::from_pod` 需要它。
         self.device = Some(Arc::new(gfx.device().clone()));
         self.tex = Some(Tex::create(gfx));
         // 文本子系统由运行时 `Ctx` 持有（`Frame::text` 借出），应用不再自建。
         // 相机视口在 `update` 里用当前画面矩形写回（`f.region()`），与窗口尺寸自动一致。
         self.cam.transform.pos = self.game.player.pos;
+        Ok(())
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
@@ -1140,7 +1151,9 @@ impl App for RpgApp {
         // 每帧只提交实例数据，全部合批。树保持动态（Y 排序插入实体，绝不入此地）。
         if self.static_terrain.as_ref().map(|t| t.rev) != Some(self.game.map_rev) {
             let device = self.device.as_ref().expect("device 已在 init 取得");
-            self.static_terrain = Some(StaticTerrain::build(device, &self.game.map, self.game.map_rev));
+            let meshes = self.meshes.as_ref().expect("meshes 已在 init 取得");
+            self.static_terrain =
+                Some(StaticTerrain::build(device, meshes, &self.game.map, self.game.map_rev));
         }
         self.static_terrain.as_ref().unwrap().draw(f.draw());
         draw_tiles(f.draw(), &self.cam, tex, &self.game);
@@ -1168,7 +1181,7 @@ impl App for RpgApp {
     }
 }
 
-fn main() -> Result<(), EventLoopError> {
+fn main() -> Result<(), RunError> {
     env_logger::init();
     run(RpgApp::default())
 }

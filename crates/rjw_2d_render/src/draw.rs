@@ -832,6 +832,41 @@ impl<'a> Draw2D<'a, Mesh> {
         let (ve, te) = (mesh.vertices.len(), mesh.tri_indices.len());
         Self::mesh_from(queue, mesh, vs..ve, ts..te, ColorMode::Instance, Some(tex_uid))
     }
+
+    /// **顶点 + 显式三角形索引段**（整段实例色；`Render2D::mesh_indexed`）。
+    ///
+    /// 与 [`Self::quads`] 同为 `ColorMode::Instance`：顶点自带色 **不被改写**，
+    /// `tint` 作为整段实例色与之相乘。用于调用方已自行三角化的几何
+    /// （例如 UI 的圆角 + 羽化镶嵌）。
+    pub(crate) fn mesh_indexed(
+        queue: &'a mut DrawCommandQueue,
+        mesh: &'a mut MeshStorage,
+        vertices: &[VertexP3U2C4],
+        indices: &[[u16; 3]],
+        tex_uid: u64,
+    ) -> Self {
+        assert!(
+            !vertices.is_empty() && !indices.is_empty(),
+            "mesh_indexed: vertices and indices must be non-empty"
+        );
+        let vs = mesh.vertices.len();
+        let ts = mesh.tri_indices.len();
+        mesh.vertices.extend_from_slice(vertices);
+        for t in indices {
+            debug_assert!(
+                t.iter().all(|&i| (i as usize) < vertices.len()),
+                "mesh_indexed: index out of bounds ({t:?}, vertex count {})",
+                vertices.len()
+            );
+            mesh.tri_indices.push(TriIndices(
+                Index((t[0] as usize + vs) as u16),
+                Index((t[1] as usize + vs) as u16),
+                Index((t[2] as usize + vs) as u16),
+            ));
+        }
+        let (ve, te) = (mesh.vertices.len(), mesh.tri_indices.len());
+        Self::mesh_from(queue, mesh, vs..ve, ts..te, ColorMode::Instance, Some(tex_uid))
+    }
 }
 
 // ─── 单元测试（无 GPU：Builder → 命令队列） ───────────────────

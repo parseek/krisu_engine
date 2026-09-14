@@ -7,10 +7,25 @@ krusie 引擎的 UI 模块：**hybrid 模式**（立即外观 + ID 持久状态�
 
 ## 设计要点
 
-- **立即外观**：每帧 `Ui::begin(...)` → 录制控件 → `finish()` 深度排序后一次提交绘制（与 `Render2D` 逐帧录制架构一致）。
+- **立即外观**：每帧 `Ui::begin(...)` → 录制控件 → `finish(&mut backend)` 深度排序后**产出 `UiBatch` 批次**交给绘制后端（`rjw_ui` 不直接调用任何渲染器）。
+- **绘制后端解耦**（v0.3）：`rjw_ui` 只认识 [`UiBackend`](src/backend.rs) trait —
+  **只有 `texture(uid)` 与 `submit(UiBatch)` 两个方法**（矩形渐变改为四角顶点色后，
+  不再有「后端替我建渐变纹理」这一职责）。一个 `UiBatch` = 一个实例
+  =（纹理 + 顶点 + 实例变换 + 实例 tint + 实例数据 `UiBatchSource`）。
+  - 实例粒度 = **（窗口 × 纹理）**：同一窗口内**所有控件 / 容器**合成一批
+    ⇒ 「一个窗口 ≈ 1~2 次 draw call」（`source.elements` 记录本批覆盖的控件数）。
+  - **不按控件切**是「尽量减少 DrawCall」的关键；**按窗口切**是因为批次携带窗口级
+    transform/tint（烘进顶点会让窗口 FX 动画每帧重建整窗顶点，摧毁窗口顶点缓存）。
+  - 切段规则由纯函数 `segment_runs` 裁决，契约由 `ui::batch_contract_tests` 断言（无 GPU）。
+  - 真实后端：`rjw_krusie::runtime::layers::ui_backend::Render2dUiBackend`；
+    测试后端：`rjw_ui::RecordingBackend`（收集批次，可断言 draw call 数）。
 - **状态持久**：交互控件（按钮/滑块/勾选/输入框）通过 **ID**（`&str`）把 hover / 按下 / 焦点 / 输入内容 / 拖拽标记持久化在 `UiState` 中（应用持有，跨帧复用）。
 - **自动尺寸**（DOM 风格）：叶子控件由内容测量（`rjw_text::Text::measure` + padding）自然撑开，容器（panel / pack / grid）在闭包结束时按子控件结算自身尺寸——**默认无需手写宽高**；任何控件可显式 `.size(w, h)` 或传 `Rect` 覆盖。
 - **屏幕空间**：控件坐标一律为屏幕像素（左上角原点、Y+ 向下），内部经相机屏幕固定变换绘制，命中测试直接在屏幕像素进行（旋转/缩放相机依然准确）。
+
+> ⚠ **下方"快速上手"是 v0.2 的旧签名**（`Ui::begin` 收 6 参、`finish()` 不收后端），
+> 与 v0.3 不符。现行写法见 [`docs/API_REFERENCE.md`](../../docs/API_REFERENCE.md) §11
+> 与 `examples/eg260818UI`。
 
 ## 快速上手
 

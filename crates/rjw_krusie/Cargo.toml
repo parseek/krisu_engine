@@ -18,6 +18,7 @@ rjw_transform = { path = "../rjw_transform", version = "0.3.0" }
 rjw_color = { path = "../rjw_color", version = "0.3.0", features = ["wgpu"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 log = "0.4.33"
+thiserror = "2"
 rjw_atlas = { path = "../rjw_atlas", version = "0.3.0", optional = true }
 rjw_text = { path = "../rjw_text", version = "0.3.0", optional = true }
 rjw_ui = { path = "../rjw_ui", version = "0.3.0", optional = true }

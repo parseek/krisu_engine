@@ -27,7 +27,7 @@ pub mod window;
 pub use config::{AppConfig, Background, Clear, RenderConfig, ViewportBorders, Vsync};
 pub use ctx::{Ctx, Escape};
 pub use frame::Frame;
-pub use game::{run, run_with, App};
+pub use game::{run, run_with, App, AppInitError, RunError};
 pub use gfx::Gfx;
 pub use window::WindowId;
 

@@ -14,13 +14,23 @@
 
 好在有不少东西都是继承自 [`krjw_rust`](https://github.com/parseek/krjw_rust) 的，不用重复造轮子，yay（
 
-你说音频？直接套 `kira` crate 就够了（
+你说音频？直接套 `kira` crate 就够了（  
+
+## -≤- 目标
+
+> Easy to use but powerful.  
+> Clean and easy to maintain by hands.  
+> Quick but customizable.  
+> -- krisuRJW
+
+或许大肥鱼搞的代码并没有达到以上目标吧  
 
 ## ✨ 特性
 
 - 🎨 **Batch2D 批渲染**（`rjw_2d_render`）：Sprite/Mesh **统一管线** + RStates 渲染状态 bitfield（u64），按 (layer, states) 排序
 - 🚪 **统一入口 + 模块化运行时**（`rjw_krusie`）：`use rjw_krusie::prelude::*;` 一行起步；窗口 / 帧 / 相机视口 / 清屏 / 提交 / present 由 `App` + `Ctx` + `Frame` 接管，低层/冲突名走 `rjw_krusie::<模块>::…`
 - 🔗 **Builder 责任链**：按对象定制渲染状态（`.blend(BlendMode::Additive)` / `.depth(DepthState::test_write(..))` / `.states(RStates)`）；不链式 = 全局默认
+- 🧩 **UI 后端解耦**：`rjw_ui` 只输出批次（纹理 + 顶点 + 实例变换 + 实例数据）经 `UiBackend` trait 提交，不直接调用渲染器；一个批次 = 一个实例 =（窗口 × 纹理）⇒ 同窗口全部控件合批（一个窗口 ≈ 1~2 次 draw call）
 - 🎛️ **渲染状态 RStates**：Blend（含 Inverse/Subtract/Min/Max/Disabled 9 种模式）/ Sampler / Cull+Raster / Depth / Stencil 6 域 bitfield，三级控制（全局默认 → 单条绘制 → 批量描述符）
 - 📦 **实例缓冲页池**：单帧精灵数量可远超单批上限（8192），自动分页绘制，不阻塞帧、无运行时扩张
 - 🎥 **相机 = 矩形区域 + 2D 变换**（`Camera2D { region, transform }`）：中心原点、Y+ 向下、VP 矩阵直接透传、屏幕↔世界互转；`Viewport` 已并入 `Rect`
@@ -28,8 +38,6 @@
 - 🌅 **无帧也跑逻辑**：取不到表面（最小化/遮挡/超时）时 `Ctx::frame()` 返回 `None`，应用用 `let Some(mut f) = ctx.frame() else { return };` 守卫渲染代码；后台按 `Background` 退避不空转
 - 📐 **变换系统**（`Transform2D`）：位置/缩放/旋转、父子组合（`compose` / `compose_inverse`）、命中检测
 - ⌨️ **输入**：键盘（`KeyState` 边沿：pressed / down_edge / true_edge）+ 鼠标（位置/增量/滚轮/按钮）
-- 🎞️ **程序化纹理**：无需外部资源，运行时生成草地/水面/树冠/角色等
-- 🕹️ **综合 RPG 示例**（`eg260731RPG`）：波次敌人、多地形大地图、自动 y-sort 纵深感、相机跟踪居中、高 DPI 适配
 
 ## 📁 模块地图（crates）
 
@@ -37,17 +45,19 @@
 |---|---|
 | `rjw_krusie` | ★ **统一入口（聚合 + 模块化运行时）**：`rjw_krusie::prelude::*` 一行起步；`rjw_krusie::runtime`（`App`/`Ctx`/`Frame`/`Gfx`/`AppConfig`）+ `main`/`gpu`/`render2d`/`transform`/`color`/`atlas`/`text`/`ui`/`tilemap`/`collision` 命名空间 |
 | `rjw_main` | 平台底座：winit / 输入 / 计时重导出 + 默认窗口标题（事件循环在 `rjw_krusie::runtime`） |
-| `rjw_render` | 底层 `RenderContext`/`Gpu`/`Clear`/`RenderFrame`/`PassBuilder`/`FrameSource`、纹理与静态网格注册表、wgpu 重导出 |
+| `rjw_render` | 底层 `RenderContext`/`Gpu`/`Clear`/`RenderFrame`/`PassBuilder`/`FrameSource`、纹理与静态网格注册表（**每 `RenderContext` 私有**）、wgpu 重导出 |
 | `rjw_2d_render` | ★ 2D 批渲染器 `Render2D`、`RStates`、Builder 责任链、`SpriteRect`、`Mesh`、分页实例缓冲、**统一管线缓存** |
 | `rjw_atlas` | ★ 运行时图集：DynamicAtlas（Guillotine 空闲矩形 + 寿命 + clamp_margin）+ StaticAtlas（TOML） |
 | `rjw_text` | ★ 文本渲染（cosmic-text 排版 + swash 字形光栅化 + DynamicAtlas 缓存） |
-| `rjw_ui` | ★ UI：hybrid 模式（立即外观 + ID 持久状态）+ DOM 风格自动尺寸 + Tkinter 布局（pack/grid/place），含按钮/滑块/勾选/单选/输入框 |
+| `rjw_ui` | ★ UI：hybrid 模式（立即外观 + ID 持久状态）+ DOM 风格自动尺寸 + Tkinter 布局（pack/grid/place），含按钮/滑块/勾选/单选/输入框；**绘制经 `UiBackend` trait 解耦**（输出 `UiBatch`，不直接调用渲染器） |
+| `rjw_tilemap` | 任意图集区域贴片：Chunk 预生成静态网格 + 复用 `Render2D` 剔除语言 + solid AABB 碰撞矩形 |
 | `rjw_transform` | `Transform2D` + `Camera2D { region, transform }`（矩形区域 + 2D 变换、正交投影、坐标转换）+ `Rect` |
 | `rjw_color` | `Color`(f32) / `ColorF64`(f64) + 常用常量 |
+| `rjw_collision` | 轻量 2D 碰撞原语：`Aabb { rect, transform }` + `overlaps` / `slide` |
 | `rjw_keyboard` / `rjw_keystate` | 键盘输入（含 `chars()` 字符输入）与边沿状态机（`KeyState`） |
 | `rjw_mouse` | 鼠标状态（位置/位移/滚轮/按键） |
 | `rjw_time` | `DeltaTimer`（帧间隔 dt / FPS） |
-| `rjw_typed_registry` | 泛型线程安全注册表 `TypedRegistry<T>` + `HasUid`（纹理 / 网格全局表） |
+| `rjw_typed_registry` | 泛型线程安全注册表 `TypedRegistry<T>` + `HasUid`（纹理 / 网格注册表的实现底座） |
 
 ## 🚀 快速开始
 

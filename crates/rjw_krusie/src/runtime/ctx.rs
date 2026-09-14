@@ -563,7 +563,10 @@ impl Ctx {
             .scale_factor(scale)
             .build();
         f(&mut ui);
-        ui.finish(r2d);
+        // UI 只输出批次；适配到本上下文的 2D 渲染器由桥接层负责。
+        let mut backend =
+            crate::runtime::layers::ui_backend::Render2dUiBackend::new(r2d);
+        ui.finish(&mut backend);
     }
 
     /// 文本子系统（feature = `text`；`Frame` 上的便捷入口在 P2 提供 `label` 链）。

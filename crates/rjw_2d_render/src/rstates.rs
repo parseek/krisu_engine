@@ -278,16 +278,22 @@ impl RStates {
         self
     }
 
+    /// 剔除面（读 **bits 24-25**——即 [`Self::cull`] 写入的 Cull + Raster 域）。
+    ///
+    /// 旧实现误读 bits 0-1（**blend 域**），后果有两条：
+    /// 1. `.cull(CullMode::Front | Back)` 是**彻底的空操作**——`cull()` 写 bits 24-25，
+    ///    而没有任何代码读它们；
+    /// 2. **blend 预设悄悄决定剔除模式**：`Additive` / `Subtract` → `Face::Front`，
+    ///    `Multiply` / `Premultiplied` / `Min` / `Max` → `Face::Back`。
+    ///
+    /// 又因默认四边形在 `FrontFace::Ccw` 下是**背面**（`QUAD_TRI_INDICIES` 绕序 + DirectX-RH
+    /// 正交投影的 Y 翻转），`Face::Front` 会把精灵**整块剔除**——加色混合的精灵因此不可见。
     #[inline]
     pub fn to_cull(self) -> Option<wgpu::Face> {
-        if self.0 & 2 != 0 {
-            // Back
-            Some(wgpu::Face::Back)
-        } else if self.0 & 1 != 0 {
-            // Front
-            Some(wgpu::Face::Front)
-        } else {
-            None
+        match CullMode::from_u32(((self.0 >> 24) & 0x3) as u32) {
+            CullMode::Front => Some(wgpu::Face::Front),
+            CullMode::Back => Some(wgpu::Face::Back),
+            CullMode::None => None,
         }
     }
 
@@ -929,5 +935,60 @@ mod depth_state_tests {
         RStates::new()
             .depth_test(true)
             .to_depth_stencil_with(wgpu::TextureFormat::Stencil8);
+    }
+}
+
+#[cfg(test)]
+mod cull_field_tests {
+    use super::*;
+
+    /// **`.cull(..)` 必须真的生效**（回归：旧实现 `to_cull()` 读 blend 域 bits 0-1，
+    /// 而 `cull()` 写 Cull + Raster 域 bits 24-25 ⇒ 写进去没人读，`.cull(..)` 是空操作）。
+    #[test]
+    fn cull_roundtrips_through_to_cull() {
+        assert_eq!(RStates::new().cull(CullMode::None).to_cull(), None);
+        assert_eq!(
+            RStates::new().cull(CullMode::Front).to_cull(),
+            Some(wgpu::Face::Front),
+            "CullMode::Front 必须映射到 Face::Front"
+        );
+        assert_eq!(
+            RStates::new().cull(CullMode::Back).to_cull(),
+            Some(wgpu::Face::Back),
+            "CullMode::Back 必须映射到 Face::Back"
+        );
+    }
+
+    /// **blend 不得影响剔除**（回归：旧实现下 `Additive` → `Face::Front`，
+    /// 而默认四边形是背面 ⇒ 加色精灵被整块剔除、屏幕上完全消失）。
+    #[test]
+    fn blend_does_not_alias_into_cull() {
+        for mode in [
+            BlendMode::Alpha,
+            BlendMode::Additive,
+            BlendMode::Multiply,
+            BlendMode::Premultiplied,
+            BlendMode::Inverse,
+            BlendMode::Subtract,
+            BlendMode::Min,
+            BlendMode::Max,
+            BlendMode::Disabled,
+        ] {
+            assert_eq!(
+                RStates::new().blend(mode).to_cull(),
+                None,
+                "blend({mode:?}) 不应产生剔除模式（blend 域与 cull 域必须正交）"
+            );
+        }
+    }
+
+    /// `raster_state(..)` 是 cull 的批量入口，也必须落到 bits 24-25。
+    #[test]
+    fn raster_state_roundtrips_cull() {
+        let s = RStates::new().raster_state(RasterState {
+            cull: CullMode::Back,
+            ..RasterState::default()
+        });
+        assert_eq!(s.to_cull(), Some(wgpu::Face::Back));
     }
 }

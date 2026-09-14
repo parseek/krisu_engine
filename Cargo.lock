@@ -2017,6 +2017,7 @@ dependencies = [
  "log",
  "rjw_render",
  "serde",
+ "thiserror 2.0.19",
  "toml",
  "wgpu",
 ]
@@ -2066,6 +2067,7 @@ dependencies = [
  "rjw_tilemap",
  "rjw_transform",
  "rjw_ui",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -2096,6 +2098,7 @@ dependencies = [
  "pollster",
  "rjw_color",
  "rjw_typed_registry",
+ "thiserror 2.0.19",
  "wgpu",
  "winit",
 ]

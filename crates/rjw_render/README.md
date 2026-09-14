@@ -1,10 +1,10 @@
 # rjw_render
 
 中文：
-`rjw_render` 是基于 wgpu 30 的底层渲染上下文，管理 surface / device / queue / swapchain，并提供纹理包装、静态网格与线程安全全局注册表。
+`rjw_render` 是基于 wgpu 30 的底层渲染上下文，管理 surface / device / queue / swapchain，并提供纹理包装、静态网格与**每上下文私有**的线程安全资源注册表。
 
 English：
-`rjw_render` is the low-level wgpu 30 based render context that manages the surface, device, queue and swapchain, plus texture wrappers, static meshes and thread-safe global registries.
+`rjw_render` is the low-level wgpu 30 based render context that manages the surface, device, queue and swapchain, plus texture wrappers, static meshes and thread-safe **per-context** resource registries.
 
 ---
 
@@ -14,7 +14,7 @@ English：
 - `RenderContext`：surface / device / queue / swapchain 生命周期管理；`acquire_frame()`（→ `RenderFrame`）/ `resize()` / `size()`。
 - `RenderConfig`：后端选择（默认 Windows 下 DX12 | GL）、垂直同步、表面格式。
 - `TextureWrapped` / `ArcTextureWrapped`：RGBA8 纹理包装，内置 `width` / `height` / `uid`，与采样器解耦。
-- `TypedRegistry` + `TEXTURES` / `MESHES`：线程安全全局注册表（`register` / `get` / `remove` / `rename` …）。
+- `TypedRegistry` + `Gpu::{textures, meshes}`：**每 `RenderContext` 私有**的线程安全注册表（`register` / `get` / `remove` / `rename` …）。`TEXTURES` / `MESHES` 两个全局 `static` 已移除——它让「同一 uid 的不同纹理」在多个渲染上下文间静默串味。
 - `MeshData`：静态网格（GPU 顶点 / 索引缓冲 + uid）。
 - `pub use wgpu;`：重导出 wgpu，避免版本不一致。
 
@@ -22,7 +22,7 @@ English：
 - `RenderContext`: manages the surface, device, queue and swapchain lifecycle; `acquire_frame()` (→ `RenderFrame`) / `resize()` / `size()`.
 - `RenderConfig`: backend selection (default DX12 | GL on Windows), vsync and surface format.
 - `TextureWrapped` / `ArcTextureWrapped`: RGBA8 texture wrapper with built-in `width` / `height` / `uid`, decoupled from samplers.
-- `TypedRegistry` + `TEXTURES` / `MESHES`: thread-safe global registries (`register` / `get` / `remove` / `rename` …).
+- `TypedRegistry` + `Gpu::{textures, meshes}`: **per-`RenderContext`** thread-safe registries (`register` / `get` / `remove` / `rename` …). The global `TEXTURES` / `MESHES` statics were removed — they let distinct textures sharing a uid silently alias across render contexts.
 - `MeshData`: static mesh (GPU vertex/index buffers + uid).
 - `pub use wgpu;`: re-exports wgpu to avoid version mismatches.
 

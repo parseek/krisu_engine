@@ -48,7 +48,7 @@ impl App for ClearScreen {
     }
 }
 
-fn main() -> Result<(), EventLoopError> {
+fn main() -> Result<(), RunError> {
     env_logger::init();
     run(ClearScreen::default())
 }

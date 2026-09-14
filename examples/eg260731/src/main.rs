@@ -35,9 +35,10 @@ impl App for SpriteDemo {
         AppConfig::new("eg260731 - Render2D Sprites").size(1280.0, 720.0)
     }
 
-    fn init(&mut self, gfx: &Gfx) {
+    fn init(&mut self, gfx: &Gfx) -> Result<(), AppInitError> {
         let px = checker_rgba(16, 16);
         self.tex = Some(gfx.texture("checkboard", Rgba8::new(&px, (16, 16))));
+        Ok(())
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
@@ -162,7 +163,7 @@ fn axis(ctx: &Ctx, plus: KeyCode, minus: KeyCode) -> f32 {
     (ctx.key(plus).pressed() as i32 - ctx.key(minus).pressed() as i32) as f32
 }
 
-fn main() -> Result<(), EventLoopError> {
+fn main() -> Result<(), RunError> {
     env_logger::init();
     run(SpriteDemo::default())
 }

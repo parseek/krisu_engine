@@ -38,7 +38,12 @@ pub trait App: Sized + 'static {
     }
 
     /// 窗口就绪后调用一次：用 [`Gfx`] 建长期资源（纹理 / 网格 / 文本子系统…）。
-    fn init(&mut self, _gfx: &Gfx<'_>) {}
+    ///
+    /// 返回 `Err` 会**终止启动**并把错误上报给调用方（而不是 panic）——便于
+    /// 「纹理加载失败」这类可恢复失败给出可读提示。
+    fn init(&mut self, _gfx: &Gfx<'_>) -> Result<(), AppInitError> {
+        Ok(())
+    }
 
     /// 每帧调用（含无帧帧）。
     fn update(&mut self, ctx: &mut Ctx);
@@ -50,8 +55,35 @@ pub trait App: Sized + 'static {
     fn close(&mut self) {}
 }
 
+/// 应用启动期错误（窗口创建 / 渲染上下文初始化 / [`App::init`] 的失败）。
+#[derive(Debug, thiserror::Error)]
+pub enum AppInitError {
+    /// 创建主窗口失败（窗口系统 / 后端问题）。
+    #[error("创建主窗口失败：{0}")]
+    CreateWindow(String),
+    /// 渲染上下文初始化失败（无适配器 / surface 创建失败 / 无可用格式）。
+    #[error(transparent)]
+    Render(#[from] rjw_render::RenderInitError),
+    /// 应用自己的 `init` 失败（如资产加载）。
+    #[error("应用 init 失败：{0}")]
+    App(String),
+}
+
+/// [`run`] / [`run_with`] 的错误：事件循环本身出错，或启动期失败。
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    /// 事件循环创建失败。
+    #[error(transparent)]
+    EventLoop(#[from] EventLoopError),
+    /// 启动期失败（窗口 / 渲染上下文 / `App::init`）。
+    #[error(transparent)]
+    Init(#[from] AppInitError),
+}
+
 /// 运行应用（自建渲染上下文）。
-pub fn run<A: App>(app: A) -> Result<(), EventLoopError> {
+///
+/// `main` 里通常写 `fn main() -> Result<(), RunError> { run(Game) }`。
+pub fn run<A: App>(app: A) -> Result<(), RunError> {
     run_engine(app, None::<Never>)
 }
 
@@ -60,11 +92,11 @@ pub fn run<A: App>(app: A) -> Result<(), EventLoopError> {
 /// ```ignore
 /// run_with(app, Never);   // 强制永不出帧：验证「无帧也执行 update」
 /// ```
-pub fn run_with<A: App, S: FrameSource>(app: A, source: S) -> Result<(), EventLoopError> {
+pub fn run_with<A: App, S: FrameSource>(app: A, source: S) -> Result<(), RunError> {
     run_engine(app, Some(source))
 }
 
-fn run_engine<A: App, S: FrameSource>(app: A, injected: Option<S>) -> Result<(), EventLoopError> {
+fn run_engine<A: App, S: FrameSource>(app: A, injected: Option<S>) -> Result<(), RunError> {
     let mut config = app.config();
     // 冒烟开关：`--frames N` 或 `KRUSIE_SMOKE_FRAMES=N` ⇒ 跑满 N 次迭代自动退出。
     if let Some(frames) = smoke_frames_arg() {
@@ -73,8 +105,23 @@ fn run_engine<A: App, S: FrameSource>(app: A, injected: Option<S>) -> Result<(),
     let ctx = Ctx::new(&config);
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-    let mut engine = Engine { app, config, injected, render: None, ctx, resized: None, smoke_reported: false };
-    event_loop.run_app(&mut engine)
+    let mut engine = Engine {
+        app,
+        config,
+        injected,
+        render: None,
+        ctx,
+        resized: None,
+        smoke_reported: false,
+        init_error: None,
+    };
+    event_loop.run_app(&mut engine)?;
+    // 启动期失败：`resumed` 里无法把错误送给 `run_app`（它只认 `EventLoopError`），
+    // 因此先存进 `Engine`、`event_loop.exit()` 退出循环，这里再上报给调用方。
+    match engine.init_error {
+        Some(e) => Err(RunError::Init(e)),
+        None => Ok(()),
+    }
 }
 
 /// 解析冒烟帧数：`--frames N` 优先，其次 `KRUSIE_SMOKE_FRAMES=N`。
@@ -99,6 +146,17 @@ struct Engine<A: App, S: FrameSource> {
     resized: Option<(u32, u32)>,
     /// 冒烟收尾是否已报告（`event_loop.exit()` 之后仍可能再跑一次迭代）。
     smoke_reported: bool,
+    /// 启动期失败（`resumed` 里存下、`run_engine` 事后上报）。
+    init_error: Option<AppInitError>,
+}
+
+impl<A: App, S: FrameSource> Engine<A, S> {
+    /// 启动期失败：记录错误、打日志、退出事件循环（`run_engine` 事后上报给调用方）。
+    fn fail_startup(&mut self, event_loop: &ActiveEventLoop, err: AppInitError) {
+        log::error!("krusie: 启动失败：{err}");
+        self.init_error = Some(err);
+        event_loop.exit();
+    }
 }
 
 impl<A: App, S: FrameSource> ApplicationHandler for Engine<A, S> {
@@ -110,16 +168,24 @@ impl<A: App, S: FrameSource> ApplicationHandler for Engine<A, S> {
         let attrs = WindowAttributes::default()
             .with_title(&self.config.title)
             .with_inner_size(LogicalSize::new(self.config.size.0 as f64, self.config.size.1 as f64));
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("krusie: 创建主窗口失败"),
-        );
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                self.fail_startup(event_loop, AppInitError::CreateWindow(e.to_string()));
+                return;
+            }
+        };
         // IME（中文输入法等）：否则部分平台（Windows）不产生 `WindowEvent::Ime`。
         window.set_ime_allowed(true);
 
         // SAFETY: window 是 `Arc`，与 `RenderContext` 一同活到事件循环结束。
-        let render = unsafe { RenderContext::new(&window, &self.config.render) };
+        let render = match unsafe { RenderContext::new(&window, &self.config.render) } {
+            Ok(r) => r,
+            Err(e) => {
+                self.fail_startup(event_loop, AppInitError::from(e));
+                return;
+            }
+        };
         self.ctx.attach(window, &render);
         self.render = Some(render);
 
@@ -130,7 +196,9 @@ impl<A: App, S: FrameSource> ApplicationHandler for Engine<A, S> {
             render_ref.depth_format(),
             render_ref.size(),
         );
-        self.app.init(&gfx);
+        if let Err(e) = self.app.init(&gfx) {
+            self.fail_startup(event_loop, e);
+        }
     }
 
     fn window_event(

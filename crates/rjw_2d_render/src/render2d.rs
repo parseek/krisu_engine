@@ -31,8 +31,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use rjw_render::{
-    ArcTextureWrapped, MeshData, MeshId, PassBuilder, PassContext, PassRecorder, TextureWrapped,
-    MESHES, TEXTURES,
+    ArcTextureWrapped, Gpu, MeshData, MeshId, MeshRegistry, PassBuilder, PassContext, PassRecorder,
+    TextureRegistry, TextureWrapped,
 };
 #[cfg(feature = "rjw_atlas")]
 use rjw_atlas::AtlasSprite;
@@ -96,6 +96,13 @@ pub struct Render2D {
     /// 深度 / 模板附件格式（构造期固定；**不进管线缓存 key**）。
     depth_format: wgpu::TextureFormat,
     tex_bind_group_layout: wgpu::BindGroupLayout,
+    /// **本上下文**的 GPU 能力对象（注册表所有者）。经 `Arc` 共享，使渲染器可以
+    /// 持有比 `&Gpu` 更长的生命周期，并把同一套注册表交给 `rjw_text` / `rjw_ui`。
+    gpu: Arc<Gpu>,
+    /// 本上下文的纹理注册表（`gpu.textures()` 的克隆；绘制期唯一解析点）。
+    textures: Arc<TextureRegistry>,
+    /// 本上下文的静态网格注册表（`gpu.meshes()` 的克隆；绘制期唯一解析点）。
+    meshes: Arc<MeshRegistry>,
     white_texture: ArcTextureWrapped,
     mesh_storage: MeshStorage,
     command_queue: DrawCommandQueue,
@@ -147,7 +154,7 @@ impl Render2D {
     /// **不持有 surface / VP**：取帧与 present 走 `RenderContext`（唯一取帧权威）；
     /// VP 由帧级槽环按 pass 提供（见 [`Self::submit`]）。
     pub fn new(render: &rjw_render::RenderContext) -> Self {
-        let gpu = render.gpu();
+        let gpu = render.gpu_arc().clone();
         let device = gpu.device();
         let queue = gpu.queue();
         let surface_format = render.format();
@@ -156,6 +163,9 @@ impl Render2D {
         // 纹理 / VP bind group layout 由 `Gpu` 统一提供（子系统间可复用 bind group）。
         let vp_bl = gpu.vp_layout().clone();
         let tex_bl = gpu.texture_layout().clone();
+        // 注册表：本上下文的共享句柄（world / UI 两个渲染器共用同一套）。
+        let textures = gpu.texture_registry().clone();
+        let meshes = gpu.mesh_registry().clone();
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Render2D: Default Shader"),
@@ -171,7 +181,7 @@ impl Render2D {
             MAX_INSTANCES_PER_DRAW,
         );
         // 注册四边形为静态网格（Sprite 与 StaticMesh 共用实例化绘制路径）。
-        let quad_mesh_id = MESHES.register(Arc::new(MeshData::from_buffers(
+        let quad_mesh_id = meshes.register(Arc::new(MeshData::from_buffers(
             draw_page.quad_vb.clone(),
             draw_page.quad_ib.clone(),
             QUAD_TRI_INDICIES.len() as u32,
@@ -184,7 +194,7 @@ impl Render2D {
             1,
             1,
         ));
-        TEXTURES.register(white_texture.clone());
+        textures.register(white_texture.clone());
 
         // 默认采样器（RStates::default()：线性 + ClampToEdge），samp_key == 0 零开销路径。
         let default_sampler = device.create_sampler(&RStates::default().to_sampler_desc());
@@ -199,6 +209,9 @@ impl Render2D {
             format: surface_format,
             depth_format,
             tex_bind_group_layout: tex_bl,
+            gpu,
+            textures,
+            meshes,
             white_texture,
             mesh_storage: MeshStorage::default(),
             command_queue: DrawCommandQueue::default(),
@@ -373,6 +386,31 @@ impl Render2D {
         &self.white_texture
     }
 
+    /// **本上下文的纹理注册表**（绘制期唯一解析点）。
+    ///
+    /// `rjw_text` / `rjw_ui` / `rjw_tilemap` 等下游在绘制时经此解析 `tex_uid`，
+    /// 不再触碰任何进程级全局表。
+    #[inline]
+    pub fn textures(&self) -> &TextureRegistry {
+        &self.textures
+    }
+
+    /// **本上下文的静态网格注册表**（绘制期唯一解析点）。
+    #[inline]
+    pub fn meshes(&self) -> &MeshRegistry {
+        &self.meshes
+    }
+
+    /// 本上下文的能力对象（`device` / `queue` / `texture_layout` / 注册表）。
+    ///
+    /// 供下游在**运行时**惰性创建资源——这些资源的创建时机晚于 `App::init`，
+    /// 拿不到 `Gfx`（例如自建纹理 / 网格、或 `rjw_text::Text::white_region` 之外
+    /// 需要 `&Gpu` 的构造器）。
+    #[inline]
+    pub fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
+
     /// 设备（低层逃生口：自建缓冲 / 管线）。
     #[inline]
     pub fn device(&self) -> &wgpu::Device {
@@ -426,6 +464,10 @@ impl Render2D {
     /// ```
     ///
     /// 初始 mesh 左上角在原点、尺寸 = 图集区域尺寸；用 `.at(..)` / `.transform(..)` 摆位。
+    ///
+    /// 需要 `rjw_atlas` feature（`AtlasSprite` 来自该 crate）；关闭后本入口不存在，
+    /// 其余 2D 绘制能力不受影响。
+    #[cfg(feature = "rjw_atlas")]
     pub fn region(&mut self, sprite: AtlasSprite) -> SpriteBuilder<'_> {
         let region = sprite.region;
         let tex_w = (sprite.texture.width as f32).max(1.0);
@@ -472,6 +514,30 @@ impl Render2D {
             &mut self.command_queue,
             &mut self.mesh_storage,
             f,
+            texture.uid,
+        )
+    }
+
+    /// **顶点 + 显式三角形索引段**（整段实例色，与 [`Self::quads`] 同语义）：
+    /// `r2d.mesh_indexed(&verts, &tris, &tex).transform(tf).tint(c).layer(l)`。
+    ///
+    /// 供调用方**自行三角化**的几何使用（例如 UI 的圆角 + 羽化镶嵌：顶点自带
+    /// 四角渐变色与羽化 alpha）。与 [`Self::mesh_with`] 的区别在 **`tint` 的作用位置**：
+    /// 本方法把 `tint` 作为**整段实例色**（顶点色 × tint），`mesh_with` 则把它写进
+    /// **逐顶点色**（会覆盖顶点自带色）。需要「保留逐顶点渐变 / 羽化 alpha，同时整段
+    /// 染色」时用本方法。
+    #[inline]
+    pub fn mesh_indexed(
+        &mut self,
+        vertices: &[VertexP3U2C4],
+        indices: &[[u16; 3]],
+        texture: &ArcTextureWrapped,
+    ) -> MeshBuilder<'_> {
+        Draw2D::mesh_indexed(
+            &mut self.command_queue,
+            &mut self.mesh_storage,
+            vertices,
+            indices,
             texture.uid,
         )
     }
@@ -536,8 +602,8 @@ impl Render2D {
         texture: &ArcTextureWrapped,
     ) -> StaticMeshBuilder<'_> {
         debug_assert!(
-            MESHES.contains_uid(mesh_id.uid()),
-            "mesh {mesh_id:?} is not registered in MESHES"
+            self.meshes.contains_uid(mesh_id.uid()),
+            "mesh {mesh_id:?} is not registered in this context's mesh registry"
         );
         Draw2D::static_mesh(
             &mut self.command_queue,
@@ -813,7 +879,7 @@ impl Render2D {
                     transform,
                 } => {
                     flush_dyn!();
-                    let mesh = MESHES.get(*mesh_id).expect("mesh not registered");
+                    let Some(mesh) = self.resolve_mesh(*mesh_id) else { continue };
                     self.buf_items.push(BatchItem {
                         mesh_id: Some(*mesh_id),
                         dyn_seq: 0,
@@ -831,7 +897,7 @@ impl Render2D {
                 } => {
                     flush_dyn!();
                     let m = self.command_queue.matrices[*mat_idx];
-                    let mesh = MESHES.get(*mesh_id).expect("mesh not registered");
+                    let Some(mesh) = self.resolve_mesh(*mesh_id) else { continue };
                     self.buf_items.push(BatchItem {
                         mesh_id: Some(*mesh_id),
                         dyn_seq: 0,
@@ -956,27 +1022,53 @@ impl Render2D {
         }
 
         // ── 清理失效 bind group 缓存 ──
-        // 用户调用 `TEXTURES.remove(uid)` 后，缓存条目在此剔除，
+        // 用户调用 `meshes/textures.remove(uid)` 后，缓存条目在此剔除，
         // 其持有的 Arc<Texture> 与 BindGroup 一并 drop，GPU 资源正确释放。
         if !self.tex_bind_group_cache.is_empty() {
             self.tex_bind_group_cache
-                .retain(|&(tex_uid, _), _| TEXTURES.contains_uid(tex_uid));
+                .retain(|&(tex_uid, _), _| self.textures.contains_uid(tex_uid));
         }
     }
 
     /// 采样器位域取出（RStates bits 8..24，与 rstates.rs 的采样器域一致）。
     const SAMPLER_KEY_MASK: u64 = 0xFF_FF00;
 
-    /// 解析纹理 uid → `Arc<TextureWrapped>`（`None` 使用白纹理），并确保该纹理在注册表中。
+    /// 解析**本上下文**注册表里的静态网格。
+    ///
+    /// 返回 `None` 表示该 uid 不在本上下文的网格注册表里（未注册 / 已被 `remove` /
+    /// 属于另一个 `RenderContext`）。调用方**跳过该命令并告警**，而不是在 pass 中途
+    /// panic —— `prepare` 已经容忍移除（见上方 bind group 缓存清理），两半行为对齐。
+    #[inline]
+    fn resolve_mesh(&self, mesh_id: u64) -> Option<Arc<MeshData>> {
+        let mesh = self.meshes.get(mesh_id);
+        if mesh.is_none() {
+            log::warn!(
+                "Render2D: 网格 uid {mesh_id} 不在本上下文注册表中，跳过该绘制命令\
+                 （未注册 / 已被 remove / 属于另一个 RenderContext）"
+            );
+        }
+        mesh
+    }
+
+    /// 解析纹理 uid → `Arc<TextureWrapped>`（`None` 使用白纹理）。
+    ///
+    /// 解析不到时**告警并回退到白纹理**（而非 panic）：与 `resolve_mesh` 同一策略，
+    /// 使「纹理被注销后仍被绘制」不再在 pass 中途崩溃。
     fn resolve_tex(&self, tex_uid: Option<u64>) -> ArcTextureWrapped {
         match tex_uid {
-            Some(uid) => TEXTURES.get(uid).expect("tex not found in TEXTURES"),
+            Some(uid) => self.textures.get(uid).unwrap_or_else(|| {
+                log::warn!(
+                    "Render2D: 纹理 uid {uid} 不在本上下文注册表中，回退白纹理\
+                     （未注册 / 已被 remove / 属于另一个 RenderContext）"
+                );
+                self.white_texture.clone()
+            }),
             None => self.white_texture.clone(),
         }
     }
 
     /// 绑定 group(1) 纹理 bind group（纹理 + 采样器缓存复用）。
-    /// bind group 缓存持有 `Arc<Texture>` —— 纹理被 `TEXTURES.remove` 后由 prepare 末尾清理，资源正确释放。
+    /// bind group 缓存持有 `Arc<Texture>` —— 纹理被 `textures.remove` 后由 prepare 末尾清理，资源正确释放。
     fn bind_tex_group(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -1069,8 +1161,9 @@ impl Render2D {
                         *tex_uid,
                     );
                     let count = instance_range.end - instance_range.start;
-                    if count != 0 {
-                        let mesh = MESHES.get(mesh_id).expect("mesh not registered");
+                    if count != 0
+                        && let Some(mesh) = self.resolve_mesh(mesh_id)
+                    {
                         let pipeline = self.draw_page.get_or_create_pipeline(
                             &self.device,
                             rstates,

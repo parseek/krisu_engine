@@ -4,13 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::Vec2;
-use rjw_2d_render::VertexP3U2C4;
 use rjw_text::Buffer;
 use rjw_transform::Rect;
 
 use crate::focus::FocusKind;
 use crate::id::IdAbsolute;
-use crate::proc::ProcTextures;
 
 /// 控件文本 `Arc<Buffer>` 缓存容量上限：超出时按"本帧未使用"驱逐（帧级近似 LRU），
 /// **不再整表清空**——高帧率动态文本（FPS 计数、日志、自动刷新的标签）不会把
@@ -156,7 +154,7 @@ pub struct UiState {
     /// 若只看当前帧候选会误判为"非组合"而执行本地退格（误删已有文本）。
     /// 组合中或刚结束的帧，退格/删除/方向键一律交给 IME 系统处理。
     pub(crate) ime_composing: bool,
-    /// **窗口四边形缓存**：窗口 **绝对 ID** → (内容签名, 按 **(元素序, 组, 纹理)** 分组的**局部顶点**)。
+    /// **窗口几何缓存**：窗口 **绝对 ID** → (内容签名, 按 **(元素序, 组, 纹理)** 分组的**局部几何**)。
     /// 组：`0` = 图形（白纹理 / 圆角 / 渐变 / 边框）、`1` = 文字（字形图集）。
     /// 窗口内容不变时复用（`finish` 按**全量签名**命中），**移动窗口只改变换、顶点不重建**；
     /// 任何内容变化（hover 变色、点击按下、文字编辑、滚动等）都会使签名变化而自动重建。
@@ -164,13 +162,19 @@ pub struct UiState {
     /// ⚠ 签名必须是**逐命令全量哈希**（含颜色 / 边框宽 / 圆角 / 对齐 / 光标 / 选择）——
     /// 轻量摘要曾漏掉颜色位，hover/click 变色被误判"内容未变" → 复用陈旧顶点，
     /// 窗口内交互效果不刷新（下拉框 / 背包 / 窗口按钮失效）。
-    pub(crate) window_quads: HashMap<IdAbsolute<'static>, (u64, Vec<(u32, u8, u64, Vec<VertexP3U2C4>)>)>,
-    /// **非窗口（win=0）内容的按放置子槽顶点缓存**：放置子槽组号 → (内容签名, 局部顶点)。
+    pub(crate) window_quads:
+        HashMap<IdAbsolute<'static>, (u64, Vec<(u32, u8, u64, crate::gpu_batch::Geom)>)>,
+    /// **非窗口（win=0）内容的按放置子槽几何缓存**：放置子槽组号 → (内容签名, 局部几何)。
     /// 分组与缓存机制同 `window_quads`（**全量签名** → 命中复用 / 未命中重建），但针对
     /// **顶层非窗口放置**（pack / flex / scroll / list / drag_panel / container 等，
     /// 分组见 [`crate::ui::Ui::z0_ranges`]）。值/交互变化只重建对应子槽，其余 win=0
     /// 放置仍命中复用（缓解"任何 win=0 变化 → 整区重建"）。
-    pub(crate) z0_quads: HashMap<u32, (u64, Vec<(u32, u8, u64, Vec<VertexP3U2C4>)>)>,
+    pub(crate) z0_quads: HashMap<u32, (u64, Vec<(u32, u8, u64, crate::gpu_batch::Geom)>)>,
+    /// **圆角镶嵌缓存**：单位四分之一圆弧表（一张表服务所有半径）。
+    ///
+    /// 住这里而不是 `Ui`：`Ui` 每帧由 `begin` 重建，放它里面等于每帧重建表。
+    /// 缓存只有一张表 ⇒ 不需 LRU、不需容量上限、不需版本号。
+    pub(crate) tess: crate::tess::TessCache,
     /// **诊断**：本帧**命中但被更高窗口遮挡而未响应**的控件次数
     /// （点击穿透拦截计数；`Ui::hit_abs` 累加，`begin_frame` 清零）。
     pub(crate) occluded_hits: u32,
@@ -182,8 +186,6 @@ pub struct UiState {
     /// Ui 每帧由 egin 重建，帧内诊断（Ui::debug_dump）常在本帧**录制期**调用，
     /// 故放在跨帧状态里；与 win_origins 对照即可判定"引擎状态 vs 视觉"是否一致。
     pub(crate) debug_submit: HashMap<u32, Vec2>,
-    /// **程序化纹理缓存**（圆角矩形 / 渐变 / WHITE）：塞进动态 Atlas，跨帧复用。
-    pub(crate) proc: ProcTextures,
     /// **滚动容器状态**：`scroll_at` 的 **绝对 ID** → (偏移, 内容高)，跨帧持久。
     pub(crate) scrolls: HashMap<IdAbsolute<'static>, ScrollState>,
     /// **下拉框展开状态**：当前展开的 `combo` 的 **绝对 ID**（`None` = 全部收起）。

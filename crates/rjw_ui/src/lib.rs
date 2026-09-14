@@ -27,9 +27,14 @@
 //!   示例 `eg260818UI` 右上角有实时诊断面板。
 //! - **渲染增强（圆角 / 渐变）**：`Theme` 子样式的 `radius`（面板 / 窗口 / 按钮 /
 //!   输入框，逻辑像素，0 = 直角）与绘制原语 [`Ui::rounded_rect_at`] /
-//!   [`Ui::gradient_rect_at`]——程序化纹理（圆角 9-patch / 渐变 / WHITE）**塞进动态
-//!   Atlas**（[`ProcTextures`] → `UiState` 持有），圆角纹理只存白色 + alpha（颜色顶点色
-//!   tint），提交分组升级为 `(win, 图形/文字组, 纹理)` 保证"先图形后文字"。
+//!   [`Ui::gradient_rect_at`]。**两者都不需要纹理，也不需要改着色器**：
+//!   渐变把四角颜色放进顶点色，由光栅化器双线性插值（`pure` / `vertical` /
+//!   `horizontal` / `rotated` / `corners`）；圆角由 CPU **镶嵌**成三角形
+//!   （`tess` 模块：单位四分之一圆弧表 + 步长抽样 + 1 物理像素羽化带，
+//!   硬体 `alpha = 1`、外环 `alpha = 0`，靠插值得到抗锯齿边缘）。四角可同色亦可各异
+//!   ⇒ 「圆角 + 渐变」自然成立。图形与文字同页同纹理时仍合批。
+//! - **提交粒度**：一个批次 = 一个实例 = `(窗口 × 纹理)`，顶点 + 索引直出三角形；
+//!   提交分组 `(win, 图形/文字组, 纹理)` 保证"先图形后文字"。
 //! - **窗口级合批 + 窗口级 FX**：`finish` 提交按窗口聚合（每窗口每纹理合并成整段、
 //!   一次 `draw_indexed`，命中 Render2D 的 QuadVertices 合批；不同纹理/状态/超顶点上限
 //!   自动切段，**尽力而为**）。[`Ui::window_fx`]（[`WindowFx`]：tint + transform override）
@@ -79,8 +84,9 @@
 //!
 //! ```no_run
 //! # let viewport = todo!(); let mouse = todo!(); let keyboard = todo!();
-//! # let text = todo!(); let r2d = todo!(); let state = todo!(); let window = todo!();
-//! use rjw_ui::{PackSide, Theme, Ui, UiAdd};
+//! # let text = todo!(); let state = todo!(); let window = todo!();
+//! use rjw_ui::{PackSide, RecordingBackend, Theme, Ui, UiAdd};
+//! # let mut backend = RecordingBackend::default();   // 真实项目用 `rjw_krusie` 的桥接后端
 //! let mut ui = Ui::begin(&window, &mut text, &mut state)
 //!     .capture(&mouse, &keyboard)
 //!     .theme(Theme::dark())
@@ -102,7 +108,7 @@
 //!     g.button("slot_1", "B");
 //!     g.button("slot_2", "C");
 //! });
-//! ui.finish(&mut r2d);
+//! ui.finish(&mut backend);
 //! ```
 //!
 //! # 模块
@@ -126,21 +132,25 @@
 // 入口）不受影响：那部分的参数已按 R1（≤2 参数）+ 枚举状态糖收敛。
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod backend;
 pub mod draw;
 pub mod edit;
 pub mod focus;
+pub(crate) mod gpu_batch;
 pub mod id;
 pub mod hit;
 pub mod input;
 pub mod layout;
-pub mod proc;
 pub mod state;
 pub mod style;
+pub(crate) mod tess;
 pub mod ui;
 pub mod view;
 pub mod widgets;
+pub(crate) mod ui_types;
 
-pub use draw::{GradientAxis, Metric, Position, Size, TextAlign};
+pub use backend::{RecordingBackend, Tri, UiBackend, UiBatch, UiBatchSource};
+pub use draw::{lerp_color, Gradient, Metric, Position, Size, TextAlign};
 pub use focus::FocusKind;
 pub use id::{IdAbsolute, IdRelative, IdStack};
 pub use hit::{hit_test, InteractEvents};
@@ -151,3 +161,37 @@ pub use input::{KeyboardSnapshot, MouseSnapshot};
 pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Placement, Resize, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
 pub use view::{ViewCtx, ViewMode};
 pub use widgets::{Button, Checkbox, Divider, FontModal, Label, NumberInput, Response, Slider, Widget, WidgetId};
+
+/// **UI 文本模块**（公开）：`rjw_ui` 里与文字渲染相关的全部公开面。
+///
+/// 供两类场景：
+/// 1. **自定义控件 / 自定义容器**——需要自己测文字、摆文字、画裁剪文本、
+///    取共享排版缓冲（避免每帧重复整形）；
+/// 2. **自己实现 `UiBackend` 或另建 UI 层**——需要 `TextAlign` / `TextVAlign` /
+///    `text_block_offset` 来复现同样的文本块对齐语义。
+///
+/// 这里的条目都是**重导出**（定义仍在 `draw` / `edit` / `ui` 模块），
+/// 因此 `rjw_ui::draw::TextAlign` 与 `rjw_ui::text::TextAlign` 是同一个类型。
+///
+/// 文字**形状与字形图集**在 `rjw_text`：`Text::{label, measure_buffer, lines,
+/// white_region, user_texture, glyph_cache, glyph_cache_mut}`。
+pub mod text {
+    // ── 对齐与文本块定位（定义在 `draw`）──
+    pub use crate::draw::{
+        TextAlign, TextVAlign, text_block_offset, text_cmd,
+    };
+
+    // ── 纯逻辑文本编辑 / 测量辅助（定义在 `edit`；无 UI 状态依赖，可独立单测）──
+    pub use crate::edit::{
+        byte_to_char, caret_at_visual_click, caret_index_by_width, char_to_byte, delete_range,
+        ellipsize, extend_word_caret, index_of_line_col, insert_str_at, line_col_of,
+        move_caret_line, scroll_follow_caret, sel_range, selected_text, vline_of_byte, word_range,
+    };
+
+    // ── 逐字形 / 逐行文本图元与测量（`rjw_text` 的形状层）──
+    // 文字渐变（多段 stops 的能力在这里——矩形渐变 `crate::Gradient` 不支持多段）
+    pub use rjw_text::Gradient as TextGradient;
+    pub use rjw_text::{
+        Align, GradientAxis, LineSpace, TextBuffer, TextStyle, VisualLine,
+    };
+}

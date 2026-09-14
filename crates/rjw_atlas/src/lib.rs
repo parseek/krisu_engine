@@ -7,7 +7,7 @@
 //! - `DynamicAtlas` / `StaticAtlas` 均实现 `Index` / `IndexMut`：`atlas[&key]` 直接读写区域。
 //! - `AtlasRegion`：图集内精灵坐标（像素左上角 + 尺寸 + 原点偏移 + 页 uid）。
 //!
-//! 依赖全局纹理注册表 `rjw_render::TEXTURES`（DashMap），完全解耦 `rjw_2d_render`。
+//! 依赖所属 [`Gpu`] 的**纹理注册表**（每 `RenderContext` 一份，非全局），但完全解耦 `rjw_2d_render`。
 
 use std::{
     borrow::Borrow,
@@ -17,7 +17,9 @@ use std::{
     sync::Arc,
 };
 
-use rjw_render::{ArcTextureWrapped, Gpu, Rgba8, TextureWrapped, TEXTURES};
+use rjw_render::{
+    ArcTextureWrapped, Gpu, Rgba8, TextureRegistry, TextureWrapped,
+};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -319,7 +321,7 @@ struct AtlasPage {
 }
 
 impl AtlasPage {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, _layout: &wgpu::BindGroupLayout, page_size: u32) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, _layout: &wgpu::BindGroupLayout, page_size: u32, registry: &TextureRegistry) -> Self {
         let size = (page_size * page_size * 4) as usize;
         let clear = vec![0u8; size];
         let label = if cfg!(debug_assertions) { 
@@ -331,7 +333,7 @@ impl AtlasPage {
             format!("DynamicAtlas page {}x{}", page_size, page_size) 
         };
         let tex = Arc::new(TextureWrapped::from_rgba8(device, queue, &label, &clear, page_size, page_size));
-        TEXTURES.register(tex.clone());
+        registry.register(tex.clone());
         Self { texture: tex, allocator: Guillotine::new(page_size) }
     }
 }
@@ -398,6 +400,11 @@ pub struct DynamicAtlas<K = String> {
     device: wgpu::Device,
     queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
+    /// **页纹理注册表**（来自 `Gpu`，每 `RenderContext` 一份）。
+    ///
+    /// 图集新建页时把页纹理注册进这里，绘制期由渲染器经同一注册表按 `page_uid` 解析。
+    /// 不再是进程级全局表 ⇒ 图集与它服务的渲染器共享同一套纹理空间。
+    textures: Arc<TextureRegistry>,
     /// region_id 分配器。
     next_region_id: u64,
     /// region_id → 键（`resolve_by_id` / `acquire_by_id` 用）。
@@ -421,27 +428,10 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         let device = gpu.device().clone();
         let queue = gpu.queue().clone();
         let layout = gpu.texture_layout().clone();
+        let textures = gpu.texture_registry().clone();
         let page_size = config.page_size;
-        let page = AtlasPage::new(&device, &queue, &layout, page_size);
-        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout, next_region_id: 1, by_id: HashMap::new(), white: None, white_alloc: None }
-    }
-
-    /// **低层构造**（逃生口）：已有 `device` / `queue` / 纹理 layout 时用。
-    ///
-    /// 等价于 [`Self::new`]，但绕过 `Gpu`。给尚未迁移到 `&Gpu` 的内部消费者使用
-    /// （当前是 `rjw_ui::ProcTextures`；P3 收敛后会删除本入口）。
-    pub fn from_raw(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        layout: &wgpu::BindGroupLayout,
-        config: AtlasConfig,
-    ) -> Self {
-        let device = device.clone();
-        let queue = queue.clone();
-        let layout = layout.clone();
-        let page_size = config.page_size;
-        let page = AtlasPage::new(&device, &queue, &layout, page_size);
-        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout, next_region_id: 1, by_id: HashMap::new(), white: None, white_alloc: None }
+        let page = AtlasPage::new(&device, &queue, &layout, page_size, &textures);
+        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout, textures, next_region_id: 1, by_id: HashMap::new(), white: None, white_alloc: None }
     }
 
     /// 便捷插入：`insert(key, Rgba8::new(&rgba, (w, h)))`（默认 clamp_margin、非常驻、原点 0）。
@@ -504,7 +494,7 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
             match self.try_alloc(alloc_w, alloc_h, padding) {
                 Some(res) => break res,
                 None if self.pages.len() < self.config.max_pages => {
-                    self.pages.push(AtlasPage::new(&self.device, &self.queue, &self.layout, self.page_size));
+                    self.pages.push(AtlasPage::new(&self.device, &self.queue, &self.layout, self.page_size, &self.textures));
                 }
                 None => unreachable!("1×1 white should always fit"),
             }
@@ -558,7 +548,7 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
     /// ```
     pub fn sprite(&self, handle: &RegionRef) -> Option<AtlasSprite> {
         let region = self.resolve_by_id(handle.region_id())?;
-        let texture = TEXTURES.get(region.page_uid)?;
+        let texture = self.textures.get(region.page_uid)?;
         Some(AtlasSprite { region, texture })
     }
 
@@ -612,7 +602,7 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
             match self.try_alloc(alloc_w, alloc_h, padding) {
                 Some(res) => break res,
                 None if self.pages.len() < self.config.max_pages => {
-                    self.pages.push(AtlasPage::new(&self.device, &self.queue, &self.layout, self.page_size));
+                    self.pages.push(AtlasPage::new(&self.device, &self.queue, &self.layout, self.page_size, &self.textures));
                 }
                 _ => return None,
             }
@@ -768,7 +758,7 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         }
 
         while self.pages.len() < allocators.len() {
-            self.pages.push(AtlasPage::new(&self.device, &self.queue, &self.layout, self.page_size));
+            self.pages.push(AtlasPage::new(&self.device, &self.queue, &self.layout, self.page_size, &self.textures));
         }
         for (it, (pi, x, y)) in items.into_iter().zip(slots) {
             let page = &self.pages[pi];
@@ -804,7 +794,12 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
             e.alloc_wh = (it.alloc_w + padding * 2, it.alloc_h + padding * 2);
             e.lifetime = it.lifetime;
         }
-        self.pages.truncate(allocators.len());
+        // 重排后不再需要的尾页：从**纹理注册表**注销，否则页纹理会永久驻留
+        // （旧实现写全局 `TEXTURES` 且从不 `remove` ⇒ 每次重排泄漏 GPU 显存）。
+        while self.pages.len() > allocators.len() {
+            let discarded = self.pages.pop().expect("len > allocators.len()");
+            self.textures.remove(discarded.texture.uid);
+        }
         for (page, sky) in self.pages.iter_mut().zip(allocators) {
             page.allocator = sky;
         }
@@ -894,19 +889,19 @@ fn crop_rgba(full: &[u8], tex_w: usize, x: usize, y: usize, w: usize, h: usize) 
     out
 }
 
-#[derive(Debug)]
+/// 动态图集 TOML 批量导入的错误。
+#[derive(Debug, thiserror::Error)]
 pub enum AtlasLoadError {
-    Toml(toml::de::Error),
+    /// TOML 解析失败。
+    #[error("TOML parse error: {0}")]
+    Toml(#[from] toml::de::Error),
+    /// `rgba_provider` 找不到条目引用的源纹理。
+    #[error("source texture '{0}' not found in provider")]
     TexNotFound(String),
+    /// 图集页耗尽（`max_pages` 已满且无法腾出空间）。
+    #[error("atlas is full")]
     AtlasFull,
 }
-
-impl std::fmt::Display for AtlasLoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::Toml(e) => write!(f, "TOML parse error: {e}"), Self::TexNotFound(s) => write!(f, "source texture '{s}' not found in provider"), Self::AtlasFull => write!(f, "atlas is full") }
-    }
-}
-impl std::error::Error for AtlasLoadError {}
 
 #[derive(Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
@@ -973,12 +968,16 @@ impl<K: Hash + Eq> StaticAtlas<K> {
 
 // String 特化：TOML 导入/导出（serde feature），向后兼容。
 impl StaticAtlas<String> {
+    /// 从 TOML 导入；`tex` 字段按**名称**在本上下文的纹理注册表里解析成 uid。
+    ///
+    /// 注册表由调用方传入（而不是进程级全局表）——因为纹理空间现在是每个
+    /// `RenderContext` 私有的：`atlas.from_toml(toml, gfx.textures())`。
     #[cfg(feature = "serde")]
-    pub fn from_toml(toml_str: &str) -> Result<Self, StaticAtlasError> {
+    pub fn from_toml(toml_str: &str, registry: &TextureRegistry) -> Result<Self, StaticAtlasError> {
         let data: SpriteAtlasToml = toml::from_str(toml_str)?;
         let mut regions = HashMap::new();
         for (name, entry) in &data.entries {
-            let uid = TEXTURES.uid_by_name(&entry.tex).ok_or_else(|| StaticAtlasError::TexNotFound(entry.tex.clone()))?;
+            let uid = registry.uid_by_name(&entry.tex).ok_or_else(|| StaticAtlasError::TexNotFound(entry.tex.clone()))?;
             regions.insert(name.clone(), AtlasRegion { tl_px: (entry.lt[0], entry.lt[1]), wh_px: (entry.wh[0], entry.wh[1]), origin_px: (entry.or[0], entry.or[1]), page_uid: uid });
         }
         Ok(Self { regions })
@@ -1014,16 +1013,16 @@ where
     }
 }
 
-#[derive(Debug)]
-pub enum StaticAtlasError { Toml(toml::de::Error), TexNotFound(String) }
-
-impl From<toml::de::Error> for StaticAtlasError { fn from(e: toml::de::Error) -> Self { Self::Toml(e) } }
-impl std::fmt::Display for StaticAtlasError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::Toml(e) => write!(f, "TOML: {e}"), Self::TexNotFound(s) => write!(f, "tex '{s}' not found") }
-    }
+/// `StaticAtlas::from_toml` 的错误。
+#[derive(Debug, thiserror::Error)]
+pub enum StaticAtlasError {
+    /// TOML 解析失败。
+    #[error("TOML: {0}")]
+    Toml(#[from] toml::de::Error),
+    /// `tex` 字段引用的纹理名不在本上下文的纹理注册表里。
+    #[error("tex '{0}' not found")]
+    TexNotFound(String),
 }
-impl std::error::Error for StaticAtlasError {}
 
 // ─── clamp margin ──────────────────────────────────────────────
 

@@ -3,7 +3,7 @@
 //! 用法（见 crate 文档与示例）：
 //! ```no_run
 //! # let viewport = todo!(); let mouse = todo!(); let keyboard = todo!();
-//! # let text = todo!(); let r2d = todo!(); let state = todo!(); let window = todo!();
+//! # let text = todo!(); let mut backend = rjw_ui::RecordingBackend::default(); let state = todo!(); let window = todo!();
 //! use rjw_ui::{Theme, Ui};
 //! let mut ui = Ui::begin(&window, &mut text, &mut state)
 //!     .capture(&mouse, &keyboard)
@@ -11,7 +11,7 @@
 //!     .base_layer(1e7)
 //!     .build();
 //! ui.label_at(glam::Vec2::new(20.0, 20.0), "Hello UI");
-//! ui.finish(&mut r2d);
+//! ui.finish(&mut backend);
 //! ```
 //!
 //! 坐标语义：所有位置为**屏幕逻辑像素**（左上角原点，Y+ 向下）；容器内 `*_at` 的 `pos`
@@ -22,21 +22,25 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::Vec2;
-use rjw_2d_render::{Layer, Render2D, VertexP3U2C4};
 use rjw_color::Color;
 use rjw_keyboard::{KeyCode, KeyboardInput};
 use rjw_keystate::KeyState;
 use rjw_mouse::{MouseButton, MouseInput};
-use rjw_render::TEXTURES;
 use rjw_text::{Align, Buffer, CachePolicy, Text, TextStyle, VisualLine};
 use rjw_transform::{Rect, Transform2D};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window as WinitWindow;
 
+use crate::backend::{UiBackend, UiBatch, UiBatchSource};
 use crate::draw::{
     border_rects, clipped, debug_shape_segments, intersect_rect, screen_fixed_tf, snap_rect,
-    text_block_offset, text_cmd, DebugShape, DrawKind, GradientAxis, Position, Size, TextAlign,
+    text_block_offset, text_cmd, DebugShape, DrawKind, Gradient, Position, Size, TextAlign,
     TextVAlign, UiDraw,
+};
+// 顶点收集 / 合批机制（原在此文件，见 `gpu_batch` 模块文档）。
+use crate::gpu_batch::{
+    CacheStats, CachedQuad, Geom, QuadCollector, cmd_sig_hash, debug_layout_outline, line_row_at_y,
+    resample_gradient, safe_line_slice, segment_runs, vertex_p3u2c4,
 };
 use crate::edit::{
     byte_to_char, caret_at_visual_click, caret_index_by_width, char_to_byte, insert_char_at,
@@ -94,88 +98,18 @@ pub(crate) const WIN_TOPMOST: u32 = u32::MAX;
 
 /// 文本缓冲区行高版本号。当行高计算方式变更时递增，使旧缓存失效。
 /// 版本 1：行高 = 字号（原为 1.2 倍字号，导致英文字母在文本框内偏上）。
-const TEXT_LINE_HEIGHT_VERSION: u8 = 1;
+///
+/// `pub(crate)`：内容签名哈希（`gpu_batch::cmd_sig_hash`）必须把它算进签名，
+/// 否则改行高策略后窗口顶点缓存不会失效。
+pub(crate) const TEXT_LINE_HEIGHT_VERSION: u8 = 1;
 
-// ─── Ui ─────────────────────────────────────────────────────────
-
-/// 视口锚点（[`Ui::anchor_pos`]）：内容在视口（窗口客户区）内的停靠位置。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Anchor {
-    TopLeft,
-    TopCenter,
-    TopRight,
-    CenterLeft,
-    Center,
-    CenterRight,
-    BottomLeft,
-    BottomCenter,
-    BottomRight,
-}
-
-/// **窗口位置约束模式**（[`WindowBuilder::clamp`] / [`Ui::window`] 责任链传入；
-/// 默认 [`WindowClamp::Screen`]）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WindowClamp {
-    /// **限制在画面内**（默认）：窗口**整体**不跑出屏幕——拖拽 / 脚本定位后的位置被
-    /// clamp 到窗口客户区内；窗口比画面大时仍可拖动（左上角允许到 `负 = 屏幕-尺寸`，
-    /// 窗口始终覆盖画面，不会钉死）。
-    Screen,
-    /// **完全自由**：窗口可拖出屏幕（不做限位）。
-    Free,
-    /// **锁定**：位置固定（用户拖拽无效；脚本 / 传入位置仍生效，点击置顶仍有效）。
-    Locked,
-}
-
-/// **窗口整窗口特效**（[`Ui::window_fx`]）：整窗口混合色 + 叠加变换。
-/// 每帧可改；窗口顶点缓存不变，仅提交时应用实例矩阵/颜色。
-#[derive(Clone, Copy, Debug)]
-pub struct WindowFx {
-    /// 整窗口混合色（默认白 = 不染色；用于淡入淡出 / 整窗染色）。
-    pub tint: Color,
-    /// 叠加变换（基础屏幕固定 × 此变换；默认 `None`；用于位移/缩放/旋转动画）。
-    pub transform: Option<Transform2D>,
-    /// **归一化变换锚点**（`x, y ∈ [0.0, 1.0]`，相对窗口内容区；`(0.5, 0.5)` =
-    /// 窗口中心）。变换绕该锚点进行（位移/旋转/缩放以锚点为基准）。
-    /// **无论锚点何值，`transform = IDENTITY` 时位置恒为窗口原位置**。
-    pub anchor: Vec2,
-}
-
-impl Default for WindowFx {
-    fn default() -> Self {
-        Self { tint: Color::WHITE, transform: None, anchor: Vec2::ZERO }
-    }
-}
-
-/// 系统光标（控件作者经 [`Ui::set_cursor`] 设置；`finish` 统一应用，优先级低于
-/// 内置拖拽抓握）。窗体悬停/拖动保持 [`UiCursor::Default`]（Arrow）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UiCursor {
-    /// 默认箭头（窗体悬停 / 拖动）。
-    Default,
-    /// 文本输入 I 型（内置：输入框悬停）。
-    Text,
-    /// 可拖拽悬停（张手；内置：滚动条 thumb）。
-    Grab,
-    /// 正在拖拽（抓握；内置：滚动条拖拽中）。
-    Grabbing,
-    /// 水平双向箭头（↔；滑块 / 拖拽调值手柄 / 窗口宽度缩放柄）。
-    EwResize,
-    /// 对角线双向箭头（↖↘；可调整大小的 TextArea 右下角缩放柄）。
-    NwseResize,
-}
-
-impl UiCursor {
-    pub(crate) fn to_winit(self) -> winit::window::CursorIcon {
-        match self {
-            UiCursor::Default => winit::window::CursorIcon::Default,
-            UiCursor::Text => winit::window::CursorIcon::Text,
-            UiCursor::Grab => winit::window::CursorIcon::Grab,
-            UiCursor::Grabbing => winit::window::CursorIcon::Grabbing,
-            UiCursor::EwResize => winit::window::CursorIcon::EwResize,
-            UiCursor::NwseResize => winit::window::CursorIcon::NwseResize,
-        }
-    }
-}
+// ─── Ui 门面类型（Anchor / WindowClamp / WindowFx / UiCursor / Level /
+//     Placement / Resize / WindowOptions / PanelOptions）已拆到 `crate::ui_types`，
+//     在此重导出以保持 `crate::ui::X` 路径不变。 ─────────────────────
+pub use crate::ui_types::{
+    Anchor, Level, PanelOptions, Placement, Resize, UiCursor, WindowClamp, WindowFx,
+    WindowOptions,
+};
 
 /// `Ui::begin` 返回的构建器：捕获输入快照 / 设置主题 / 基层层级 / scale_factor /
 /// 调试开关后 `build()`。
@@ -942,8 +876,11 @@ impl<'a> Ui<'a> {
         });
     }
 
-    /// **圆角矩形**（背景填充原语；绝对定位，`radius` 带单位，9-patch 绘制——
-    /// 程序化纹理进动态 Atlas，颜色顶点色 tint）。
+    /// **圆角矩形**（背景填充原语；绝对定位，`radius` 带单位）。
+    ///
+    /// **无纹理、无着色器改动**：CPU 把矩形镶嵌成三角形（硬体 + 1 物理像素羽化带，
+    /// 见 `crate::tess`）。半径接受任意值（含小数），超出半高时 clamp 成胶囊；
+    /// `radius <= 0` 退化成普通四边形（仍带 4 个顶点以便统一走索引路径）。
     pub fn rounded_rect_at(
         &mut self,
         pos: impl Into<Position>,
@@ -960,19 +897,43 @@ impl<'a> Ui<'a> {
         );
     }
 
-    /// **线性渐变矩形**（背景填充原语；绝对定位，`stops` 沿 `axis`——
-    /// 程序化渐变纹理进动态 Atlas，按主轴拉伸采样）。
+    /// **矩形渐变**（绝对定位；背景填充原语）。
+    ///
+    /// `gradient` 接受 [`Gradient`] 或 `Color`（`Color: Into<Gradient>`，等价纯色）：
+    ///
+    /// ```ignore
+    /// ui.gradient_rect_at(pos, size, Color::RED);                                  // 纯色
+    /// ui.gradient_rect_at(pos, size, Gradient::vertical(Color::RED, Color::BLUE)); // 上下
+    /// ui.gradient_rect_at(pos, size, Gradient::horizontal(a, b));                  // 左右
+    /// ui.gradient_rect_at(pos, size, Gradient::rotated(a, b, 0.5));                // 任意角
+    /// ui.gradient_rect_at(pos, size, Gradient::corners(tl, tr, bl, br));           // 四角
+    /// ```
+    ///
+    /// **无纹理**：四角颜色经顶点色由光栅化器双线性插值（详见 [`Gradient`]）。
     pub fn gradient_rect_at(
         &mut self,
         pos: impl Into<Position>,
         size: impl Into<Size<Vec2>>,
-        axis: GradientAxis,
-        stops: Vec<(f32, Color)>,
+        gradient: impl Into<Gradient>,
     ) {
         let pos = pos.into().to_physical(self.scale);
         let size = size.into().to_physical(self.scale);
         self.push_draw(
-            DrawKind::Gradient { axis, stops },
+            DrawKind::Rect(gradient.into()),
+            Rect::new(pos.x, pos.y, size.x, size.y),
+        );
+    }
+
+    /// **矩形渐变**（随布局流排布；与 [`Self::gradient_rect_at`] 同语义，位置来自当前容器游标）。
+    pub fn gradient_rect(
+        &mut self,
+        size: impl Into<Size<Vec2>>,
+        gradient: impl Into<Gradient>,
+    ) {
+        let size = size.into().to_physical(self.scale);
+        let pos = self.child_rect(size.x, size.y, Child::Expand).min();
+        self.push_draw(
+            DrawKind::Rect(gradient.into()),
             Rect::new(pos.x, pos.y, size.x, size.y),
         );
     }
@@ -1955,7 +1916,7 @@ impl<'a> Ui<'a> {
     /// 示例（HUD 自动左右摆动，但用户仍可拖动——`-10 < 0` 拖拽优先）：
     /// ```no_run
     /// # let viewport = todo!(); let mouse = todo!(); let keyboard = todo!();
-    /// # let text = todo!(); let r2d = todo!(); let state = todo!(); let window = todo!();
+    /// # let text = todo!(); let mut backend = rjw_ui::RecordingBackend::default(); let state = todo!(); let window = todo!();
     /// use rjw_ui::{Theme, Ui, UiAdd};
     /// let mut ui = Ui::begin(&window, &mut text, &mut state)
     ///     .capture(&mouse, &keyboard)
@@ -1971,7 +1932,7 @@ impl<'a> Ui<'a> {
     ///     }
     /// });
     /// ui.window("hud").pos(glam::Vec2::new(400.0, 40.0)).show(|w| { w.label("HUD"); });
-    /// ui.finish(&mut r2d);
+    /// ui.finish(&mut backend);
     /// ```
     pub fn pos_handler(&mut self, priority: i32, f: impl Fn(&str) -> Option<Vec2> + 'static) {
         self.pos_chain.push((priority, PosLink::Script(Box::new(f))));
@@ -2692,7 +2653,7 @@ impl<'a> Ui<'a> {
     /// 录制阶段可完全独立于绘制资源；`viewport`（屏幕矩形，见 [`rjw_transform::Rect`]）
     /// 提供屏幕固定变换，`r2d` 接收四边形。UI 不需要相机（恒为 identity：不旋转/缩放），
     /// 仅需视口矩形。
-    pub fn finish(&mut self, r2d: &mut Render2D) {
+    pub fn finish(&mut self, backend: &mut dyn UiBackend) {
         let t_finish = Instant::now();
         // ── `finish` 流水线（已拆分为内聚子函数，职责见各自文档注释） ──────
         // 1. 帧末输入结算：空白清焦点 / 清一次性边沿 / 窗口按下裁决 / 键盘导航
@@ -2716,11 +2677,11 @@ impl<'a> Ui<'a> {
         let queue = std::mem::take(&mut self.queue);
         // **WHITE 基础纹理优先取字形图集页**（`Text::white_region`，1×1 clamp_margin）：
         // 实心填充（Solid / 边框 / 光标）与字形**同页同纹理** → 同窗口内"图形组 → 文字组"
-        // 相邻且同纹理，Render2D 合批为单个 draw call，省去图形↔文字的纹理状态切换。
-        // 兜底：渲染器自带白纹理（整纹理 UV）。
+        // 相邻且同纹理，后端的连续段合批合成单次 draw call，省去图形↔文字的纹理状态切换。
+        // 兜底：`rjw_text` 不可用时用当前帧第一个命令引用的纹理（整纹理 UV）。
         let (white_uid, white_uv_tl, white_uv_wh) = match self.text.white_region() {
             Some(r) => {
-                let inv = match TEXTURES.get(r.page_uid) {
+                let inv = match backend.texture(r.page_uid) {
                     Some(t) => 1.0 / t.width as f32,
                     None => 1.0,
                 };
@@ -2728,10 +2689,7 @@ impl<'a> Ui<'a> {
                 let wh = Vec2::new(r.wh_px.0 as f32, r.wh_px.1 as f32) * inv;
                 (r.page_uid, tl, wh)
             }
-            None => {
-                let uid = r2d.white_texture().uid;
-                (uid, Vec2::ZERO, Vec2::ONE)
-            }
+            None => (0, Vec2::ZERO, Vec2::ONE),
         };
         // 按窗口分组 + 组内 depth 分桶（桶内保持录制序）：非窗口（win=0）每帧重建；
         // 窗口按**内容签名**缓存局部顶点，内容不变时复用（移动窗口只改变换，顶点不重建）。
@@ -2750,7 +2708,6 @@ impl<'a> Ui<'a> {
         self.cache_all_windows(
             &mut groups,
             &wins,
-            r2d,
             &mut quads,
             &mut cached,
             white_uid,
@@ -2777,12 +2734,12 @@ impl<'a> Ui<'a> {
         // ── 提交：**尽力而为的窗口合批**（`submit_quads`：ordered 排序 + 连续运行切段 +
         //    每段一次 `quads(..).color(tint)`；窗口级 FX 应用在段实例上，顶点缓存不变）──
         let layer_base = self.base_layer;
-        let submit_us = self.submit_quads(r2d, cached, &mut quads, layer_base);
+        let submit_us = self.submit_quads(backend, cached, &mut quads, layer_base);
 
         // ── Debug 叠加（DebugDraw / debug_layout 描边）────────────
         // 在**全部 UI 内容之后**提交（`submit_debug`：合并 debug_queue 与布局描边、
         // 按 win 分组、白纹理、屏幕固定变换提交——不进窗口缓存、恒覆盖在最上）。
-        self.submit_debug(r2d, &mut quads, white_uid, layer_base);
+        self.submit_debug(backend, &mut quads, white_uid, layer_base);
         // 记录 IME 组合状态（供下一帧退格判定，见 text_input_at）
         self.state.ime_composing =
             self.keyboard.ime_preedit().is_some_and(|p| !p.is_empty());
@@ -2843,7 +2800,6 @@ impl<'a> Ui<'a> {
         &mut self,
         groups: &mut std::collections::HashMap<u32, Vec<Vec<UiDraw>>>,
         wins: &[u32],
-        r2d: &Render2D,
         quads: &mut QuadCollector,
         cached: &mut Vec<CachedQuad>,
         white_uid: u64,
@@ -2855,13 +2811,12 @@ impl<'a> Ui<'a> {
             let cmds = groups.remove(&win).expect("group exists");
             // debug_layout：每帧重建（布局描边是调试视图，跳过窗口顶点缓存）。
             if self.debug_layout {
-                self.collect_cmds(quads, win, &cmds, r2d);
+                self.collect_cmds(quads, win, &cmds);
                 continue;
             }
             if win == 0 {
                 self.cache_z0_window(
                     &cmds,
-                    r2d,
                     cached,
                     white_uid,
                     white_uv_tl,
@@ -2871,7 +2826,7 @@ impl<'a> Ui<'a> {
                 continue;
             }
             let Some(id) = self.win_ids.get(&win).cloned() else {
-                self.collect_cmds(quads, win, &cmds, r2d);
+                self.collect_cmds(quads, win, &cmds);
                 continue;
             };
             stats.win_count += 1;
@@ -2879,7 +2834,6 @@ impl<'a> Ui<'a> {
                 win,
                 id,
                 &cmds,
-                r2d,
                 cached,
                 white_uid,
                 white_uv_tl,
@@ -2897,7 +2851,6 @@ impl<'a> Ui<'a> {
     fn cache_z0_window(
         &mut self,
         cmds: &[Vec<UiDraw>],
-        r2d: &Render2D,
         cached: &mut Vec<CachedQuad>,
         white_uid: u64,
         white_uv_tl: Vec2,
@@ -2922,8 +2875,8 @@ impl<'a> Ui<'a> {
             if entry.0 == sig {
                 stats.cache_hits += 1;
                 let t_clone = Instant::now();
-                for (elem, gg, tex, verts) in &entry.1 {
-                    cached.push((0, *elem, *gg, *tex, verts.clone()));
+                for (elem, gg, tex, geom) in &entry.1 {
+                    cached.push((0, *elem, *gg, *tex, geom.clone(), vec![*elem]));
                 }
                 stats.clone_us += t_clone.elapsed().as_secs_f64() * 1e6;
                 continue;
@@ -2933,13 +2886,13 @@ impl<'a> Ui<'a> {
             let mut q = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh);
             // 该子槽重建（克隆命令为 owned 单桶传入 collect_cmds）。
             let owned: Vec<UiDraw> = refs.iter().map(|d| (*d).clone()).collect();
-            self.collect_cmds(&mut q, 0, std::slice::from_ref(&owned), r2d);
+            self.collect_cmds(&mut q, 0, std::slice::from_ref(&owned));
             stats.collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
-            let mut grp: Vec<(u32, u8, u64, Vec<VertexP3U2C4>)> = Vec::new();
-            for ((_, elem, gg, tex), verts) in q.quads {
-                // 缓存存克隆、本帧提交原顶点（各一份）——重建帧照常绘制，不"消失 1 帧"。
-                grp.push((elem, gg, tex, verts.clone()));
-                cached.push((0, elem, gg, tex, verts));
+            let mut grp: Vec<(u32, u8, u64, Geom)> = Vec::new();
+            for ((_, elem, gg, tex), geom) in q.quads {
+                // 缓存存克隆、本帧提交原几何（各一份）——重建帧照常绘制，不"消失 1 帧"。
+                grp.push((elem, gg, tex, geom.clone()));
+                cached.push((0, elem, gg, tex, geom, vec![elem]));
             }
             grp.sort_by_key(|&(elem, gg, tex, _)| (elem, gg, tex));
             self.state.z0_quads.insert(g, (sig, grp));
@@ -2957,7 +2910,6 @@ impl<'a> Ui<'a> {
         win: u32,
         id: IdAbsolute<'static>,
         cmds: &[Vec<UiDraw>],
-        r2d: &Render2D,
         cached: &mut Vec<CachedQuad>,
         white_uid: u64,
         white_uv_tl: Vec2,
@@ -2973,27 +2925,27 @@ impl<'a> Ui<'a> {
             if entry.0 == sig {
                 stats.cache_hits += 1;
                 let t_clone = Instant::now();
-                for (elem, g, tex, verts) in &entry.1 {
-                    cached.push((win, *elem, *g, *tex, verts.clone()));
+                for (elem, g, tex, geom) in &entry.1 {
+                    cached.push((win, *elem, *g, *tex, geom.clone(), vec![*elem]));
                 }
                 stats.clone_us += t_clone.elapsed().as_secs_f64() * 1e6;
                 return;
             }
         }
         stats.cache_misses += 1;
-        // 未命中：收集该窗口命令为局部顶点，写入缓存
+        // 未命中：收集该窗口命令为局部几何，写入缓存
         let t_collect = Instant::now();
         let mut q = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh);
-        self.collect_cmds(&mut q, win, cmds, r2d);
+        self.collect_cmds(&mut q, win, cmds);
         stats.collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
-        let mut grp: Vec<(u32, u8, u64, Vec<VertexP3U2C4>)> = Vec::new();
-        for ((_, elem, g, tex), verts) in q.quads {
-            // 缓存存克隆、本帧提交原顶点（各一份）——**重建帧窗口照常绘制**：
+        let mut grp: Vec<(u32, u8, u64, Geom)> = Vec::new();
+        for ((_, elem, g, tex), geom) in q.quads {
+            // 缓存存克隆、本帧提交原几何（各一份）——**重建帧窗口照常绘制**：
             // 否则窗口内容一变就"消失 1 帧"（缓存冷启动 / 拖动中 hover、光标
             // 闪烁、滚动等逐帧变化 → 窗口每帧重建、每帧消失 → "消失与显示
             // 瞬间交替"闪烁）。
-            grp.push((elem, g, tex, verts.clone()));
-            cached.push((win, elem, g, tex, verts));
+            grp.push((elem, g, tex, geom.clone()));
+            cached.push((win, elem, g, tex, geom, vec![elem]));
         }
         // 缓存组顺序与提交顺序一致：控件序 → 元素内图形 → 文字 → 纹理——跨帧稳定。
         grp.sort_by_key(|&(elem, g, tex, _)| (elem, g, tex));
@@ -3017,53 +2969,62 @@ impl<'a> Ui<'a> {
     /// （tint + transform override）应用在段实例上（顶点缓存不变）。返回本阶段耗时（µs）。
     fn submit_quads(
         &mut self,
-        r2d: &mut Render2D,
+        backend: &mut dyn UiBackend,
         cached: Vec<CachedQuad>,
         quads: &mut QuadCollector,
         layer_base: f64,
     ) -> f64 {
         let t_submit = Instant::now();
         let mut ordered: Vec<CachedQuad> = Vec::with_capacity(cached.len() + quads.quads.len());
-        // mem::take：只移走内容四边形，`quads.debug`（调试叠加）留待最后提交。
-        for ((win, elem, g, tex_uid), verts) in std::mem::take(&mut quads.quads) {
-            ordered.push((win, elem, g, tex_uid, verts));
+        // mem::take：只移走内容几何，`quads.debug`（调试叠加）留待最后提交。
+        for ((win, elem, g, tex_uid), geom) in std::mem::take(&mut quads.quads) {
+            let elems = quads.elems.remove(&(win, elem, g, tex_uid)).unwrap_or_default();
+            ordered.push((win, elem, g, tex_uid, geom, elems));
         }
+        // 缓存命中路径（`cached`）来自 `cache_window`，其元素数已在采集期统计。
         ordered.extend(cached);
-        ordered.sort_by_key(|&(win, elem, g, tex_uid, _)| (win, elem, g, tex_uid));
+        ordered.sort_by_key(|&(win, elem, g, tex_uid, _, _)| (win, elem, g, tex_uid));
         // 连续运行合批：同 (win, tex) 顶点合并成一段；窗口/纹理切换或超段顶点上限时切段。
-        let mut seg: Vec<VertexP3U2C4> = Vec::new();
-        let mut seg_win = 0u32;
-        let mut seg_tex = 0u64;
-        for (win, _elem, _g, tex_uid, verts) in ordered {
-            if !seg.is_empty()
-                && (win != seg_win || tex_uid != seg_tex || seg.len() + verts.len() > MAX_UI_SEG_VERTS)
-            {
-                self.flush_seg(r2d, layer_base, &mut seg, seg_win, seg_tex);
+        // 切段规则抽成纯函数 [`segment_runs`]，使「一次交互产生几次 draw call」
+        // 可在**无 GPU** 的情况下断言（回归测试见 `backend::batch_contract_tests`）。
+        let runs = segment_runs(
+            ordered.iter().map(|q| (q.0, q.3, q.4.verts.len())),
+            MAX_UI_SEG_VERTS,
+        );
+        let mut next = 0usize;
+        for run in runs {
+            let mut seg = Geom::default();
+            seg.verts.reserve(run.verts);
+            let mut seg_elems: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            for q in &ordered[next..next + run.quads] {
+                // 索引按已累计顶点数平移（`Geom::append`）——不同段的索引各自从 0 起。
+                seg.append(&q.4);
+                seg_elems.extend(q.5.iter().copied());
             }
-            if seg.is_empty() {
-                seg_win = win;
-                seg_tex = tex_uid;
-            }
-            seg.extend_from_slice(&verts);
-        }
-        if !seg.is_empty() {
-            self.flush_seg(r2d, layer_base, &mut seg, seg_win, seg_tex);
+            next += run.quads;
+            let n = seg_elems.len() as u32;
+            self.flush_seg(backend, layer_base, seg, run.window, run.texture, n);
         }
         t_submit.elapsed().as_secs_f64() * 1e6
     }
 
-    /// **冲刷一个窗口段**：把累计的顶点段经 `quads(..).color(tint)` 提交（单一窗口的
-    /// `screen_fixed_tf` 变换 + 窗口级 FX tint/transform override；`MeshBuilder` Drop 即提交）。
+    /// **冲刷一个窗口段**：把累计的几何段作为 [`UiBatch`] 提交（单一窗口的
+    /// `screen_fixed_tf` 变换 + 窗口级 FX tint/transform override）。
+    ///
+    /// **解耦**：不直接调 `Render2D`，只产出数据；后端决定如何提交。
     fn flush_seg(
         &mut self,
-        r2d: &mut Render2D,
+        backend: &mut dyn UiBackend,
         layer_base: f64,
-        seg: &mut Vec<VertexP3U2C4>,
+        seg: Geom,
         win: u32,
         tex_uid: u64,
+        elements: u32,
     ) {
-        let Some(tex) = TEXTURES.get(tex_uid) else {
-            seg.clear();
+        if seg.is_empty() {
+            return;
+        }
+        let Some(texture) = backend.texture(tex_uid) else {
             return;
         };
         let anchor_px = self.win_origins.get(&win).copied().unwrap_or(Vec2::ZERO);
@@ -3097,16 +3058,18 @@ impl<'a> Ui<'a> {
             }
             None => base_tf,
         };
-        let layer = Layer::from(layer_base + win as f64 * 1.0);
         // 诊断：记录本窗口**实际提交用的平移量**（`debug_dump` 的 `submit` 字段）——
         // 与 `origin` 比对即可判定"引擎状态 vs 视觉"是否一致。
         self.state.debug_submit.insert(win, tf.pos);
-        r2d.quads(seg, &tex)
-            .transform(tf)
-            .tint(fx.tint)
-            .layer(layer);
-        // Builder Drop 即提交 ✓
-        seg.clear();
+        backend.submit(UiBatch {
+            texture,
+            vertices: seg.verts,
+            indices: seg.tris,
+            transform: tf,
+            tint: fx.tint,
+            layer: layer_base + win as f64 * 1.0,
+            source: UiBatchSource { window: win, elements, debug: false },
+        });
     }
 
     /// **提交 Debug 叠加**（`finish` 末尾，全部 UI 内容之后）：合并 `debug_queue`
@@ -3114,7 +3077,7 @@ impl<'a> Ui<'a> {
     /// 分组、白纹理、屏幕固定变换提交——不进窗口缓存、同 layer 后提交 → 恒覆盖在最上。
     fn submit_debug(
         &mut self,
-        r2d: &mut Render2D,
+        backend: &mut dyn UiBackend,
         quads: &mut QuadCollector,
         white_uid: u64,
         layer_base: f64,
@@ -3129,21 +3092,31 @@ impl<'a> Ui<'a> {
         dwins.sort_unstable();
         for win in dwins {
             let cmds = debug_groups.remove(&win).expect("group exists");
-            self.collect_cmds(quads, win, &[cmds], r2d);
+            self.collect_cmds(quads, win, &[cmds]);
         }
         // 2. 提交 quads.debug 顶点（白纹理 + 屏幕固定变换）。
         let mut dwins: Vec<u32> = quads.debug.keys().copied().collect();
         dwins.sort_unstable();
         for win in dwins {
-            let verts = quads.debug.remove(&win).expect("debug group exists");
-            let Some(tex) = TEXTURES.get(white_uid) else {
+            let geom = quads.debug.remove(&win).expect("debug group exists");
+            if geom.is_empty() {
+                continue;
+            }
+            let Some(texture) = backend.texture(white_uid) else {
                 continue;
             };
             let anchor_px = self.win_origins.get(&win).copied().unwrap_or(Vec2::ZERO);
             let tf = screen_fixed_tf(anchor_px);
-            let layer = Layer::from(layer_base + win as f64 * 1.0);
             self.state.debug_submit.insert(win, tf.pos);
-            r2d.quads(&verts, &tex).transform(tf).layer(layer);
+            backend.submit(UiBatch {
+                texture,
+                vertices: geom.verts,
+                indices: geom.tris,
+                transform: tf,
+                tint: Color::WHITE,
+                layer: layer_base + win as f64 * 1.0,
+                source: UiBatchSource { window: win, elements: 1, debug: true },
+            });
         }
     }
 
@@ -3210,7 +3183,6 @@ impl<'a> Ui<'a> {
         quads: &mut QuadCollector,
         win: u32,
         cmds: &[Vec<UiDraw>],
-        r2d: &Render2D,
     ) {
         let anchor_px = self
             .win_origins
@@ -3250,109 +3222,39 @@ impl<'a> Ui<'a> {
                         Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
                     })
                         && local.w > 0.0 && local.h > 0.0 {
-                            // 物理半径**取整**（再 clamp，与生成纹理时一致）：
-                            // 9-patch 9 块边界须落在整数像素——非整数边界会让光栅化共享
-                            // 边界像素归属漂移（圆弧外侧列被边/中心填充块抢占 → 填充
-                            // 偏右下 / 1px 缝隙）。取整误差 ≤ 0.5px（像素栅格渲染无感）；
-                            // < 0.5px 取整为 0 → 自动回退直角 push_white 路径。
-                            let r = (*radius)
-                                .round()
-                                .clamp(0.0, crate::proc::ROUNDED_TEX_SIZE as f32 * 0.5 - 1.0)
-                                .max(0.0);
-                            if r <= 0.0 {
-                                quads.push_white(win, local, *color);
-                            } else {
-                                // 圆角纹理塞进**字形图集**（`Text::user_texture`）：
-                                // 与字形 / WHITE 同页同纹理 → 窗口内圆角图形与文字合批。
-                                // id = 半径位模式（定长 u64，同半径复用）；纹理存白色+alpha，
-                                // 颜色用顶点色 tint。已存在时 insert_permanent 短路返回最新
-                                // region（compact 重排后 UV 自动跟随）。
-                                let id = r.to_bits() as u64;
-                                let rgba = crate::proc::rounded_rect_rgba(
-                                    crate::proc::ROUNDED_TEX_SIZE,
-                                    r,
-                                    Color::WHITE,
-                                );
-                                if let Some(region) = self.text.user_texture(
-                                    id,
-                                    rjw_render::Rgba8::new(
-                                        &rgba,
-                                        (
-                                            crate::proc::ROUNDED_TEX_SIZE,
-                                            crate::proc::ROUNDED_TEX_SIZE,
-                                        ),
-                                    ),
-                                ) {
-                                    if let Some(tex) = TEXTURES.get(region.page_uid) {
-                                        let inv_page = 1.0 / tex.width as f32;
-                                        let base = Vec2::new(
-                                            region.tl_px.0 as f32,
-                                            region.tl_px.1 as f32,
-                                        ) * inv_page;
-                                        let tex_wh = Vec2::new(
-                                            region.wh_px.0 as f32,
-                                            region.wh_px.1 as f32,
-                                        ) * inv_page;
-                                        // 9-patch：四角原样、四边/中心拉伸（任意尺寸圆弧不畸变）。
-                                        for (mr, uvtl, uvwh) in crate::proc::rounded_9patch(
-                                            local,
-                                            r,
-                                            crate::proc::ROUNDED_TEX_SIZE,
-                                            r,
-                                        ) {
-                                            if mr.w <= 0.0 || mr.h <= 0.0 {
-                                                continue;
-                                            }
-                                            quads.push_tex_rect(
-                                                win,
-                                                region.page_uid,
-                                                base + uvtl * tex_wh,
-                                                uvwh * tex_wh,
-                                                mr,
-                                                *color,
-                                            );
-                                        }
-                                    } else {
-                                        quads.push_white(win, local, *color);
-                                    }
-                                } else {
-                                    quads.push_white(win, local, *color);
-                                }
-                            }
+                            // **无纹理、无着色器改动**：CPU 把圆角矩形镶嵌成三角形
+                            // （硬体 + 1 物理像素羽化带，见 `crate::tess`）。
+                            // 半径不做取整 / 9-patch clamp——镶嵌器接受任意半径并把
+                            // 超出半高的半径 clamp 成胶囊；羽化带随控件尺寸自动收紧。
+                            //
+                            // 裁剪后的矩形：四角色同一（`color`），故裁剪不影响颜色锚定。
+                            // 半径同样需要按裁剪**重算**：被裁小的一侧圆角会更小，
+                            // 但 UI 的裁剪多为矩形硬裁（可见部分本来就会被切掉），
+                            // 保持原半径与旧 9-patch 路径视觉一致。
+                            let table = self.state.tess.table();
+                            quads.push_rounded(
+                                win,
+                                &table,
+                                crate::tess::RoundedRectSpec {
+                                    rect: local,
+                                    radius: *radius,
+                                    corners: [*color; 4],
+                                },
+                            );
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
                 }
-                DrawKind::Gradient { axis, stops } => {
+                DrawKind::Rect(gradient) => {
                     let pr = snap_rect(&d.rect);
                     if let Some(local) = clipped(pr, clip_abs).map(|r| {
                         Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
                     })
                         && local.w > 0.0 && local.h > 0.0 {
-                            let device = r2d.device();
-                            let queue = r2d.queue();
-                            let layout = r2d.texture_layout();
-                            if let Some((tex_uid, region)) =
-                                self.state.proc.gradient(device, queue, layout, *axis, stops)
-                                && let Some(tex) = TEXTURES.get(tex_uid) {
-                                    let inv_page = 1.0 / tex.width as f32;
-                                    let base = Vec2::new(
-                                        region.tl_px.0 as f32,
-                                        region.tl_px.1 as f32,
-                                    ) * inv_page;
-                                    let tex_wh = Vec2::new(
-                                        region.wh_px.0 as f32,
-                                        region.wh_px.1 as f32,
-                                    ) * inv_page;
-                                    // 整矩形拉伸采样渐变纹理（主轴 64 级已平滑）。
-                                    quads.push_tex_rect(
-                                        win,
-                                        tex_uid,
-                                        base,
-                                        tex_wh,
-                                        local,
-                                        Color::WHITE,
-                                    );
-                                }
+                            // **无纹理**：四角颜色直接进顶点色（光栅化器双线性插值）。
+                            // 裁剪后的矩形按它在**原矩形**中的相对位置重采样四角色，
+                            // 保证渐变锚定在原矩形上（裁剪不会让颜色整体平移）。
+                            let c = resample_gradient(*gradient, local, pr);
+                            quads.push_white_quad(win, local, c);
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
                 }
@@ -3717,344 +3619,6 @@ impl<'a> Ui<'a> {
             quads.push_tex_quad(win, region.page_uid, quad);
         });
     }
-}
-
-// ─── 四边形收集器（QuadVertices） ──────────────────────────────
-
-/// 分组维度（提交排序用，见 [`submit_group_key`]）：
-/// - `0` = 图形（Solid / RoundedRect / Gradient / Border / Caret——白纹理与程序化纹理）；
-/// - `1` = 文字（字形图集纹理）。
-pub(crate) const GROUP_GRAPHIC: u8 = 0;
-pub(crate) const GROUP_TEXT: u8 = 1;
-
-/// 按 `(窗口 z, 元素序, 图形/文字组, 纹理 uid)` 分组的四边形顶点收集器（finish 提交用）。
-///
-/// **控件级提交顺序**：`(win, elem, g, tex)`——同窗内按**元素序**（后录控件覆盖
-/// 先录控件），元素内"背景/图形 → 文字"（`g`）。与队列排序键一致；白纹理与字形
-/// 同页时，控件背景+文字相邻同纹理 → Render2D 合批（单窗口一次 DrawCall）。
-///
-/// `debug`：**屏幕调试叠加**（DebugDraw 图元 + debug_layout 布局描边）——
-/// 按 `win` 分组、恒用白纹理，`finish` 时在全部 UI 内容**之后**提交。
-/// 一条**可提交的顶点段**：`(窗口 win, 元素序 elem, 图形/文字组 g, 纹理 uid, 局部顶点)`。
-/// 由窗口 / win=0 子槽的**顶点缓存命中**或**本帧重建**产生；`submit` 按 `(win, elem, g, tex)`
-/// 排序后合批提交。`win` 决定窗口原点（局部顶点 → 世界变换）与 layer。
-type CachedQuad = (u32, u32, u8, u64, Vec<VertexP3U2C4>);
-
-/// `finish` 顶点缓存各阶段**累计**（µs / 计数）：拆出的缓存/提交子函数共享一个
-/// `&mut CacheStats` 累加，`finish` 末尾统一写入 [`UiStats`]（示例/诊断读取）。
-#[derive(Default)]
-struct CacheStats {
-    /// 内容签名（`cmd_sig` 全量哈希）耗时（µs）。
-    sig_us: f64,
-    /// 缓存未命中 → 顶点重建（`collect_cmds`）耗时（µs）。
-    collect_us: f64,
-    /// 缓存命中 → 提交列表组装（顶点克隆）耗时（µs）。
-    clone_us: f64,
-    cache_hits: u32,
-    cache_misses: u32,
-    win_count: u32,
-}
-
-struct QuadCollector {
-    quads: std::collections::HashMap<(u32, u32, u8, u64), Vec<VertexP3U2C4>>,
-    /// 调试叠加顶点（白纹理；窗口局部物理坐标）。
-    debug: std::collections::HashMap<u32, Vec<VertexP3U2C4>>,
-    white_uid: u64,
-    /// WHITE 纹理区域 UV（字形图集页白纹理 region；兜底为整纹理 [0,1)）。
-    white_uv_tl: Vec2,
-    white_uv_wh: Vec2,
-    /// **当前元素序**（collect_cmds 每处理一个命令设置；push 方法按其分组）。
-    cur_elem: u32,
-}
-
-impl QuadCollector {
-    fn new(white_uid: u64, white_uv_tl: Vec2, white_uv_wh: Vec2) -> Self {
-        Self {
-            quads: std::collections::HashMap::new(),
-            debug: std::collections::HashMap::new(),
-            white_uid,
-            white_uv_tl,
-            white_uv_wh,
-            cur_elem: 0,
-        }
-    }
-
-    /// 白色纹理四边形（背景 / 边框 / 光标；WHITE region UV；图形组）。
-    fn push_white(&mut self, win: u32, r: Rect, c: Color) {
-        self.push_tex_rect(win, self.white_uid, self.white_uv_tl, self.white_uv_wh, r, c);
-    }
-
-    /// 带 UV 子区域的矩形四边形（图形组；圆角 9-patch / 渐变 / WHITE region 用）。
-    fn push_tex_rect(
-        &mut self,
-        win: u32,
-        tex: u64,
-        uv_tl: Vec2,
-        uv_wh: Vec2,
-        r: Rect,
-        c: Color,
-    ) {
-        if r.w <= 0.0 || r.h <= 0.0 {
-            return;
-        }
-        let ca: [f32; 4] = c.into();
-        let uv_br = uv_tl + uv_wh;
-        let quad = [
-            vertex_p3u2c4(Vec2::new(r.x, r.y), [uv_tl.x, uv_tl.y], ca),
-            vertex_p3u2c4(Vec2::new(r.x + r.w, r.y), [uv_br.x, uv_tl.y], ca),
-            vertex_p3u2c4(Vec2::new(r.x, r.y + r.h), [uv_tl.x, uv_br.y], ca),
-            vertex_p3u2c4(Vec2::new(r.x + r.w, r.y + r.h), [uv_br.x, uv_br.y], ca),
-        ];
-        self.push_tex_quad_group(win, tex, quad, GROUP_GRAPHIC);
-    }
-
-    /// 追加一个带 UV 的四边形（字形用；文字组）。
-    fn push_tex_quad(&mut self, win: u32, tex: u64, quad: [VertexP3U2C4; 4]) {
-        self.push_tex_quad_group(win, tex, quad, GROUP_TEXT);
-    }
-
-    fn push_tex_quad_group(
-        &mut self,
-        win: u32,
-        tex: u64,
-        quad: [VertexP3U2C4; 4],
-        group: u8,
-    ) {
-        let elem = self.cur_elem;
-        self.quads
-            .entry((win, elem, group, tex))
-            .or_default()
-            .extend_from_slice(&quad);
-    }
-
-    /// 调试叠加：一条带厚度线段（白纹理实心色；UV 取 WHITE region 中心）。
-    /// 几何复用 [`rjw_2d_render::debug_draw::thick_line_quad`]；退化线段（零长 / 零宽）跳过。
-    fn push_debug_line(&mut self, win: u32, a: Vec2, b: Vec2, width: f32, c: Color) {
-        let Some([tl, tr, bl, br]) = rjw_2d_render::debug_draw::thick_line_quad(a, b, width) else {
-            return;
-        };
-        let ca: [f32; 4] = c.into();
-        // UV 必须落在 WHITE region 内（[0,0] 会采样字形页左上角，可能是字形像素）。
-        let uv = self.white_uv_tl + self.white_uv_wh * 0.5;
-        let quad = [
-            vertex_p3u2c4(tl, [uv.x, uv.y], ca),
-            vertex_p3u2c4(tr, [uv.x, uv.y], ca),
-            vertex_p3u2c4(bl, [uv.x, uv.y], ca),
-            vertex_p3u2c4(br, [uv.x, uv.y], ca),
-        ];
-        self.debug.entry(win).or_default().extend_from_slice(&quad);
-    }
-
-    /// 调试叠加：矩形描边（4 条带厚度线段；`width` 为物理像素）。
-    fn push_debug_rect(&mut self, win: u32, r: Rect, width: f32, c: Color) {
-        if r.w <= 0.0 || r.h <= 0.0 {
-            return;
-        }
-        let tl = Vec2::new(r.x, r.y);
-        let tr = Vec2::new(r.x + r.w, r.y);
-        let br = Vec2::new(r.x + r.w, r.y + r.h);
-        let bl = Vec2::new(r.x, r.y + r.h);
-        self.push_debug_line(win, tl, tr, width, c);
-        self.push_debug_line(win, tr, br, width, c);
-        self.push_debug_line(win, br, bl, width, c);
-        self.push_debug_line(win, bl, tl, width, c);
-    }
-}
-
-/// 取视觉行的文本切片（**字符边界安全**）：视觉行的字节区间来自排版缓冲，
-/// 编辑（粘贴/打字/IME）同帧改写文本后可能过期——按 char 边界对齐并防
-/// `start > end`，避免 `&value[a..b]` 落在多字节字符中间 panic（短暂错位，
-/// 次帧重新排版后自愈）。
-#[inline]
-fn safe_line_slice<'a>(value: &'a str, line: &VisualLine) -> &'a str {
-    let s = value.floor_char_boundary(line.byte_start);
-    let e = value.floor_char_boundary(line.byte_end.min(value.len()));
-    if s < e {
-        &value[s..e]
-    } else {
-        ""
-    }
-}
-
-/// 文本坐标 y（逻辑像素）→ 视觉行序号：按**真实行顶**（`VisualLine.top`，物理像素）
-/// 定位。不要用 `行号 × line_h`——排版行高是 `round(font×1.2)`（取整），逻辑 `line_h`
-/// 每行差 ~0.2px，长文本累积后点击/拖选错行、视图滚不到真正的底部（"卡在纵轴
-/// 范围内"）。
-#[inline]
-fn line_row_at_y(vlines: &[VisualLine], y: f32, line_h: f32) -> usize {
-    if vlines.is_empty() {
-        return 0;
-    }
-    let lh_px = line_h.round();
-    vlines
-        .iter()
-        .position(|l| y < l.top + lh_px)
-        .unwrap_or(vlines.len() - 1)
-}
-
-/// 构造一个顶点（世界坐标 + UV + 颜色）。
-#[inline]
-fn vertex_p3u2c4(pos: Vec2, uv: [f32; 2], color: [f32; 4]) -> VertexP3U2C4 {
-    VertexP3U2C4 {
-        pos: [pos.x, pos.y, 0.0],
-        uv,
-        color,
-    }
-}
-
-/// **窗口/放置内容签名哈希**（提取为自由函数，便于无 `Ui` 实例的单元测试）。
-///
-/// 逐命令哈希**一切渲染相关字段**（颜色 / 边框宽 / 圆角 / 对齐 / 光标 / 选择 / 文本），
-/// 忽略 `win/seq`。任何影响绘制的内容变化（含 hover/click 变色、传入值改变）都会改变
-/// 签名 → 对应窗口 / win=0 放置子槽缓存自动失效重建。⚠ 不可退回"轻量摘要"（曾漏颜色位，
-/// 导致 hover/click 变色不刷新）。
-fn cmd_sig_hash(h: &mut std::collections::hash_map::DefaultHasher, d: &UiDraw) {
-    use std::hash::Hash;
-    d.depth.hash(h);
-    d.elem.hash(h);
-    d.rect.x.to_bits().hash(h);
-    d.rect.y.to_bits().hash(h);
-    d.rect.w.to_bits().hash(h);
-    d.rect.h.to_bits().hash(h);
-    match &d.kind {
-        DrawKind::Solid(c) => {
-            0u8.hash(h);
-            color_bits(*c).hash(h);
-        }
-        DrawKind::RoundedRect { color, radius } => {
-            5u8.hash(h);
-            color_bits(*color).hash(h);
-            radius.to_bits().hash(h);
-        }
-        DrawKind::Gradient { axis, stops } => {
-            6u8.hash(h);
-            match axis {
-                GradientAxis::Vertical => 0u8.hash(h),
-                GradientAxis::Horizontal => 1u8.hash(h),
-            }
-            stops.len().hash(h);
-            for (t, c) in stops {
-                t.to_bits().hash(h);
-                color_bits(*c).hash(h);
-            }
-        }
-        DrawKind::Border { color, width } => {
-            1u8.hash(h);
-            color_bits(*color).hash(h);
-            width.to_bits().hash(h);
-        }
-        DrawKind::Text {
-            text,
-            size,
-            color,
-            align,
-            valign,
-            family,
-            clip,
-            buf: _,
-        } => {
-            2u8.hash(h);
-            text.hash(h);
-            size.to_bits().hash(h);
-            color_bits(*color).hash(h);
-            (*align as u8).hash(h);
-            (*valign as u8).hash(h);
-            family.hash(h);
-            // 文本缓存版本号影响排版结果，必须包含在签名中
-            TEXT_LINE_HEIGHT_VERSION.hash(h);
-            if let Some(c) = clip {
-                c.x.to_bits().hash(h);
-                c.y.to_bits().hash(h);
-                c.w.to_bits().hash(h);
-                c.h.to_bits().hash(h);
-            }
-        }
-        DrawKind::Caret { color, width } => {
-            3u8.hash(h);
-            color_bits(*color).hash(h);
-            width.to_bits().hash(h);
-        }
-        DrawKind::Debug { color, shape } => {
-            4u8.hash(h);
-            color_bits(*color).hash(h);
-            // 形状参数逐字段哈希（DebugShape 未实现 Hash）。
-            match shape {
-                DebugShape::Line { a, b, width } => {
-                    0u8.hash(h);
-                    a.x.to_bits().hash(h);
-                    a.y.to_bits().hash(h);
-                    b.x.to_bits().hash(h);
-                    b.y.to_bits().hash(h);
-                    width.to_bits().hash(h);
-                }
-                DebugShape::RectOutline { rect, width } => {
-                    1u8.hash(h);
-                    rect.x.to_bits().hash(h);
-                    rect.y.to_bits().hash(h);
-                    rect.w.to_bits().hash(h);
-                    rect.h.to_bits().hash(h);
-                    width.to_bits().hash(h);
-                }
-                DebugShape::CircleOutline {
-                    center,
-                    radius,
-                    segments,
-                    width,
-                } => {
-                    2u8.hash(h);
-                    center.x.to_bits().hash(h);
-                    center.y.to_bits().hash(h);
-                    radius.to_bits().hash(h);
-                    segments.hash(h);
-                    width.to_bits().hash(h);
-                }
-                DebugShape::Cross { center, half, width } => {
-                    3u8.hash(h);
-                    center.x.to_bits().hash(h);
-                    center.y.to_bits().hash(h);
-                    half.to_bits().hash(h);
-                    width.to_bits().hash(h);
-                }
-                DebugShape::Grid { rect, spacing, width } => {
-                    4u8.hash(h);
-                    rect.x.to_bits().hash(h);
-                    rect.y.to_bits().hash(h);
-                    rect.w.to_bits().hash(h);
-                    rect.h.to_bits().hash(h);
-                    spacing.to_bits().hash(h);
-                    width.to_bits().hash(h);
-                }
-            }
-        }
-    }
-}
-
-/// 颜色位模式（签名哈希用）。
-#[inline]
-fn color_bits(c: Color) -> [u32; 4] {    let a: [f32; 4] = c.into();
-    [
-        a[0].to_bits(),
-        a[1].to_bits(),
-        a[2].to_bits(),
-        a[3].to_bits(),
-    ]
-}
-
-/// debug_layout 模式：给已取整的物理矩形画一圈描边（转窗口局部坐标后写入 debug 叠加）。
-/// `dbg = None` 时零开销；`Some((color, width))` 取 [`Theme::debug`] 样式。
-#[inline]
-fn debug_layout_outline(
-    quads: &mut QuadCollector,
-    win: u32,
-    anchor_px: Vec2,
-    pr: Rect,
-    dbg: Option<(Color, f32)>,
-) {
-    let Some((color, width)) = dbg else {
-        return;
-    };
-    let r = Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h);
-    quads.push_debug_rect(win, r, width, color);
 }
 
 /// 拖拽激活所需的最小**物理像素**位移：按下后鼠标位移 ≥ 此值才视为“拖拽”。
@@ -4491,19 +4055,8 @@ impl<'ui, 'a> UiAdd<'a> for FlexCtx<'ui, 'a> {
 
 // ─── 容器责任链 builder（window / panel / modal） ─────────────────
 
-/// **可调整尺寸控件的缩放方向**（取代旧的 `show_handle: bool` 裸布尔）。
-///
-/// 用于 [`Ui::resizable_text_input_at`] / [`Ui::resizable_text_area_at`]。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Resize {
-    /// **不显示缩放柄**（尺寸只由尺寸责任链 / 持久值决定）。
-    #[default]
-    None,
-    /// 显示右下角缩放柄，**只可调宽**（单行输入框；`↔` 光标）。
-    Horizontal,
-    /// 显示右下角缩放柄，**宽高同调**（多行 TextArea；`⤡` 光标）。
-    Both,
-}
+// `Resize` / `Level` / `Placement` / `WindowOptions` / `PanelOptions` 已拆到
+// `crate::ui_types`，在此重导出（builder 本体留在本文件：它与 `Ui` 内部方法强相关）。
 
 /// **单个窗口的调试信息**（[`Ui::debug_dump`]）。
 #[derive(Clone, Debug)]
@@ -4571,73 +4124,6 @@ impl std::fmt::Display for UiDebugDump {
             )?;
         }
         Ok(())
-    }
-}
-
-/// **窗口层级**（点击是否置顶；取代旧的 `.topmost(bool)` 裸布尔）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Level {
-    /// **点击置顶**（默认）：点击窗口即提到最上层（焦点）。
-    #[default]
-    Topmost,
-    /// **不置顶**：点击不改变 z-order（浮层 / 常驻 HUD 用）。
-    Normal,
-}
-
-/// **窗口内容排布方式**（取代旧的 `.strict()` 开关）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Placement {
-    /// **Expand**（默认）：内容自然尺寸撑高窗口，**不裁剪**（子项自动换行）。
-    #[default]
-    Expand,
-    /// **Clip**：内容**强制裁剪**到窗口矩形（Clip 沙箱：超出部分被裁，含 noclip
-    /// 绘制；外层 ScrollView 的裁切一并生效）。命中仍由窗口遮挡机制隔离。
-    Clip,
-}
-
-/// **窗口选项**（[`Ui::window`] / [`WindowBuilder`] 的数据载体，可独立构造/复用）。
-///
-/// - `pos`：窗口左上角（[`Position`]：逻辑/物理，相对当前容器内容原点；顶层 = 屏幕原点）；
-/// - `width`：`Some` = 固定宽（[`Size<f32>`]：逻辑/物理，高度自动，右下角可鼠标缩放，
-///   跨帧持久）；`None` = 自动宽（内容自然结算）；
-/// - `level`：点击是否置顶（默认 [`Level::Topmost`]）；
-/// - `placement`：内容排布（默认 [`Placement::Expand`]；[`Placement::Clip`] = 严格裁剪）；
-/// - `style`：逐窗口样式覆盖（默认 `None` = 全局 [`Theme::panel`]）；
-/// - `clamp`：位置约束模式（默认 [`WindowClamp::Screen`]：窗口整体不跑出屏幕）。
-#[derive(Clone, Debug)]
-pub struct WindowOptions {
-    pub pos: Position,
-    pub width: Option<Size<f32>>,
-    pub level: Level,
-    pub placement: Placement,
-    pub style: Option<PanelStyle>,
-    pub clamp: WindowClamp,
-}
-
-impl Default for WindowOptions {
-    fn default() -> Self {
-        Self {
-            pos: Position::Logical(Vec2::ZERO),
-            width: None,
-            level: Level::Topmost,
-            placement: Placement::Expand,
-            style: None,
-            clamp: WindowClamp::Screen,
-        }
-    }
-}
-
-/// **面板选项**（[`Ui::panel`] / [`PanelBuilder`] 的数据载体）。
-#[derive(Clone, Debug)]
-pub struct PanelOptions {
-    pub pos: Position,
-    pub drag: Option<String>,
-    pub style: Option<PanelStyle>,
-}
-
-impl Default for PanelOptions {
-    fn default() -> Self {
-        Self { pos: Position::Logical(Vec2::ZERO), drag: None, style: None }
     }
 }
 
@@ -6628,699 +6114,7 @@ fn clamp_window_pos(abs: Vec2, size: Vec2, sw: f32, sh: f32) -> Vec2 {
     Vec2::new(abs.x.clamp(min_x, max_x), abs.y.clamp(min_y, max_y))
 }
 
+/// `ui` 模块的单元测试（独立文件，见该目录下的 `tests.rs`）。
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::edit::{remove_at, remove_before};
-
-    #[test]
-    fn insert_char_at_handles_caret() {
-        let mut s = String::from("abc");
-        insert_char_at(&mut s, 1, 'X');
-        assert_eq!(s, "aXbc");
-        insert_char_at(&mut s, 0, '!');
-        assert_eq!(s, "!aXbc");
-        insert_char_at(&mut s, 99, 'z');
-        assert_eq!(s, "!aXbcz", "caret 越界 clamp 到末尾");
-        // 多字节字符按 char 索引
-        let mut s = String::from("中文ab");
-        insert_char_at(&mut s, 2, '字');
-        assert_eq!(s, "中文字ab");
-    }
-
-    #[test]
-    fn remove_before_and_at() {
-        let mut s = String::from("abc");
-        assert_eq!(remove_before(&mut s, 2), 1);
-        assert_eq!(s, "ac");
-        remove_at(&mut s, 0);
-        assert_eq!(s, "c");
-        // 多字节
-        let mut s = String::from("中文");
-        assert_eq!(remove_before(&mut s, 2), 1);
-        assert_eq!(s, "中", "caret=2 删除前一个字符（'文'）");
-        remove_at(&mut s, 0);
-        assert_eq!(s, "");
-    }
-
-    #[test]
-    fn text_align_conversion_roundtrip() {
-        assert_eq!(Align::from(TextAlign::Left), Align::Left);
-        assert_eq!(Align::from(TextAlign::Center), Align::Center);
-        assert_eq!(Align::from(TextAlign::Right), Align::Right);
-        assert_eq!(TextAlign::from(Align::Left), TextAlign::Left);
-        assert_eq!(TextAlign::from(Align::Center), TextAlign::Center);
-        assert_eq!(TextAlign::from(Align::Right), TextAlign::Right);
-        // 其他 Align（Justified/End）归入 Center
-        assert_eq!(TextAlign::from(Align::Justified), TextAlign::Center);
-        assert_eq!(TextAlign::from(Align::End), TextAlign::Center);
-    }
-
-    #[test]
-    fn cmd_sig_invalidates_on_content_change() {
-        // 回归防线：**内容签名必须区分一切渲染相关字段**（尤其颜色 / 文本）——
-        // 否则 hover/click 变色、传入值改变时窗口 / win=0 放置缓存误判"未变"而
-        // 复用陈旧顶点（历史 bug：轻量摘要漏颜色位 → 交互不刷新）。窗口与 win=0
-        // 子槽缓存共用本签名，故在此直接验证。
-        use std::hash::{Hasher};
-        let base = UiDraw {
-            depth: 0,
-            seq: 1,
-            win: 0,
-            elem: 0,
-            rect: Rect::new(0.0, 0.0, 10.0, 10.0),
-            clip: None,
-            kind: DrawKind::Solid(Color::rgba_u8(10, 20, 30, 255)),
-        };
-        fn sig(d: &UiDraw) -> u64 {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            cmd_sig_hash(&mut h, d);
-            h.finish()
-        }
-        // 同一命令哈希确定（命中复用前提）
-        assert_eq!(sig(&base), sig(&base), "同命令签名应确定");
-        // 颜色位变化 → 签名变化（hover/click 变色必须使缓存失效）
-        let hovered = UiDraw { kind: DrawKind::Solid(Color::rgba_u8(11, 20, 30, 255)), ..base.clone() };
-        assert_ne!(sig(&base), sig(&hovered), "颜色变化必须改变签名");
-        // 文本内容变化 → 签名变化（传入值改变必须使缓存失效）
-        let text_kind = |s: &str| DrawKind::Text {
-            text: s.into(),
-            size: 14.0,
-            color: Color::WHITE,
-            align: TextAlign::Left,
-            valign: TextVAlign::Center,
-            family: None,
-            clip: None,
-            buf: None,
-        };
-        let t1 = UiDraw { kind: text_kind("on"), ..base.clone() };
-        let t2 = UiDraw { kind: text_kind("off"), ..base.clone() };
-        assert_ne!(sig(&t1), sig(&t2), "文本内容变化必须改变签名");
-    }
-
-    #[test]
-    fn draw_kind_group_graphic_before_text() {
-        // 同一 layer 内：图形（Solid/Border/Caret）分组 0，文字（Text）分组 1
-        assert_eq!(DrawKind::Solid(Color::WHITE).group(), 0);
-        assert_eq!(
-            DrawKind::Border {
-                color: Color::WHITE,
-                width: 1.0,
-            }
-            .group(),
-            0
-        );
-        assert_eq!(DrawKind::Caret { color: Color::WHITE, width: 1.0 }.group(), 0);
-        assert_eq!(
-            DrawKind::Text {
-                text: "x".into(),
-                size: 14.0,
-                color: Color::WHITE,
-                align: TextAlign::Left,
-                family: None,
-                valign: TextVAlign::Center,
-                clip: None,
-                buf: None,
-            }
-            .group(),
-            1
-        );
-        // finish 排序键顺序：win → depth → elem → group → seq
-        let mut cmds = [UiDraw {
-                depth: 0,
-                seq: 2,
-                win: 0,
-                elem: 1,
-                rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                clip: None,                kind: DrawKind::Text {                    text: "t".into(),
-                    size: 14.0,
-                    color: Color::WHITE,
-                    align: TextAlign::Left,
-                    family: None,
-                    valign: TextVAlign::Center,
-                    clip: None,
-                    buf: None,
-                },
-            },
-            UiDraw {
-                depth: 0,
-                seq: 1,
-                win: 0,
-                elem: 1,
-                rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: DrawKind::Solid(Color::WHITE),
-                clip: None,
-            },
-            UiDraw {
-                depth: 0,
-                seq: 3,
-                win: 1,
-                elem: 2,
-                rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: DrawKind::Solid(Color::WHITE),
-                clip: None,
-            },
-            UiDraw {
-                depth: 0,
-                seq: 4,
-                win: 1,
-                elem: 2,
-                rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                clip: None,                kind: DrawKind::Text {                    text: "w".into(),
-                    size: 14.0,
-                    color: Color::WHITE,
-                    align: TextAlign::Left,
-                    family: None,
-                    valign: TextVAlign::Center,
-                    clip: None,
-                    buf: None,
-                },
-            }];
-        cmds.sort_by_key(|d| (d.win, d.depth, d.elem, d.kind.group(), d.seq));
-        // 期望：win0 图形(elem1) → win0 文字(elem1) → win1 图形(elem2) → win1 文字(elem2)
-        let order: Vec<u32> = cmds.iter().map(|d| d.seq).collect();
-        assert_eq!(order, vec![1, 2, 3, 4], "窗口 z 升序；元素内图形先、文字后");
-    }
-
-    #[test]
-    fn bucket_cmds_equals_full_sort() {
-        // P2 回归：depth 分桶提交序必须与全量稳定排序 (win, depth, elem, group, seq) 等价。
-        // 模拟"录制序"：seq 单调递增，但 depth（容器嵌套进出）与 win（跨帧 z 缓存）
-        // 乱序——正是免排序分桶要处理的场景。
-        let mut rng = 42u64;
-        let mut rand = move |m: u64| -> u64 {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (rng >> 33) % m
-        };
-        let n = 300;
-        let mut seq = 0u32;
-        let cmds: Vec<UiDraw> = (0..n)
-            .map(|_| {
-                let depth = (rand(5)) as u32; // depth ∈ [0,5)
-                let win = (rand(3)) as u32; // win ∈ {0,1,2}
-                let graphic = rand(2) == 0;
-                seq += 1;
-                let kind = if graphic {
-                    DrawKind::Solid(Color::WHITE)
-                } else {
-                    DrawKind::Text {
-                        text: Arc::from("x"),
-                        size: 14.0,
-                        color: Color::WHITE,
-                        align: TextAlign::Left,
-                        valign: TextVAlign::Center,
-                        family: None,
-                        clip: None,
-                        buf: None,
-                    }
-                };
-                UiDraw {
-                    depth,
-                    seq,
-                    win,
-                    elem: seq,
-                    rect: Rect::ZERO,
-                    clip: None,
-                    kind,
-                }
-            })
-            .collect();
-        let mut sorted = cmds.clone();
-        sorted.sort_by_key(|d| (d.win, d.depth, d.elem, d.kind.group(), d.seq));
-        let groups = bucket_cmds(cmds);
-        let mut wins: Vec<u32> = groups.keys().copied().collect();
-        wins.sort_unstable();
-        let key = |d: &UiDraw| (d.win, d.depth, d.elem, d.kind.group(), d.seq);
-        let mut got: Vec<(u32, u32, u32, u8, u32)> = Vec::with_capacity(n);
-        for win in wins {
-            let buckets = &groups[&win];
-            for bucket in buckets {
-                for d in bucket {
-                    got.push(key(d));
-                }
-            }
-        }
-        let want: Vec<(u32, u32, u32, u8, u32)> = sorted.iter().map(key).collect();
-        assert_eq!(got, want, "depth 分桶提交序必须与全量排序完全等价");
-    }
-
-    #[test]
-    fn clamp_window_pos_screen_mode() {
-        // 窗口 ≤ 屏幕：整体在屏幕内，贴边 clamp。
-        let p = clamp_window_pos(Vec2::new(-50.0, 200.0), Vec2::new(100.0, 60.0), 800.0, 600.0);
-        assert_eq!(p, Vec2::new(0.0, 200.0), "左/上超界贴 0");
-        let p = clamp_window_pos(Vec2::new(900.0, 580.0), Vec2::new(100.0, 60.0), 800.0, 600.0);
-        assert_eq!(p, Vec2::new(700.0, 540.0), "右/下超界贴 sw-size");
-        // 窗口 ≤ 屏幕：区间内位置原样保留。
-        let p = clamp_window_pos(Vec2::new(100.0, 50.0), Vec2::new(100.0, 60.0), 800.0, 600.0);
-        assert_eq!(p, Vec2::new(100.0, 50.0));
-        // 窗口 > 屏幕：左上角允许 ∈ [sw-size, 0]（仍覆盖屏幕、**可拖动**，不钉死 0）。
-        let p = clamp_window_pos(Vec2::new(300.0, 200.0), Vec2::new(900.0, 700.0), 800.0, 600.0);
-        assert_eq!(p, Vec2::new(0.0, 0.0), "超大窗口贴左上角（覆盖全屏）");
-        let p = clamp_window_pos(Vec2::new(-300.0, -200.0), Vec2::new(900.0, 700.0), 800.0, 600.0);
-        assert_eq!(p, Vec2::new(-100.0, -100.0), "超大窗口可拖到负区间（sw-size）");
-        let p = clamp_window_pos(Vec2::new(-50.0, -50.0), Vec2::new(900.0, 700.0), 800.0, 600.0);
-        assert_eq!(p, Vec2::new(-50.0, -50.0), "超大窗口在负区间内原样保留");
-    }
-
-    #[test]
-    fn window_drag_clamp_size_fixed_during_drag() {
-        // 拖拽中窗口内容尺寸变化（变宽）时，clamp 边界**固定为按下帧尺寸**：
-        // 贴右缘的窗口不被推回（纯跟手、无单帧跳变）；非拖拽帧才按最新尺寸复位。
-        let sw = 800.0;
-        let sh = 600.0;
-        let press_size = Vec2::new(200.0, 100.0); // 按下帧窗口尺寸
-        let now_size = Vec2::new(260.0, 100.0); // 拖拽中内容变宽后的尺寸
-        // 同一目标位置（拖到屏幕右缘外）：
-        let target = Vec2::new(720.0, 300.0);
-        let with_press = clamp_window_pos(target, press_size, sw, sh);
-        let with_now = clamp_window_pos(target, now_size, sw, sh);
-        assert_eq!(with_press.x, 600.0, "按下帧尺寸 clamp：窗口贴右缘 600（拖拽中稳定）");
-        assert_eq!(with_now.x, 540.0, "当前尺寸 clamp：窗口被推左 60px（拖拽中跳变源）");
-        // 拖拽中窗口位置 = clamp(press_panel + d, press_size)：随鼠标位移连续。
-        let press_panel = Vec2::new(600.0, 300.0);
-        // let press_mouse = Vec2::new(700.0, 350.0);
-        let mut last = press_panel.x;
-        for i in 1..=6 {
-            // 鼠标位移 -30, -20, -10, 0, +10, +20（先回拖离开右缘、再拖回贴边）。
-            let d = Vec2::new(10.0 * (i as f32 - 4.0), 0.0);
-            let disp = clamp_window_pos(press_panel + d, press_size, sw, sh);
-            assert!(
-                (disp.x - last).abs() <= 30.0 + 0.001,
-                "帧 {i}: 拖拽中位置应随鼠标平滑（每帧 ≤ 鼠标步进 30px），实际 {last} → {}",
-                disp.x
-            );
-            last = disp.x;
-        }
-    }
-
-    #[test]
-    fn window_first_frame_position_converges() {
-        // 首帧（prev_size 未知）：命中基准 = origin（不 clamp）；显示 = clamp(origin, size)。
-        // 次帧：prev_size = size → base_pos = clamp(origin, size) = **首帧显示位置**
-        // → 命中/显示收敛、位置无跳（消除"窗口刚出现就按下 → 按下瞬间跳变"）。
-        let origin = Vec2::new(700.0, 300.0); // 窗口内容大，origin 超出真实 clamp 边界
-        let size = Vec2::new(300.0, 100.0);
-        let sw = 800.0;
-        let sh = 600.0;
-        let first_display = clamp_window_pos(origin, size, sw, sh);
-        assert_eq!(first_display.x, 500.0, "首帧显示 clamp 到 [0, sw-size]=500");
-        // 次帧命中基准 = clamp(origin, size)（首帧显示位置）→ 一致。
-        let second_base = clamp_window_pos(origin, size, sw, sh);
-        assert_eq!(second_base, first_display, "次帧命中基准 = 首帧显示位置（无跳变）");
-        // 次帧后 origin 已持久化为 clamp 后位置 → 再 clamp 不变。
-        let origin2 = first_display;
-        assert_eq!(
-            clamp_window_pos(origin2, size, sw, sh),
-            origin2,
-            "已 clamp 位置再 clamp 不变"
-        );
-    }
-
-    #[test]
-    fn window_size_persists_across_z_change() {
-        // 点击置顶 z+1 只影响 `window_rects[z]` 索引；尺寸按 **id** 持久
-        // （`window_sizes`）→ 下帧 prev_size 不回落 ZERO，clamp 边界稳定。
-        let id = "win_a";
-        let mut sizes = std::collections::HashMap::<String, Vec2>::new();
-        sizes.insert(id.into(), Vec2::new(200.0, 100.0));
-        // 置顶后（window_rects 无新 z 记录）：
-        let prev_size = sizes.get(id).copied(); // window_sizes 优先
-        assert_eq!(prev_size, Some(Vec2::new(200.0, 100.0)), "置顶后尺寸仍可取（不回落 ZERO）");
-        // 用持久尺寸 clamp：贴右缘窗口位置稳定（若回落 ZERO 会贴到 sw=800）。
-        let p = clamp_window_pos(Vec2::new(650.0, 300.0), prev_size.unwrap(), 800.0, 600.0);
-        assert_eq!(p.x, 600.0, "clamp 边界 = sw-size = 600（稳定）");
-        let p_zero = clamp_window_pos(Vec2::new(650.0, 300.0), Vec2::ZERO, 800.0, 600.0);
-        assert_eq!(p_zero.x, 650.0, "ZERO 尺寸 clamp 区间 [0,sw]（不生效，跳变源对比）");
-    }
-
-    #[test]
-    fn submit_order_graphics_before_text_per_window() {
-        // 回归：窗口图形/文字绘制顺序抖动——同一窗口内图形组（白纹理 / 圆角 / 渐变）
-        // 必须先于字形文字组，且跨帧稳定（不随 HashMap 迭代顺序 / 纹理 uid 分配变化）。
-        let g = GROUP_GRAPHIC;
-        let t = GROUP_TEXT;
-        // 模拟 finish() 的提交列表：win=0 非窗口内容 + 窗口 1/2（各含图形组与文字组）。
-        // 故意用乱序 + 反序 uid 输入（如 HashMap 迭代顺序）。
-        let mut groups = vec![
-            (2u32, t, 3u64),
-            (1u32, t, 3u64),
-            (0u32, t, 2u64),
-            (2u32, g, 2u64),
-            (0u32, g, 1u64),
-            (1u32, g, 1u64),
-            (1u32, g, 2u64),
-        ];
-        groups.sort_by_key(|&(w, gr, tex)| (w, gr, tex));
-        // 期望：win 升序；同一窗口内图形组先于文字组；组内按纹理 uid 稳定。
-        assert_eq!(
-            groups,
-            vec![
-                (0, g, 1),
-                (0, t, 2),
-                (1, g, 1),
-                (1, g, 2),
-                (1, t, 3),
-                (2, g, 2),
-                (2, t, 3),
-            ],
-            "win 升序 + 窗口内图形先于文字（含程序化纹理），跨帧确定"
-        );
-    }
-
-    #[test]
-    fn drag_needs_movement_so_clicks_work() {
-        // 回归：窗口/可拖拽面板内 CheckBox / 输入框失效——按下即激活拖拽导致
-        // `drag_panel` 在释放帧抑制子控件，点击被吞。修复：位移 ≥ DRAG_ACTIVATE_PX
-        // 才视为拖拽；纯点击（无位移 / 微小抖动）不激活。
-        let press = Vec2::new(100.0, 200.0); // 按下基准（物理像素，已取整）
-        // 静止（纯点击）：未激活
-        assert!(!drag_moved(press, Some(press)), "按下无位移不激活拖拽");
-        // 微小抖动（< 阈值）：仍视为点击
-        assert!(!drag_moved(press + Vec2::new(1.0, 1.0), Some(press)), "1px 抖动不激活");
-        assert!(!drag_moved(press + Vec2::new(2.0, 2.0), Some(press)), "~2.8px 位移不激活");
-        // 恰好达到阈值
-        assert!(
-            drag_moved(press + Vec2::new(3.0, 0.0), Some(press)),
-            "3px 水平位移激活拖拽"
-        );
-        // 明显位移：激活
-        assert!(
-            drag_moved(press + Vec2::new(0.0, -8.0), Some(press)),
-            "8px 竖直位移激活拖拽"
-        );
-        // 无按下基准（如窗口未命中时）：不激活
-        assert!(!drag_moved(press, None), "无按下基准不激活");
-    }
-
-    #[test]
-    fn text_block_placement_is_integer_with_line_box_top() {
-        // 回归：UI 文本亚像素模糊——垂直行盒对齐偏移经**整数运算**后，
-        // `block_tl = anchor + off` 的两侧操作数均为整数（浮点整数不变量）：
-        // 小数（行盒顶 / 奇数宽的一半）只在 `round` 边界被一次性消化，
-        // 不流入加法链 → 无误差累加、字形四边形角点恒为整数屏幕像素。
-        // 数据来自 14px 排版实测：行高 16.8→content_h 17，"a" 行盒顶 = -7.2
-        // （rjw_text 收集期取整为 -7.0）。
-        let anchor = Vec2::new(100.0, 200.0);
-        let content = Vec2::new(14.0, 17.0);
-        let first_line_top = -7.0;
-        // 左对齐标签：block = anchor + off，两项均为整数
-        let block = anchor + text_block_offset(TextAlign::Left, TextVAlign::Center, content, first_line_top);
-        assert_eq!(block.x.fract(), 0.0, "标签块 x 必须为整数像素，实际 {}", block.x);
-        assert_eq!(block.y.fract(), 0.0, "标签块 y 必须为整数像素，实际 {}", block.y);
-        // 行盒中心对准锚点（±0.5px 量化，奇数 content_h 的固有半像素）：
-        // block.y + first_line_top + content_h/2 ≈ anchor.y
-        let center = block.y + first_line_top + content.y * 0.5;
-        assert!(
-            (center - anchor.y).abs() <= 0.5,
-            "行盒中心应贴近锚点，偏差 {}",
-            center - anchor.y
-        );
-        // 居中按钮 + 奇数物理宽（21px，如 DPI 1.5 下）：水平对齐亦为整数
-        let btn = anchor + text_block_offset(TextAlign::Center, TextVAlign::Center, Vec2::new(21.0, 17.0), first_line_top);
-        assert_eq!(btn.x.fract(), 0.0, "按钮块 x 必须为整数像素，实际 {}", btn.x);
-        assert_eq!(btn.y.fract(), 0.0, "按钮块 y 必须为整数像素，实际 {}", btn.y);
-    }
-
-    #[test]
-    fn overlapping_elements_follow_record_order() {
-        // 元素重叠层级正确性：后录元素（elem 大）覆盖先录元素（elem 小），
-        // **即使后录元素是图形（group 0）、先录元素是文字（group 1）**——
-        // 元素序优先于图形/文字分组。
-        let mut cmds = [
-            // 元素 A（先录）：文字
-            UiDraw {
-                depth: 1,
-                seq: 1,
-                win: 1,
-                elem: 1,
-                rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: DrawKind::Text {
-                    text: "a".into(),
-                    size: 14.0,
-                    color: Color::WHITE,
-                    align: TextAlign::Left,
-                    family: None,
-                    valign: TextVAlign::Center,
-                    clip: None,
-                    buf: None,
-                },
-                clip: None,
-            },
-            // 元素 B（后录）：图形——应覆盖 A 的文字
-            UiDraw {
-                depth: 1,
-                seq: 2,
-                win: 1,
-                elem: 2,
-                rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: DrawKind::Solid(Color::WHITE),
-                clip: None,
-            },
-        ];
-        cmds.sort_by_key(|d| (d.win, d.depth, d.elem, d.kind.group(), d.seq));
-        let order: Vec<u32> = cmds.iter().map(|d| d.seq).collect();
-        assert_eq!(order, vec![1, 2], "后录元素（B 图形）应覆盖先录元素（A 文字）");
-        // 元素内：同一 elem 的图形先于文字
-        let mut inner = [
-            UiDraw {
-                depth: 1,
-                seq: 3,
-                win: 1,
-                elem: 3,
-                rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: DrawKind::Text {
-                    text: "x".into(),
-                    size: 14.0,
-                    color: Color::WHITE,
-                    align: TextAlign::Left,
-                    family: None,
-                    valign: TextVAlign::Center,
-                    clip: None,
-                    buf: None,
-                },
-                clip: None,
-            },
-            UiDraw {
-                depth: 1,
-                seq: 2,
-                win: 1,
-                elem: 3,
-                rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-                kind: DrawKind::Solid(Color::WHITE),
-                clip: None,
-            },
-        ];
-        inner.sort_by_key(|d| (d.win, d.depth, d.elem, d.kind.group(), d.seq));
-        let order: Vec<u32> = inner.iter().map(|d| d.seq).collect();
-        assert_eq!(order, vec![2, 3], "元素内：图形(seq2)先画，文字(seq3)后画（文字覆盖图形）");
-    }
-
-    #[test]
-    fn window_transform_tracks_origin() {
-        // 窗口四边形的**局部顶点**经 `screen_fixed_tf(origin)` 提交 ⇒ 窗口移动 =
-        // 变换平移量同步变化（拖动"视觉上要跟着走"的数学保证）。
-        let a = screen_fixed_tf(Vec2::new(100.0, 50.0));
-        let b = screen_fixed_tf(Vec2::new(140.0, 70.0));
-        let local = Vec2::new(7.0, 9.0);
-        assert_eq!(
-            b.transform_point(local) - a.transform_point(local),
-            Vec2::new(40.0, 20.0),
-            "origin 变化 ⇒ 窗口局部点整体平移同样的量"
-        );
-        // UI 层坐标空间 = 物理像素、左上原点（identity 相机 + `center` 平移）：
-        // 局部点 (0,0) 经变换即落在屏幕上 origin 处。
-        assert_eq!(a.transform_point(Vec2::ZERO), Vec2::new(100.0, 50.0));
-    }
-
-    #[test]
-    fn text_focus_only_for_text_widgets() {
-        let mut st = UiState::new();
-        assert!(st.text_focus().is_none(), "无焦点");
-        // 按钮持焦点：**不是**文本焦点（不应吞掉应用快捷键）。
-        st.focused = Some(IdAbsolute::from("btn"));
-        st.focused_kind = Some(FocusKind::Button);
-        assert!(st.text_focus().is_none(), "按钮焦点不算文本焦点");
-        // 文本框持焦点：是文本焦点，且带出控件 id。
-        st.focused = Some(IdAbsolute::from("name"));
-        st.focused_kind = Some(FocusKind::TextInput);
-        assert_eq!(st.text_focus().map(|f| f.id.as_str().to_owned()), Some("name".to_owned()));
-        st.focused = None;
-        st.focused_kind = None;
-        assert!(st.text_focus().is_none());
-    }
-
-    #[test]
-    fn anchor_pos_covers_all_corners_and_clamps() {
-        let vp = Vec2::new(1280.0, 720.0);
-        let size = Vec2::new(200.0, 20.0);
-        let m = Vec2::new(16.0, 16.0);
-        // 四角 + 边距
-        assert_eq!(Ui::anchor_pos_in(vp, Anchor::TopLeft, size, m), Vec2::new(16.0, 16.0));
-        assert_eq!(
-            Ui::anchor_pos_in(vp, Anchor::TopRight, size, m),
-            Vec2::new(1280.0 - 16.0 - 200.0, 16.0)
-        );
-        assert_eq!(
-            Ui::anchor_pos_in(vp, Anchor::BottomLeft, size, m),
-            Vec2::new(16.0, 720.0 - 16.0 - 20.0)
-        );
-        assert_eq!(
-            Ui::anchor_pos_in(vp, Anchor::BottomRight, size, m),
-            Vec2::new(1280.0 - 16.0 - 200.0, 720.0 - 16.0 - 20.0)
-        );
-        // 居中（上下 / 左右边距对称）
-        assert_eq!(
-            Ui::anchor_pos_in(vp, Anchor::Center, size, m),
-            Vec2::new(16.0 + (1280.0 - 32.0 - 200.0) * 0.5, 16.0 + (720.0 - 32.0 - 20.0) * 0.5)
-        );
-        // 底中对齐
-        assert_eq!(
-            Ui::anchor_pos_in(vp, Anchor::BottomCenter, size, m),
-            Vec2::new(16.0 + (1280.0 - 32.0 - 200.0) * 0.5, 720.0 - 16.0 - 20.0)
-        );
-        // 内容超视口（+边距）→ clamp 贴边（左上/左下角，不产生负坐标；
-        // 内容本身比视口宽时无法完全放入，贴边即可）
-        let big = Vec2::new(2000.0, 1000.0);
-        let p = Ui::anchor_pos_in(vp, Anchor::BottomRight, big, m);
-        assert!(p.x >= 0.0 && p.y >= 0.0, "不产生负坐标");
-        assert_eq!(Ui::anchor_pos_in(vp, Anchor::TopLeft, big, m), Vec2::new(16.0, 16.0), "左上角不 clamp");
-    }
-
-    #[test]
-    fn container_builder_options_defaults_and_overrides() {
-        // 窗口责任链选项默认值 = 旧 `window_at` 语义（自动宽 / 置顶 / Expand 不裁剪 /
-        // 全局主题）。
-        let o = WindowOptions::default();
-        assert_eq!(o.pos, Position::Logical(Vec2::ZERO));
-        assert_eq!(o.width, None);
-        assert_eq!(o.level, Level::Topmost, "默认点击置顶");
-        assert_eq!(o.placement, Placement::Expand, "默认 Expand 语义（不裁剪）");
-        assert!(o.style.is_none(), "默认跟随全局 Theme::panel");
-        // 覆盖组合 = 固定宽 + Level::Normal + Placement::Clip + 逐窗口样式。
-        let o2 = WindowOptions {
-            pos: Position::Logical(Vec2::new(10.0, 20.0)),
-            width: Some(Size::Logical(300.0)),
-            level: Level::Normal,
-            placement: Placement::Clip,
-            style: Some(PanelStyle::default().with_radius(8.0)),
-            ..WindowOptions::default()
-        };
-        assert_eq!(o2.pos, Position::Logical(Vec2::new(10.0, 20.0)));
-        assert_eq!(o2.width, Some(Size::Logical(300.0)));
-        assert_eq!(o2.level, Level::Normal);
-        assert_eq!(o2.placement, Placement::Clip);
-        assert_eq!(o2.style.unwrap().radius, 8.0);
-
-        // 面板责任链选项默认值 = `panel_at` 语义。
-        let p = PanelOptions::default();
-        assert_eq!(p.pos, Position::Logical(Vec2::ZERO));
-        assert_eq!(p.drag, None);
-        assert!(p.style.is_none());
-        // 拖拽面板 = `drag_panel_at` 语义。
-        let p2 = PanelOptions {
-            pos: Position::Logical(Vec2::new(4.0, 5.0)),
-            drag: Some("inspector".to_owned()),
-            style: None,
-        };
-        assert_eq!(p2.drag.as_deref(), Some("inspector"));
-    }
-
-    #[test]
-    fn topmost_win_never_occluded() {
-        use crate::hit::window_occluded;
-        // 任意普通窗口叠放时，置顶哨兵 z（浮层）恒不被遮挡 → 浮层始终可交互。
-        let rects = [
-            (1u32, Rect::new(0.0, 0.0, 100.0, 100.0)),
-            (5u32, Rect::new(0.0, 0.0, 100.0, 100.0)),
-        ];
-        assert!(
-            !window_occluded(WIN_TOPMOST, Vec2::new(10.0, 10.0), rects.iter().copied()),
-            "置顶哨兵 z 恒不被遮挡（IME 候选框 / 下拉浮层可交互）"
-        );
-        // 对照：普通窗口仍被更高 z 遮挡
-        assert!(window_occluded(1, Vec2::new(10.0, 10.0), rects.iter().copied()));
-    }
-
-    #[test]
-    fn pos_chain_resolves_by_priority() {
-        use std::collections::HashMap;
-        // 责任链解析顺序：脚本（优先级降序）→ 内置拖拽状态（优先级 0）→ 调用者 pos 兜底
-        let mut chain: Vec<(i32, PosLink)> = vec![(0, PosLink::Drag)];
-        chain.push((10, PosLink::Script(Box::new(|_| Some(Vec2::new(1.0, 1.0))))));
-        chain.push((-10, PosLink::Script(Box::new(|_| Some(Vec2::new(2.0, 2.0))))));
-        chain.sort_by_key(|e| std::cmp::Reverse(e.0)); // 高优先级在前（pos_handler 内部同款排序）
-        let mut panel_pos = HashMap::new();
-        panel_pos.insert(IdAbsolute::from("w"), Vec2::new(3.0, 3.0));
-        // 高优先级脚本胜出
-        assert_eq!(
-            resolve_pos_link(&chain, &panel_pos, &IdAbsolute::from("w"), Vec2::ZERO),
-            Vec2::new(1.0, 1.0)
-        );
-        // 去掉高优先级脚本 → 内置拖拽状态（优先级 0 > -10）先被询问 → 用户拖拽优先
-        chain.retain(|(p, _)| *p != 10);
-        chain.sort_by_key(|e| std::cmp::Reverse(e.0));
-        assert_eq!(
-            resolve_pos_link(&chain, &panel_pos, &IdAbsolute::from("w"), Vec2::ZERO),
-            Vec2::new(3.0, 3.0),
-            "拖拽状态优先级 0 高于负优先级脚本 → 用户拖过就赢过动画"
-        );
-        // 负优先级脚本在用户**未拖过**时兜底提供位置（动画"填空"语义）
-        assert_eq!(
-            resolve_pos_link(&chain, &panel_pos, &IdAbsolute::from("not_dragged"), Vec2::ZERO),
-            Vec2::new(2.0, 2.0)
-        );
-        // 全部脚本落空 → 内置用户拖拽状态胜出
-        chain.retain(|(p, _)| *p != -10);
-        chain.sort_by_key(|e| std::cmp::Reverse(e.0));
-        assert_eq!(
-            resolve_pos_link(&chain, &panel_pos, &IdAbsolute::from("w"), Vec2::ZERO),
-            Vec2::new(3.0, 3.0)
-        );
-        // 用户未拖过 → 调用者传入 pos 兜底
-        assert_eq!(
-            resolve_pos_link(&chain, &panel_pos, &IdAbsolute::from("other"), Vec2::new(9.0, 9.0)),
-            Vec2::new(9.0, 9.0)
-        );
-        // 脚本按 id 选择性响应：返回 None 即交还下一环
-        let mut chain2: Vec<(i32, PosLink)> = vec![(0, PosLink::Drag)];
-        chain2.push((5, PosLink::Script(Box::new(|id| {
-            if id == "scripted" {
-                Some(Vec2::new(7.0, 7.0))
-            } else {
-                None
-            }
-        }))));
-        chain2.sort_by_key(|e| std::cmp::Reverse(e.0));
-        assert_eq!(
-            resolve_pos_link(&chain2, &panel_pos, &IdAbsolute::from("scripted"), Vec2::ZERO),
-            Vec2::new(7.0, 7.0)
-        );
-        assert_eq!(
-            resolve_pos_link(&chain2, &panel_pos, &IdAbsolute::from("w"), Vec2::ZERO),
-            Vec2::new(3.0, 3.0),
-            "脚本对 id 返回 None → 落到用户拖拽状态"
-        );
-    }
-
-    #[test]
-    fn safe_line_slice_never_panics_on_stale_byte_ranges() {
-        // 回归：TextArea 粘贴中文后，旧视觉行字节区间落在新文本多字节字符中间
-        // （"start byte index 64 is not a char boundary; inside '尾'" panic）。
-        // safe_line_slice 必须对齐到字符边界且不 panic。
-        // "窗口 A 选项\n尾部文字"：'项' = bytes 12..15（3 字节/字符）
-        let value = "窗口 A 选项\n尾部文字";
-        // 模拟过期 vlines：区间起点/终点落在 '项'（12..15）中间
-        let stale = VisualLine { byte_start: 13, byte_end: 14, top: 0.0, width: 10.0 };
-        let s = safe_line_slice(value, &stale);
-        // 13 → floor 到 '项' 起点 12；14 → floor 到 12 → s == e → 空串（不 panic）
-        assert_eq!(s, "");
-        // 区间越过末尾：byte_end 超 len → clamp 到 len 并取整
-        let over = VisualLine { byte_start: 0, byte_end: 999, top: 0.0, width: 10.0 };
-        assert_eq!(safe_line_slice(value, &over), value);
-        // 正常区间原样返回（0..6 = "窗口"）
-        let ok = VisualLine { byte_start: 0, byte_end: 6, top: 0.0, width: 10.0 };
-        assert_eq!(safe_line_slice(value, &ok), "窗口");
-    }
-}
-
+#[path = "ui/tests.rs"]
+mod tests;

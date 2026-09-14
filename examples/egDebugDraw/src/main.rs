@@ -233,14 +233,14 @@ impl App for DebugApp {
             // ── rjw_ui 的 DebugDraw（屏幕空间；物理像素，覆盖在 UI 之上） ──
             if self.ui_debug_shapes {
                 // 鼠标十字 + 跟随圆圈
-                ui.debug_cross(mouse, 10.0, 1.5, Color::ORANGE);
-                ui.debug_circle_outline(mouse, 24.0, 40, 1.5, Color::ORANGE);
+                ui.debug_cross(mouse, 10.0, 1.5, Color::CSS_ORANGE);
+                ui.debug_circle_outline(mouse, 24.0, 40, 1.5, Color::CSS_ORANGE);
                 // 屏幕中心 → 鼠标 连线
                 let center = Vec2::new(region.w * 0.5, region.h * 0.5);
                 ui.debug_line(center, mouse, 1.0, Color::rgba_u8(255, 200, 100, 200));
                 // 调试面板矩形框（若面板可见）
                 if self.debug_visible {
-                    ui.debug_rect_outline(Rect::new(24.0, 24.0, 190.0, 240.0), 1.5, Color::MAGENTA);
+                    ui.debug_rect_outline(Rect::new(24.0, 24.0, 190.0, 240.0), 1.5, Color::CSS_MAGENTA);
                 }
             }
         });
@@ -250,6 +250,6 @@ impl App for DebugApp {
     }
 }
 
-fn main() -> Result<(), EventLoopError> {
+fn main() -> Result<(), RunError> {
     run(DebugApp::new())
 }

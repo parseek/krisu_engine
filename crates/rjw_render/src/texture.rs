@@ -1,11 +1,14 @@
 //! 纹理包装：纹理 + 视图 + 全局唯一 id 用于合批排序。
-//! 同时提供全局、线程安全的 `TextureRegistry`（基于 `TypedRegistry`）。
+//! 同时提供线程安全的 `TextureRegistry`（基于 `TypedRegistry`）。
 //!
 //! **与采样器解耦**：`TextureWrapped` 不再持有 sampler / bind group。
 //! 采样器由 `rjw_2d_render::rstates::RStates`（bits 8..24 位域）驱动，
 //! bind group 由渲染器按 `(tex_uid, samp_key)` 缓存创建。
+//!
+//! **注册表归 [`Gpu`](crate::Gpu) 所有**（每 `RenderContext` 一份，不再是进程级
+//! `static`）：绘制期经 `Render2D::textures()` 解析，构造期经 `Gpu::texture_registry()`。
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use crate::registry::{HasUid, TypedRegistry};
 
@@ -72,13 +75,14 @@ impl TextureWrapped {
     pub fn raw_texture(&self) -> &wgpu::Texture { &self.texture }
 }
 
-// ─── 全局纹理注册表 ──────────────────────────────────────────
+// ─── 纹理注册表（由 `Gpu` 持有；见模块文档） ─────────────────
 
 /// 线程安全纹理注册表：按 uid / name 查找 `ArcTextureWrapped`。
 ///
 /// 泛型 `TypedRegistry` 的别名；提供 `register`/`register_named`/`get`/`get_ref`/
 /// `remove`/`remove_name_mapping`/`rename`/`contains_*` 等完整能力。
+///
+/// 每个 `RenderContext`（经 [`Gpu`](crate::Gpu)）各持一份，因此**跨 `RenderContext`
+/// 互不可见**。`TextureWrapped::uid` 仍由进程级计数器保证全局单调不复用，但
+/// **uid 相等不再蕴含「同一张纹理」**——分辨能力由「哪个注册表」提供。
 pub type TextureRegistry = TypedRegistry<TextureWrapped>;
-
-/// 全局纹理注册表单例。
-pub static TEXTURES: LazyLock<TextureRegistry> = LazyLock::new(TextureRegistry::default);

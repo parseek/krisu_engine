@@ -37,9 +37,9 @@ pub use frame::{
 };
 pub use format::{has_depth_aspect, has_stencil_aspect};
 pub use gpu::{Gpu, Rgba8};
-pub use mesh::{MeshData, MeshId, MeshRegistry, MeshSpec, MESHES};
+pub use mesh::{MeshData, MeshId, MeshRegistry, MeshSpec};
 pub use registry::{HasUid, TypedRegistry};
-pub use texture::{ArcTextureWrapped, TextureRegistry, TextureWrapped, TEXTURES};
+pub use texture::{ArcTextureWrapped, TextureRegistry, TextureWrapped};
 
 // Re-export wgpu in case of version mismatch.
 pub use wgpu;
@@ -55,6 +55,26 @@ use winit::window::Window;
 /// **帧级常量**：构造期固定（`RenderConfig` → `RenderContext` → `RenderFrame`），
 /// 运行期不切换 ⇒ **不进管线缓存 key**。
 pub const DEFAULT_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
+
+/// [`RenderContext::new`] 的初始化错误。
+///
+/// 这些都是**运行期可恢复的失败**（机器没有可用 GPU、驱动缺失、surface 创建不出来），
+/// 因此返回 `Result` 而不是 panic —— 调用方可以降级、重试或给出可读提示。
+#[derive(Debug, thiserror::Error)]
+pub enum RenderInitError {
+    /// `instance.create_surface` 失败（窗口与后端不兼容 / 驱动问题）。
+    #[error("创建 surface 失败：{0}")]
+    CreateSurface(String),
+    /// 找不到满足要求的适配器（无 GPU / 驱动未安装 / 后端不匹配）。
+    #[error("找不到可用适配器：{0}")]
+    NoAdapter(String),
+    /// 适配器无法创建逻辑设备（显存 / 驱动限制）。
+    #[error("创建设备失败：{0}")]
+    CreateDevice(String),
+    /// surface 没有报告任何可用格式。
+    #[error("surface 未提供任何可用格式")]
+    NoSurfaceFormat,
+}
 
 /// 垂直同步策略（取代 `vsync: bool`，见 R2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -106,7 +126,10 @@ impl Default for RenderConfig {
 /// **它是取帧的唯一权威**（surface 只在这里）：[`FrameSource::acquire_frame`]。
 pub struct RenderContext {
     surface: wgpu::Surface<'static>,
-    gpu: Gpu,
+    /// GPU 能力对象 + **资源注册表**（纹理 / 网格）。经 `Arc` 共享，使 `Render2D` /
+    /// `rjw_atlas` / `rjw_text` 等持有者可以超出 `&Gpu` 借用期，并让同一上下文的
+    /// world / UI 两个渲染器共享同一套注册表。
+    gpu: Arc<Gpu>,
     config: wgpu::SurfaceConfiguration,
     /// 深度 / 模板附件格式（构造期固定；转发给每帧的 [`RenderFrame`]）。
     depth_format: wgpu::TextureFormat,
@@ -121,8 +144,9 @@ impl RenderContext {
     /// `'static`）。在 `rjw_krusie::runtime` 里由 `Engine` 保证（窗口与上下文同生命周期）；
     /// 手写事件循环时必须自行保证窗口不被提前 drop / 移动后失效。
     ///
-    /// 失败路径（无适配器 / 无 surface 格式 / 设备创建失败）会 panic。
-    pub unsafe fn new(window: &Window, config: &RenderConfig) -> Self {
+    /// 失败路径（无 surface / 无适配器 / 无 surface 格式 / 设备创建失败）返回
+    /// [`RenderInitError`]，不再 panic —— 调用方可以降级或给出可读提示。
+    pub unsafe fn new(window: &Window, config: &RenderConfig) -> Result<Self, RenderInitError> {
         // wgpu 30: InstanceDescriptor no longer implements Default.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: config.backends,
@@ -131,7 +155,9 @@ impl RenderContext {
 
         // SAFETY: 由调用方保证（见上）。
         let window_static: &'static Window = unsafe { std::mem::transmute(window) };
-        let surface = instance.create_surface(window_static).expect("Failed to create surface");
+        let surface = instance
+            .create_surface(window_static)
+            .map_err(|e| RenderInitError::CreateSurface(e.to_string()))?;
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -139,7 +165,7 @@ impl RenderContext {
             force_fallback_adapter: false,
             apply_limit_buckets: false,
         }))
-        .expect("Failed to find a suitable adapter");
+        .map_err(|e| RenderInitError::NoAdapter(e.to_string()))?;
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
@@ -149,13 +175,17 @@ impl RenderContext {
             memory_hints: Default::default(),
             trace: Default::default(),
         }))
-        .expect("Failed to create device");
+        .map_err(|e| RenderInitError::CreateDevice(e.to_string()))?;
 
         let size = window.inner_size();
         let surface_caps = surface.get_capabilities(&adapter);
-        let format = config
-            .desired_format
-            .unwrap_or_else(|| *surface_caps.formats.first().expect("No surface formats available"));
+        let format = match config.desired_format {
+            Some(f) => f,
+            None => *surface_caps
+                .formats
+                .first()
+                .ok_or(RenderInitError::NoSurfaceFormat)?,
+        };
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -174,14 +204,21 @@ impl RenderContext {
         };
         surface.configure(&device, &surface_config);
 
-        let gpu = Gpu::new(Arc::new(device), Arc::new(queue));
+        let gpu = Arc::new(Gpu::new(Arc::new(device), Arc::new(queue)));
 
-        Self { surface, gpu, config: surface_config, depth_format: config.depth_format }
+        Ok(Self { surface, gpu, config: surface_config, depth_format: config.depth_format })
     }
 
-    /// GPU 能力对象（资源工厂 + 逃生口）。
+    /// GPU 能力对象（资源工厂 + 逃生口 + 资源注册表）。
     #[inline]
     pub fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
+
+    /// GPU 能力对象的**共享句柄**（供需要超出 `&self` 生命周期的持有者，如
+    /// `Render2D`）。
+    #[inline]
+    pub fn gpu_arc(&self) -> &Arc<Gpu> {
         &self.gpu
     }
 

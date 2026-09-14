@@ -6,15 +6,29 @@
 English：
 `rjw_text` renders text using `cosmic-text` layout, `swash` glyph rasterization and a `DynamicAtlas` glyph cache.
 
-> 整套库入口：`use rjw_krusie::prelude::*;` 已含 `Text` / `Align` / `TextStyle` / `TextBuffer` / `TextLayout` / `TextRender`；
+> 整套库入口：`use rjw_krusie::prelude::*;` 已含 `Text` / `Align` / `TextStyle` / `TextBuffer` / `Label`；
 > 低层（`GlyphData` / `GradientAxis` / `cosmic_text`…）走 `rjw_krusie::text::*`。
+>
+> ⚠ **本文档部分代码是 v0.2 的旧 API**（`TextLayout` / `TextRender` / `draw_label` /
+> `Text::new(device, queue, layout)` / `render_from` / `precache` 均已在 v0.3 删除或改名）。
+> 现行 API 见 [`docs/API_REFERENCE.md`](../../docs/API_REFERENCE.md) §10 与
+> `examples/eg260810TextChain`。
+>
+> 字形页纹理的注册表是**每 `RenderContext` 私有**的（`rjw_render::TEXTURES` 全局表已删除）：
+> 绘制期经 `r2d.textures()` 解析。
 
 ---
 
 ## 功能特性 / Features
 
 中文：
-- `Text`：持有 `FontSystem` / `ScaleContext` / 字形缓存图集（key = `cosmic_text::CacheKey`）。
+- `Text`：持有 `FontSystem` / `ScaleContext` / 字形缓存图集（key = `AtlasKey`，分 `Glyph` / `Custom` 两命名空间）。
+- **字形图集公开可用 / 可修改**：`glyph_cache()`（只读）、`glyph_cache_mut()`（可变）、
+  `user_texture(id, Rgba8)`（★ 推荐：固定 `AtlasKey::Custom(id)` + `permanent()`）、
+  `white_region()`（1×1 白，UI 实心填充与字形同页合批）。UI 等消费者把自定义纹理塞进
+  同一张图集 ⇒ 同纹理合批、省掉图形↔文字的纹理状态切换。
+  ⚠ 约定：只写 `AtlasKey::Custom`（勿碰 `Glyph`，那是光栅化命名空间）；非 `permanent()`
+  条目会被 `tick()` 寿命机制逐出；图集重排后 `AtlasRegion` 失效（按 `generation()` 变化重取）。
 - `measure` / `measure_buffer`：排版内容宽高（GUI 布局用）。
 - `draw_text`：遍历已排版 `Buffer` 的字形，回调 `(region, world_pos, world_size)` 自定义绘制。
 - `draw_label_with`：回调版标签渲染，不绑定渲染器（GUI 自定义绘制用）。
@@ -27,7 +41,10 @@ English：
 - `DEFAULT_GLYPH_ATLAS_SIZE`：字形图集默认尺寸（1024）。
 
 English：
-- `Text`: owns `FontSystem` / `ScaleContext` / glyph cache atlas (key = `cosmic_text::CacheKey`).
+- `Text`: owns `FontSystem` / `ScaleContext` / glyph cache atlas (key = `AtlasKey`, with separate `Glyph` / `Custom` namespaces).
+- **The glyph atlas is public and mutable**: `glyph_cache()` (read-only), `glyph_cache_mut()`,
+  `user_texture(id, Rgba8)` (recommended: `AtlasKey::Custom(id)` + `permanent()`), and
+  `white_region()` (1×1 white; UI fills share the glyph page so they batch).
 - `measure` / `measure_buffer`: layout content width/height (for GUI layout).
 - `draw_text`: iterate layout glyphs of a `Buffer`, call back `(region, world_pos, world_size)` for custom drawing.
 - `draw_label_with`: callback-based label rendering, not bound to any renderer (for GUI custom drawing).

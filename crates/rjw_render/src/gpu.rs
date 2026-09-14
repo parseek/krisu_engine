@@ -10,9 +10,9 @@
 
 use std::sync::Arc;
 
-use crate::mesh::{MeshData, MeshId, MeshSpec};
-use crate::texture::{ArcTextureWrapped, TextureWrapped, TEXTURES};
-use crate::MESHES;
+use crate::mesh::{MeshData, MeshId, MeshRegistry, MeshSpec};
+use crate::registry::TypedRegistry;
+use crate::texture::{ArcTextureWrapped, TextureRegistry, TextureWrapped};
 
 /// RGBA8 像素数据 + 尺寸。
 ///
@@ -44,24 +44,42 @@ impl<'a> Rgba8<'a> {
     }
 }
 
-/// GPU 能力对象：设备 + 队列 + 纹理 bind group layout + 资源工厂。
+/// GPU 能力对象：设备 + 队列 + 纹理 bind group layout + 资源工厂 + **资源注册表**。
 ///
 /// 由 [`crate::RenderContext`] 创建并持有（`RenderContext::gpu()`）。
+///
+/// # 注册表所有权
+///
+/// `textures` / `meshes` 是**本上下文私有**的（不再是进程级 `static`）：
+/// 每个 `RenderContext` 一份，跨上下文互不可见。这是必需的——`Render2D::new` 会为
+/// 每个渲染器注册自己的 1×1 白纹理与四边形网格，全局单例下后建的会**覆盖**先建的
+/// 条目，使先建渲染器的白纹理 uid 指向别人的纹理。
 pub struct Gpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     texture_layout: wgpu::BindGroupLayout,
     vp_layout: wgpu::BindGroupLayout,
+    /// 纹理注册表（本上下文私有）。
+    textures: Arc<TextureRegistry>,
+    /// 静态网格注册表（本上下文私有）。
+    meshes: Arc<MeshRegistry>,
 }
 
 impl Gpu {
-    /// 由设备 / 队列构造，并建立引擎规范的纹理 / VP bind group layout。
+    /// 由设备 / 队列构造，并建立引擎规范的纹理 / VP bind group layout 与资源注册表。
     ///
     /// `pub(crate)`：正常路径由 [`crate::RenderContext`] 创建，不暴露给用户（R5）。
     pub(crate) fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
         let texture_layout = device.create_bind_group_layout(&TEXTURE_BIND_GROUP_LAYOUT);
         let vp_layout = device.create_bind_group_layout(&vp_bind_group_layout_desc());
-        Self { device, queue, texture_layout, vp_layout }
+        Self {
+            device,
+            queue,
+            texture_layout,
+            vp_layout,
+            textures: Arc::new(TypedRegistry::default()),
+            meshes: Arc::new(TypedRegistry::default()),
+        }
     }
 
     /// 底层设备（逃生口：自定义管线 / 后处理）。
@@ -113,7 +131,7 @@ impl Gpu {
         &self.vp_layout
     }
 
-    /// 创建 RGBA8 纹理并注册进全局 [`crate::TEXTURES`]。
+    /// 创建 RGBA8 纹理并注册进**本上下文的**纹理注册表（[`Self::textures`]）。
     ///
     /// 这是**唯一**的纹理创建入口（happy path）。
     pub fn texture(&self, label: &str, px: Rgba8<'_>) -> ArcTextureWrapped {
@@ -127,26 +145,40 @@ impl Gpu {
             h
         );
         let tex = Arc::new(TextureWrapped::from_rgba8(&self.device, &self.queue, label, px.data, w, h));
-        TEXTURES.register(tex.clone());
+        self.textures.register(tex.clone());
         tex
     }
 
-    /// 创建静态网格（POD 顶点 + u16 索引）并注册进全局 [`crate::MESHES`]，返回可复用句柄。
+    /// 创建静态网格（POD 顶点 + u16 索引）并注册进**本上下文的**网格注册表
+    /// （[`Self::meshes`]），返回可复用句柄。
     pub fn mesh<T: bytemuck::Pod>(&self, spec: MeshSpec<'_, T>) -> MeshId {
         let mesh = MeshData::from_pod(&self.device, spec.vertices, spec.indices, spec.label);
-        MeshId::new(MESHES.register(Arc::new(mesh)))
+        MeshId::new(self.meshes.register(Arc::new(mesh)))
     }
 
-    /// 全局纹理注册表（按 uid / name 查找）。
+    /// 本上下文的纹理注册表（按 uid / name 查找）。
     #[inline]
-    pub fn textures(&self) -> &'static crate::TextureRegistry {
-        &TEXTURES
+    pub fn textures(&self) -> &TextureRegistry {
+        &self.textures
     }
 
-    /// 全局静态网格注册表。
+    /// 本上下文的静态网格注册表。
     #[inline]
-    pub fn meshes(&self) -> &'static crate::MeshRegistry {
-        &MESHES
+    pub fn meshes(&self) -> &MeshRegistry {
+        &self.meshes
+    }
+
+    /// 纹理注册表的**共享句柄**（供需要超出 `&Gpu` 生命周期的持有者，如
+    /// `DynamicAtlas` / `rjw_krusie::runtime::Gfx` 使用）。
+    #[inline]
+    pub fn texture_registry(&self) -> &Arc<TextureRegistry> {
+        &self.textures
+    }
+
+    /// 网格注册表的**共享句柄**。
+    #[inline]
+    pub fn mesh_registry(&self) -> &Arc<MeshRegistry> {
+        &self.meshes
     }
 }
 

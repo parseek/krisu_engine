@@ -10,6 +10,8 @@
 //! 4. **入口 ≤2 参**：`f.submit(&mut cam, Clear::color(..))`；
 //! 5. **状态糖收对象**：`.blend(BlendMode::Additive)` / `.depth(DepthState::…)`，无裸 bool。
 
+use std::sync::LazyLock;
+
 use rjw_krusie::prelude::*;
 
 #[derive(Default)]
@@ -19,6 +21,15 @@ struct Hello {
     /// 累计时间（驱动旋转）。
     t: f32,
 }
+
+const CIRCLE_VERTS: LazyLock<[Vec2; 96]> = LazyLock::new(|| {
+    let mut verts = [Vec2::ZERO; 96];
+    for i in 0..verts.len() {
+        let a = i as f32 / verts.len() as f32 * std::f32::consts::TAU;
+        verts[i] = Vec2::new(a.cos(), a.sin()) * 200.0;
+    }
+    verts
+});
 
 impl App for Hello {
     fn config(&self) -> AppConfig {
@@ -64,9 +75,8 @@ impl App for Hello {
 
         f.draw()
             .polygon_with(|p| {
-                for i in 0..=24 {
-                    let a = i as f32 / 24.0 * std::f32::consts::TAU;
-                    p.vertex(Vec2::new(a.cos(), a.sin()) * 200.0);
+                for v in CIRCLE_VERTS.iter() {
+                    p.vertex(*v);
                 }
             })
             .tint(Color::rgba(0.0, 1.0, 1.0, 0.35))
@@ -76,7 +86,8 @@ impl App for Hello {
         f.draw()
             .solid(SpriteRect::new((-8.0, -8.0), (16.0, 16.0)))
             .at(cursor)
-            .tint(Color::YELLOW)
+            .tint(Color::YELLOW.with_a(0.4))
+            .blend(BlendMode::Additive)
             .layer(2.0);
 
         // 窗口标题显示帧率（低层逃生口：经 `Frame` 的 Deref 取 winit 窗口句柄）
@@ -95,7 +106,7 @@ fn key_axis(f: &Frame<'_>, plus: KeyCode, minus: KeyCode) -> f32 {
     (f.key(plus).pressed() as i32 - f.key(minus).pressed() as i32) as f32
 }
 
-fn main() -> Result<(), EventLoopError> {
+fn main() -> Result<(), RunError> {
     env_logger::init();
     run(Hello::default())
 }

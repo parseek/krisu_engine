@@ -111,7 +111,7 @@ impl App for MultiViewApp {
     }
 }
 
-fn main() -> Result<(), EventLoopError> {
+fn main() -> Result<(), RunError> {
     // 日志：`RUST_LOG=rjw_krusie=debug` 可看到每个画面的矩形与清屏意图（多画面排查用）。
     env_logger::init();
     run(MultiViewApp::default())

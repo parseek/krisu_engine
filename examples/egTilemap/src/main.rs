@@ -109,7 +109,7 @@ impl App for TilemapDemo {
         AppConfig::new("egTilemap - rjw_tilemap 任意图集贴片 v2").size(1280.0, 720.0)
     }
 
-    fn init(&mut self, gfx: &Gfx) {
+    fn init(&mut self, gfx: &Gfx) -> Result<(), AppInitError> {
         eprintln!("MARK: on_init");
 
         // 动态图集：运行时插入程序生成的瓦片纹理。
@@ -119,6 +119,7 @@ impl App for TilemapDemo {
         );
         self.map = Self::build_map(&mut atlas);
         self._atlas = Some(atlas);
+        Ok(())
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
@@ -244,7 +245,7 @@ impl App for TilemapDemo {
     }
 }
 
-fn main() -> Result<(), EventLoopError> {
+fn main() -> Result<(), RunError> {
     env_logger::init();
     // 可选启动参数：--cam-rot <弧度> 设置初始相机旋转（RenderDoc 验证屏幕固定文本用）。
     let mut cam = Camera2D::full(Vec2::new(1280.0, 720.0));

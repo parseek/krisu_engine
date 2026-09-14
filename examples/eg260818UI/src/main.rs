@@ -669,12 +669,13 @@ impl App for UiApp {
         AppConfig::new("eg260818UI — rjw_ui 示例").size(1280.0, 720.0)
     }
 
-    fn init(&mut self, gfx: &Gfx) {
+    fn init(&mut self, gfx: &Gfx) -> Result<(), AppInitError> {
         // 文本子系统（长期资源）由 `Gfx` 建：取代旧的
         // `Text::new(r2d.device(), r2d.queue(), r2d.texture_layout())`。
         // 其余长期资源（RenderContext / 世界层与 UI 层 Render2D / 画面矩形）由运行时持有，
         // 应用不再自建（UI 层排序已由运行时关闭，无需 `set_sort_mode(SortMode::None)`）。
         self.font = Some(gfx.text());
+        Ok(())
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
@@ -869,7 +870,7 @@ fn parse_pos_arg(args: &[String], key: &str, default: Vec2) -> Vec2 {
     out
 }
 
-fn main() -> Result<(), EventLoopError> {
+fn main() -> Result<(), RunError> {
     let args: Vec<String> = std::env::args().collect();
     let mut app = UiApp::new();
     app.windows.win_a_pos = parse_pos_arg(&args, "--win-a", app.windows.win_a_pos);

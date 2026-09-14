@@ -442,7 +442,13 @@ draw()       ：按 DrawOp.rstates 取/建管线 → 绑定纹理 bind group →
   （`.sampler(FilterMode::Nearest, AddressMode::Repeat)` 或 `.states(..)`），`Render2D` 内部按需创建并缓存 `wgpu::Sampler`。
 - bind group 按 `(tex_uid, samp_key)` 缓存，value 持有 `Arc<Texture>` 防悬挂；`prepare` 末尾自动剔除失效条目。
 - 1×1 白纹理：`Gpu::white_texture()` / `Render2D` 内部的 `white_texture`（纯色绘制与 `solid` 使用）。
-- 全局注册表 `TEXTURES`（`TypedRegistry<TextureWrapped>`）：`register` / `register_named` / `get` / `remove` / `rename` / `contains_uid` / `contains_name`。
+- **纹理注册表是每 `RenderContext` 私有的**（不再是全局 `static`）：`gpu.textures()`（`&TextureRegistry`）/
+  `r2d.textures()`（绘制期）；需要长期持有用 `gpu.texture_registry()`（`&Arc<..>`）。
+  操作：`register` / `register_named` / `get` / `remove` / `rename` / `contains_uid` / `contains_name`。
+  > v0.3 起 `rjw_render::TEXTURES` / `MESHES` 两个全局 `static` **已删除**。旧全局单例下
+  > `Render2D::new` 每次注册的 1×1 白纹理与四边形网格会**覆盖**先建渲染器的条目
+  > （同一 uid 指向别人的纹理）；实例化后跨 `RenderContext` 彻底隔离。
+  > uid 仍由进程级计数器保证全局单调不复用，但**uid 相等不再蕴含「同一张纹理」**。
 
 ---
 
@@ -504,7 +510,7 @@ crate：`rjw_2d_render`（`rstates` 模块）
 | `StaticMeshBuilder<'a>` | `static_mesh` 返回（Drop 即提交，或 `.done()` 显式） |
 | `HasUid` | trait：`fn uid(&self) -> u64`（`rjw_render`） |
 | `TypedRegistry<T: HasUid>` | 泛型注册表：`register` / `register_named` / `get` / `get_ref` / `remove` / `remove_name_mapping` / `rename` / `contains_uid` / `contains_name` |
-| `MESHES` | 全局静态网格注册表（`TypedRegistry<MeshData>`，`rjw_render`） |
+| `MeshRegistry` | 静态网格注册表（`TypedRegistry<MeshData>`）；**每 `RenderContext` 私有**，经 `gpu.meshes()` / `r2d.meshes()` / `gpu.mesh_registry()` 取得 |
 
 ### 6.4 使用示例
 
@@ -595,8 +601,7 @@ pub struct StaticAtlas<K = String>
 
 | 方法 | 说明 |
 |---|---|
-| `DynamicAtlas::new(gfx, config)` | ★ 创建空图集（`gfx: &Gpu`；页尺寸在 `config.page_size`） |
-| `DynamicAtlas::from_raw(device, queue, layout, config)` | 低层构造（逃生口；尚未迁移到 `&Gpu` 的内部消费者用） |
+| `DynamicAtlas::new(gfx, config)` | ★ 创建空图集（`gfx: &Gpu`；页尺寸在 `config.page_size`）。页纹理注册进**该 `Gpu` 的**纹理注册表（不再是全局） |
 | `insert(key, Rgba8)` | ★ 最常用：`Rgba8::new(&rgba, (w, h))`，默认 clamp_margin、非常驻、原点 (0,0) |
 | `insert_with(key, Rgba8, InsertOpts)` | 指定原点 / `no_clamp()` / `permanent()` |
 | `insert_dynamic(key, size, SpriteSource)` | 动态再生精灵（复活时调生成器） |
@@ -611,7 +616,7 @@ pub struct StaticAtlas<K = String>
 | `generation()` | 重排世代号（搬动条目时 +1；缓存区域者据此刷新） |
 | `page_size()` / `page_count()` | 查询 |
 | `load_toml` / `export_toml` | TOML 导入 / 导出（feature `toml`） |
-| `StaticAtlas::from_toml(s)` / `get(name)` | 静态图集（`K=String` 特化） |
+| `StaticAtlas::from_toml(s, registry)` / `get(name)` | 静态图集（`K=String` 特化）；`tex` 字段按名在本上下文的纹理注册表里解析 |
 
 
 ## 9. Text（文本渲染）
@@ -621,62 +626,95 @@ crate：`rjw_text`
 基于 `cosmic-text` 排版 + `swash` 字形光栅化 + `DynamicAtlas` 字形缓存。
 
 ```rust
-pub struct Text { /* font_system: FontSystem, glyph_cache: DynamicAtlas<cosmic_text::CacheKey>, ... */ }
+pub struct Text { /* font_system, scale_context, glyph_cache: DynamicAtlas<AtlasKey>, locations, ... */ }
 ```
+
+### 9.1 字形图集是**公开**的（供 UI 等消费者）
+
+字形图集把「字形 + UI 自定义纹理 + WHITE 基础纹理」放在**同一页**，因此它们
+纹理相同 → 后端可合批（省掉图形↔文字的纹理状态切换）。它现在是公开可用 / 可修改的：
+
+| 入口 | 说明 |
+|---|---|
+| `Text::glyph_cache() -> &DynamicAtlas<AtlasKey>` | 只读：`page_count()` / `stats()` / `generation()` / `region(&key)` |
+| `Text::glyph_cache_mut() -> &mut DynamicAtlas<AtlasKey>` | **可变**：插入自定义纹理、`compact()` 去碎片、低级查询 |
+| `Text::user_texture(id: u64, px: Rgba8) -> Option<AtlasRegion>` | ★ **推荐路径**：固定用 `AtlasKey::Custom(id)` 命名空间 + `permanent()`（不被逐出、不撞字形键） |
+| `Text::white_region() -> Option<AtlasRegion>` | 1×1 白纹理 region（UI 实心填充 / 边框 / 光标采样；每次调用刷新寿命） |
+| `Text::tick()` | 寿命推进（引擎每渲染帧调用；用户不必手动） |
+
+`AtlasKey` 的两个命名空间**必须分清**：
+
+```rust
+pub enum AtlasKey {
+    Glyph(cosmic_text::CacheKey),   // rjw_text 内部字形命名空间——消费者不要写
+    Custom(u64),                    // 消费者命名空间（定长去重键，如圆角半径）
+}
+```
+
+**使用 `glyph_cache_mut()` 的四条约定**（违反会静默错位，不报错）：
+
+1. **不要写 `AtlasKey::Glyph(..)`** —— 那是光栅化逻辑的命名空间，会被覆盖 / 误判命中。
+2. **不要手改 WHITE 条目** —— 它是 UI 实心填充与字形合批的基础。
+3. 插入**非 `permanent()`** 的条目会被 `tick()` 的寿命机制逐出；自己长期持有 region
+   的调用方请用 `permanent()`，或改用 `handle()` 走 RAII 保活。
+4. **图集重排后 `AtlasRegion` 失效** —— 用 `generation()` 变化判定并重新 `region()` 取。
+
+> 缓存键与命名空间隔离有回归测试锁定：`rjw_text::tests::atlas_key_namespaces_are_distinct`。
+
+### 9.2 方法表（⚠ 部分为 v0.2 旧 API）
+
+> ⚠ 下表中 `draw_label*` / `TextLayout` / `TextRender` / `render_from` /
+> `Text::new(device, queue, layout)` / `create_buffer*` / `measure` / `visual_lines`
+> 都是 **v0.2 的旧名**，v0.3 已删除或改名为 `Label` 责任链
+> （`Text::label(..).size(..).at(..).draw(layer)`）——现行写法见
+> `examples/eg260810TextChain` 与本文档 §9.3。
 
 | 方法 | 说明 |
 |---|---|
-| `Text::new(device, queue, layout)` | 创建字体管理器（自动加载系统字体） |
+| `Text::new(gfx: &Gpu)` | 创建字体管理器（自动加载系统字体） |
 | `load_font_data(data: Vec<u8>)` | 加载额外的 ttf/otf 字体数据 |
-| `create_buffer(text, attrs, size, line_height, align) -> Arc<Buffer>` | 排版并返回**共享只读** `Arc<Buffer>`（相同输入命中缓存，O(1) 签名预过滤、不深拷贝） |
-| `create_buffer_wrap(text, attrs, size, line_height, align, wrap_width, policy)` | 同 `create_buffer_policy`，但指定**排版宽度**（物理像素）：超出自动**换行**（多行）；宽度参与缓存键 |
-| `measure(text, attrs, size, line_height, align) -> Vec2` | 排版 + 测量内容宽高（GUI 布局用） |
-| `measure_buffer(buffer) -> Vec2` | 已排版 Buffer 的内容宽高（行盒；空文本返回 (0,0)） |
-| `visual_lines(buffer) -> Vec<VisualLine>` | **视觉行**（自动换行后）列表：`(byte_start, byte_end, top, width)`——光标/点击/选择与显示对齐（TextArea） |
-| `white_region() -> Option<AtlasRegion>` | **字形图集页内的 WHITE 基础纹理**（1×1 clamp_margin）——UI 实心填充与字形同页合批 |
-| `draw_label(r2d, text, color, size, line_height, pos, family, align, layer) -> Vec2` | ★ 一行渲染：pos=左上角，返回内容宽高（feature = `rjw_2d_render`） |
-| `draw_label_ex(r2d, text, color, size, line_height, pos, family, align, layer, origin) -> Vec2` | 扩展版：origin 归一化到 [0,1]，(0.5,0.5)=居中（feature = `rjw_2d_render`） |
-| `draw_label_with(text, size, line_height, pos, family, align, origin, callback) -> Vec2` | 回调版标签渲染：不绑定 Render2D，GUI 自定义字形绘制 |
-| `draw_text(buffer, callback)` | 遍历字形精灵，闭包 `(region, world_pos, world_size)` 自定义绘制 |
-| `Text::text(..) -> TextLayout` | 责任链入口（阶段一：排版配置；常量字符串 `TextStorage` 内联） |
-| `TextLayout::size/line_height/line_space/align/attrs/font_family` | 排版链设置 |
-| `TextLayout::measure() -> Vec2` | 排版 + 测量内容宽高（不消费链） |
-| `TextLayout::into_buffer() -> Arc<Buffer>` | 排版并交出共享 cosmic-text Buffer（消费链） |
-| `Text::render_from(&mut self, buffer: &Buffer) -> TextRender` | ★ 从用户保存的 `Arc<Buffer>` 直接进入阶段二（责任链渲染，跳过整形；静态大文本手动缓存路径） |
-| `TextLayout::into_render() -> TextRender` | 转阶段二（用 `Text` 内部缓冲，单标签快速路径，跨帧复用容量） |
-| `TextLayout::into_render_with(&mut TextBuffer) -> TextRender` | 转阶段二（用户持缓冲，多标签并存） |
-| `TextLayout::precache() -> Self` | 预缓存：字形入图集（预热），返回自身可稍后渲染 |
-| `TextLayout::into_render() -> TextRender` | 转阶段二：**直接堆存储** |
-| `TextRender::from_layout(layout)` | 从 `TextLayout` 转换（TextRender 的函数） |
-| `TextRender::new(text, string, size, lh, align)` | 直接构造（跳过 builder） |
-| `TextRender::origin/origin_px/offset/color/map` | 渲染设置：归一化/像素原点、偏移、全局色、逐字形修改 |
-| `TextRender::transform(Option<Transform2D>)` | 渲染级变换：作用整个文本块，`draw_with` / `draw_sprite2d` / `draw_2d_gradient` 均应用 |
-| `TextRender::draw_with(callback)` | 回调 `(measure, line, region, topleft)` 绘制（核心，无 feature 依赖） |
-| `TextRender::draw_sprite2d(r2d, layer)` | 直接渲染到 Render2D（feature = `rjw_2d_render`） |
-| `TextRender::draw_2d_gradient(r2d, layer, mode, axis, stops)` | 渐变渲染：Glyph/Line/Frame × 横/竖向，动态 mesh 逐顶点色（feature = `rjw_2d_render`） |
-| `TextStorage` / `LineSpace` / `GradientMode` / `GradientAxis` | 文本内联存储 / 行距(像素·倍率) / 渐变区间 / 渐变方向 |
-| `GlyphType` | 字形类型：`Normal`（单色可染色）/ `Color`（Emoji 等）；`GlyphData::glyph_str()` 取对应字符 &str |
-| `Text::build_style() -> TextStyle` | 构建可复用样式（临时持有 `&mut Text`；可复用多次 `text(..)`） |
-| `Style` / `TextStyle` | 解耦样式（family=`AttrsOwned` 无借用，克隆继承 `base.clone().size(..)`）/ 临时样式句柄 |
-| `RenderDefaults` / `OwnedAttrs` | 渲染默认（color/origin/offset/transform）/ 无借用完整文本属性（cosmic-text `AttrsOwned`） |
+| `Text::label(text) -> Label` | ★ 责任链入口 → `.size/.line_height/.align/.font_family/.at/.center/.anchor/.draw(layer)` |
+| `Text::label_from(&Arc<Buffer>) -> Label` | 从用户保存的共享 `Arc<Buffer>` 进入（跳过整形） |
+| `Text::measure_buffer(buffer) -> Vec2` | 已排版 Buffer 的内容宽高（空文本返回 (0,0)） |
+| `Text::lines(buffer) -> Vec<VisualLine>` | **视觉行**（自动换行后）：`(byte_start, byte_end, top, width)`——光标/点击/选择与显示对齐 |
+| `Text::buffer(..)` / `Text::geometry(..)` | UI 稳定集成面（预排版 / 几何） |
+| `white_region()` / `user_texture(..)` / `tick()` | 见 §9.1 |
 
-> **性能**：`Text` 内置**排版缓存（LRU）**——按（文本/字号/行高/对齐/attrs）缓存 cosmic-text 排版，相同输入经 **O(1) 签名**预过滤后返回共享 `Arc<Buffer>`（不深拷贝，跳过重复整形；上限 [`MAX_LAYOUT_CACHE`]=128，满时淘汰最久未用）。缓存启用规则：**Debug 恒缓存**；**Release 仅缓存 ≤ [`LARGE_TEXT_CACHE_LIMIT`]=512 字节的小文本**（大文本多为动态/低频，不入缓存、每帧直接整形）；静态大文本请保存 `Arc<Buffer>` 经 `render_from` 手动复用。空格等**无图字形**只判定一次（`no_image`）；字形图集去碎片重排后自动同步区域。
+> **性能**：`Text` 内置**排版缓存（LRU）**——按（文本/字号/行高/对齐/attrs）缓存 cosmic-text 排版，
+> 相同输入经 **O(1) 签名**预过滤后返回共享 `Arc<Buffer>`（不深拷贝，跳过重复整形；
+> 上限 `MAX_LAYOUT_CACHE` = 128，满时淘汰最久未用）。缓存启用规则：**Debug 恒缓存**；
+> **Release 仅缓存 ≤ `LARGE_TEXT_CACHE_LIMIT` = 512 字节的小文本**（大文本多为动态/低频，
+> 不入缓存、每帧直接整形）；静态大文本请保存 `Arc<Buffer>` 经 `label_from` 手动复用。
+> 空格等**无图字形**只判定一次（`no_image`）；字形图集去碎片重排后自动同步区域。
+
+### 9.3 用法示例（v0.3 现行 API）
 
 ```rust
-use rjw_text::{Text, Align};
+use rjw_krusie::prelude::*;
 
-let mut font = Text::new(device, queue, layout);
+// 世界层文本（`f.text` 绑定世界层渲染器）
+f.text(|t| {
+    t.label("HP 100").size(16.0).at(world_pos).draw(10.0);
+});
 
-// 左上角单行文本
-font.draw_label(r2d, "Hello World", Color::WHITE, 14.0, 18.0, Vec2::new(10.0, 10.0), "SimHei", Align::Left, 0.0);
+// 屏幕固定文本（`f.text_ui` 绑定 UI 层，物理像素、左上原点）
+f.text_ui(|t| {
+    t.label("FPS 60").size(14.0).at((16.0, 16.0)).color(Color::YELLOW).draw(0.0);
+});
 
-// 屏幕居中 Game Over
-let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 28.0, cam.position, "SimHei", Align::Center, 1e7, Vec2::new(0.5, 0.5));
+// 往字形图集插自定义纹理（与字形同页 → 同纹理合批）
+f.text(|t| {
+    let px = rjw_krusie::ui::proc::rounded_rect_rgba(32, 6.0, Color::WHITE);
+    let region = t
+        .glyph_cache_mut()
+        .insert_with(
+            rjw_krusie::text::AtlasKey::Custom(0xABCD),
+            rjw_krusie::gpu::Rgba8::new(&px, (32, 32)),
+            rjw_krusie::atlas::InsertOpts::new().permanent(),
+        );
+    let _ = region;
+});
 ```
-
-> 注：`draw_label` / `draw_label_ex` 依赖默认 feature `rjw_2d_render`；纯测量/回调 API
-> （`measure` / `measure_buffer` / `draw_text` / `draw_label_with`）不依赖渲染器，
-> 可通过 `default-features = false` 关闭该 feature。
 
 ## 10. 其他常用小类型速查
 
@@ -720,11 +758,54 @@ let size = font.draw_label_ex(r2d, "GAME OVER\n按 R 重开", Color::RED, 22.0, 
 | `UiInit::debug_layout()` / `without_debug_layout()` | `.debug_layout()` | 调试 UI 布局：给每个控件/容器矩形画描边（颜色/宽度见 [样式小节](#样式theme可-clone-覆盖) 的 `DebugStyle`；默认关闭）。**无裸布尔**：开 = 调 `debug_layout()`，关 = `without_debug_layout()` |
 | `Ui::debug_layout()` / `Ui::without_debug_layout()` | `ui.debug_layout()` | 同 `UiInit` 版本，帧内运行时开关 |
 | `UiInit::build()` | → `Ui` | 完成构建（内部 `state.begin_frame()`） |
-| `Ui::finish(&mut Render2D)` | `ui.finish(r2d)` | 按 `(win, depth, 图形/文字, 录制序)` 序**免全量排序**提交（win + depth 分桶、桶内保持录制序，语义与排序完全等价）；UI 无需相机/视口（屏幕固定变换由运行时 UI 层相机提供）；清空帧状态 |
+| `Ui::finish(&mut dyn UiBackend)` | `ui.finish(&mut backend)` | 按 `(win, depth, 图形/文字, 录制序)` 序**免全量排序**提交（win + depth 分桶、桶内保持录制序，语义与排序完全等价）；**产出 `UiBatch` 批次交给后端**（`rjw_ui` 不再直接调用渲染器）；UI 无需相机/视口（屏幕固定变换由运行时 UI 层相机提供）；清空帧状态 |
 | `UiState::new()` | 应用持有 | 跨帧持久状态容器 |
 | `UiState::reset()` / `remove(id)` | 示例"R 重开" | 清空全部 / 移除单个控件状态 |
 | `UiState::text_focus() -> Option<TextFocus>` | `if ui.state().text_focus().is_none() { /* 快捷键 */ }` | **文本焦点**（只有输入框/多行框持焦点才为 `Some`）；取代旧 `capturing_text()` —— 按钮/滑块的 Tab 焦点不再吞应用快捷键 |
 | `Ui::debug_dump() -> UiDebugDump` | `eprintln!("{}", ui.debug_dump())` | 引擎侧状态快照（每窗口 `id/z/origin/submit/size/drag/press/stored`），单行可 grep；见 [DEBUGGING.md](DEBUGGING.md) §1 |
+
+### UI 绘制后端（`rjw_ui::backend`，v0.3 新增）
+
+`rjw_ui` **只输出批次数据**，不直接调用任何渲染器。批次经 [`UiBackend`] 交给后端：
+
+```rust
+pub trait UiBackend {
+    fn texture(&self, uid: u64) -> Option<Arc<TextureWrapped>>;
+    fn submit(&mut self, batch: UiBatch);                       // 顺序 = 绘制顺序
+}
+```
+
+> **只有两个方法**（v0.3）：UI 的绘制输出就是「纹理 + 顶点」。后端**不需要**参与纹理生成
+> ——矩形渐变已改为四角顶点色（见「渲染增强」一节），不再有程序化渐变纹理请求。
+
+```rust
+pub struct UiBatch {
+    pub texture: Arc<TextureWrapped>,
+    pub vertices: Vec<VertexP3U2C4>,   // 已是最终屏幕物理像素坐标
+    pub transform: Transform2D,        // 实例级（窗口 FX 不重建顶点）
+    pub tint: Color,                   // 实例级整段染色（顶点色已含控件自身 tint）
+    pub layer: f64,
+    pub source: UiBatchSource,         // 实例用户数据
+}
+
+pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
+```
+
+**实现者**：`rjw_krusie::runtime::layers::ui_backend::Render2dUiBackend`（桥接到 `Render2D`）；
+`rjw_ui::RecordingBackend`（**纯 CPU**，收集批次供测试断言 draw call 数）。
+
+**实例粒度 / DrawCall 取舍**（一个 `UiBatch` = 一个实例 = 一次 draw call 候选）：
+
+| 规则 | 原因 |
+|---|---|
+| 同一窗口内**所有控件 / 容器**合成一批 | 「尽量减少 DrawCall」——实例内容范围 = 整个窗口（≈1~2 次/窗口） |
+| **按窗口切** | 批次的 `transform` / `tint` 是窗口级的；烘进顶点会让 FX 动画每帧重建整窗顶点，摧毁窗口顶点缓存 |
+| **按纹理切** | 一次 draw call 只能绑一个纹理（bind group） |
+| 超 `MAX_UI_SEG_VERTS` 切 | u16 索引上限 |
+
+`source.elements` 记录本批次覆盖的控件数，是上述取舍的可观测指标。
+切段规则由纯函数 `segment_runs` 裁决，契约由 `ui::batch_contract_tests` 断言
+（单窗口单纹理 = 1 次 draw call；控件数不增加 draw call；窗口/纹理切换必切段）。
 
 ### 容器（布局）
 
@@ -884,24 +965,51 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 - 输入框按下时置位 `press_claimed`：窗口/面板**不建立拖拽基准**（选择拖拽优先；窗口从空白/标题区拖动），并清除旧拖拽基准（防"瞬移"）；
 - 主题：`InputStyle::sel_bg`（选择高亮色，默认浅蓝 / dark 深蓝）。
 
-### 渲染增强（圆角 / 渐变，程序化纹理进动态 Atlas）
+### 渲染增强（圆角 / 渐变）
 
 | 函数 | 签名 | 说明 |
 |---|---|---|
 | `rounded_rect_at` | `ui.rounded_rect_at(pos, size, radius, color)` | 圆角矩形背景原语（radius 逻辑像素；9-patch 绘制，颜色顶点色 tint） |
-| `gradient_rect_at` | `ui.gradient_rect_at(pos, size, axis, stops)` | 线性渐变矩形原语（`axis`：`GradientAxis::Vertical/Horizontal`；`stops: Vec<(f32, Color)>`） |
-| `GradientAxis` | `Vertical` / `Horizontal` | 渐变方向（`Vertical` 沿 y：0 = 顶部） |
+| `gradient_rect_at` | `ui.gradient_rect_at(pos, size, gradient)` | **矩形渐变**原语（绝对定位）。`gradient` 接受 `Gradient` 或 `Color`（`Into`） |
+| `gradient_rect` | `ui.gradient_rect(size, gradient)` | 同上，但位置来自当前容器游标（随布局流） |
+| `Gradient` | `pure(c)` / `vertical(top, bottom)` / `horizontal(left, right)` / `rotated(from, to, angle)` / `corners(tl, tr, bl, br)` | **四角颜色**（`pub tl/tr/bl/br`）；`From<Color>` 给纯色 |
+| `lerp_color` | `lerp_color(a, b, k)` | 颜色线性插值（`Gradient` 构造器与四角采样的基础） |
 
-- 程序化纹理（圆角矩形 `32×32`、渐变主轴 `64` 级、WHITE `1×1`）**塞进动态 Atlas**
-  （`rjw_ui::ProcTextures` → `UiState` 持有，惰性创建、`DynamicAtlas::from_raw` 接管既有页纹理、
-  `InsertOpts::new().permanent().no_clamp()` 永久 + 防采样透色），页纹理自动注册进 `rjw_render::TEXTURES`；
-- 圆角纹理只存**白色 + alpha**（同半径一张，颜色由顶点色 tint，不随颜色膨胀图集）；
-- 圆角**9-patch**：四角原样、四边/中心拉伸（任意矩形尺寸圆弧不畸变）；
-  渐变矩形直接拉伸采样（主轴 64 级已平滑）；
-- 提交分组升级为 `(win, 图形/文字组, 纹理 uid)`：圆角 / 渐变属于**图形组**，先于文字
-  （不会因非白纹理 uid 排序错位盖住文字）；⚠ **UI 的 Render2D 必须 `set_sort_mode(SortMode::None)`**
-  （完全按提交顺序绘制）——`SortMode::LayerAndStates` 会按纹理 uid 重排，
-  圆角/渐变会被排在文字之后绘制而盖住文字（示例 `eg260818UI` 即如此配置）；
+```rust
+// 使用前
+use rjw_krusie::prelude::*;
+// 1) 纯色（等价实心）
+ui.gradient_rect_at(pos, size, Color::from_hex("#3af"));               // Color: Into<Gradient>
+// 2) 上下 / 左右双色
+ui.gradient_rect_at(pos, size, Gradient::vertical(Color::RED, Color::BLUE));
+ui.gradient_rect_at(pos, size, Gradient::horizontal(Color::RED, Color::BLUE));
+// 3) 任意角度（0° = 下→上，90° = 左→右，逆时针为正）
+ui.gradient_rect_at(pos, size, Gradient::rotated(Color::RED, Color::BLUE, 0.5));
+// 4) 四角各异（双线性；1D 纹理表达不了）
+ui.gradient_rect_at(pos, size, Gradient::corners(a, b, c, d));
+```
+
+**渐变不需要纹理**（v0.3 起）：顶点格式 `VertexP3U2C4` 自带 4 分量顶点色，
+光栅化器本就做重心插值 ⇒ 一个 quad + 白纹理即可，**管线零改动**。这一决定替代了旧实现
+（把渐变烘成 1×64 条纹纹理塞进动态图集）。旧实现的代价：每帧一次 `String` 建 key
+（`{t:.3}` 还会静默撞键）、`permanent` 条目让图集**永久无法 `repack_all`**、
+每次纹理切换多一次 draw call、且**单轴纹理表达不了四角各异的颜色**。
+
+- **不支持多段 stops**（3+ 停靠点）：四角顶点色是双线性的，无法精确表达多段。
+  多段渐变请用 `rjw_text::Gradient`（作用于**文字**，本就支持多段；
+  见 `Gradient::glyph_h/glyph_v/line_h/line_v/frame_h/frame_v`）。
+- **裁剪保锚**：矩形被裁剪时四角色按其在**原矩形**中的相对位置重采样，
+  颜色的空间锚定不变（否则裁剪会让渐变整体平移）。
+- 圆角仍用纹理：圆角矩形 `32×32` 进**字形图集**（`Text::user_texture`），
+  只存**白色 + alpha**（同半径一张，颜色由顶点色 tint）；圆角**9-patch**
+  四角原样、四边/中心拉伸（任意矩形圆弧不畸变）。
+  `ProcTextures` 与 `rjw_ui::proc::{gradient_rgba, gradient_key, GRADIENT_TEX_LEN}`
+  **已删除**。
+- `GradientAxis` 现在只属于**文字渐变**（`rjw_text::GradientAxis`），
+  不再是矩形渐变的参数；`rjw_ui` 根不再导出它（`rjw_ui::text::GradientAxis` 仍可用）。
+- 提交分组为 `(win, 图形/文字组, 纹理 uid)`：渐变（白纹理）与圆角属于**图形组**，先于文字；
+  ⚠ **UI 的 Render2D 必须 `set_sort_mode(SortMode::None)`**（完全按提交顺序绘制）——
+  `SortMode::LayerAndStates` 会按纹理 uid 重排而盖住文字（示例 `eg260818UI` 即如此配置）；
 - 控件级集成：`Theme` 的 `PanelStyle::radius` / `ButtonStyle::radius` / `InputStyle::radius`。
 
 ### 调试（Debug UI / DebugDraw / 窗口诊断）
