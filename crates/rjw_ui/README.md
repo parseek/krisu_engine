@@ -11,14 +11,35 @@ krusie 引擎的 UI 模块：**hybrid 模式**（立即外观 + ID 持久状态�
 - **绘制后端解耦**（v0.3）：`rjw_ui` 只认识 [`UiBackend`](src/backend.rs) trait —
   **只有 `texture(uid)` 与 `submit(UiBatch)` 两个方法**（矩形渐变改为四角顶点色后，
   不再有「后端替我建渐变纹理」这一职责）。一个 `UiBatch` = 一个实例
-  =（纹理 + 顶点 + 实例变换 + 实例 tint + 实例数据 `UiBatchSource`）。
+  =（纹理 + 顶点 + **三角形索引** + 实例变换 + 实例 tint + 实例数据 `UiBatchSource`）。
+  - **几何全程直出三角形**：`indices: Vec<Tri>`（`Tri = [u16; 3]`）相对 `vertices`；
+    索引与顶点同源同段存放（`Geom`），拼接时由 `Geom::append` 自动平移——分开算一旦
+    不一致会产生错乱三角形且**不会 panic**。为空索引时后端按「每 4 顶点一组、
+    `TL,TR,BL,BR`」的旧约定回退，外部后端可继续只产出顶点。
   - 实例粒度 = **（窗口 × 纹理）**：同一窗口内**所有控件 / 容器**合成一批
     ⇒ 「一个窗口 ≈ 1~2 次 draw call」（`source.elements` 记录本批覆盖的控件数）。
   - **不按控件切**是「尽量减少 DrawCall」的关键；**按窗口切**是因为批次携带窗口级
     transform/tint（烘进顶点会让窗口 FX 动画每帧重建整窗顶点，摧毁窗口顶点缓存）。
+    窗口 FX tint 非白时该段自带实例色（`MeshStyled`）会自成一整段不参与跨段合批；
+    其余批次走普通 `Mesh`，可继续与相邻同纹理同变换的段合并。
   - 切段规则由纯函数 `segment_runs` 裁决，契约由 `ui::batch_contract_tests` 断言（无 GPU）。
   - 真实后端：`rjw_krusie::runtime::layers::ui_backend::Render2dUiBackend`；
     测试后端：`rjw_ui::RecordingBackend`（收集批次，可断言 draw call 数）。
+- **圆角不用纹理、不改着色器**（v0.4）：`tess` 模块把圆角矩形**CPU 镶嵌成三角形**——
+  硬体轮廓 `alpha = 1`、沿法线外扩 1 **物理像素**得到外环 `alpha = 0`，带状三角形由
+  光栅化器插值出羽化边缘（这就是抗锯齿）。「单位四分之一圆弧表 + 步长抽样」用**一张**
+  32 点表服务所有半径（半径 → 目标弧距 2px → `stride`（2 的幂）→ `segs = 32 / stride`）。
+  圆角**边框**是外/内轮廓之间的**环带**（内半径 `max(0, r - width)`，与 CSS 同规则），
+  只画一次边界。半径**不取整**（任意小数半径，超出半高 clamp 成胶囊）。
+  旧的 `rjw_ui::proc` 32×32 九宫格圆角纹理**已删除**。
+- **背景刷与配色令牌**（v0.4）：`PanelStyle::bg` / `ButtonStyle::{bg,bg_hover,bg_pressed}` /
+  `InputStyle::bg` 的类型是 [`Brush`](src/style.rs)（`Solid` / `Vertical` / `Horizontal`；
+  `Color: Into<Brush>` ⇒ 既有 `with_bg(Color::RED)` 不用改）。四角色进顶点色 ⇒
+  **圆角 + 渐变天然共存**，零纹理。整套配色来自 `Palette`（按**层次**命名的表面阶梯 +
+  描边 / 前景 / 强调）：`Theme::themed(&Palette)` 组装，`Theme::{light,dark,dark_legacy}`
+  是预设；`Palette.bevel` + `bevel_raised/sunken` 从**一个**表面色派生微渐变。
+  `Theme::with_radius` 级联到全部有圆角的子样式（panel / button / input /
+  checkbox`r/2` / combo.menu_radius`min(r,6)`）。
 - **状态持久**：交互控件（按钮/滑块/勾选/输入框）通过 **ID**（`&str`）把 hover / 按下 / 焦点 / 输入内容 / 拖拽标记持久化在 `UiState` 中（应用持有，跨帧复用）。
 - **自动尺寸**（DOM 风格）：叶子控件由内容测量（`rjw_text::Text::measure` + padding）自然撑开，容器（panel / pack / grid）在闭包结束时按子控件结算自身尺寸——**默认无需手写宽高**；任何控件可显式 `.size(w, h)` 或传 `Rect` 覆盖。
 - **屏幕空间**：控件坐标一律为屏幕像素（左上角原点、Y+ 向下），内部经相机屏幕固定变换绘制，命中测试直接在屏幕像素进行（旋转/缩放相机依然准确）。

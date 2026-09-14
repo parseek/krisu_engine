@@ -126,14 +126,20 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 
 命令排序键 `(win, depth, elem, 图形/文字组, seq)`：窗口 z 升序 → 元素录制序 → 元素内
 "背景/图形先于文字"。实心填充 / 光标用**字形图集页白纹理**（与字形同页同纹理 → 合批）。
-圆角矩形（9-patch）纹理也**塞进字形图集**（[`rjw_text::Text::insert_user_texture`]，
-白色 + alpha、顶点色 tint）——圆角图形与文字/白填充同页同纹理 → 窗口内合并一次 draw；
-线性渐变仍在独立程序化 Atlas 页。
+**圆角矩形与矩形渐变都不需要纹理**（v0.4）：渐变走四角顶点色，圆角由 CPU 镶嵌成
+三角形（硬体 + 1 物理像素羽化带，`rjw_ui::tess`）——两者都属于图形组、都用白纹理，
+因此圆角图形与文字/白填充**同页同纹理**，窗口内仍合并成一次 draw。
+（旧的 `rjw_ui::proc` 32×32 圆角 9-patch 纹理已删除。）
+
+**几何**：`UiBatch` 携带 `vertices` + `indices`（`Tri = [u16; 3]`），UI 全程直出三角形。
+索引与顶点同段存放、`Geom::append` 拼接时自动平移，二者永不脱节。为空索引时后端按
+「每 4 顶点一组、`TL,TR,BL,BR`」的旧约定回退，保证外部后端兼容。
 
 **窗口级合批（尽力而为）**：`finish` 提交按窗口聚合——同一窗口内**连续的同纹理同状态
-内容**顶点合并成整段，一次 `quads(..).color(tint)` → Render2D 一次 `draw_indexed`（命中其
-QuadVertices 合批）。窗口内出现不同纹理（白纹理 / 圆角渐变程序化页）或不同混合状态、
-或超顶点上限（`MAX_UI_SEG_VERTS`）时自动**切段**（层级保序）。
+同变换**内容顶点合并成整段，一次 `mesh_indexed(..)` → Render2D 一次 `draw_indexed`。
+窗口内出现不同纹理或超顶点上限（`MAX_UI_SEG_VERTS`）时自动**切段**（层级保序）。
+窗口 FX tint 非白时该段自带实例色（`MeshStyled`）会自成一整段、不参与跨段合批
+（这是 `Render2D` 既有语义，与旧 `quads(..).tint(..)` 路径一致）。
 
 **窗口级 FX**（[`Ui::window_fx`] / `WindowFx`）：每个窗口可设 `tint`（整窗混合色，
 shader 里 `顶点色 × 实例色`）、`transform` override（叠加在窗口原点上）与 **`anchor`

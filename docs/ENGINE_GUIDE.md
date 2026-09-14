@@ -490,7 +490,8 @@ let mut atlas = DynamicAtlas::new(
 ```
 
 > `DynamicAtlas::new(gfx, cfg)`：`gfx` 可为 `&Gfx`（`Deref` 到 `&Gpu`）或 `&Gpu`。
-> 需要接管**已有页纹理**时用 `DynamicAtlas::from_raw(...)`（`rjw_ui::ProcTextures` 即此路径）。
+> 需要接管**已有页纹理**时用 `DynamicAtlas::from_raw(...)`（`rjw_text` 的字形图集
+> 即此路径；`rjw_ui::ProcTextures` 已在 v0.4 删除，见 §18.6）。
 
 #### 插入精灵
 
@@ -673,7 +674,7 @@ if let Some(spr) = tex.atlas.sprite(&tex.grass) {
 1. `Tex` 持有 `DynamicAtlas`，确保图集页纹理不会被释放；`RegionRef` 句柄是 RAII 保活的。
 2. `atlas.sprite(&handle) -> Option<AtlasSprite>`（`{ texture, region }`）取代了「`TEXTURES.get(page_uid)` + 手算像素→归一化 UV + `SpriteRect::with_uv_tex` + `sprite`」四步。
 3. `region(..)` 返回 `SpriteBuilder`，后续链式状态/RStates 与世界层完全一致。
-4. 需要**子区域裁剪**（9-patch / 特效）时，用 `SpriteRect::with_uv_px(.., tex_wh)` + `r2d.sprite(..)`；`AtlasRegion` 自身带 `tl_px`/`wh_px`，换算即 `with_uv_tex`。
+4. 需要**子区域裁剪**（九宫格 / 特效）时，用 `SpriteRect::with_uv_px(.., tex_wh)` + `r2d.sprite(..)`；`AtlasRegion` 自身带 `tl_px`/`wh_px`，换算即 `with_uv_tex`。
 
 ---
 
@@ -1162,24 +1163,39 @@ ui.gradient_rect_at(Vec2::new(0.0, 0.0), Vec2::new(1280.0, 56.0),
     vec![(0.0, Color::rgba_u8(38, 52, 90, 255)), (1.0, Color::rgba_u8(26, 34, 60, 255))]);
 ```
 
-**程序化纹理进动态 Atlas**：圆角矩形（`32×32`）、线性渐变（主轴 `64` 级）、WHITE（`1×1`）
-由 `rjw_ui::ProcTextures`（`UiState` 持有，惰性初始化）生成并 `insert_permanent` 塞进
-`rjw_atlas::DynamicAtlas`——与字形图集同机制（Guillotine 打包、页纹理自动注册进
-`TEXTURES`、`clamp_margin` 防采样透色）。要点：
+**v0.4：圆角不再走纹理。** `rjw_ui::proc`（`ProcTextures` / `rounded_rect_rgba` /
+`rounded_9patch` / `ROUNDED_TEX_SIZE`）**已删除**。圆角矩形由 CPU **镶嵌成三角形**
+（`rjw_ui::tess`）：
 
-- **圆角纹理只存白色 + alpha**：同半径一张纹理，绘制时用**顶点色 tint** 得到任意颜色
-  （图集不随颜色膨胀）；key 仅含半径（`r.to_bits()` 位模式，非整数半径不串味）；
-- **9-patch 绘制**（`proc::rounded_9patch`）：四角原样采样、四边/中心拉伸——任意
-  矩形尺寸圆弧不畸变；`radius > 0` 的边框 ≈ 外圈 border 色圆角 + 内圈 bg 色圆角
-  （`Ui::push_panel_like`）；
-- **生成器按像素半区选圆心**（`proc::rounded_rect_rgba`）：非整数物理半径（高 DPI：
-  radius × scale，如 6 × 1.25 = 7.5）不再因 `r as i32` 截断导致角区整列透明；
-- 渐变矩形直接拉伸采样（主轴 64 级已平滑）；渐变纹理存**真实颜色**（key 含停靠点，
-  改变停靠即换纹理）；
-- **提交分组升级为 `(win, 图形/文字组, 纹理 uid)`**（`GROUP_GRAPHIC=0` / `GROUP_TEXT=1`）：
+- **不改着色器**：抗锯齿不靠 SDF，靠光栅化器对顶点 alpha 的线性插值——硬体轮廓
+  `alpha = 1`，沿法线外扩 1 **物理像素**得到外环 `alpha = 0`，带状三角形插出羽化边缘。
+  `sprite.wgsl` / `InstanceData` 零改动，也不需要第二条管线。
+- **单位弧表 + 步长抽样**（而非每半径一张纹理 / 一张表）：32 点的单位四分之一圆弧表
+  服务所有半径；半径 → 目标弧距 2px → `stride`（2 的幂）→ `segs = 32 / stride`。
+  `N_FINE` 是 2 的幂 ⇒ `segs × stride` 恒等于 `N_FINE`。
+- **羽化环**用更粗的段数（`FEATHER_SEGS_MAX = 4`，整除 `segs`）⇒ 环上每点精确落在
+  硬体轮廓的某点上；这是顶点数的主要旋钮（~136 顶点/圆角矩形）。
+- **索引内联、不缓存、不共用**：索引与顶点同源（同一次抽样循环），分开算一旦不一致
+  会产生错乱三角形且**不会 panic**。也**不用静态网格**：静态网格把几何冻结在 GPU
+  缓冲，与立即模式每帧重录冲突；羽化带是 1 物理像素、不可被实例缩放。
+- **圆角边框 = 环带**（`tess::push_rounded_ring`）：外轮廓与内轮廓之间的一圈带子，
+  内半径按 `max(0, r_outer - width)`（与 CSS `border-radius` 同规则）。比"外圈实心 +
+  内圈实心"少一次抗锯齿边缘混合。
+- 半径**不取整**（镶嵌器接受任意小数半径），高 DPI 下不再有 `radius × scale` 的
+  取整误差。
+- GPU 侧的唯一新入口是 `Render2D::mesh_indexed(vertices, indices, texture)`
+  （`ColorMode::Instance`：`tint` 是整段实例色，顶点自带色不被改写）；
+  桥接后端仅在窗口 FX tint 非白时才调 `.tint()`，其余批次保留可跨段合批的普通 `Mesh`。
+
+**仍进动态 Atlas 的**：WHITE（`1×1`，兼作渐变/圆角的 UV 源）；线性渐变**不再需要纹理**
+（四角顶点色由光栅化器双线性插值）。要点：
+
+- **提交分组是 `(win, 图形/文字组, 纹理 uid)`**（`GROUP_GRAPHIC=0` / `GROUP_TEXT=1`）：
   圆角 / 渐变 / 白纹理属于图形组，恒先于字形文字组——非白纹理 uid 不会因与白纹理
-  比较而排序错位（背景不会盖住文字）。窗口顶点缓存（`UiState.window_quads`）同步
+  比较而排序错位（背景不会盖住文字）。窗口几何缓存（`UiState.window_quads`）同步
   携带分组。
+- `rjw_atlas` 的 Guillotine 打包 / `clamp_margin` / 页纹理注册机制不变；
+  `rjw_text::Text::user_texture` 仍是对外可用的自定义纹理入口（UI 自己不再用它做圆角）。
 
 ### 18.7 滚动容器（scroll_at）
 

@@ -114,6 +114,17 @@ L2 的构造器只收 `&Gpu`，不收 `device/queue/layout` 三件套。
 | 清屏 | `ClearConfig`(3 `Option`) / `Clear` / `AppConfig::clear` | `Clear` |
 | 帧源 | 无（直接 `RenderContext::begin_frame`） | `FrameSource`（`RenderContext` 实现 + `Never`） |
 
+### 5.1 v0.4 增补（UI 绘制与主题）
+
+| 概念 | 坍缩前（多个表达） | 坍缩后（唯一） |
+|---|---|---|
+| UI 几何 | 「每 4 顶点一组 = 一个四边形」的隐式约定（`Vec<VertexP3U2C4>`，索引由后端推） | `Geom { verts, tris }` + `UiBatch::indices`（`Tri = [u16; 3]`）——**三角形是唯一表达**，四边形只是它的退化情形。索引与顶点同源同段，拼接时由 `Geom::append` 平移 |
+| 圆角 | `rjw_ui::proc` 的 32×32 九宫格程序化纹理（进字形图集、顶点色 tint、半径取整、key = `r.to_bits()`）**已删** | `tess::push_rounded_rect`（CPU 镶嵌：单位弧表 + 步长抽样 + 1 物理像素羽化带）。**零纹理、零着色器改动**；半径不取整 |
+| 圆角边框 | 「外圈 border 色实心圆角 + 内圈 bg 色实心圆角」两块叠加（圆角处抗锯齿混合两次） | `tess::push_rounded_ring`（外/内轮廓之间的环带；内半径 `max(0, r - width)`，与 CSS 同规则） |
+| 面板背景色 | 各子样式的裸 `Color` 字面量（11 处，随主题漂移） | `Brush { Solid, Vertical, Horizontal }` + `Palette` 层次令牌；`bevel_raised/sunken` 从**一个**表面色派生微渐变 |
+| 主题来源 | `Theme` 直接在 11 个子样式里写死深色 / 浅色 | `Theme::themed(&Palette)`；`Theme::{light,dark,dark_legacy}` 是它的三个预设。`Color: Into<Brush>` 让链式调用点不变 |
+| 绘制调用 | `Render2D::quads(vertices, texture)`（只能画四边形 + 需 `tint` 才成批） | `Render2D::mesh_indexed(vertices, indices, texture)`（`ColorMode::Instance`）；tint 仅在非白时抬到实例上，否则保留可跨段合批的普通 `Mesh` |
+
 ---
 
 ## 6. prelude 清单（L1）
@@ -314,19 +325,19 @@ L2 的构造器只收 `&Gpu`，不收 `device/queue/layout` 三件套。
 | `resizable_text_*_at(.., show_handle: bool)` | `resize(Resize::None/Horizontal/Both)` |
 | `debug_layout(bool)` ×2 | `.debug_layout()` / `.without_debug_layout()` |
 | `child_rect_exp(expands: bool)` | `child_rect(Child::Fit/Child::Expand)` |
-| `proc::gradient_rgba(vertical: bool)` | `GradientAxis` |
+| `proc::gradient_rgba(vertical: bool)` | `GradientAxis`（**v0.4：`proc` 整模块已删**，见 §5.1） |
 | `id: &str` / `group: &str`、两套分隔符（`/` 与 `::`） | **保留现状**（未统一 `impl Into<Id>`：控件签名已用 `&str`，改动面 >60 处入口且无功能收益） |
 | `IdRelative`/`IdAbsolute`/`IdStack`/`WidgetId` | **保留两类型**（不合并为单一 `Id`）：`IdRelative`（未解析名字）/ `IdAbsolute`（完整键）在**编译期**阻止"拿原始名字查状态"这类漏前缀 bug（`IdStack::id_for` 只收前者、状态表只收后者）；`WidgetId` 是 `&str`/`u64`/标签三态的 `Into` 适配器。合并成 `Id` 会丢掉这层类型安全（收益 < 代价，R5/R6 优先） |
 | `capturing_text()` = `focused.is_some()` | `text_focus() -> Option<TextFocus>`（**真正的文本焦点**：只有文本控件持焦点才为真，按钮/滑块 Tab 焦点不再吞应用快捷键） |
 | `mouse_logical()`（返回物理像素，与 `mouse_screen()` 重复） | 删除；保留 `mouse()` |
 | `Ui::theme` 公开字段（绕过 `scaled`） | `theme()` / `theme_mut()`（字段转 `pub(crate)`） |
 | `Widget::resizable()`（零消费） | 删除（文档改 `resize_handle`） |
-| `pub use proc::ProcTextures`（不可达） | 删除根导出（`proc::ProcTextures` 仍在，供 crate 内使用） |
+| `pub use proc::ProcTextures`（不可达） | 删除根导出（**v0.4：`proc` 模块整体删除**，见 §5.1） |
 | `layout::Frame` 的 `pub fn`（类型 `pub(crate)`） | 转 `pub(crate)` |
 | `focus` 只对 Combo/文本框注册（Button/Checkbox/Radio/Slider 的 `key_click` 是死路径） | 四类控件补 `register_focus` ⇒ Tab/方向键导航与 Enter/Space 激活真正生效 |
 | `rjw_ui::draw::GradientAxis` 与 `rjw_text::GradientAxis` 两份同名枚举 | 合并为一份：`pub use rjw_text::GradientAxis`（R13） |
-| `proc::gradient_rgba(w, h, vertical: bool, stops)` | `gradient_rgba(w, h, axis: GradientAxis, stops)`；`ProcTextures::gradient(.., axis, ..)` |
-| 11 子样式 ×(`dark()`+`scaled`+`with_*`) ≈120 方法 | `Theme::dark()` 预设 + 单内部宏实现 `scaled`；删子样式 `dark()` |
+| `proc::gradient_rgba(w, h, vertical: bool, stops)` | 已随 `proc` 删除（**v0.4**）。矩形渐变改为四角顶点色，不需要纹理；多段 stops 用 `rjw_text::Gradient`（文字）或 `draw::Gradient`（四角） |
+| 11 子样式 ×(`dark()`+`scaled`+`with_*`) ≈120 方法 | `SubStyle::themed(&Palette)` 单一配色入口 + `scaled` + `with_*`（**v0.4**：`dark()` 无参版本已被 `themed(&Palette)` 取代） |
 | `draw::TextAlign` / `TextVAlign` 半公开 | 统一 `rjw_text::Align`；`TextVAlign` 补根导出 |
 | `WidgetState::{press_panel,press_mouse}` 一结构三义 | 拆分为 `press_rect` / `drag_value` 等具名状态 |
 

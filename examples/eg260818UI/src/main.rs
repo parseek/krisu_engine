@@ -74,8 +74,12 @@ impl TopBar {
     fn ui(&mut self, ui: &mut Ui, fps: f64, clicks: u32) {
         ui.label_at(Vec2::new(16.0, 12.0), &format!("FPS: {fps:.0}"));
         ui.label_at(Vec2::new(16.0, 34.0), &format!("点击次数: {clicks}"));
+        // ── 外观演示：圆角 + 渐变（**零纹理、零着色器改动**）──
+        // 两者都是顶点色路径：圆角由 CPU 镶嵌成三角形（硬体 + 1px 羽化带），
+        // 渐变由光栅化器对四角顶点色双线性插值。四角色各异 ⇒「圆角 + 渐变」共存。
+        self.show_look_demo(ui);
         // 字体按钮（**pack 内自动尺寸**：随字体名变长自动变宽）打开 Modal。
-        ui.pack_at(Vec2::new(16.0, 56.0), PackSide::Top, |p| {
+        ui.pack_at(Vec2::new(16.0, 150.0), PackSide::Top, |p| {
             if p.button("font_btn", &format!("字体… {}", self.font_name)).clicked() {
                 self.font_modal_open = true;
             }
@@ -85,6 +89,44 @@ impl TopBar {
             p.label("玩家名（可拖动）");
             p.text_input("name", &mut self.player_name);
         });
+    }
+
+    /// **外观演示区**（左上角，`y = 56 .. 148`）：两块显式原语样例，用来目视确认
+    /// 「两端色渐变」「圆角 + 羽化抗锯齿」——**两者都不生成纹理、不改着色器**：
+    /// 渐变是四角顶点色（光栅化器双线性插值），圆角是 CPU 镶嵌成三角形
+    /// （硬体 `alpha = 1` + 1 物理像素羽化带 `alpha = 0`）。
+    ///
+    /// 「圆角 + 渐变」的组合不需要额外演示：本示例主题是 `Theme::dark()` +
+    /// `.with_radius(8.0)`，而 `Theme::dark()` 的面板 / 按钮背景本身就是 `Brush`
+    /// 纵向微渐变 ⇒ 下方每个按钮、面板都是「圆角 + 渐变 + 圆角边框环带」。
+    fn show_look_demo(&self, ui: &mut Ui) {
+        // 1) 水平两端色渐变条（无圆角；`Gradient` 支持 `rotated` / 四角各异）。
+        ui.gradient_rect_at(
+            Vec2::new(16.0, 56.0),
+            Vec2::new(168.0, 24.0),
+            rjw_krusie::ui::Gradient::horizontal(Color::rgba_u8(90, 150, 240, 255), Color::rgba_u8(214, 96, 190, 255)),
+        );
+        // 2) 垂直两端色渐变条 + 小圆角（`Gradient::corners` 与 `rounded_rect_at`
+        //    是两个独立原语；二者共用的都是同一条顶点色路径）。
+        ui.gradient_rect_at(
+            Vec2::new(16.0, 84.0),
+            Vec2::new(168.0, 24.0),
+            rjw_krusie::ui::Gradient::vertical(Color::rgba_u8(70, 200, 160, 255), Color::rgba_u8(28, 60, 74, 255)),
+        );
+        // 3) 圆角矩形（纯色 + 8 逻辑 px 圆角 + 羽化边缘）。
+        ui.rounded_rect_at(
+            Vec2::new(16.0, 112.0),
+            Vec2::new(80.0, 28.0),
+            8.0,
+            Color::rgba_u8(210, 150, 60, 255),
+        );
+        // 4) 胶囊形（半径 > 半高 ⇒ clamp 成胶囊）+ 强圆角对照。
+        ui.rounded_rect_at(
+            Vec2::new(104.0, 112.0),
+            Vec2::new(80.0, 28.0),
+            999.0,
+            Color::rgba_u8(190, 80, 90, 255),
+        );
     }
 
     /// 字体 Modal（**帧末调用**：modal 的 z 每帧重写为当前最大，最后录制才能保证

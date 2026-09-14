@@ -704,7 +704,8 @@ f.text_ui(|t| {
 
 // 往字形图集插自定义纹理（与字形同页 → 同纹理合批）
 f.text(|t| {
-    let px = rjw_krusie::ui::proc::rounded_rect_rgba(32, 6.0, Color::WHITE);
+    // 由任意 RGBA 像素（此处 32×32，自行填充）构造
+    let px = vec![255u8; 32 * 32 * 4];
     let region = t
         .glyph_cache_mut()
         .insert_with(
@@ -715,6 +716,10 @@ f.text(|t| {
     let _ = region;
 });
 ```
+
+> **注（v0.4）**：`rjw_ui::proc`（圆角 9-patch 程序化纹理：`rounded_rect_rgba` /
+> `rounded_9patch` / `ROUNDED_TEX_SIZE`）**已删除**。圆角不再走纹理，改由 CPU 镶嵌成
+> 三角形（见「渲染增强」一节），因此上面这个示例改为完全自备像素。
 
 ## 10. 其他常用小类型速查
 
@@ -779,9 +784,12 @@ pub trait UiBackend {
 > ——矩形渐变已改为四角顶点色（见「渲染增强」一节），不再有程序化渐变纹理请求。
 
 ```rust
+pub type Tri = [u16; 3];
+
 pub struct UiBatch {
     pub texture: Arc<TextureWrapped>,
     pub vertices: Vec<VertexP3U2C4>,   // 已是最终屏幕物理像素坐标
+    pub indices: Vec<Tri>,             // 相对 vertices；UI 全程直出三角形
     pub transform: Transform2D,        // 实例级（窗口 FX 不重建顶点）
     pub tint: Color,                   // 实例级整段染色（顶点色已含控件自身 tint）
     pub layer: f64,
@@ -790,6 +798,10 @@ pub struct UiBatch {
 
 pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 ```
+
+> `indices` 允许为空——后端此时应按「每 4 顶点一组、顺序 `TL,TR,BL,BR`」的旧四边形
+> 约定补出索引（`Render2dUiBackend` 即如此回退），使外部后端仍可只产出顶点。
+> `rjw_ui` 自己的产出**恒带索引**：圆角 / 羽化本身就是三角形，四边形只是它的退化情形。
 
 **实现者**：`rjw_krusie::runtime::layers::ui_backend::Render2dUiBackend`（桥接到 `Render2D`）；
 `rjw_ui::RecordingBackend`（**纯 CPU**，收集批次供测试断言 draw call 数）。
@@ -899,12 +911,22 @@ with_bg(c).with_radius(6.0)` / `SliderStyle::default().with_track(c).with_fill(c
 × scale 换算；`Size::Physical` 原样）。widget builder 的数值覆盖（`Label::font_size` /
 `Button::radius/padding/font_size` / `Divider::thickness/margin` 等）同样接收 `Size`。
 
-> **圆角半径**（`radius`，逻辑像素，默认 0 = 直角）：面板 / 窗口 / 按钮 / 输入框的
-> 背景与边框走 **9-patch 圆角矩形**（程序化纹理进字形图集，颜色顶点色 tint）——
-> 任意尺寸圆弧不畸变；`radius > 0` 时边框 ≈ 外圈 border 色圆角 + 内圈 bg 色圆角。
-> 纹理生成按像素半区选圆心，**非整数物理半径（高 DPI：radius × scale）无缺口**；
-> 绘制侧物理半径**取整**（`(radius × scale).round()`），9-patch 9 块边界恒落在
-> 整数像素——高 DPI 下圆角填充不偏右下、无 1px 缝隙。
+> **圆角半径**（`radius`，逻辑像素，默认 0 = 直角）：面板 / 窗口 / 按钮 / 输入框 /
+> 勾选框（`CheckboxStyle.radius`）的**背景与边框**都由 CPU 把矩形**镶嵌成三角形**
+> （`tess` 模块）——**不生成任何纹理、不改着色器**。
+>
+> - 硬体轮廓 `alpha = 1`，沿法线外扩 1 **物理像素**得到外环 `alpha = 0`，
+>   两者配成带状三角形，由光栅化器插值出羽化边缘（这就是抗锯齿）。
+> - 「单位四分之一圆弧表 + 步长抽样」：一张 32 点细表服务**所有**半径——
+>   半径 → 目标弧距 2px → `stride`（2 的幂）→ `segs = 32 / stride`。
+>   `N_FINE` 是 2 的幂 ⇒ `segs × stride` 恒等于 `N_FINE`，四角弧首尾严丝合缝。
+> - 半径**不做取整**（镶嵌器接受任意小数半径，超出半高时 clamp 成胶囊）；
+>   因此高 DPI 下不再有 `radius × scale` 的取整误差问题。
+> - 圆角**边框**是一圈**环带**（外轮廓与内轮廓之间；内半径按
+>   `max(0, r_outer - width)`，与 CSS `border-radius` 同规则）——只画一次边界，
+>   不会像"外圈实心 + 内圈实心"那样在圆角处把抗锯齿边缘混合两次。
+> - `Theme::with_radius(r)` 级联到全部有圆角的子样式：
+>   `panel` / `button` / `input` / `checkbox`（取 `r/2`）/ `combo.menu_radius`（取 `min(r, 6)`）。
 
 #### 调试样式（`DebugStyle`）
 
@@ -969,7 +991,7 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 
 | 函数 | 签名 | 说明 |
 |---|---|---|
-| `rounded_rect_at` | `ui.rounded_rect_at(pos, size, radius, color)` | 圆角矩形背景原语（radius 逻辑像素；9-patch 绘制，颜色顶点色 tint） |
+| `rounded_rect_at` | `ui.rounded_rect_at(pos, size, radius, color)` | 圆角矩形背景原语（radius 逻辑像素；CPU 镶嵌成三角形 + 1px 羽化，无纹理） |
 | `gradient_rect_at` | `ui.gradient_rect_at(pos, size, gradient)` | **矩形渐变**原语（绝对定位）。`gradient` 接受 `Gradient` 或 `Color`（`Into`） |
 | `gradient_rect` | `ui.gradient_rect(size, gradient)` | 同上，但位置来自当前容器游标（随布局流） |
 | `Gradient` | `pure(c)` / `vertical(top, bottom)` / `horizontal(left, right)` / `rotated(from, to, angle)` / `corners(tl, tr, bl, br)` | **四角颜色**（`pub tl/tr/bl/br`）；`From<Color>` 给纯色 |
@@ -999,18 +1021,52 @@ ui.gradient_rect_at(pos, size, Gradient::corners(a, b, c, d));
   多段渐变请用 `rjw_text::Gradient`（作用于**文字**，本就支持多段；
   见 `Gradient::glyph_h/glyph_v/line_h/line_v/frame_h/frame_v`）。
 - **裁剪保锚**：矩形被裁剪时四角色按其在**原矩形**中的相对位置重采样，
-  颜色的空间锚定不变（否则裁剪会让渐变整体平移）。
-- 圆角仍用纹理：圆角矩形 `32×32` 进**字形图集**（`Text::user_texture`），
-  只存**白色 + alpha**（同半径一张，颜色由顶点色 tint）；圆角**9-patch**
-  四角原样、四边/中心拉伸（任意矩形圆弧不畸变）。
-  `ProcTextures` 与 `rjw_ui::proc::{gradient_rgba, gradient_key, GRADIENT_TEX_LEN}`
-  **已删除**。
+  颜色的空间锚定不变（否则裁剪会让渐变整体平移）。⚠ 重采样前必须把命令的**绝对**
+  矩形换算到与裁剪结果相同的**窗口局部**空间（`resample_gradient_local`）——
+  混用会让 u/v 整体偏心窗口原点，渐变被平移甚至外推出界。
+- **圆角 + 渐变天然共存**：圆角镶嵌直接吃**四角色**（`RoundedRectSpec.corners`），
+  所以 `Brush` 的两端色与圆角是同一套顶点色路径，不需要专门着色器，也不需要纹理。
 - `GradientAxis` 现在只属于**文字渐变**（`rjw_text::GradientAxis`），
   不再是矩形渐变的参数；`rjw_ui` 根不再导出它（`rjw_ui::text::GradientAxis` 仍可用）。
-- 提交分组为 `(win, 图形/文字组, 纹理 uid)`：渐变（白纹理）与圆角属于**图形组**，先于文字；
+- 提交分组为 `(win, 图形/文字组, 纹理 uid)`：渐变与圆角都属于**图形组**（白纹理），
+  先于文字；
   ⚠ **UI 的 Render2D 必须 `set_sort_mode(SortMode::None)`**（完全按提交顺序绘制）——
   `SortMode::LayerAndStates` 会按纹理 uid 重排而盖住文字（示例 `eg260818UI` 即如此配置）；
-- 控件级集成：`Theme` 的 `PanelStyle::radius` / `ButtonStyle::radius` / `InputStyle::radius`。
+- 控件级集成：`Theme` 的 `PanelStyle::radius` / `ButtonStyle::radius` / `InputStyle::radius` /
+  `CheckboxStyle.radius`，背景色则统一是 [`Brush`]（纯色 / 两端色渐变，见下节）。
+
+#### 背景刷 `Brush`（主题里的背景渐变）
+
+`PanelStyle::bg` / `ButtonStyle::{bg,bg_hover,bg_pressed}` / `InputStyle::bg` 的类型是
+`Brush`（`Color: Into<Brush>` ⇒ 既有 `with_bg(Color::RED)` 调用点不用改）：
+
+```rust
+pub enum Brush { Solid(Color), Vertical(Color, Color), Horizontal(Color, Color) }
+```
+
+- `Brush::corners() -> [Color; 4]` 是所有绘制路径的统一输入，与圆角天然共存。
+- 只有**两端色**：多段 stops 的能力在 `Gradient`（显式原语，支持 `rotated` / 四角各异）
+  与 `rjw_text::Gradient`（文字）上；主题默认值要便宜、好维护。
+- `Brush::as_solid()` 让"两端同色"退化回纯色路径；`PartialEq<Color>` 让
+  `theme.panel.bg == Color::RED` 这类断言可直接写。
+- 表面微渐变由 `Palette.bevel` + `bevel_raised` / `bevel_sunken` 从一个表面色派生：
+  深色取 0.10（面板/按钮上亮下暗、输入框上暗下亮），浅色取 0.02，`legacy_dark` 取 0。
+
+#### 配色令牌 `Palette`
+
+`Theme::themed(&Palette)` 从一份调色板组装整套主题；`Theme::{light,dark,dark_legacy}`
+是它的三个预设。字段按**层次**命名（`surface_dim` < `surface_sunken` 例外 < `surface` <
+`surface_raised` < `surface_overlay` < `surface_hover` < `surface_active`），
+一套明暗阶梯服务全部控件。换肤只需换一份 `Palette`：
+
+```rust
+let mut p = rjw_ui::Palette::dark();
+p.accent = Color::rgba_u8(255, 120, 200, 255);
+let theme = rjw_ui::Theme::themed(&p);
+```
+
+`Theme::palette()` 返回**组装来源**（手工改过字段后不代表实际颜色）。
+`Palette::legacy_dark()` + `Theme::dark_legacy()` 精确复刻 v0.3 的硬编码深色配色。
 
 ### 调试（Debug UI / DebugDraw / 窗口诊断）
 

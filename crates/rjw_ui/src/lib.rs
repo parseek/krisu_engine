@@ -114,9 +114,11 @@
 //! # 模块
 //!
 //! - [`ui`]：`Ui` 主体 / `Panel` / `Pack` / `Grid` / `UiAdd` 容器控件 API
+//! - [`backend`]：绘制后端抽象（[`UiBackend`] / [`UiBatch`] / [`Tri`] /
+//!   [`RecordingBackend`]）——`rjw_ui` 只输出批次数据，不调用任何渲染器
 //! - [`id`]：ID 命名空间（[`IdRelative`] 原始名字 / [`IdAbsolute`] 完整状态键 / [`IdStack`]）
 //! - [`layout`]：容器布局（Frame / PackSide）
-//! - [`style`]：`Theme` 样式系统
+//! - [`style`]：`Theme` 样式系统 + [`Palette`]（配色令牌）+ [`Brush`]（背景刷）
 //! - [`state`]：`UiState` 持久状态 + `ButtonState` / `CheckboxState`
 //! - [`hit`]：命中测试与交互状态机
 //! - [`focus`]：键盘导航（焦点链 / [`focus_step`]）
@@ -124,6 +126,9 @@
 //! - [`edit`]：文本编辑纯逻辑（编辑状态机 / 词边界 / 省略号 / 剪贴板）
 //! - [`view`]：**View 沙箱**（裁剪分层 / 可用宽度 / 命中过滤；`ViewMode`）
 //! - [`widgets`]：`Widget` trait + 尺寸契约 + 属性化 builder（非宏添加控件）
+//!
+//! 内部模块（`pub(crate)`，不构成公开面）：`gpu_batch`（几何收集 + 切段裁决）、
+//! `tess`（圆角 CPU 镶嵌：单位弧表 + 羽化带 / 环带）、`ui_types`（窗口与面板选项枚举）。
 
 // 结构性复杂度豁免（**仅内部实现**，不在公开 API 面上）：
 // `rjw_ui` 的实现是"布局 / 命中 / 绘制"三段式的坐标数学，参数表
