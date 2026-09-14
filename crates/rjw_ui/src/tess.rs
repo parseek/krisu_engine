@@ -373,6 +373,133 @@ pub(crate) fn push_rounded_rect(
     }
 }
 
+/// **圆角环带**（圆角矩形的边框）：外轮廓与内轮廓之间的一圈带子。
+///
+/// 前提：`inner = outer` 各边内缩 `width`、且 `r_inner = max(0, r_outer - width)`
+/// ——此时两轮廓的每对角弧**同心**，带子不会自交（与 CSS `border-radius`
+/// 的内侧半径规则一致）。
+///
+/// 退化情形：
+/// - `r_outer == 0`（直角边框）走**四条轴对齐矩形条**的专用路径（16 顶点），
+///   不让圆弧带子在零半径下退化成 32 个重合点 + 零面积三角形；
+/// - `r_inner == 0`（边框宽 ≥ 外半径，如细边框的小方框）时内角为**直角**——
+///   这与 CSS `border-radius` 的内侧半径规则一致；该角内侧两点重合，
+///   零面积的那一个三角形被跳过。
+///
+/// 之所以要这个原语：`push_panel_like` 的"外圈 border 色圆角 + 内圈背景圆角"
+/// 是**两块实心**叠加，圆角处的抗锯齿边缘会各混合一次；环带只画一次边界。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_rounded_ring(
+    verts: &mut Vec<VertexP3U2C4>,
+    tris: &mut Vec<Tri>,
+    table: &CornerTable,
+    rect: Rect,
+    radius: f32,
+    width: f32,
+    color: Color,
+) -> TessOutput {
+    let Rect { w, h, .. } = rect;
+    if w <= 0.0 || h <= 0.0 || width <= 0.0 {
+        return TessOutput { verts: 0, tris: 0 };
+    }
+    let width = width.min(w.min(h) * 0.5);
+    let ro = radius.clamp(0.0, w.min(h) * 0.5);
+    let inner_rect = rect.shrink(width);
+    let ri = (ro - width).max(0.0).min(inner_rect.w.min(inner_rect.h) * 0.5);
+
+    let mut col: [f32; 4] = color.into();
+    col[3] = 1.0;
+    let verts_before = verts.len();
+    let tris_before = tris.len();
+
+    // 直角边框（内外半径都为 0）：四条轴对齐矩形条。走专用路径而不是让圆弧带子
+    // 在零半径下退化（那会产生一堆零面积三角形，且顶点数从 16 涨到 32）。
+    if ro <= 0.0 {
+        let mut push = |r: Rect| {
+            let b = verts.len() as u16;
+            for p in [
+                (r.x, r.y),
+                (r.x + r.w, r.y),
+                (r.x, r.y + r.h),
+                (r.x + r.w, r.y + r.h),
+            ] {
+                verts.push(VertexP3U2C4 { pos: [p.0, p.1, 0.0], uv: [0.0, 0.0], color: col });
+            }
+            tris.push([b, b + 1, b + 3]);
+            tris.push([b + 3, b + 2, b]);
+        };
+        for r in crate::draw::border_rects(&rect, width) {
+            if r.w > 0.0 && r.h > 0.0 {
+                push(r);
+            }
+        }
+        return TessOutput {
+            verts: verts.len() - verts_before,
+            tris: tris.len() - tris_before,
+        };
+    }
+
+    // 内轮廓在前、外轮廓在后（带状三角形的绕序按下标区分，见下）。
+    //
+    // `ri == 0`（边框宽 ≥ 外半径）时内轮廓**塌缩**：每角的 `segs + 1` 个点落在同一
+    // 位置上。此时只为每角留**一个**内角点，改用它向该角的外轮廓扇形展开
+    // （`[ip, oₖ, oₖ₊₁]`，绕序与带状相反）——否则会退化成零面积三角形。
+    let collapsed = ri <= 0.0;
+    let outer_corners = corners_of(rect, ro, [color; 4]);
+    let stride = table.stride_for(ro);
+    let segs = CornerTable::segs_of(stride);
+    let per_corner = if collapsed { 1u16 } else { segs as u16 + 1 };
+
+    let inner_corners = corners_of(inner_rect, ri, [color; 4]);
+    let inner_start = verts.len();
+    for c in &inner_corners {
+        for k in 0..per_corner {
+            let (cos_t, sin_t) = if collapsed {
+                (1.0, 0.0)
+            } else {
+                table.sample(stride, k as u32)
+            };
+            let pos = c.center + c.dir(cos_t, sin_t) * ri;
+            verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv: [0.0, 0.0], color: col });
+        }
+    }
+    let outer_start = verts.len();
+    for c in &outer_corners {
+        for k in 0..=segs {
+            let (cos_t, sin_t) = table.sample(stride, k);
+            let pos = c.center + c.dir(cos_t, sin_t) * ro;
+            verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv: [0.0, 0.0], color: col });
+        }
+    }
+
+    // 四个角各自成带（角的末点与下一角的首点之间是直边，由同一条带子跨过）。
+    for ci in 0..4usize {
+        let ib = inner_start as u16 + ci as u16 * per_corner;
+        let ob = outer_start as u16 + ci as u16 * (segs as u16 + 1);
+        if collapsed {
+            // 内角为直角：从该单一内角点向本角的外轮廓扇形展开。
+            for k in 0..segs {
+                tris.push([ib, ob + k as u16, ob + k as u16 + 1]);
+            }
+            continue;
+        }
+        for k in 0..segs {
+            let (inner0, inner1) = (ib + k as u16, ib + k as u16 + 1);
+            let (outer0, outer1) = (ob + k as u16, ob + k as u16 + 1);
+            // 与羽化带同向：外轮廓在硬体之外 ⇒ 需相对内轮廓翻转绕序。
+            if inner0 != inner1 {
+                tris.push([inner0, outer1, inner1]);
+            }
+            tris.push([inner0, outer0, outer1]);
+        }
+    }
+
+    TessOutput {
+        verts: verts.len() - verts_before,
+        tris: tris.len() - tris_before,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,5 +749,89 @@ mod tests {
         let b = cache.table();
         assert!(Rc::ptr_eq(&a, &b), "同一缓存必须复用同一张表");
         assert_eq!(a.pts.len(), N_FINE as usize + 1, "表含两端点");
+    }
+
+    // ─── 圆角环带（边框） ────────────────────────────────────
+
+    #[test]
+    fn ring_right_angle_matches_four_rect_strips() {
+        // r = 0 走专用路径：四条轴对齐矩形条（与 `border_rects` 一致），
+        // 而不是让圆弧带子在零半径下退化成重合点。
+        let t = table();
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        let out = push_rounded_ring(
+            &mut v,
+            &mut tr,
+            &t,
+            Rect::new(0.0, 0.0, 40.0, 20.0),
+            0.0,
+            2.0,
+            Color::WHITE,
+        );
+        assert_eq!(out.verts, 16, "四条矩形条 = 4×4 顶点");
+        assert_eq!(out.tris, 8);
+        assert_well_formed(&v, &tr);
+    }
+
+    #[test]
+    fn ring_with_radius_is_well_formed_and_clockwise() {
+        let t = table();
+        for (w, h, r, bw) in [
+            (40.0, 20.0, 8.0, 2.0),
+            (16.0, 16.0, 4.0, 1.0),
+            (60.0, 60.0, 30.0, 3.0),
+            // 边框宽 ≥ 半径 ⇒ 内角为直角（CSS 语义），不得产生零面积三角形
+            (20.0, 20.0, 3.0, 5.0),
+            (10.0, 10.0, 5.0, 5.0),
+        ] {
+            let mut v = Vec::new();
+            let mut tr = Vec::new();
+            push_rounded_ring(&mut v, &mut tr, &t, Rect::new(2.0, 3.0, w, h), r, bw, Color::WHITE);
+            assert_well_formed(&v, &tr);
+            for tri in &tr {
+                assert!(cross(&v, tri) > 0.0, "环带三角形 {tri:?} 绕序反了");
+            }
+        }
+    }
+
+    #[test]
+    fn ring_vertices_are_bounded() {
+        // 环带 = 内外两圈轮廓：2 × 4 × (segs + 1) 顶点，segs ≤ N_FINE。
+        let t = table();
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        push_rounded_ring(
+            &mut v,
+            &mut tr,
+            &t,
+            Rect::new(0.0, 0.0, 100.0, 40.0),
+            12.0,
+            1.0,
+            Color::WHITE,
+        );
+        let segs = CornerTable::segs_of(t.stride_for(12.0)) as usize;
+        assert!(v.len() <= 2 * 4 * (segs + 1), "环带顶点数 {} 超界", v.len());
+    }
+
+    #[test]
+    fn ring_degenerate_inputs_produce_nothing() {
+        let t = table();
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        // 零宽 / 零高 / 零边框宽都要安全返回
+        for (w, h, bw) in [(0.0, 20.0, 2.0), (20.0, 0.0, 2.0), (20.0, 20.0, 0.0)] {
+            let out = push_rounded_ring(
+                &mut v,
+                &mut tr,
+                &t,
+                Rect::new(0.0, 0.0, w, h),
+                4.0,
+                bw,
+                Color::WHITE,
+            );
+            assert_eq!(out.verts, 0);
+        }
+        assert!(v.is_empty() && tr.is_empty());
     }
 }

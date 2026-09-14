@@ -40,7 +40,7 @@ use crate::draw::{
 // 顶点收集 / 合批机制（原在此文件，见 `gpu_batch` 模块文档）。
 use crate::gpu_batch::{
     CacheStats, CachedQuad, Geom, QuadCollector, cmd_sig_hash, debug_layout_outline, line_row_at_y,
-    resample_gradient, resample_gradient_local, safe_line_slice, segment_runs, vertex_p3u2c4,
+    resample_gradient_local, safe_line_slice, segment_runs, vertex_p3u2c4,
 };
 use crate::edit::{
     byte_to_char, caret_at_visual_click, caret_index_by_width, char_to_byte, insert_char_at,
@@ -973,7 +973,7 @@ impl<'a> Ui<'a> {
         let depth = self.depth;
         let win = self.cur_win;
         let clip = self.clip;
-        // 渐变锚定在 `rect` 上（内圈重采样用）。
+        // 渐变锚定在 `rect` 上（`resample_gradient_local` 保证裁剪不改变颜色锚定）。
         let grad = Gradient::corners(
             bg.corners()[0],
             bg.corners()[1],
@@ -981,38 +981,43 @@ impl<'a> Ui<'a> {
             bg.corners()[3],
         );
         if radius > 0.0 {
-            // 圆角边框 ≈ 外圈 border 色圆角 + 内圈背景刷圆角（内缩 border_w）。
-            self.queue.push(UiDraw {
-                depth,
-                seq,
-                win,
-                elem,
-                rect,
-                clip,
-                kind: DrawKind::RoundedRect {
-                    corners: [border; 4],
-                    radius: radius + border_w,
-                },
-            });
-            let bw = border_w.min(rect.w * 0.5).min(rect.h * 0.5);
-            let inner = Rect::new(
-                rect.x + bw,
-                rect.y + bw,
-                (rect.w - bw * 2.0).max(0.0),
-                (rect.h - bw * 2.0).max(0.0),
-            );
-            if inner.w > 0.0 && inner.h > 0.0 {
+            // 圆角背景 = **一整块**圆角矩形（渐变四角色直接给它，无需内缩重采样）；
+            // 边框 = 覆盖在其边缘的**圆角环带**（`Border { radius }`）。
+            //
+            // 旧实现是"外圈 border 色实心圆角 + 内圈 bg 色实心圆角"，两块的抗锯齿
+            // 边缘会在圆角处各混合一次（看起来发灰、边缘偏粗）；环带只画一次边界。
+            match bg.as_solid() {
+                Some(c) => self.queue.push(UiDraw {
+                    depth,
+                    seq,
+                    win,
+                    elem,
+                    rect,
+                    clip,
+                    kind: DrawKind::RoundedRect { corners: [c; 4], radius },
+                }),
+                None => self.queue.push(UiDraw {
+                    depth,
+                    seq,
+                    win,
+                    elem,
+                    rect,
+                    clip,
+                    kind: DrawKind::RoundedRect {
+                        corners: [grad.tl, grad.tr, grad.bl, grad.br],
+                        radius,
+                    },
+                }),
+            }
+            if border_w > 0.0 {
                 self.queue.push(UiDraw {
                     depth,
                     seq: seq + 1,
                     win,
                     elem,
-                    rect: inner,
+                    rect,
                     clip,
-                    kind: DrawKind::RoundedRect {
-                        corners: resample_gradient(grad, inner, rect),
-                        radius,
-                    },
+                    kind: DrawKind::Border { color: border, width: border_w, radius },
                 });
             }
         } else {
@@ -1044,7 +1049,7 @@ impl<'a> Ui<'a> {
                     elem,
                     rect,
                     clip,
-                    kind: DrawKind::Border { color: border, width: border_w },
+                    kind: DrawKind::Border { color: border, width: border_w, radius: 0.0 },
                 });
             }
         }
@@ -1292,7 +1297,7 @@ impl<'a> Ui<'a> {
                 elem,
                 rect,
                 clip: self.clip,
-                kind: DrawKind::Border { color, width },
+                kind: DrawKind::Border { color, width, radius: 0.0 },
             });
         }
     }
@@ -3293,13 +3298,23 @@ impl<'a> Ui<'a> {
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
                 }
-                DrawKind::Border { color, width } => {
+                DrawKind::Border { color, width, radius } => {
                     let pr = snap_rect(&d.rect);
                     if let Some(r) = clipped(pr, clip_abs) {
                         let local = Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h);
-                        for br in border_rects(&local, (*width).round()) {
-                            if br.w > 0.0 && br.h > 0.0 {
-                                quads.push_white(win, br, *color);
+                        // 是否被裁剪过（尺寸真的变小）：被裁掉一侧时圆角环带的
+                        // 外/内轮廓半径关系不再成立，退回直角四边条更稳。
+                        let trimmed = local.w < pr.w - 0.01 || local.h < pr.h - 0.01;
+                        if *radius > 0.0 && !trimmed {
+                            // 圆角环带：只画一次边界，圆角处不会像"外圈实心 + 内圈实心"
+                            // 那样把抗锯齿边缘混合两次。
+                            let table = self.state.tess.table();
+                            quads.push_rounded_ring(win, &table, local, *radius, *width, *color);
+                        } else {
+                            for br in border_rects(&local, (*width).round()) {
+                                if br.w > 0.0 && br.h > 0.0 {
+                                    quads.push_white(win, br, *color);
+                                }
                             }
                         }
                         debug_layout_outline(quads, win, anchor_px, pr, dbg);
@@ -3510,7 +3525,7 @@ impl<'a> Ui<'a> {
                 elem,
                 rect,
                 clip,
-                kind: DrawKind::Border { color: focus.color, width: focus.width },
+                kind: DrawKind::Border { color: focus.color, width: focus.width, radius: 0.0 },
             });
         }
     }
@@ -4802,6 +4817,7 @@ impl Ui<'_> {
                 kind: DrawKind::Border {
                     color: style.handle_border,
                     width: 1.0,
+                    radius: 0.0,
                 },
             });
         }
@@ -4953,6 +4969,7 @@ impl Ui<'_> {
             kind: DrawKind::Border {
                 color: style.box_border,
                 width: style.border_w,
+                radius: style.radius,
             },
         });
         if checked {
@@ -4963,6 +4980,9 @@ impl Ui<'_> {
             let inner = box_rect.shrink(inset_px);
             if inner.w > 0.0 && inner.h > 0.0 {
                 let seq = self.next_seq();
+                // 填充与外框同心的内圆角（`radius - inset`，clamp 到 0）——
+                // 与外框环带的内侧半径取同一套规则，两者贴合不留缝。
+                let fill_radius = (style.radius - inset_px).max(0.0);
                 self.queue.push(UiDraw {
                     depth,
                     seq,
@@ -4970,7 +4990,10 @@ impl Ui<'_> {
                     elem,
                     rect: inner,
                     clip: self.clip,
-                    kind: DrawKind::Solid(style.checked_fill),
+                    kind: DrawKind::RoundedRect {
+                        corners: [style.checked_fill; 4],
+                        radius: fill_radius,
+                    },
                 });
             }
         }

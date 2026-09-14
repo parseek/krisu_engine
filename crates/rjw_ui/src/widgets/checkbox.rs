@@ -68,6 +68,7 @@ impl<'a> Checkbox<'a> {
         let base = &theme.checkbox;
         CheckboxStyle {
             box_size: base.box_size,
+            radius: base.radius,
             box_border: self.box_border.unwrap_or(base.box_border),
             border_w: base.border_w,
             checked_fill: self.checked_fill.unwrap_or(base.checked_fill),

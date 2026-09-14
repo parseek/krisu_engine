@@ -486,8 +486,12 @@ pub enum DrawKind {
     RoundedRect { corners: [Color; 4], radius: f32 },
     /// **矩形渐变**（四角颜色；顶点色插值，**无纹理**）。
     Rect(Gradient),
-    /// 矩形边框（画在 rect 内缘）。
-    Border { color: Color, width: f32 },
+    /// 矩形边框（画在 `rect` 内缘）。
+    ///
+    /// `radius > 0` 时是**圆角环带**（外轮廓半径 `radius`、内轮廓半径
+    /// `max(0, radius - width)`；见 `crate::tess::push_rounded_ring`），
+    /// 与 [`Self::RoundedRect`] 的圆角语义一致。
+    Border { color: Color, width: f32, radius: f32 },
     /// 文本（绘制时经 `rjw_text` 责任链渲染）。
     Text {
         /// 文本内容（`Arc<str>`：命令间共享，避免每命令 String 克隆）。

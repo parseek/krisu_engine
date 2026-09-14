@@ -256,6 +256,21 @@ impl QuadCollector {
         crate::tess::push_rounded_rect(&mut g.verts, &mut g.tris, table, spec)
     }
 
+    /// **CPU 镶嵌的圆角边框（环带）**（图形组；白纹理 + 纯色）。
+    pub(crate) fn push_rounded_ring(
+        &mut self,
+        win: u32,
+        table: &crate::tess::CornerTable,
+        rect: Rect,
+        radius: f32,
+        width: f32,
+        color: Color,
+    ) -> crate::tess::TessOutput {
+        let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
+        let g = self.geom(key);
+        crate::tess::push_rounded_ring(&mut g.verts, &mut g.tris, table, rect, radius, width, color)
+    }
+
     /// 追加一个带 UV 的四边形（字形用；文字组）。
     pub(crate) fn push_tex_quad(&mut self, win: u32, tex: u64, quad: [VertexP3U2C4; 4]) {
         let key = (win, self.cur_elem, GROUP_TEXT, tex);
@@ -419,10 +434,11 @@ pub(crate) fn cmd_sig_hash(h: &mut std::collections::hash_map::DefaultHasher, d:
             color_bits(g.bl).hash(h);
             color_bits(g.br).hash(h);
         }
-        DrawKind::Border { color, width } => {
+        DrawKind::Border { color, width, radius } => {
             1u8.hash(h);
             color_bits(*color).hash(h);
             width.to_bits().hash(h);
+            radius.to_bits().hash(h);
         }
         DrawKind::Text {
             text,

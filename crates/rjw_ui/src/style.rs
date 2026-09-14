@@ -124,6 +124,11 @@ pub struct Theme {
     pub row_h: f32,
     /// pack / grid 默认子项间距（像素）。
     pub gap: f32,
+    /// **本主题的调色板**（换肤 / 回退 / 诊断用；由 [`Theme::themed`] 记录）。
+    ///
+    /// 手工改过子样式字段后它可能与实际颜色不一致——它记录的是"组装来源"，
+    /// 不是从现有字段反推的结果。
+    pub palette: Palette,
 }
 
 /// **下拉框（combo）样式**：触发按钮用 [`ButtonStyle`]；选项浮层 = **现代右键菜单
@@ -251,13 +256,14 @@ impl InputStyle {
 }
 
 impl CheckboxStyle {
-    /// 预乘 DPI scale：方框 / 边框宽 / 字号 / 间距 × s 取整。
+    /// 预乘 DPI scale：方框 / 圆角 / 边框宽 / 字号 / 间距 × s 取整。
     pub fn scaled(mut self, s: f32) -> Self {
         if s <= 0.0 {
             return self;
         }
         let m = |v: f32| (v * s).round();
         self.box_size = m(self.box_size);
+        self.radius = m(self.radius);
         self.border_w = m(self.border_w);
         self.font_size = m(self.font_size);
         self.gap = m(self.gap);
@@ -330,136 +336,334 @@ impl ComboStyle {
     }
 }
 
-// ─── 子样式深色预设：每个子样式都有 `dark()`（深色配色，尺寸同 [`Default`]）。
-// `Theme::dark()` 逐一组装——与 `scaled` 同样的单一职责。 ───
+// ─── 配色令牌（Palette）：换肤 / 新主题的唯一入口 ───
+
+/// 明度缩放（`k > 1` 变亮、`< 1` 变暗；alpha 不变、分量 clamp 到 [0,1]）。
+#[inline]
+fn shade(c: Color, k: f32) -> Color {
+    let a: [f32; 4] = c.into();
+    Color::from([
+        (a[0] * k).clamp(0.0, 1.0),
+        (a[1] * k).clamp(0.0, 1.0),
+        (a[2] * k).clamp(0.0, 1.0),
+        a[3],
+    ])
+}
+
+/// 把纯色变成**上亮下暗**的微渐变（"凸起 / 抬升"感）。`k = 0` 时退化为纯色
+/// （[`Brush::as_solid`] 会把两端同色的渐变当纯色走更省的路径）。
+#[inline]
+pub fn bevel_raised(c: Color, k: f32) -> Brush {
+    if k <= 0.0 {
+        return Brush::Solid(c);
+    }
+    Brush::Vertical(shade(c, 1.0 + k), shade(c, 1.0 - k))
+}
+
+/// 把纯色变成**上暗下亮**的微渐变（"凹陷 / 可编辑"感），与 [`bevel_raised`] 反向。
+#[inline]
+pub fn bevel_sunken(c: Color, k: f32) -> Brush {
+    if k <= 0.0 {
+        return Brush::Solid(c);
+    }
+    Brush::Vertical(shade(c, 1.0 - k), shade(c, 1.0 + k))
+}
+
+/// **配色令牌**——主题的调色板。
+///
+/// # 为什么按"层次"命名而不是按控件
+///
+/// 字段名描述的是**表面的高度**（`surface` / `surface_raised` / `surface_overlay` …），
+/// 不是"面板色 / 按钮色 / 菜单色"。控件样式引用层次，于是：
+///
+/// - 一套明暗阶梯服务全部控件，"面板 vs 卡片 vs 菜单"不会各自漂移；
+/// - 新增控件直接挑一个层次，不需要发明新颜色；
+/// - 换肤 = 换一份 `Palette`，不必逐子样式改 11 处字面量。
+///
+/// # 明暗阶梯（`dark` 预设，亮度单调递增）
+///
+/// ```text
+/// surface_sunken  输入框 / 滑轨槽（凹陷，比 surface 更暗）
+/// surface_dim     画布底 / 遮罩基色
+/// surface         面板 / 窗口
+/// surface_raised  卡片 / 工具栏
+/// surface_overlay 浮层（菜单 / tooltip）
+/// surface_hover   悬停
+/// surface_active  按下 / 激活
+/// ```
+///
+/// 注意 `surface_sunken` 比 `surface` **更暗**是刻意的（"可编辑"的通用暗示，
+/// 与 VS Code / Discord / egui 一致）；`surface_raised` 及以上才是越抬越亮。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Palette {
+    // ── 表面（暗 → 亮）──
+    /// 最底：窗口之外的画布 / 模态遮罩基色。
+    pub surface_dim: Color,
+    /// 凹陷表面：输入框 / 滑轨槽（刻意比 [`Self::surface`] 更暗）。
+    pub surface_sunken: Color,
+    /// 面板 / 窗口底。
+    pub surface: Color,
+    /// 抬升表面：卡片 / 工具栏。
+    pub surface_raised: Color,
+    /// 浮层表面：下拉菜单 / tooltip。
+    pub surface_overlay: Color,
+    /// 悬停态表面。
+    pub surface_hover: Color,
+    /// 按下 / 激活态表面。
+    pub surface_active: Color,
+    // ── 描边 ──
+    /// 常规描边。
+    pub border: Color,
+    /// 强描边（需要更清晰的分隔 / 焦点邻域）。
+    pub border_strong: Color,
+    // ── 前景 ──
+    /// 正文。
+    pub text: Color,
+    /// 次级文字（占位符 / 说明 / 未上屏候选）。
+    pub text_muted: Color,
+    /// 极弱文字（禁用 / 轴标注）。
+    pub text_dim: Color,
+    // ── 强调 ──
+    /// 强调色（焦点描边 / 滑轨填充 / 选中标记 / 勾选填充）。
+    pub accent: Color,
+    /// 强调色悬停。
+    pub accent_hover: Color,
+    /// 强调色按下 / 已激活。
+    pub accent_active: Color,
+    /// 文本选择背景。
+    pub selection: Color,
+    /// 危险 / 错误。
+    pub danger: Color,
+    // ── 非层次性的零星色 ──
+    /// 高亮前景（滑块手柄 / 勾选标记等"浮在深色上"的浅色）。
+    pub handle: Color,
+    /// 调试描边（`debug_layout`）。
+    pub debug_outline: Color,
+    /// 模态遮罩。
+    pub scrim: Color,
+    /// **表面微渐变强度**（0 = 纯平色）。见 [`bevel_raised`] / [`bevel_sunken`]。
+    ///
+    /// 深色下一点明暗差能把相邻表面"分"开；浅色主题通常取更小值或 0（扁平观感）。
+    pub bevel: f32,
+}
+
+impl Default for Palette {
+    /// 浅色（= [`Self::light`]）：保持既有浅色主题观感，渐变强度取极轻。
+    fn default() -> Self {
+        Self::light()
+    }
+}
+
+impl Palette {
+    /// **浅色**调色板：白底 + 蓝强调。
+    pub fn light() -> Self {
+        Self {
+            surface_dim: Color::rgba_u8(228, 230, 234, 255),
+            surface_sunken: Color::rgba_u8(255, 255, 255, 255),
+            surface: Color::rgba_u8(245, 245, 245, 255),
+            surface_raised: Color::rgba_u8(255, 255, 255, 255),
+            surface_overlay: Color::rgba_u8(250, 250, 252, 255),
+            surface_hover: Color::rgba_u8(228, 238, 252, 255),
+            surface_active: Color::rgba_u8(206, 224, 246, 255),
+            border: Color::rgba_u8(180, 180, 180, 255),
+            border_strong: Color::rgba_u8(150, 150, 150, 255),
+            text: Color::rgba_u8(30, 30, 30, 255),
+            text_muted: Color::rgba_u8(120, 120, 120, 255),
+            text_dim: Color::rgba_u8(150, 150, 150, 255),
+            accent: Color::rgba_u8(80, 140, 220, 255),
+            accent_hover: Color::rgba_u8(58, 122, 208, 255),
+            accent_active: Color::rgba_u8(40, 100, 184, 255),
+            selection: Color::rgba_u8(190, 214, 245, 255),
+            danger: Color::rgba_u8(214, 69, 69, 255),
+            handle: Color::rgba_u8(240, 240, 240, 255),
+            debug_outline: Color::CYAN,
+            scrim: Color::rgba_u8(0, 0, 0, 140),
+            bevel: 0.02,
+        }
+    }
+
+    /// **深色**调色板：低饱和冷灰阶梯 + 明亮蓝强调。
+    ///
+    /// 比历史上的深色预设**整体更暗**（面板 ~9% 亮度而非 ~16%），并且
+    /// **层次单调递增**：此前 `input`(28,32,40) 比 `panel`(38,42,52) 更暗、
+    /// 又和 `menu_bg`(40,45,55) 几乎同色，导致"输入框 / 菜单 / 面板"三者在
+    /// 深色下难以分辨；现在它们分别落在 `surface_sunken` / `surface_overlay` /
+    /// `surface`，间距明确。
+    pub fn dark() -> Self {
+        Self {
+            surface_dim: Color::rgba_u8(14, 15, 19, 255),
+            surface_sunken: Color::rgba_u8(16, 18, 24, 255),
+            surface: Color::rgba_u8(23, 25, 31, 255),
+            surface_raised: Color::rgba_u8(34, 37, 45, 255),
+            surface_overlay: Color::rgba_u8(43, 47, 57, 255),
+            surface_hover: Color::rgba_u8(51, 56, 69, 255),
+            surface_active: Color::rgba_u8(61, 68, 83, 255),
+            border: Color::rgba_u8(58, 63, 75, 255),
+            border_strong: Color::rgba_u8(74, 81, 98, 255),
+            text: Color::rgba_u8(232, 234, 240, 255),
+            text_muted: Color::rgba_u8(154, 163, 178, 255),
+            text_dim: Color::rgba_u8(107, 114, 128, 255),
+            accent: Color::rgba_u8(110, 168, 255, 255),
+            accent_hover: Color::rgba_u8(140, 188, 255, 255),
+            accent_active: Color::rgba_u8(85, 140, 219, 255),
+            selection: Color::rgba_u8(43, 74, 120, 255),
+            danger: Color::rgba_u8(255, 107, 107, 255),
+            handle: Color::rgba_u8(200, 208, 220, 255),
+            debug_outline: Color::rgba_u8(96, 200, 255, 255),
+            scrim: Color::rgba_u8(0, 0, 0, 180),
+            bevel: 0.10,
+        }
+    }
+
+    /// **历史深色调色板**：逐字段复刻改造前的硬编码深色配色（`bevel = 0`）。
+    /// 供不想被新配色影响的下游一键回退：`Theme::themed(&Palette::legacy_dark())`。
+    pub fn legacy_dark() -> Self {
+        Self {
+            surface_dim: Color::rgba_u8(0, 0, 0, 255),
+            surface_sunken: Color::rgba_u8(28, 32, 40, 255),
+            surface: Color::rgba_u8(38, 42, 52, 255),
+            surface_raised: Color::rgba_u8(52, 58, 70, 255),
+            surface_overlay: Color::rgba_u8(40, 45, 55, 255),
+            surface_hover: Color::rgba_u8(66, 76, 96, 255),
+            surface_active: Color::rgba_u8(90, 110, 150, 255),
+            border: Color::rgba_u8(70, 78, 96, 255),
+            border_strong: Color::rgba_u8(90, 98, 118, 255),
+            text: Color::rgba_u8(230, 230, 230, 255),
+            text_muted: Color::rgba_u8(150, 158, 176, 255),
+            text_dim: Color::rgba_u8(120, 132, 150, 255),
+            accent: Color::rgba_u8(96, 150, 220, 255),
+            accent_hover: Color::rgba_u8(110, 160, 230, 255),
+            accent_active: Color::rgba_u8(70, 120, 190, 255),
+            selection: Color::rgba_u8(70, 120, 190, 255),
+            danger: Color::rgba_u8(220, 80, 80, 255),
+            handle: Color::rgba_u8(200, 210, 225, 255),
+            debug_outline: Color::rgba_u8(96, 200, 255, 255),
+            scrim: Color::rgba_u8(0, 0, 0, 180),
+            bevel: 0.0,
+        }
+    }
+}
+
+// ─── 子样式配色预设：`themed(&Palette)` 从调色板派生（尺寸同 [`Default`]）。
+// `Theme::{light,dark,themed}` 逐一组装——与 `scaled` 同样的单一职责。 ───
 
 impl LabelStyle {
-    /// 深色主题预设：浅色文字。
-    pub fn dark() -> Self {
-        Self { color: Color::rgba_u8(225, 225, 225, 255), ..Self::default() }
+    /// 从调色板派生：正文色的标签。
+    pub fn themed(p: &Palette) -> Self {
+        Self { color: p.text, ..Self::default() }
     }
 }
 
 impl PanelStyle {
-    /// 深色主题预设：深灰面板 + 边框，背景带**极轻的纵向渐变**（上亮下暗）。
-    ///
-    /// 纯平色在深色主题下边界"糊"，一点明暗差即可把面板从背景里"抬"起来，
-    /// 且不引入任何纹理（四角色走顶点色，见 [`Brush`]）。
-    pub fn dark() -> Self {
+    /// 从调色板派生：`surface` 面板 + 常规描边（背景带调色板强度的微渐变）。
+    pub fn themed(p: &Palette) -> Self {
         Self {
-            bg: Brush::Vertical(Color::rgba_u8(40, 44, 54, 255), Color::rgba_u8(32, 35, 44, 255)),
-            border: Color::rgba_u8(70, 78, 96, 255),
+            bg: bevel_raised(p.surface, p.bevel),
+            border: p.border,
             ..Self::default()
         }
     }
 }
 
 impl ButtonStyle {
-    /// 深色主题预设：深色三态背景（各带轻微纵向渐变，按下时更亮、更"凸"）。
-    pub fn dark() -> Self {
+    /// 从调色板派生：`surface_raised` 三态按钮（常态 → 悬停 → 激活逐级抬升）。
+    pub fn themed(p: &Palette) -> Self {
         Self {
-            bg: Brush::Vertical(Color::rgba_u8(58, 64, 78, 255), Color::rgba_u8(46, 51, 63, 255)),
-            bg_hover: Brush::Vertical(
-                Color::rgba_u8(72, 82, 104, 255),
-                Color::rgba_u8(58, 66, 84, 255),
-            ),
-            bg_pressed: Brush::Vertical(
-                Color::rgba_u8(84, 102, 142, 255),
-                Color::rgba_u8(64, 80, 116, 255),
-            ),
-            fg: Color::rgba_u8(230, 230, 230, 255),
-            border: Color::rgba_u8(90, 98, 118, 255),
+            bg: bevel_raised(p.surface_raised, p.bevel),
+            bg_hover: bevel_raised(p.surface_hover, p.bevel),
+            bg_pressed: bevel_raised(p.surface_active, p.bevel),
+            fg: p.text,
+            border: p.border_strong,
             ..Self::default()
         }
     }
 }
 
 impl SliderStyle {
-    /// 深色主题预设：深色轨道 + 亮填充 / 手柄。
-    pub fn dark() -> Self {
+    /// 从调色板派生：`surface_sunken` 轨道 + 强调色填充 + `handle` 手柄。
+    pub fn themed(p: &Palette) -> Self {
         Self {
-            track: Color::rgba_u8(58, 64, 78, 255),
-            fill: Color::rgba_u8(96, 150, 220, 255),
-            handle: Color::rgba_u8(200, 210, 225, 255),
-            handle_border: Color::rgba_u8(120, 132, 150, 255),
+            track: p.surface_sunken,
+            fill: p.accent,
+            handle: p.handle,
+            handle_border: p.border_strong,
             ..Self::default()
         }
     }
 }
 
 impl InputStyle {
-    /// 深色主题预设：深色输入框 + 亮边框 / 光标 / 选择。
-    ///
-    /// 背景带**反向**纵向渐变（上暗下亮）——与面板/按钮相反的方向给出"凹陷"感，
-    /// 这是深色 UI 里区分可编辑区域与按钮的最小手段。
-    pub fn dark() -> Self {
+    /// 从调色板派生：`surface_sunken` 输入框（反向微渐变 = 凹陷感）+ 强调色聚焦边框。
+    pub fn themed(p: &Palette) -> Self {
         Self {
-            bg: Brush::Vertical(Color::rgba_u8(22, 25, 32, 255), Color::rgba_u8(30, 34, 42, 255)),
-            border: Color::rgba_u8(80, 88, 104, 255),
-            border_focus: Color::rgba_u8(110, 160, 230, 255),
-            fg: Color::rgba_u8(230, 230, 230, 255),
-            caret: Color::rgba_u8(230, 230, 230, 255),
-            preedit: Color::rgba_u8(150, 158, 176, 255),
-            sel_bg: Color::rgba_u8(70, 120, 190, 255),
+            bg: bevel_sunken(p.surface_sunken, p.bevel),
+            border: p.border_strong,
+            border_focus: p.accent,
+            fg: p.text,
+            caret: p.text,
+            preedit: p.text_muted,
+            sel_bg: p.selection,
+            resize_handle: p.text_dim,
             ..Self::default()
         }
     }
 }
 
 impl CheckboxStyle {
-    /// 深色主题预设：深色方框 + 亮填充 / 文字。
-    pub fn dark() -> Self {
+    /// 从调色板派生：强描边方框 + 强调色勾选填充。
+    pub fn themed(p: &Palette) -> Self {
         Self {
-            box_border: Color::rgba_u8(150, 158, 176, 255),
-            checked_fill: Color::rgba_u8(96, 150, 220, 255),
-            fg: Color::rgba_u8(225, 225, 225, 255),
+            box_border: p.border_strong,
+            checked_fill: p.accent,
+            fg: p.text,
             ..Self::default()
         }
     }
 }
 
 impl DividerStyle {
-    /// 深色主题预设：深灰分割线（深色背景上可见）。
-    pub fn dark() -> Self {
-        Self { color: Color::rgba_u8(70, 78, 96, 255), ..Self::default() }
+    /// 从调色板派生：常规描边色的分割线。
+    pub fn themed(p: &Palette) -> Self {
+        Self { color: p.border, ..Self::default() }
     }
 }
 
 impl DebugStyle {
-    /// 深色主题预设：亮青布局描边。
-    pub fn dark() -> Self {
-        Self { layout_outline: Color::rgba_u8(96, 200, 255, 255), ..Self::default() }
+    /// 从调色板派生：调试描边色。
+    pub fn themed(p: &Palette) -> Self {
+        Self { layout_outline: p.debug_outline, ..Self::default() }
     }
 }
 
 impl FocusStyle {
-    /// 深色主题预设：亮蓝焦点描边（深色下更易辨认）。
-    pub fn dark() -> Self {
-        Self { color: Color::rgba_u8(96, 200, 255, 255), ..Self::default() }
+    /// 从调色板派生：强调色焦点描边（宽度取 `DEFAULT_WIDTH`）。
+    pub fn themed(p: &Palette) -> Self {
+        Self { color: p.accent, ..Self::default() }
     }
 }
 
 impl ModalStyle {
-    /// 深色主题预设：更深遮罩。
-    pub fn dark() -> Self {
-        Self { dim: Color::rgba_u8(0, 0, 0, 180), ..Self::default() }
+    /// 从调色板派生：遮罩色。
+    pub fn themed(p: &Palette) -> Self {
+        Self { dim: p.scrim, ..Self::default() }
     }
 }
 
 impl ComboStyle {
-    /// 深色主题预设：深色浮层 + 深蓝菜单项高亮。
-    pub fn dark() -> Self {
+    /// 从调色板派生：`surface_overlay` 浮层 + 悬停 / 选中态高亮 + 强调色 ✓ 标记。
+    pub fn themed(p: &Palette) -> Self {
         Self {
-            menu_bg: Color::rgba_u8(40, 45, 55, 255),
-            menu_border: Color::rgba_u8(72, 80, 96, 255),
-            item_hover: Color::rgba_u8(52, 82, 122, 255),
-            item_selected: Color::rgba_u8(45, 72, 108, 255),
-            fg: Color::rgba_u8(228, 228, 228, 255),
-            fg_mark: Color::rgba_u8(110, 180, 255, 255),
+            menu_bg: p.surface_overlay,
+            menu_border: p.border_strong,
+            item_hover: p.surface_hover,
+            item_selected: p.selection,
+            fg: p.text,
+            fg_mark: p.accent,
             ..Self::default()
         }
     }
 }
+
 
 /// 模态对话框样式（[`Ui::modal`](crate::ui::Ui::modal) 的全屏遮罩）。
 #[derive(Clone, Debug)]
@@ -672,6 +876,11 @@ impl Default for DividerStyle {
 pub struct CheckboxStyle {
     /// 方框边长。
     pub box_size: f32,
+    /// 方框圆角半径（**逻辑像素**；0 = 直角）。
+    ///
+    /// 无边框（`border_w == 0`）时无效——此时填充是直角小方块。由
+    /// [`Theme::with_radius`] 级联为全局半径的一半（勾选框比按钮小，同半径会显得过圆）。
+    pub radius: f32,
     pub box_border: Color,
     /// 方框边框宽（逻辑像素；中心填充 = 外框 shrink(border_w + [`CHECKBOX_INNER`](crate::ui) 内边距)）。
     pub border_w: f32,
@@ -687,6 +896,7 @@ impl Default for CheckboxStyle {
     fn default() -> Self {
         Self {
             box_size: 16.0,
+            radius: 0.0,
             box_border: Color::rgba_u8(140, 140, 140, 255),
             border_w: 1.0,
             checked_fill: Color::rgba_u8(80, 140, 220, 255),
@@ -722,7 +932,8 @@ impl Default for DebugStyle {
 }
 
 /// **焦点样式**（键盘导航）：`finish` 给当前焦点控件画的描边（颜色 / 宽度）。
-/// 宽度为**逻辑像素**（内部 × scale 后取整）；默认青色 1.0，`Theme::dark` 下偏亮。
+/// 宽度为**逻辑像素**（内部 × scale 后取整）；默认取调色板强调色、宽 2.0
+/// ——1.0 在深色高 DPI 下几乎看不出来，键盘导航"看不见焦点"是硬伤。
 #[derive(Clone, Debug)]
 pub struct FocusStyle {
     pub color: Color,
@@ -731,8 +942,13 @@ pub struct FocusStyle {
 
 impl Default for FocusStyle {
     fn default() -> Self {
-        Self { color: Color::CYAN, width: 1.0 }
+        Self { color: Color::CYAN, width: Self::DEFAULT_WIDTH }
     }
+}
+
+impl FocusStyle {
+    /// 默认焦点描边宽（**逻辑像素**）。
+    pub const DEFAULT_WIDTH: f32 = 2.0;
 }
 
 impl LabelStyle {
@@ -1048,44 +1264,66 @@ impl ModalStyle {
 /// 浅色主题（默认）：实现标准 [`Default`] 特化（`Theme::default()` 即浅色）。
 impl Default for Theme {
     fn default() -> Self {
-        Self {
-            label: LabelStyle::default(),
-            panel: PanelStyle::default(),
-            button: ButtonStyle::default(),
-            slider: SliderStyle::default(),
-            input: InputStyle::default(),
-            checkbox: CheckboxStyle::default(),
-            divider: DividerStyle::default(),
-            debug: DebugStyle::default(),
-            focus: FocusStyle::default(),
-            modal: ModalStyle::default(),
-            combo: ComboStyle::default(),
-            row_h: 26.0,
-            gap: 6.0,
-        }
+        Self::light()
     }
 }
 
 impl Theme {
-
-    /// 深色主题：逐一组装每个子样式的 [`dark()`](LabelStyle::dark) 预设
-    /// （深色配色、尺寸同 `Default`）+ 主题级 `row_h` / `gap`。
-    pub fn dark() -> Self {
+    /// **从调色板组装整套主题**（换肤 / 新主题的唯一入口）。
+    ///
+    /// 全部子样式经各自的 `themed(&Palette)` 派生 ⇒ 新增一个主题 = 提供一份
+    /// [`Palette`]，不必逐子样式写字面量。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{Palette, Theme};
+    /// // 只要改强调色：仍走 dark 的层次，只换 accent
+    /// let mut p = Palette::dark();
+    /// p.accent = rjw_color::Color::rgba_u8(255, 120, 200, 255);
+    /// let theme = Theme::themed(&p);
+    /// # let _ = theme;
+    /// ```
+    pub fn themed(p: &Palette) -> Self {
         Self {
-            label: LabelStyle::dark(),
-            panel: PanelStyle::dark(),
-            button: ButtonStyle::dark(),
-            slider: SliderStyle::dark(),
-            input: InputStyle::dark(),
-            checkbox: CheckboxStyle::dark(),
-            divider: DividerStyle::dark(),
-            debug: DebugStyle::dark(),
-            focus: FocusStyle::dark(),
-            modal: ModalStyle::dark(),
-            combo: ComboStyle::dark(),
+            label: LabelStyle::themed(p),
+            panel: PanelStyle::themed(p),
+            button: ButtonStyle::themed(p),
+            slider: SliderStyle::themed(p),
+            input: InputStyle::themed(p),
+            checkbox: CheckboxStyle::themed(p),
+            divider: DividerStyle::themed(p),
+            debug: DebugStyle::themed(p),
+            focus: FocusStyle::themed(p),
+            modal: ModalStyle::themed(p),
+            combo: ComboStyle::themed(p),
             row_h: 26.0,
             gap: 6.0,
+            palette: *p,
         }
+    }
+
+    /// **浅色主题**（= [`Default`]）：[`Palette::light`] 组装。
+    pub fn light() -> Self {
+        Self::themed(&Palette::light())
+    }
+
+    /// **深色主题**：[`Palette::dark`] 组装（低饱和冷灰阶梯 + 明亮蓝强调）。
+    ///
+    /// 比历史深色预设整体更暗、且层次单调递增——见 [`Palette::dark`] 的说明。
+    pub fn dark() -> Self {
+        Self::themed(&Palette::dark())
+    }
+
+    /// **历史深色主题**：复刻改造前的硬编码深色配色（`bevel = 0`，纯平色）。
+    /// 供不接受新配色的下游一键回退。
+    pub fn dark_legacy() -> Self {
+        Self::themed(&Palette::legacy_dark())
+    }
+
+    /// 本主题使用的调色板（从当前子样式反推**不可行**，故只记录"最近一次用于
+    /// 组装的主题来源"）。`Theme` 由 `themed` 组装时记录；手工改过字段后可能与
+    /// 实际颜色不一致，仅作诊断/回退用途。
+    pub fn palette(&self) -> Palette {
+        self.palette
     }
 
     // ── with 链（责任链语义：链上后设覆盖先设；可级联的全局参数） ──
@@ -1119,11 +1357,20 @@ impl Theme {
         self
     }
 
-    /// **圆角半径**：级联到 `panel` / `button` / `input`（逻辑像素；0 = 直角）。
+    /// **圆角半径**（逻辑像素；0 = 直角）。
+    ///
+    /// 级联到**全部有圆角的子样式**：`panel` / `button` / `input` / `checkbox` /
+    /// `combo.menu_radius`。此前只覆盖前三个，于是"全局设了圆角但勾选框 / 下拉菜单
+    /// 仍是直角"，看起来像 bug。
+    ///
+    /// 浮层（`combo`）用的是**更小的**圆角：`min(radius, 6)`——菜单是贴边弹出的浮层，
+    /// 与按钮同半径会显得笨重。
     pub fn with_radius(mut self, radius: f32) -> Self {
         self.panel.radius = radius;
         self.button.radius = radius;
         self.input.radius = radius;
+        self.checkbox.radius = radius * 0.5;
+        self.combo.menu_radius = radius.min(6.0);
         self
     }
 
@@ -1377,6 +1624,125 @@ mod tests {
     fn luma(c: Color) -> f32 {
         let a: [f32; 4] = c.into();
         0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]
+    }
+
+    // ─── Palette（配色令牌） ────────────────────────────────
+
+    #[test]
+    fn dark_palette_elevation_is_monotonic() {
+        // 深色主题的层次必须单调递增（这是"能分辨面板 / 卡片 / 菜单"的前提）。
+        let p = Palette::dark();
+        let dim = luma(p.surface_dim);
+        let s = luma(p.surface);
+        let raised = luma(p.surface_raised);
+        let overlay = luma(p.surface_overlay);
+        let hover = luma(p.surface_hover);
+        let active = luma(p.surface_active);
+        assert!(dim < s, "画布底应比面板更暗：{dim} < {s}");
+        assert!(s < raised, "面板 < 抬升：{s} < {raised}");
+        assert!(raised < overlay, "抬升 < 浮层：{raised} < {overlay}");
+        assert!(overlay < hover, "浮层 < 悬停：{overlay} < {hover}");
+        assert!(hover < active, "悬停 < 激活：{hover} < {active}");
+        // 凹陷表面刻意比面板更暗（"可编辑"的通用暗示）
+        assert!(luma(p.surface_sunken) < s, "输入框应比面板更暗（凹陷）");
+    }
+
+    #[test]
+    fn dark_theme_is_actually_dark() {
+        // 用户反馈"dark 主题不够暗"：面板的感知亮度必须低于 ~15%。
+        let p = Palette::dark();
+        assert!(luma(p.surface) < 0.15, "面板太亮：{}", luma(p.surface));
+        assert!(luma(p.surface_overlay) < 0.25, "浮层太亮");
+        // 但正文必须足够亮以保持对比度（> 0.7 的感知亮度）。
+        assert!(luma(p.text) > 0.7, "正文太暗：{}", luma(p.text));
+        // 强调色是"冷蓝"而非洗白的蓝：蓝分量显著高于红。
+        let a: [f32; 4] = p.accent.into();
+        assert!(a[2] > a[0] + 0.3, "强调色应偏蓝：{a:?}");
+    }
+
+    #[test]
+    fn dark_and_light_palettes_differ_in_every_surface_token() {
+        // 同一份 `themed()` 映射要能服务两套调色板 ⇒ 每个表面令牌都必须不同，
+        // 否则说明某个令牌被漏掉、两套主题在该处会撞色。
+        let (d, l) = (Palette::dark(), Palette::light());
+        assert_ne!(d.surface_dim, l.surface_dim);
+        assert_ne!(d.surface_sunken, l.surface_sunken);
+        assert_ne!(d.surface, l.surface);
+        assert_ne!(d.surface_raised, l.surface_raised);
+        assert_ne!(d.surface_overlay, l.surface_overlay);
+        assert_ne!(d.surface_hover, l.surface_hover);
+        assert_ne!(d.surface_active, l.surface_active);
+        assert_ne!(d.text, l.text);
+        assert_ne!(d.border, l.border);
+        assert_ne!(d.scrim, l.scrim);
+    }
+
+    #[test]
+    fn surface_sunken_is_darker_than_surface_in_dark_but_brighter_in_light() {
+        // "凹陷"在深色 = 更暗、在浅色 = 更亮（白底输入框 vs 灰面板）。
+        assert!(luma(Palette::dark().surface_sunken) < luma(Palette::dark().surface));
+        assert!(luma(Palette::light().surface_sunken) > luma(Palette::light().surface));
+    }
+
+    #[test]
+    fn themed_records_palette_and_legacy_reproduces_old_dark() {
+        let t = Theme::dark();
+        assert_eq!(t.palette, Palette::dark());
+        // legacy：bevel = 0 ⇒ 纯平色（不是"两端同色的渐变"）
+        let lg = Theme::dark_legacy();
+        assert_eq!(lg.palette, Palette::legacy_dark());
+        assert_eq!(lg.panel.bg, Brush::Solid(Color::rgba_u8(38, 42, 52, 255)));
+        assert_eq!(lg.input.bg, Brush::Solid(Color::rgba_u8(28, 32, 40, 255)));
+        assert_eq!(lg.button.bg_hover, Brush::Solid(Color::rgba_u8(66, 76, 96, 255)));
+        // 新 dark 则是真渐变（两端不同色）
+        assert!(Theme::dark().panel.bg.as_solid().is_none(), "新 dark 面板应有微渐变");
+    }
+
+    #[test]
+    fn light_theme_is_the_default_and_matches_palette_light() {
+        assert_eq!(Theme::default().palette, Palette::light());
+        assert_eq!(Theme::light().palette, Palette::light());
+    }
+
+    #[test]
+    fn with_radius_cascades_to_every_rounded_substyle() {
+        // 历史 BUG：只级联 panel/button/input，勾选框与下拉菜单仍是直角。
+        let t = Theme::dark().with_radius(8.0);
+        assert_eq!(t.panel.radius, 8.0);
+        assert_eq!(t.button.radius, 8.0);
+        assert_eq!(t.input.radius, 8.0);
+        assert_eq!(t.checkbox.radius, 4.0, "勾选框取全局半径的一半");
+        assert_eq!(t.combo.menu_radius, 6.0, "浮层圆角上限 6");
+        // 小半径时浮层跟随全局半径
+        assert_eq!(Theme::dark().with_radius(3.0).combo.menu_radius, 3.0);
+    }
+
+    #[test]
+    fn focus_and_checkbox_defaults_are_usable() {
+        // 1px 焦点描边在高 DPI 下几乎看不见，键盘导航"看不见焦点"是硬伤 ⇒ 取 2。
+        assert_eq!(FocusStyle::default().width, 2.0);
+        // 勾选框默认直角（保持既有观感），只有显式 with_radius 才变圆
+        assert_eq!(CheckboxStyle::default().radius, 0.0);
+    }
+
+    #[test]
+    fn scaled_preserves_palette_and_scales_checkbox_radius() {
+        let t = Theme::dark().with_radius(8.0).scaled(2.0);
+        assert_eq!(t.palette, Palette::dark(), "缩放不改变配色来源记录");
+        assert_eq!(t.checkbox.radius, 8.0, "半径 ×2（逻辑 4 → 物理 8）");
+        assert_eq!(t.combo.menu_radius, 12.0);
+    }
+
+    #[test]
+    fn bevel_helpers_degrade_to_solid_at_zero() {
+        assert_eq!(bevel_raised(Color::RED, 0.0), Brush::Solid(Color::RED));
+        assert_eq!(bevel_sunken(Color::RED, 0.0), Brush::Solid(Color::RED));
+        assert_eq!(bevel_raised(Color::RED, -1.0), Brush::Solid(Color::RED));
+        // 抬升 = 上亮下暗；凹陷 = 上暗下亮
+        let r = bevel_raised(Color::rgba_u8(100, 100, 100, 255), 0.1).corners();
+        assert!(luma(r[0]) > luma(r[2]));
+        let s = bevel_sunken(Color::rgba_u8(100, 100, 100, 255), 0.1).corners();
+        assert!(luma(s[0]) < luma(s[2]));
     }
 
     #[test]
