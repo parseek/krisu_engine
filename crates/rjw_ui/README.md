@@ -41,7 +41,9 @@ krusie 引擎的 UI 模块：**hybrid 模式**（立即外观 + ID 持久状态�
   描边 / 前景 / 强调）：`Theme::themed(&Palette)` 组装，`Theme::{light,dark,dark_legacy}`
   是预设；`Palette.bevel` + `bevel_raised/sunken` 从**一个**表面色派生微渐变。
   `Theme::with_radius` 级联到全部有圆角的子样式（panel / button / input /
-  checkbox`r/2` / combo.menu_radius`min(r,6)`）。
+  checkbox`r/2` / combo.menu_radius`min(r,6)`）；`Theme::with_border_w` 级联边框宽
+  （0 = 不画），边框**颜色**是 `Palette::{border, border_strong}` 令牌。
+  背景颜色按顶点位置双线性 lerp（圆角弧上的顶点也按位置取色 ⇒ 渐变不被"压进中间"）。
 - **状态持久**：交互控件（按钮/滑块/勾选/输入框）通过 **ID**（`&str`）把 hover / 按下 / 焦点 / 输入内容 / 拖拽标记持久化在 `UiState` 中（应用持有，跨帧复用）。
 - **自动尺寸**（DOM 风格）：叶子控件由内容测量（`rjw_text::Text::measure` + padding）自然撑开，容器（panel / pack / grid）在闭包结束时按子控件结算自身尺寸——**默认无需手写宽高**；任何控件可显式 `.size(w, h)` 或传 `Rect` 覆盖。
 - **屏幕空间**：控件坐标一律为屏幕像素（左上角原点、Y+ 向下），内部经相机屏幕固定变换绘制，命中测试直接在屏幕像素进行（旋转/缩放相机依然准确）。

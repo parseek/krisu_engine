@@ -1388,6 +1388,21 @@ impl Theme {
         self
     }
 
+    /// **边框宽度**（逻辑像素；0 = 不画边框）。
+    ///
+    /// 级联到全部**有边框**的子样式：`panel` / `button` / `input` / `checkbox`。
+    /// 边框**颜色**不是主题标量而是调色板令牌（[`Palette::border`] 常规 /
+    /// [`Palette::border_strong`] 强描边）——换色请改调色板，这样"面板 / 按钮 /
+    /// 输入框"的描边深浅关系不会各自漂移。
+    pub fn with_border_w(mut self, w: f32) -> Self {
+        let w = w.max(0.0);
+        self.panel.border_w = w;
+        self.button.border_w = w;
+        self.input.border_w = w;
+        self.checkbox.border_w = w;
+        self
+    }
+
     /// pack / grid 默认子项间距（像素）。
     pub fn with_gap(mut self, gap: f32) -> Self {
         self.gap = gap;
@@ -1731,6 +1746,28 @@ mod tests {
         assert_eq!(t.combo.menu_radius, 6.0, "浮层圆角上限 6");
         // 小半径时浮层跟随全局半径
         assert_eq!(Theme::dark().with_radius(3.0).combo.menu_radius, 3.0);
+    }
+
+    #[test]
+    fn with_border_w_cascades_and_border_colour_comes_from_the_palette() {
+        let t = Theme::dark().with_border_w(3.0);
+        assert_eq!(t.panel.border_w, 3.0);
+        assert_eq!(t.button.border_w, 3.0);
+        assert_eq!(t.input.border_w, 3.0);
+        assert_eq!(t.checkbox.border_w, 3.0);
+        // 0 = 无边框（`push_panel_like` 会跳过 Border 命令）；负数夹到 0。
+        assert_eq!(Theme::dark().with_border_w(0.0).panel.border_w, 0.0);
+        assert_eq!(Theme::dark().with_border_w(-5.0).button.border_w, 0.0);
+        // 边框**颜色**是调色板令牌：面板取 `border`、按钮/输入框/勾选框取 `border_strong`。
+        let p = Palette::dark();
+        let t = Theme::themed(&p);
+        assert_eq!(t.panel.border, p.border);
+        assert_eq!(t.divider.color, p.border);
+        assert_eq!(t.button.border, p.border_strong);
+        assert_eq!(t.input.border, p.border_strong);
+        assert_eq!(t.checkbox.box_border, p.border_strong);
+        // 缩放同时作用于宽度（DPI 预乘）。
+        assert_eq!(Theme::dark().with_border_w(2.0).scaled(2.0).panel.border_w, 4.0);
     }
 
     #[test]

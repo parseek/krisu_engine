@@ -174,7 +174,7 @@ use rjw_ui::{Button, Label, NumberInput, PackSide, Theme, Ui, UiAdd, Viewport};
 // 每帧：
 let mut ui = Ui::begin(&window, &mut text, &mut state)
     .capture(&mouse, &keyboard)
-    .theme(Theme::dark().with_radius(8.0))      // with_font_family / with_font_size / with_radius / ...
+    .theme(Theme::dark().with_radius(8.0))      // with_font_family / with_font_size / with_radius / with_border_w / with_feather / ...
     .scale_factor(ctx.scale_factor().unwrap_or(1.0))
     .build();
 

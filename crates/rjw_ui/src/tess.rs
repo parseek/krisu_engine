@@ -218,7 +218,6 @@ struct Corner {
     radius: f32,
     a: Vec2,
     b: Vec2,
-    color: Color,
 }
 
 impl Corner {
@@ -233,31 +232,73 @@ impl Corner {
 /// （`MIN_AA_RADIUS`）：半径 < 1px 的圆角本来就看不出锯齿。
 const MIN_AA_RADIUS: f32 = 0.5;
 
+/// **双线性取色**：按点在 `rect` 中的归一化位置 `(u, v)` 插值四角色。
+///
+/// 这是"背景渐变靠 lerp"的**唯一**取色入口——**每一个**顶点（含圆角弧上的）都用自己的
+/// 位置算色，而不是整段弧直接带"本角颜色"。
+///
+/// 为什么必须这样：若弧上顶点直接带本角颜色，渐变的**两端会被钉在弧的跨度上**。
+/// 例：200×36 的胶囊 + 半径 18 + 水平渐变 `L → R`，左侧 18px 全是纯 `L`、右侧 18px
+/// 全是纯 `R`，整条 `L→R` 斜坡被压进中间 164px —— 肉眼就是"两端发平、渐变被拉长"。
+/// 按位置 lerp 后，弧上的颜色恰好是该处应有的渐变值，整块颜色场与矩形渐变一致。
+///
+/// `rect` 退化（宽 / 高 ≤ 0）时回退到左上角色（调用方保证不会走到这里）。
+#[inline]
+fn bilinear_color(corners: [Color; 4], rect: Rect, p: Vec2) -> Color {
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return corners[0];
+    }
+    let u = ((p.x - rect.x) / rect.w).clamp(0.0, 1.0);
+    let v = ((p.y - rect.y) / rect.h).clamp(0.0, 1.0);
+    let top = crate::draw::lerp_color(corners[0], corners[1], u);
+    let bot = crate::draw::lerp_color(corners[2], corners[3], u);
+    crate::draw::lerp_color(top, bot, v)
+}
+
 /// 写入**一圈圆角轮廓**（4 角 × `segs + 1` 点），返回该圈首顶点的下标。
 ///
-/// `colors` 是四角色（支持四角渐变）；`alpha` 覆盖第 4 分量——羽化就是靠"硬体
-/// `alpha = 1` / 外环 `alpha = 0`"由光栅化器插值出过渡实现的。
-fn push_outline(
+/// `color_at(点序号, 位置)` 决定每个顶点的颜色（含 alpha）：背景传"按位置双线性取色"，
+/// 羽化环传"复制主轮廓同序号点的颜色 + `alpha = 0`"（保证纯 alpha 斜坡、不夹带色偏），
+/// 边框传固定色。
+fn push_outline<F>(
     verts: &mut Vec<VertexP3U2C4>,
     table: &CornerTable,
     stride: u32,
     segs: u32,
     corners: &[Corner; 4],
-    colors: [Color; 4],
-    alpha: f32,
     uv: [f32; 2],
-) -> u16 {
+    color_at: F,
+) -> u16
+where
+    F: Fn(usize, Vec2) -> [f32; 4],
+{
     let start = verts.len() as u16;
-    for (c, col) in corners.iter().zip(colors) {
-        let mut a: [f32; 4] = col.into();
-        a[3] = alpha;
+    let mut i = 0usize;
+    for c in corners {
         for k in 0..=segs {
             let (cos_t, sin_t) = table.sample(stride, k);
             let pos = c.center + c.dir(cos_t, sin_t) * c.radius;
-            verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv, color: a });
+            verts.push(VertexP3U2C4 {
+                pos: [pos.x, pos.y, 0.0],
+                uv,
+                color: color_at(i, pos),
+            });
+            i += 1;
         }
     }
     start
+}
+
+/// 取已写入的 `[start, start+n)` 顶点色，把 alpha 覆盖为 `alpha`。
+fn copy_colors(verts: &[VertexP3U2C4], start: u16, n: u16, alpha: f32) -> Vec<[f32; 4]> {
+    verts[start as usize..start as usize + n as usize]
+        .iter()
+        .map(|v| {
+            let mut c = v.color;
+            c[3] = alpha;
+            c
+        })
+        .collect()
 }
 
 /// **两圈同心轮廓之间的带状几何**，沿**整圈**推进（`n = 4 × (segs + 1)`）。
@@ -287,8 +328,10 @@ fn grow(r: Rect, d: f32) -> Rect {
 /// 四角（顺时针 TL → TR → BR → BL）的圆心与基向量。
 ///
 /// `radius` 已 clamp 过，调用方保证 `0 < radius ≤ min(w, h) / 2`。
+/// **不带颜色**——每个顶点的颜色由 [`push_outline`] 的 `color_at` 按**位置**算
+/// （见 [`bilinear_color`]）；四角颜色是"颜色场"的参数，不是"角"的属性。
 #[inline]
-fn corners_of(rect: Rect, radius: f32, colors: [Color; 4]) -> [Corner; 4] {
+fn corners_of(rect: Rect, radius: f32) -> [Corner; 4] {
     let Rect { x, y, w, h } = rect;
     let centers = [
         Vec2::new(x + radius, y + radius),                 // TL
@@ -298,19 +341,12 @@ fn corners_of(rect: Rect, radius: f32, colors: [Color; 4]) -> [Corner; 4] {
     ];
     let mut a = Vec2::new(-1.0, 0.0);
     let mut b = Vec2::new(0.0, -1.0);
-    let mut out = [Corner {
-        center: Vec2::ZERO,
-        radius,
-        a,
-        b,
-        color: colors[0],
-    }; 4];
+    let mut out = [Corner { center: Vec2::ZERO, radius, a, b }; 4];
     for (i, slot) in out.iter_mut().enumerate() {
         slot.center = centers[i];
         slot.radius = radius;
         slot.a = a;
         slot.b = b;
-        slot.color = colors[i];
         // 顺时针转 90°：`(a, b) ← (b, -a)`。
         let na = b;
         let nb = Vec2::new(-a.x, -a.y);
@@ -360,6 +396,18 @@ fn push_plain_quad(
 ///
 /// `f = spec.feather`（物理像素，由 `Theme::feather` 逻辑值 × DPI 而来）；`f <= 0`
 /// 或半径小到放不下两个同心轮廓时不羽化（硬体 = 原矩形，半径原样）。
+/// # 颜色（背景渐变）
+///
+/// 硬体的**每个**顶点（含圆角弧上的）都按自己在 `rect` 中的位置做**双线性取色**
+/// （[`bilinear_color`]）——整块颜色场与矩形渐变一致。若弧上顶点直接带"本角颜色"，
+/// 渐变两端会被钉在弧的跨度上（200px 宽的胶囊 + 半径 18，两侧各 18px 变成纯端色，
+/// 整条斜坡被压进中间 164px，肉眼就是"两端发平、渐变被拉长"）。
+///
+/// 中心顶点取中心的双线性值（= 四角均值），扇形内部为重心插值——对纵向 / 横向这类
+/// 可分离渐变是精确的，四角各异的对角渐变是可接受的近似。
+///
+/// 外环直接**复制**硬体同序号顶点的颜色、只把 alpha 置 0 ⇒ 羽化是纯 alpha 斜坡，
+/// 不会夹带色偏。
 pub(crate) fn push_rounded_rect(
     verts: &mut Vec<VertexP3U2C4>,
     tris: &mut Vec<Tri>,
@@ -387,34 +435,30 @@ pub(crate) fn push_rounded_rect(
     let half = if aa { f * 0.5 } else { 0.0 };
     let hard_rect = grow(spec.rect, -half);
     let hard_radius = (radius - half).max(0.0);
-    let hard = corners_of(hard_rect, hard_radius, spec.corners);
+    let hard = corners_of(hard_rect, hard_radius);
     let stride = table.stride_for(radius + half);
     let segs = CornerTable::segs_of(stride);
     let n = (4 * (segs + 1)) as u16;
 
-    let hard_start = push_outline(verts, table, stride, segs, &hard, spec.corners, 1.0, uv);
-    let hard_len = (verts.len() as u16) - hard_start;
-    debug_assert_eq!(hard_len, n);
+    // 每个顶点按**自己在 rect 中的位置**取色（不是按角取色）。
+    let rect = spec.rect;
+    let cols = spec.corners;
+    let hard_start = push_outline(verts, table, stride, segs, &hard, uv, |_i, p| {
+        let mut c: [f32; 4] = bilinear_color(cols, rect, p).into();
+        c[3] = 1.0;
+        c
+    });
+    debug_assert_eq!((verts.len() as u16) - hard_start, n);
 
     // ── 硬体填充：以矩形中心为轴的扇形三角化 ──
-    // 轮廓天然闭合（最后一个点连回第一个点，跨过四条直边）。四角色各异 ⇒ 中心取
-    // 四角均值，扇形内做重心插值（矩形内部本来就是双线性场，近似足够）。
-    let mut center_col = [0.0f32; 4];
-    for c in &hard {
-        let a: [f32; 4] = c.color.into();
-        for (dst, s) in center_col.iter_mut().zip(a) {
-            *dst += s * 0.25;
-        }
-    }
+    // 轮廓天然闭合（最后一个点连回第一个点，跨过四条直边）。中心色 = 中心的双线性值
+    // （= 四角均值），内部为重心插值。
+    let center = Vec2::new(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
     let center_idx = verts.len() as u16;
     verts.push(VertexP3U2C4 {
-        pos: [
-            spec.rect.x + spec.rect.w * 0.5,
-            spec.rect.y + spec.rect.h * 0.5,
-            0.0,
-        ],
+        pos: [center.x, center.y, 0.0],
         uv,
-        color: center_col,
+        color: bilinear_color(cols, rect, center).into(),
     });
     for i in 0..n {
         let a = hard_start + i;
@@ -422,12 +466,13 @@ pub(crate) fn push_rounded_rect(
         tris.push([a, b, center_idx]);
     }
 
-    // ── 羽化带：外环 alpha = 0，沿**整圈**与硬体配成带子（含直边）──
+    // ── 羽化带：外环 alpha = 0（颜色照抄硬体同序号点），沿**整圈**成带 ──
     if aa {
         let outer_rect = grow(spec.rect, half);
-        let outer = corners_of(outer_rect, radius + half, spec.corners);
+        let outer = corners_of(outer_rect, radius + half);
+        let fade = copy_colors(verts, hard_start, n, 0.0);
         let outer_start =
-            push_outline(verts, table, stride, segs, &outer, spec.corners, 0.0, uv);
+            push_outline(verts, table, stride, segs, &outer, uv, |i, _p| fade[i]);
         // `hard` 半径更小 ⇒ 是 inner。
         push_band(tris, hard_start, outer_start, n);
     }
@@ -552,29 +597,42 @@ pub(crate) fn push_rounded_ring(
     let stride = table.stride_for(ro + half);
     let segs = CornerTable::segs_of(stride);
     let n = (4 * (segs + 1)) as u16;
-    let flat = [color; 4];
+    let mut solid: [f32; 4] = color.into();
+    solid[3] = 1.0;
+    let flat = |_i: usize, _p: Vec2| solid;
 
     // 由外向内写：A（外羽化，0）→ B（外轮廓，1）→ C（内轮廓，1）→ D（内羽化，0）。
-    let a_start = if outer_aa {
-        let cs = corners_of(grow(rect, half), ro + half, flat);
-        Some(push_outline(verts, table, stride, segs, &cs, flat, 0.0, uv))
-    } else {
-        None
-    };
-    let b_start = push_outline(verts, table, stride, segs, &corners_of(rect, ro, flat), flat, 1.0, uv);
+    // 羽化圈的**颜色照抄对应主轮廓的同序号点**（只把 alpha 置 0）⇒ 纯 alpha 斜坡，
+    // 不夹带色偏。
+    let b_start = push_outline(
+        verts,
+        table,
+        stride,
+        segs,
+        &corners_of(rect, ro),
+        uv,
+        flat,
+    );
     let c_start = push_outline(
         verts,
         table,
         stride,
         segs,
-        &corners_of(inner_rect, ri, flat),
-        flat,
-        1.0,
+        &corners_of(inner_rect, ri),
         uv,
+        flat,
     );
+    let a_start = if outer_aa {
+        let cs = corners_of(grow(rect, half), ro + half);
+        let fade = copy_colors(verts, b_start, n, 0.0);
+        Some(push_outline(verts, table, stride, segs, &cs, uv, |i, _p| fade[i]))
+    } else {
+        None
+    };
     let d_start = if inner_aa {
-        let cs = corners_of(grow(inner_rect, -half), (ri - half).max(0.0), flat);
-        Some(push_outline(verts, table, stride, segs, &cs, flat, 0.0, uv))
+        let cs = corners_of(grow(inner_rect, -half), (ri - half).max(0.0));
+        let fade = copy_colors(verts, c_start, n, 0.0);
+        Some(push_outline(verts, table, stride, segs, &cs, uv, |i, _p| fade[i]))
     } else {
         None
     };
@@ -635,6 +693,154 @@ mod tests {
         let p = |i: u16| Vec2::new(v[i as usize].pos[0], v[i as usize].pos[1]);
         let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
         (b - a).perp_dot(c - a)
+    }
+
+    /// 按位置找一个顶点（位置完全相同才命中）。
+    fn vertex_at(v: &[VertexP3U2C4], p: Vec2) -> Option<&VertexP3U2C4> {
+        v.iter()
+            .find(|x| (x.pos[0] - p.x).abs() < 1e-3 && (x.pos[1] - p.y).abs() < 1e-3)
+    }
+
+    // ─── 背景颜色靠 lerp（弧上顶点按位置取色） ──────────────
+
+    #[test]
+    fn bilinear_color_hits_corners_center_and_clamps() {
+        let rect = Rect::new(10.0, 20.0, 100.0, 50.0);
+        let c = [Color::RED, Color::GREEN, Color::BLUE, Color::YELLOW];
+        assert_eq!(bilinear_color(c, rect, Vec2::new(10.0, 20.0)), Color::RED);
+        assert_eq!(bilinear_color(c, rect, Vec2::new(110.0, 20.0)), Color::GREEN);
+        assert_eq!(bilinear_color(c, rect, Vec2::new(10.0, 70.0)), Color::BLUE);
+        assert_eq!(bilinear_color(c, rect, Vec2::new(110.0, 70.0)), Color::YELLOW);
+        // 中心 = 四角均值
+        let mid: [f32; 4] = bilinear_color(c, rect, Vec2::new(60.0, 45.0)).into();
+        let avg: [f32; 4] = c
+            .iter()
+            .fold([0.0f32; 4], |mut a, x| {
+                let y: [f32; 4] = (*x).into();
+                for i in 0..4 {
+                    a[i] += y[i] * 0.25;
+                }
+                a
+            });
+        for i in 0..4 {
+            assert!((mid[i] - avg[i]).abs() < 1e-5, "中心应为四角均值");
+        }
+        // 超界 clamp（羽化外环会落到 rect 外，此时应取边缘色而不是外推）
+        assert_eq!(bilinear_color(c, rect, Vec2::new(-50.0, -50.0)), Color::RED);
+        assert_eq!(bilinear_color(c, rect, Vec2::new(500.0, 500.0)), Color::YELLOW);
+    }
+
+    #[test]
+    fn arc_vertices_are_coloured_by_position_not_by_corner() {
+        // 回归：圆角弧上的顶点曾直接带"本角颜色"。水平渐变 + 大半径时渐变的**两端会被
+        // 钉在弧的跨度上**——200px 宽、半径 18 的胶囊，左右各 18px 全是纯端色，
+        // 整条 L→R 斜坡被压进中间 164px（肉眼："两端发平、渐变被拉长"）。
+        // 按位置做双线性取色后，弧上顶点恰好是该处应有的渐变值。
+        let t = table();
+        let (l, r) = (Color::RED, Color::BLUE);
+        let rect = Rect::new(0.0, 0.0, 200.0, 36.0);
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        // `feather = 0` ⇒ 硬体轮廓就是 rect + radius 本身，顶点位置好算。
+        push_rounded_rect(
+            &mut v,
+            &mut tr,
+            &t,
+            RoundedRectSpec {
+                rect,
+                radius: 18.0,
+                feather: 0.0,
+                corners: [l, r, l, r],
+                uv: TEST_UV,
+            },
+        );
+        // TL 弧的末点 = 上边 y=0 处 x=18 ⇒ u = 18/200 = 0.09。
+        let got = vertex_at(&v, Vec2::new(18.0, 0.0)).expect("TL 弧末点应存在");
+        let mut pure_l: [f32; 4] = l.into();
+        pure_l[3] = 1.0;
+        assert_ne!(got.color, pure_l, "弧上顶点不得是纯端色（应已 lerp）");
+        let want: [f32; 4] = crate::draw::lerp_color(l, r, 0.09).into();
+        for i in 0..3 {
+            assert!(
+                (got.color[i] - want[i]).abs() < 0.01,
+                "上边 x=18 处应约为 9% 混色：实际 {:?}，期望 {:?}",
+                got.color,
+                want
+            );
+        }
+        // 对照：同一行最左端（左中点在 x=0）仍是纯左端色。
+        let left: [f32; 4] = vertex_at(&v, Vec2::new(0.0, 18.0)).expect("左中点").color;
+        assert!((left[0] - pure_l[0]).abs() < 0.01 && (left[2] - pure_l[2]).abs() < 0.01);
+    }
+
+    #[test]
+    fn vertical_gradient_edge_colours_are_exact() {
+        // 纵向两端色：上下边缘必须是**精确**的端色（不能被平均拉走）。
+        let t = table();
+        let (top, bot) = (Color::WHITE, Color::BLACK);
+        let rect = Rect::new(0.0, 0.0, 80.0, 40.0);
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        push_rounded_rect(
+            &mut v,
+            &mut tr,
+            &t,
+            RoundedRectSpec {
+                rect,
+                radius: 8.0,
+                feather: 0.0,
+                corners: [top, top, bot, bot],
+                uv: TEST_UV,
+            },
+        );
+        let w: [f32; 4] = top.into();
+        let b: [f32; 4] = bot.into();
+        // ⚠ 直边**不细分**：只能取弧的端点（x = r 与 x = w - r），中间没有顶点。
+        for x in [8.0f32, 72.0] {
+            let tp = vertex_at(&v, Vec2::new(x, 0.0)).expect("上边弧端点");
+            assert!((tp.color[0] - w[0]).abs() < 1e-4, "上边应为纯上端色（x={x}）");
+        }
+        let bp = vertex_at(&v, Vec2::new(8.0, 40.0)).expect("下边弧端点");
+        assert!((bp.color[0] - b[0]).abs() < 1e-4, "下边应为纯下端色");
+    }
+
+    #[test]
+    fn feather_ring_copies_hard_body_colours() {
+        // 羽化必须是**纯 alpha 斜坡**：外环顶点色 = 硬体同序号点，只有 alpha 变 0。
+        let t = table();
+        let f = 3.0;
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        push_rounded_rect(
+            &mut v,
+            &mut tr,
+            &t,
+            RoundedRectSpec {
+                rect: Rect::new(0.0, 0.0, 120.0, 40.0),
+                radius: 10.0,
+                feather: f,
+                corners: [Color::RED, Color::BLUE, Color::RED, Color::BLUE],
+                uv: TEST_UV,
+            },
+        );
+        let stride = t.stride_for(10.0 + f * 0.5);
+        let n = 4 * (CornerTable::segs_of(stride) + 1);
+        // 布局：[硬体 n][中心 1][外环 n]
+        assert_eq!(v.len() as u32, n * 2 + 1);
+        for i in 0..n {
+            let h = v[i as usize].color;
+            let o = v[(n + 1 + i) as usize].color;
+            assert_eq!(h[3], 1.0);
+            assert_eq!(o[3], 0.0);
+            for ch in 0..3 {
+                assert!(
+                    (h[ch] - o[ch]).abs() < 1e-6,
+                    "外环不得夹带色偏（i={i}）：{:?} vs {:?}",
+                    h,
+                    o
+                );
+            }
+        }
     }
 
     #[test]
@@ -999,20 +1205,26 @@ mod tests {
     }
 
     #[test]
-    fn corners_are_carried_into_vertices() {
-        // 「圆角 + 渐变」靠逐顶点色：四角不同的输入必须体现在顶点里
-        // （这正是不能走实例单色的原因）。
+    fn per_vertex_colour_spans_the_full_gradient() {
+        // 「圆角 + 渐变」靠逐顶点色（这正是不能走实例单色的原因）。但**顶点不带
+        // "本角颜色"**——它带的是该位置的双线性值 ⇒ 四角**原始色**可能一个都不出现在
+        // 顶点里（弧的端点已经离角 r 远）。这里断言的是"色场确实铺满整个渐变区间"。
         let t = table();
         let mut v = Vec::new();
         let mut tr = Vec::new();
-        push_rounded_rect(&mut v, &mut tr, &t, spec(40.0, 24.0, 6.0));
+        // 水平红→绿（另一项测试覆盖四角各异的对角情形）。
+        let mut s = spec(40.0, 24.0, 6.0);
+        s.corners = [Color::RED, Color::GREEN, Color::RED, Color::GREEN];
+        push_rounded_rect(&mut v, &mut tr, &t, s);
         let alphas: Vec<f32> = v.iter().map(|x| x.color[3]).collect();
         assert!(alphas.contains(&1.0), "硬体顶点 alpha 必须为 1");
         assert!(alphas.contains(&0.0), "羽化环顶点 alpha 必须为 0");
-        // 四角色确实进了硬体顶点（不再只有单一 tint）
-        let colors: Vec<[f32; 4]> = v.iter().map(|x| x.color).collect();
-        let red: [f32; 4] = Color::RED.into();
-        assert!(colors.contains(&red), "TL 角色应出现在顶点里");
+        // 红分量应铺满 [0, 1) 的绝大部分（弧端点只比角内缩约 r/w，占比很小）。
+        let reds: Vec<f32> = v.iter().map(|x| x.color[0]).collect();
+        let hi = reds.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let lo = reds.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(hi > 0.95, "红分量应接近上界（实际最大 {hi}）");
+        assert!(lo < 0.05, "红分量应接近下界（实际最小 {lo}）");
     }
 
     #[test]

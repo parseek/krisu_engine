@@ -496,14 +496,19 @@ impl RightPanel {
 /// 旧的 `render` / `render2d` / `render2d_ui` / `font` / `viewport` 字段已删除：
 /// 渲染上下文、世界层与 UI 层渲染器、文本子系统、画面矩形全部由运行时持有
 /// （`Ctx` / `Frame` / `Gfx`），应用不再直接管理它们。
-/// **主题调节窗口**：实时改调色板令牌 / 圆角 / 羽化 / 微渐变强度。
+/// **主题调节窗口**：实时改调色板令牌 / 圆角 / 羽化 / 微渐变 / 边框。
 ///
 /// 主题每帧由 [`ThemeTuner::theme`] 重新组装（`Theme::themed(&Palette)`），所以拖动
 /// 滑块**当帧**就能看到整屏变化——顺带演示了「换肤 = 换一份 [`Palette`]」这条设计：
 /// 主题不是 11 个子样式的字面量，而是一份按**层次**命名的调色板 + 几个全局标量。
 ///
-/// 用法：拖「圆角 / 羽化」看窗口与按钮的圆角与边缘软硬；拖「表面明度」找你要的暗度；
-/// 拖「强调 R/G/B」看焦点描边、滑轨填充、勾选填充、下拉菜单选中项一起变色。
+/// 用法：
+/// - 「圆角 / 羽化」看窗口与按钮的圆角与边缘软硬；
+/// - 「微渐变」看背景刷（`Brush::Vertical`）两端色的差值——**颜色由顶点色 lerp**，
+///   圆角弧上的顶点也按位置取色，所以整块渐变与矩形渐变一致；
+/// - 「背景 R/G/B」直接设表面基色（整条层次阶梯按通道比一起缩，保持相对关系）；
+/// - 「边框 R/G/B / 宽」改描边色与宽度（宽度级联到 panel / button / input / checkbox）；
+/// - 「强调 R/G/B」看焦点描边、滑轨填充、勾选填充、下拉菜单选中项一起变色。
 struct ThemeTuner {
     /// 预设：0 = dark，1 = light，2 = legacy dark（改造前的旧配色，用于对照）。
     preset: u8,
@@ -513,53 +518,90 @@ struct ThemeTuner {
     feather: f32,
     /// 表面微渐变强度（`Palette.bevel`）。
     bevel: f32,
-    /// 表面基色明度增益（乘到全部 `surface*` 令牌上；< 1 更暗、> 1 更亮）。
-    surface_gain: f32,
-    /// 强调色（sRGB 0..1 的 RGB；hover / active 由它派生）。
+    /// 全局边框宽（逻辑像素；0 = 无边框）。
+    border_w: f32,
+    /// 表面基色（sRGB 0..1；整条 `surface*` 阶梯按通道比一起缩）。
+    bg: [f32; 3],
+    /// 描边色（sRGB 0..1）；`border_strong` 由它派生。
+    border: [f32; 3],
+    /// 强调色（sRGB 0..1）；hover / active 由它派生。
     accent: [f32; 3],
     /// 是否显示本窗口。
     open: bool,
 }
 
+/// 预设调色板。
+fn preset_palette(preset: u8) -> Palette {
+    match preset {
+        1 => Palette::light(),
+        2 => Palette::legacy_dark(),
+        _ => Palette::dark(),
+    }
+}
+
+/// 取颜色的 RGB（sRGB 0..1）——用于把预设颜色灌进调色旋钮。
+fn rgb_of(c: rjw_krusie::color::Color) -> [f32; 3] {
+    let a: [f32; 4] = c.into();
+    [a[0], a[1], a[2]]
+}
+
 impl ThemeTuner {
     fn new() -> Self {
+        let p = preset_palette(0);
         Self {
             preset: 0,
             radius: 8.0,
             feather: 1.0,
-            bevel: 0.10,
-            surface_gain: 1.0,
-            accent: [0.43, 0.66, 1.0],
-            open: false,
+            bevel: p.bevel,
+            border_w: 1.0,
+            bg: rgb_of(p.surface),
+            border: rgb_of(p.border),
+            accent: rgb_of(p.accent),
+            // 默认打开：这是个"可调的窗口"，开着才能看见效果。
+            open: true,
         }
+    }
+
+    /// 切到某个预设并把旋钮复位到该预设的令牌（预设按钮用）。
+    fn set_preset(&mut self, preset: u8) {
+        let p = preset_palette(preset);
+        self.preset = preset;
+        self.bevel = p.bevel;
+        self.bg = rgb_of(p.surface);
+        self.border = rgb_of(p.border);
+        self.accent = rgb_of(p.accent);
     }
 
     /// 按当前旋钮组装主题（`frame.ui(..)` 之前调用——闭包借用 `self`，闭包内不能构造）。
     fn theme(&self, font: &str) -> Theme {
-        let mut p = match self.preset {
-            1 => Palette::light(),
-            2 => Palette::legacy_dark(),
-            _ => Palette::dark(),
-        };
-        // 表面明度整体增益：一次改完一整条层次阶梯，不用逐个令牌调。
-        let g = self.surface_gain;
-        if (g - 1.0).abs() > 1e-4 {
-            let sc = |c: rjw_krusie::color::Color| scale_luma(c, g);
-            p.surface_dim = sc(p.surface_dim);
-            p.surface_sunken = sc(p.surface_sunken);
-            p.surface = sc(p.surface);
-            p.surface_raised = sc(p.surface_raised);
-            p.surface_overlay = sc(p.surface_overlay);
-            p.surface_hover = sc(p.surface_hover);
-            p.surface_active = sc(p.surface_active);
-        }
+        let mut p = preset_palette(self.preset);
+        // 表面基色：按**逐通道比**缩放整条 `surface*` 阶梯 —— 既改亮度也改色相，
+        // 同时保持"凹陷 / 面板 / 抬升 / 浮层 / 悬停 / 激活"之间的相对关系不塌。
+        let base = rgb_of(p.surface);
+        let f = [
+            self.bg[0] / base[0].max(0.02),
+            self.bg[1] / base[1].max(0.02),
+            self.bg[2] / base[2].max(0.02),
+        ];
+        let sc = |c: rjw_krusie::color::Color| scale_rgb(c, f);
+        p.surface_dim = sc(p.surface_dim);
+        p.surface_sunken = sc(p.surface_sunken);
+        p.surface_raised = sc(p.surface_raised);
+        p.surface_overlay = sc(p.surface_overlay);
+        p.surface_hover = sc(p.surface_hover);
+        p.surface_active = sc(p.surface_active);
+        p.surface = Color::rgba(self.bg[0], self.bg[1], self.bg[2], 1.0);
+        // 描边：常规 + 强描边（后者更亮，用于按钮 / 输入框 / 勾选框）。
+        p.border = Color::rgba(self.border[0], self.border[1], self.border[2], 1.0);
+        p.border_strong = scale_luma(p.border, 1.25);
         p.bevel = self.bevel;
         p.accent = Color::rgba(self.accent[0], self.accent[1], self.accent[2], 1.0);
         p.accent_hover = scale_luma(p.accent, 1.25);
         p.accent_active = scale_luma(p.accent, 0.80);
         let mut t = Theme::themed(&p)
             .with_radius(self.radius)
-            .with_feather(self.feather);
+            .with_feather(self.feather)
+            .with_border_w(self.border_w);
         if !font.is_empty() {
             t = t.with_font_family(font);
         }
@@ -581,22 +623,13 @@ impl ThemeTuner {
                 w.row(|w| {
                     w.label("预设:");
                     if w.button("th_dark", "dark").clicked() {
-                        self.preset = 0;
-                        self.surface_gain = 1.0;
-                        self.bevel = 0.10;
-                        self.accent = [0.43, 0.66, 1.0];
+                        self.set_preset(0);
                     }
                     if w.button("th_light", "light").clicked() {
-                        self.preset = 1;
-                        self.surface_gain = 1.0;
-                        self.bevel = 0.02;
-                        self.accent = [0.31, 0.55, 0.86];
+                        self.set_preset(1);
                     }
                     if w.button("th_legacy", "legacy").clicked() {
-                        self.preset = 2;
-                        self.surface_gain = 1.0;
-                        self.bevel = 0.0;
-                        self.accent = [0.38, 0.59, 0.86];
+                        self.set_preset(2);
                     }
                 });
                 w.row(|w| {
@@ -612,8 +645,20 @@ impl ThemeTuner {
                     self.bevel = w.slider("th_bevel", 0.0..=0.35, self.bevel);
                 });
                 w.row(|w| {
-                    w.label("表面");
-                    self.surface_gain = w.slider("th_gain", 0.4..=1.6, self.surface_gain);
+                    w.label("背景");
+                    self.bg[0] = w.slider("th_bgr", 0.0..=1.0, self.bg[0]);
+                    self.bg[1] = w.slider("th_bgg", 0.0..=1.0, self.bg[1]);
+                    self.bg[2] = w.slider("th_bgb", 0.0..=1.0, self.bg[2]);
+                });
+                w.row(|w| {
+                    w.label("边框");
+                    self.border[0] = w.slider("th_bdr", 0.0..=1.0, self.border[0]);
+                    self.border[1] = w.slider("th_bdg", 0.0..=1.0, self.border[1]);
+                    self.border[2] = w.slider("th_bdb", 0.0..=1.0, self.border[2]);
+                });
+                w.row(|w| {
+                    w.label("边框宽");
+                    self.border_w = w.slider("th_bdw", 0.0..=5.0, self.border_w);
                 });
                 w.row(|w| {
                     w.label("强调");
@@ -622,12 +667,12 @@ impl ThemeTuner {
                     self.accent[2] = w.slider("th_ab", 0.0..=1.0, self.accent[2]);
                 });
                 w.label(&format!(
-                    "预设 {} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 表面 ×{:.2}",
+                    "{} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 边框宽 {:.1}",
                     ["dark", "light", "legacy"][self.preset.min(2) as usize],
                     self.radius,
                     self.feather,
                     self.bevel,
-                    self.surface_gain,
+                    self.border_w,
                 ));
             });
     }
@@ -640,6 +685,17 @@ fn scale_luma(c: rjw_krusie::color::Color, k: f32) -> rjw_krusie::color::Color {
         (a[0] * k).clamp(0.0, 1.0),
         (a[1] * k).clamp(0.0, 1.0),
         (a[2] * k).clamp(0.0, 1.0),
+        a[3],
+    ])
+}
+
+/// 逐通道缩放（保持色相 / 相对层次；alpha 不变）。
+fn scale_rgb(c: rjw_krusie::color::Color, f: [f32; 3]) -> rjw_krusie::color::Color {
+    let a: [f32; 4] = c.into();
+    Color::from([
+        (a[0] * f[0]).clamp(0.0, 1.0),
+        (a[1] * f[1]).clamp(0.0, 1.0),
+        (a[2] * f[2]).clamp(0.0, 1.0),
         a[3],
     ])
 }
