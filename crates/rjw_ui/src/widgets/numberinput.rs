@@ -15,6 +15,7 @@
 use glam::Vec2;
 use rjw_transform::Rect;
 
+use crate::draw::CornerRadius;
 use crate::hit::update_drag;
 use crate::id::IdAbsolute;
 use crate::{FocusKind, Response, Ui, UiCursor, Widget};
@@ -256,17 +257,35 @@ impl Widget for NumberInput<'_> {
                 None
             };
         }
-        // 拖拽手柄（公开绘制原语）
-        let (border, fg, font_size) = {
+        // 拖拽手柄：与文本框**拼成一个控件**——
+        // - 只圆**右侧**两角，且半径与输入框同源 ⇒ 与文本框的圆角严丝合缝
+        //   （`CornerRadius` 的具名字段在这里正好用上）；
+        // - 底色用按钮刷（略高于输入框的"可按"暗示），边框色只作**左缘分隔线**，
+        //   不再整块刷成边框色（旧样子像"两个独立的深色方块"）。
+        let (grip_bg, sep, glyph, font_size, radius) = {
             let st = &ui.theme.input;
-            (st.border, st.fg, st.font_size)
+            (
+                ui.theme.button.bg,
+                st.border,
+                st.fg,
+                st.font_size,
+                CornerRadius { tl: 0.0, tr: st.radius.tr, br: st.radius.br, bl: 0.0 },
+            )
         };
-        ui.push_panel_like(grip, border, border, 1.0, 0.0, 1);
+        ui.push_panel_like(grip, grip_bg, sep, 0.0, radius, 1);
+        ui.push_panel_like(
+            Rect::new(grip.x, grip.y, 1.0, grip.h),
+            sep,
+            sep,
+            0.0,
+            CornerRadius::default(),
+            1,
+        );
         ui.push_text_rect(
             grip,
             "≡",
             font_size,
-            fg,
+            glyph,
             None,
             crate::TextAlign::Center,
             crate::draw::TextVAlign::Center,

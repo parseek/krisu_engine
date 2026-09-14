@@ -175,7 +175,7 @@ pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, Panel
 pub use view::{ViewCtx, ViewMode};
 pub use widgets::{
     Button, Checkbox, ColorPicker, Divider, FontModal, Label, NumberInput, Response, Slider,
-    Widget, WidgetId, color_hex, parse_hex,
+    SliderValue, Widget, WidgetId, color_hex, ink_on, luma, parse_hex,
 };
 
 /// **UI 文本模块**（公开）：`rjw_ui` 里与文字渲染相关的全部公开面。

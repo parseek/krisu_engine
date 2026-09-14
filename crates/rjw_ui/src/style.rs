@@ -7,6 +7,11 @@ use rjw_text::Align;
 
 use crate::draw::CornerRadius;
 
+/// "胶囊"哨兵半径：交给 [`CornerRadius::fit`] 夹成 `min(w, h) / 2`（半圆端 / 正圆）。
+///
+/// 用一个大而有限的值而不是 `INFINITY`——`fit` 里有 `len / sum`，`INFINITY` 会算出 NaN。
+pub const PILL_RADIUS: f32 = 1.0e3;
+
 /// **背景刷**：纯色 / 两端色渐变。
 ///
 /// # 为什么只有"两端色"
@@ -243,6 +248,7 @@ impl SliderStyle {
         self.handle_w = m(self.handle_w);
         self.height = m(self.height);
         self.min_w = m(self.min_w);
+        self.radius = self.radius.map(|r| if r >= PILL_RADIUS { r } else { m(r) });
         self
     }
 }
@@ -792,6 +798,11 @@ pub struct SliderStyle {
     pub height: f32,
     /// 控件最小宽（pack 内自动尺寸用）。
     pub min_w: f32,
+    /// 轨道 / 填充 / 手柄的圆角（逻辑像素）。
+    ///
+    /// 默认值**很大** ⇒ 被 [`CornerRadius::fit`] 夹成**胶囊**：轨道两端半圆、
+    /// 手柄正圆（`r = min(w,h)/2`）。设小即变成圆角矩形，设 0 = 直角。
+    pub radius: CornerRadius,
 }
 
 impl Default for SliderStyle {
@@ -805,6 +816,7 @@ impl Default for SliderStyle {
             handle_w: 12.0,
             height: 20.0,
             min_w: 120.0,
+            radius: CornerRadius::all(PILL_RADIUS),
         }
     }
 }
@@ -1096,6 +1108,11 @@ impl SliderStyle {
     /// 控件最小宽（pack 内自动尺寸用）。
     pub fn with_min_w(mut self, w: f32) -> Self {
         self.min_w = w;
+        self
+    }
+    /// 轨道 / 填充 / 手柄的圆角（接受 `f32` 或 [`CornerRadius`]；`0` = 直角）。
+    pub fn with_radius(mut self, r: impl Into<CornerRadius>) -> Self {
+        self.radius = r.into();
         self
     }
 }

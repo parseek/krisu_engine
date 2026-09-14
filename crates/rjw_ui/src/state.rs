@@ -26,6 +26,10 @@ pub struct WidgetState {
     pub clicked: bool,
     /// 滑块拖拽中。
     pub dragging: bool,
+    /// **本控件的浮层是否展开**（内置 `ColorPicker` 用）：点控件开关、点浮层外或
+    /// `Esc` 收起。与 `UiState::combo_open`（下拉框专用，参与键盘导航）分开存——
+    /// 两者互不干扰，各自只管自己的浮层。
+    pub popup_open: bool,
     /// 面板拖拽基准：按下时面板左上角（**逻辑**坐标）。
     /// 配合 [`Self::press_mouse`]（按下时鼠标**物理**坐标，取整）——
     /// 拖拽中面板位置 = `press_panel + round(鼠标物理增量) / scale`：

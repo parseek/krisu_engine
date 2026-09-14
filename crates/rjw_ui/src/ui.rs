@@ -4801,8 +4801,6 @@ impl Ui<'_> {
             0.0
         };
         let style = self.theme.slider.clone();
-        let depth = self.depth;
-        let win = self.cur_win;
         let elem = self.seq + 1;
         let track_rect =
             Rect::new(rect.x, rect.y + (rect.h - style.track_h) * 0.5, rect.w, style.track_h);
@@ -4817,39 +4815,18 @@ impl Ui<'_> {
             style.handle_w,
             style.handle_w,
         );
-        let push_solid = |ui: &mut Ui<'_>, r: Rect, c: Color| {
-            if r.w > 0.0 && r.h > 0.0 {
-                let seq = ui.next_seq();
-                ui.queue.push(UiDraw {
-                    depth,
-                    seq,
-                    win,
-                    elem,
-                    rect: r,
-                    clip: ui.clip,
-                    kind: DrawKind::Solid(c),
-                });
-            }
-        };
-        push_solid(self, track_rect, style.track);
-        push_solid(self, fill_rect, style.fill);
-        push_solid(self, handle_rect, style.handle);
-        if style.handle_w > 2.0 {
-            let seq = self.next_seq();
-            self.queue.push(UiDraw {
-                depth,
-                seq,
-                win,
-                elem,
-                rect: handle_rect,
-                clip: self.clip,
-                kind: DrawKind::Border {
-                    color: style.handle_border,
-                    width: 1.0,
-                    radius: CornerRadius::default(),
-                },
-            });
-        }
+        // 轨道 / 填充 / 手柄都是**圆角**矩形（`SliderStyle::radius`，默认胶囊）。
+        // 填充画在手柄**左缘**且与手柄同高——两者都是胶囊时左右端自然接成一条。
+        self.push_panel_like(track_rect, style.track, style.track, 0.0, style.radius, elem);
+        self.push_panel_like(fill_rect, style.fill, style.fill, 0.0, style.radius, elem);
+        self.push_panel_like(
+            handle_rect,
+            style.handle,
+            style.handle_border,
+            if style.handle_w > 2.0 { 1.0 } else { 0.0 },
+            style.radius,
+            elem,
+        );
         new_value
     }
 

@@ -43,12 +43,12 @@ mod slider;
 
 pub use button::Button;
 pub use checkbox::Checkbox;
-pub use colorpicker::{ColorPicker, color_hex, parse_hex};
+pub use colorpicker::{ColorPicker, color_hex, ink_on, luma, parse_hex};
 pub use divider::Divider;
 pub use fontmodal::FontModal;
 pub use label::Label;
 pub use numberinput::NumberInput;
-pub use slider::Slider;
+pub use slider::{Slider, SliderValue};
 
 // ─── 统一响应 ───────────────────────────────────────────────────
 
