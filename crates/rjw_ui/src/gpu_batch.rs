@@ -188,6 +188,17 @@ impl QuadCollector {
         self.quads.entry(key).or_default()
     }
 
+    /// **白纹理 region 的中心 UV**——所有"纯色顶点"几何必须用它采样。
+    ///
+    /// ⚠ 绝不能用 `(0, 0)`：图形与字形共用同一张图集页，`(0, 0)` 是字形页左上角，
+    /// 采到的是某个字形的像素（通常 `alpha = 0`）⇒ 整块图形变成透明/乱码。
+    /// 取中心而非左上角，是为了在过滤采样下也稳稳落在白纹素内。
+    #[inline]
+    fn white_uv_center(&self) -> [f32; 2] {
+        let uv = self.white_uv_tl + self.white_uv_wh * 0.5;
+        [uv.x, uv.y]
+    }
+
     /// 白色纹理四边形（背景 / 边框 / 光标；WHITE region UV；图形组）。
     pub(crate) fn push_white(&mut self, win: u32, r: Rect, c: Color) {
         self.push_tex_rect(win, self.white_uid, self.white_uv_tl, self.white_uv_wh, r, c);
@@ -245,15 +256,26 @@ impl QuadCollector {
     ///
     /// 硬体 + 羽化带由 [`crate::tess::push_rounded_rect`] 产生；索引直接内联写入
     /// 同一段几何（同源，永不脱节）。`corners` 四角各异 ⇒ 支持「圆角 + 渐变」。
+    ///
+    /// **不接收 `uv`**：采样 UV 由本方法填成白纹理 region 中心——调用方没有机会写错
+    /// （写错 `(0,0)` 会静默采到字形像素，整块图形变透明）。
     pub(crate) fn push_rounded(
         &mut self,
         win: u32,
         table: &crate::tess::CornerTable,
-        spec: crate::tess::RoundedRectSpec,
+        rect: Rect,
+        radius: f32,
+        corners: [Color; 4],
     ) -> crate::tess::TessOutput {
         let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
+        let uv = self.white_uv_center();
         let g = self.geom(key);
-        crate::tess::push_rounded_rect(&mut g.verts, &mut g.tris, table, spec)
+        crate::tess::push_rounded_rect(
+            &mut g.verts,
+            &mut g.tris,
+            table,
+            crate::tess::RoundedRectSpec { rect, radius, corners, uv },
+        )
     }
 
     /// **CPU 镶嵌的圆角边框（环带）**（图形组；白纹理 + 纯色）。
@@ -267,8 +289,18 @@ impl QuadCollector {
         color: Color,
     ) -> crate::tess::TessOutput {
         let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
+        let uv = self.white_uv_center();
         let g = self.geom(key);
-        crate::tess::push_rounded_ring(&mut g.verts, &mut g.tris, table, rect, radius, width, color)
+        crate::tess::push_rounded_ring(
+            &mut g.verts,
+            &mut g.tris,
+            table,
+            rect,
+            radius,
+            width,
+            color,
+            uv,
+        )
     }
 
     /// 追加一个带 UV 的四边形（字形用；文字组）。
@@ -631,6 +663,51 @@ mod batch_contract_tests {
     #[test]
     fn no_quads_means_no_draw_calls() {
         assert!(segment_runs(std::iter::empty(), MAX_UI_SEG_VERTS).is_empty());
+    }
+
+    /// **纯色几何必须采样白纹理 region**（回归：屏幕背景整块消失）。
+    ///
+    /// 图形与字形共用同一张图集页 ⇒ UV `(0,0)` 是**字形页左上角**（某个字形的像素，
+    /// 通常 `alpha = 0`）。曾把镶嵌顶点 UV 写死成 `(0,0)`，结果所有圆角矩形
+    /// （窗口 / 面板 / 按钮背景）与圆角边框整块变透明——表现就是"窗口背景完全消失"。
+    #[test]
+    fn solid_geometry_samples_the_white_texel() {
+        use super::QuadCollector;
+        use crate::tess::{RoundedRectSpec, TessCache};
+        use glam::Vec2;
+        use rjw_color::Color;
+        use rjw_transform::Rect;
+
+        // 白 region 在页内某个非零位置（真实情况：字形已先占据左上角）。
+        let (tl, wh) = (Vec2::new(0.25, 0.5), Vec2::new(0.03125, 0.03125));
+        let center = tl + wh * 0.5;
+        let mut q = QuadCollector::new(7, tl, wh);
+        let table = TessCache::default().table();
+
+        // 圆角矩形 + 圆角边框环带都会写入同一段几何。
+        q.push_rounded(1, &table, Rect::new(0.0, 0.0, 60.0, 36.0), 8.0, [Color::RED; 4]);
+        q.push_rounded_ring(1, &table, Rect::new(0.0, 0.0, 60.0, 36.0), 8.0, 1.0, Color::BLUE);
+
+        let geom = q.quads.values().next().expect("至少一段几何");
+        assert!(geom.verts.len() > 40, "应有镶嵌顶点");
+        for v in &geom.verts {
+            assert_eq!(v.uv, [center.x, center.y], "镶嵌顶点必须采样白纹素中心");
+            assert_ne!(v.uv, [0.0, 0.0], "绝不能落到字形页左上角");
+        }
+        // 直角四边形（`push_white`）跨越白 region 的 tl→br——它本来就该这样，
+        // 与镶嵌路径的单点 UV 不同。
+        let mut q2 = QuadCollector::new(7, tl, wh);
+        q2.push_white(1, Rect::new(0.0, 0.0, 4.0, 4.0), Color::WHITE);
+        let g2 = q2.quads.values().next().expect("四边形");
+        assert_eq!(g2.verts[0].uv, [tl.x, tl.y], "四边形左上角 = region 左上角");
+        assert_eq!(g2.verts[3].uv, [tl.x + wh.x, tl.y + wh.y], "四边形右下角 = region 右下角");
+        // `RoundedRectSpec` 仍要求显式 UV：遗漏即编译错误。
+        let _ = RoundedRectSpec {
+            rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+            radius: 0.0,
+            corners: [Color::WHITE; 4],
+            uv: [1.0, 1.0],
+        };
     }
 
     /// `Geom::append` 必须把被追加段的索引整体平移（否则拼接后三角形错乱且不 panic）。

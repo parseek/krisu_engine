@@ -850,6 +850,15 @@ impl<'a> Draw2D<'a, Mesh> {
             "mesh_indexed: vertices and indices must be non-empty"
         );
         let vs = mesh.vertices.len();
+        // ⚠ u16 索引是**本帧暂存缓冲**（`MeshStorage`）内的偏移：本帧累计顶点数一旦
+        // 超过 65536，`(i + vs) as u16` 会**静默截断** → 后续所有段的索引全错
+        // （画面错乱且不 panic）。这是"直出三角形"路径（顶点数可能是四边形的几十倍）
+        // 必须守住的边界，故用 debug 断言把它变成显式失败而不是静默损坏。
+        debug_assert!(
+            vs + vertices.len() <= u16::MAX as usize + 1,
+            "mesh_indexed: u16 索引溢出——本帧暂存已有 {vs} 顶点，本段再加 {}",
+            vertices.len()
+        );
         let ts = mesh.tri_indices.len();
         mesh.vertices.extend_from_slice(vertices);
         for t in indices {

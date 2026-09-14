@@ -166,6 +166,16 @@ pub(crate) struct RoundedRectSpec {
     /// **必须支持四角各异**——这正是「圆角 + 渐变」需要逐顶点色、不能走实例单色的原因：
     /// 硬体四角各取本角颜色，中心取四角均值，光栅化器在扇形三角形内做重心插值。
     pub corners: [Color; 4],
+    /// **采样 UV**（所有顶点同值）。
+    ///
+    /// ⚠ **必须落在白纹理 region 内**。绝不能图省事填 `(0, 0)`：UI 的图形与字形共用同一张
+    /// 图集页，`(0, 0)` 是**字形页左上角**，采到的是某个字形的像素（通常 alpha = 0）
+    /// ⇒ 整块圆角矩形变成透明/乱码，看起来就是"背景完全消失"。
+    ///
+    /// 这个字段是**故意的**：让"忘了给 UV"变成编译错误，而不是一个只能靠肉眼发现的
+    /// 静默渲染错误。调用方传白纹理 region 的**中心**
+    /// （`white_uv_tl + white_uv_wh * 0.5`，见 `QuadCollector::white_uv_center`）。
+    pub uv: [f32; 2],
 }
 
 /// 镶嵌结果：本次追加的顶点数与三角形数。
@@ -259,14 +269,15 @@ fn push_plain_quad(
     tris: &mut Vec<Tri>,
     rect: Rect,
     corners: [Color; 4],
+    uv: [f32; 2],
 ) -> TessOutput {
     let Rect { x, y, w, h } = rect;
     let base = verts.len() as u16;
     let [tl, tr, bl, br] = corners.map(Into::<[f32; 4]>::into);
-    verts.push(VertexP3U2C4 { pos: [x, y, 0.0], uv: [0.0, 0.0], color: tl });
-    verts.push(VertexP3U2C4 { pos: [x + w, y, 0.0], uv: [0.0, 0.0], color: tr });
-    verts.push(VertexP3U2C4 { pos: [x, y + h, 0.0], uv: [0.0, 0.0], color: bl });
-    verts.push(VertexP3U2C4 { pos: [x + w, y + h, 0.0], uv: [0.0, 0.0], color: br });
+    verts.push(VertexP3U2C4 { pos: [x, y, 0.0], uv, color: tl });
+    verts.push(VertexP3U2C4 { pos: [x + w, y, 0.0], uv, color: tr });
+    verts.push(VertexP3U2C4 { pos: [x, y + h, 0.0], uv, color: bl });
+    verts.push(VertexP3U2C4 { pos: [x + w, y + h, 0.0], uv, color: br });
     tris.push([base, base + 1, base + 3]);
     tris.push([base + 3, base + 2, base]);
     TessOutput { verts: 4, tris: 2 }
@@ -291,8 +302,9 @@ pub(crate) fn push_rounded_rect(
     }
     let radius = spec.radius.clamp(0.0, w.min(h) * 0.5);
     if radius <= 0.0 {
-        return push_plain_quad(verts, tris, spec.rect, spec.corners);
+        return push_plain_quad(verts, tris, spec.rect, spec.corners, spec.uv);
     }
+    let uv = spec.uv;
 
     let stride = table.stride_for(radius);
     let segs = CornerTable::segs_of(stride);
@@ -315,7 +327,7 @@ pub(crate) fn push_rounded_rect(
         for k in 0..=segs {
             let (cos_t, sin_t) = table.sample(stride, k);
             let pos = c.center + c.dir(cos_t, sin_t) * radius;
-            verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv: [0.0, 0.0], color: col });
+            verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv, color: col });
         }
     }
     let outline_len = verts.len() - outline_start;
@@ -334,7 +346,7 @@ pub(crate) fn push_rounded_rect(
     let center_idx = verts.len() as u16;
     verts.push(VertexP3U2C4 {
         pos: [x + w * 0.5, y + h * 0.5, 0.0],
-        uv: [0.0, 0.0],
+        uv,
         color: center_col,
     });
     for i in 0..outline_len as u16 {
@@ -352,7 +364,7 @@ pub(crate) fn push_rounded_rect(
             for k in 0..=feather_segs {
                 let (cos_t, sin_t) = table.sample(fstride, k);
                 let pos = c.center + c.dir(cos_t, sin_t) * (radius + feather);
-                verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv: [0.0, 0.0], color: col });
+                verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv, color: col });
             }
             let corner_base = outline_start as u16 + ci as u16 * (segs as u16 + 1);
             for k in 0..feather_segs {
@@ -388,6 +400,8 @@ pub(crate) fn push_rounded_rect(
 ///
 /// 之所以要这个原语：`push_panel_like` 的"外圈 border 色圆角 + 内圈背景圆角"
 /// 是**两块实心**叠加，圆角处的抗锯齿边缘会各混合一次；环带只画一次边界。
+///
+/// `uv` 同 [`RoundedRectSpec::uv`]：**必须落在白纹理 region 内**。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push_rounded_ring(
     verts: &mut Vec<VertexP3U2C4>,
@@ -397,6 +411,7 @@ pub(crate) fn push_rounded_ring(
     radius: f32,
     width: f32,
     color: Color,
+    uv: [f32; 2],
 ) -> TessOutput {
     let Rect { w, h, .. } = rect;
     if w <= 0.0 || h <= 0.0 || width <= 0.0 {
@@ -423,7 +438,7 @@ pub(crate) fn push_rounded_ring(
                 (r.x, r.y + r.h),
                 (r.x + r.w, r.y + r.h),
             ] {
-                verts.push(VertexP3U2C4 { pos: [p.0, p.1, 0.0], uv: [0.0, 0.0], color: col });
+                verts.push(VertexP3U2C4 { pos: [p.0, p.1, 0.0], uv, color: col });
             }
             tris.push([b, b + 1, b + 3]);
             tris.push([b + 3, b + 2, b]);
@@ -460,7 +475,7 @@ pub(crate) fn push_rounded_ring(
                 table.sample(stride, k as u32)
             };
             let pos = c.center + c.dir(cos_t, sin_t) * ri;
-            verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv: [0.0, 0.0], color: col });
+            verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv, color: col });
         }
     }
     let outer_start = verts.len();
@@ -468,7 +483,7 @@ pub(crate) fn push_rounded_ring(
         for k in 0..=segs {
             let (cos_t, sin_t) = table.sample(stride, k);
             let pos = c.center + c.dir(cos_t, sin_t) * ro;
-            verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv: [0.0, 0.0], color: col });
+            verts.push(VertexP3U2C4 { pos: [pos.x, pos.y, 0.0], uv, color: col });
         }
     }
 
@@ -504,6 +519,10 @@ pub(crate) fn push_rounded_ring(
 mod tests {
     use super::*;
 
+    /// 测试用采样 UV（**刻意不是 `(0,0)`**：`(0,0)` 会采到字形图集页左上角的字形像素，
+    /// 这正是曾让所有镶嵌图形整块变透明的那个 bug）。
+    const TEST_UV: [f32; 2] = [0.25, 0.75];
+
     fn table() -> CornerTable {
         CornerTable::build()
     }
@@ -513,6 +532,7 @@ mod tests {
             rect: Rect::new(3.0, 5.0, w, h),
             radius: r,
             corners: [Color::RED, Color::GREEN, Color::BLUE, Color::YELLOW],
+            uv: TEST_UV,
         }
     }
 
@@ -751,6 +771,67 @@ mod tests {
         assert_eq!(a.pts.len(), N_FINE as usize + 1, "表含两端点");
     }
 
+    // ─── 采样 UV（曾经让所有镶嵌图形整块变透明的 BUG） ────────
+
+    #[test]
+    fn every_vertex_carries_the_given_uv() {
+        // 回归：`push_rounded_rect` 曾把 UV 写死成 (0,0)。图形与字形共用同一张图集页，
+        // (0,0) 是**字形页左上角**——采到的是某个字形的像素（通常 alpha = 0），
+        // 于是所有圆角矩形（窗口/面板/按钮背景）整块变透明 = "背景完全消失"。
+        let t = table();
+        let uv = [0.375, 0.625];
+        for (w, h, r) in [(60.0, 36.0, 8.0), (30.0, 30.0, 0.0), (200.0, 20.0, 999.0)] {
+            let mut v = Vec::new();
+            let mut tr = Vec::new();
+            let mut s = spec(w, h, r);
+            s.uv = uv;
+            push_rounded_rect(&mut v, &mut tr, &t, s);
+            assert!(!v.is_empty());
+            for x in &v {
+                assert_eq!(x.uv, uv, "顶点 UV 必须是调用方给的采样点");
+                assert_ne!(x.uv, [0.0, 0.0], "绝不能落到字形页左上角");
+            }
+        }
+    }
+
+    #[test]
+    fn ring_vertices_carry_the_given_uv() {
+        // 同上：圆角边框环带也必须带正确 UV（否则边框连同背景一起不可见）。
+        let t = table();
+        let uv = [0.375, 0.625];
+        for (r, bw) in [(8.0, 2.0), (0.0, 1.0), (4.0, 9.0)] {
+            let mut v = Vec::new();
+            let mut tr = Vec::new();
+            push_rounded_ring(
+                &mut v,
+                &mut tr,
+                &t,
+                Rect::new(0.0, 0.0, 40.0, 24.0),
+                r,
+                bw,
+                Color::WHITE,
+                uv,
+            );
+            assert!(!v.is_empty());
+            for x in &v {
+                assert_eq!(x.uv, uv, "环带顶点 UV 必须是调用方给的采样点");
+            }
+        }
+    }
+
+    #[test]
+    fn hard_body_alpha_is_one_and_feather_is_zero() {
+        // 羽化抗锯齿的前提：硬体 alpha = 1、外环 alpha = 0（光栅化器插值出过渡）。
+        let t = table();
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        push_rounded_rect(&mut v, &mut tr, &t, spec(60.0, 36.0, 8.0));
+        let hard = v.iter().filter(|x| x.color[3] == 1.0).count();
+        let feather = v.iter().filter(|x| x.color[3] == 0.0).count();
+        assert!(hard > 0 && feather > 0);
+        assert_eq!(hard + feather, v.len(), "只应有 alpha 1 与 0 两类顶点");
+    }
+
     // ─── 圆角环带（边框） ────────────────────────────────────
 
     #[test]
@@ -768,6 +849,7 @@ mod tests {
             0.0,
             2.0,
             Color::WHITE,
+            TEST_UV,
         );
         assert_eq!(out.verts, 16, "四条矩形条 = 4×4 顶点");
         assert_eq!(out.tris, 8);
@@ -787,7 +869,16 @@ mod tests {
         ] {
             let mut v = Vec::new();
             let mut tr = Vec::new();
-            push_rounded_ring(&mut v, &mut tr, &t, Rect::new(2.0, 3.0, w, h), r, bw, Color::WHITE);
+            push_rounded_ring(
+                &mut v,
+                &mut tr,
+                &t,
+                Rect::new(2.0, 3.0, w, h),
+                r,
+                bw,
+                Color::WHITE,
+                TEST_UV,
+            );
             assert_well_formed(&v, &tr);
             for tri in &tr {
                 assert!(cross(&v, tri) > 0.0, "环带三角形 {tri:?} 绕序反了");
@@ -809,6 +900,7 @@ mod tests {
             12.0,
             1.0,
             Color::WHITE,
+            TEST_UV,
         );
         let segs = CornerTable::segs_of(t.stride_for(12.0)) as usize;
         assert!(v.len() <= 2 * 4 * (segs + 1), "环带顶点数 {} 超界", v.len());
@@ -829,6 +921,7 @@ mod tests {
                 4.0,
                 bw,
                 Color::WHITE,
+                TEST_UV,
             );
             assert_eq!(out.verts, 0);
         }

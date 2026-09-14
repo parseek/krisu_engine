@@ -3272,15 +3272,9 @@ impl<'a> Ui<'a> {
                             );
                             let c = resample_gradient_local(grad, local, pr, anchor_px);
                             let table = self.state.tess.table();
-                            quads.push_rounded(
-                                win,
-                                &table,
-                                crate::tess::RoundedRectSpec {
-                                    rect: local,
-                                    radius: *radius,
-                                    corners: c,
-                                },
-                            );
+                            // 采样 UV 由 `push_rounded` 填成白纹理 region 中心
+                            // （写错 `(0,0)` 会静默采到字形页左上角的字形像素）。
+                            quads.push_rounded(win, &table, local, *radius, c);
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
                 }
