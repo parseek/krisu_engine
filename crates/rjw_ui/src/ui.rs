@@ -33,6 +33,7 @@ use winit::window::Window as WinitWindow;
 
 use crate::backend::{UiBackend, UiBatch, UiBatchSource};
 use crate::draw::{
+    CornerRadius,
     border_rects, clipped, debug_shape_segments, intersect_rect, screen_fixed_tf, snap_rect,
     text_block_offset, text_cmd, DebugShape, DrawKind, Gradient, Position, Size, TextAlign,
     TextVAlign, UiDraw,
@@ -878,14 +879,31 @@ impl<'a> Ui<'a> {
 
     /// **圆角矩形**（背景填充原语；绝对定位，`radius` 带单位）。
     ///
-    /// **无纹理、无着色器改动**：CPU 把矩形镶嵌成三角形（硬体 + 1 物理像素羽化带，
-    /// 见 `crate::tess`）。半径接受任意值（含小数），超出半高时 clamp 成胶囊；
-    /// `radius <= 0` 退化成普通四边形（仍带 4 个顶点以便统一走索引路径）。
+    /// **无纹理、无着色器改动**：CPU 把矩形镶嵌成三角形（硬体 + 边缘羽化带，
+    /// 见 `crate::tess`）。半径接受任意值（含小数）；四角之和超过边长时按 CSS 规则
+    /// **等比收缩**（[`CornerRadius::fit`]）；四角**全**为 0 时退化成普通四边形。
+    ///
+    /// `radius` 接受 `f32`（四角相同）或 [`CornerRadius`]（**只圆某些角**）：
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{CornerRadius, Position, Size, Ui};
+    /// # fn demo(ui: &mut Ui, pos: Position, size: Size<glam::Vec2>) {
+    /// // 四角相同
+    /// ui.rounded_rect_at(pos, size, 8.0, rjw_color::Color::RED);
+    /// // 只圆上面两个角（标签页 / 附着在工具栏下方的面板）
+    /// ui.rounded_rect_at(
+    ///     pos,
+    ///     size,
+    ///     CornerRadius { tl: 10.0, tr: 10.0, br: 0.0, bl: 0.0 },
+    ///     rjw_color::Color::RED,
+    /// );
+    /// # }
+    /// ```
     pub fn rounded_rect_at(
         &mut self,
         pos: impl Into<Position>,
         size: impl Into<Size<Vec2>>,
-        radius: impl Into<Size<f32>>,
+        radius: impl Into<Size<CornerRadius>>,
         color: Color,
     ) {
         let pos = pos.into().to_physical(self.scale);
@@ -965,10 +983,11 @@ impl<'a> Ui<'a> {
         bg: impl Into<crate::style::Brush>,
         border: Color,
         border_w: f32,
-        radius: f32,
+        radius: impl Into<CornerRadius>,
         elem: u32,
     ) {
         let bg = bg.into();
+        let radius = radius.into();
         let seq = self.next_seq();
         let depth = self.depth;
         let win = self.cur_win;
@@ -980,7 +999,7 @@ impl<'a> Ui<'a> {
             bg.corners()[2],
             bg.corners()[3],
         );
-        if radius > 0.0 {
+        if !radius.is_zero() {
             // 圆角背景 = **一整块**圆角矩形（渐变四角色直接给它，无需内缩重采样）；
             // 边框 = 覆盖在其边缘的**圆角环带**（`Border { radius }`）。
             //
@@ -1049,7 +1068,11 @@ impl<'a> Ui<'a> {
                     elem,
                     rect,
                     clip,
-                    kind: DrawKind::Border { color: border, width: border_w, radius: 0.0 },
+                    kind: DrawKind::Border {
+                        color: border,
+                        width: border_w,
+                        radius: CornerRadius::default(),
+                    },
                 });
             }
         }
@@ -1297,7 +1320,7 @@ impl<'a> Ui<'a> {
                 elem,
                 rect,
                 clip: self.clip,
-                kind: DrawKind::Border { color, width, radius: 0.0 },
+                kind: DrawKind::Border { color, width, radius: CornerRadius::default() },
             });
         }
     }
@@ -3299,7 +3322,7 @@ impl<'a> Ui<'a> {
                         // 是否被裁剪过（尺寸真的变小）：被裁掉一侧时圆角环带的
                         // 外/内轮廓半径关系不再成立，退回直角四边条更稳。
                         let trimmed = local.w < pr.w - 0.01 || local.h < pr.h - 0.01;
-                        if *radius > 0.0 && !trimmed {
+                        if !radius.is_zero() && !trimmed {
                             // 圆角环带：只画一次边界，圆角处不会像"外圈实心 + 内圈实心"
                             // 那样把抗锯齿边缘混合两次。
                             let table = self.state.tess.table();
@@ -3527,7 +3550,11 @@ impl<'a> Ui<'a> {
                 elem,
                 rect,
                 clip,
-                kind: DrawKind::Border { color: focus.color, width: focus.width, radius: 0.0 },
+                kind: DrawKind::Border {
+                    color: focus.color,
+                    width: focus.width,
+                    radius: CornerRadius::default(),
+                },
             });
         }
     }
@@ -4819,7 +4846,7 @@ impl Ui<'_> {
                 kind: DrawKind::Border {
                     color: style.handle_border,
                     width: 1.0,
-                    radius: 0.0,
+                    radius: CornerRadius::default(),
                 },
             });
         }
@@ -4984,7 +5011,7 @@ impl Ui<'_> {
                 let seq = self.next_seq();
                 // 填充与外框同心的内圆角（`radius - inset`，clamp 到 0）——
                 // 与外框环带的内侧半径取同一套规则，两者贴合不留缝。
-                let fill_radius = (style.radius - inset_px).max(0.0);
+                let fill_radius = style.radius.map(|r| (r - inset_px).max(0.0));
                 self.queue.push(UiDraw {
                     depth,
                     seq,

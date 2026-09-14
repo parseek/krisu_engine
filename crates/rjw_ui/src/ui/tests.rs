@@ -101,7 +101,7 @@ fn draw_kind_group_graphic_before_text() {
         DrawKind::Border {
             color: Color::WHITE,
             width: 1.0,
-            radius: 0.0,
+            radius: Default::default(),
         }
         .group(),
         0

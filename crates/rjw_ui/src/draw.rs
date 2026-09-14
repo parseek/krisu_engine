@@ -97,6 +97,155 @@ impl Size<f32> {
     }
 }
 
+impl Size<CornerRadius> {
+    /// 换算为**物理像素**的圆角（`Logical` 四角 × scale 取整；`Physical` 原样）。
+    #[inline]
+    pub fn to_physical(self, scale: f32) -> CornerRadius {
+        match self {
+            Size::Physical(v) => v,
+            Size::Logical(v) => v.scaled_rounded(scale),
+        }
+    }
+}
+
+// ─── 圆角半径（四角可各自独立） ───────────────────────────────
+
+/// **四角各自独立的圆角半径**（逻辑像素；0 = 直角）。
+///
+/// 常见用法是"只圆上面两个角"（标签页 / 附着在工具栏下方的面板 / 气泡尖角）或
+/// "只圆外上角"（折叠面板首项）：
+///
+/// ```no_run
+/// # use rjw_ui::draw::CornerRadius;
+/// # use rjw_ui::{Theme, PanelStyle};
+/// let tab = CornerRadius { tl: 8.0, tr: 8.0, br: 0.0, bl: 0.0 };
+/// let style = PanelStyle::default().with_radius(tab);
+/// let theme = Theme::dark().with_radius(CornerRadius::all(6.0));
+/// # let _ = (style, theme);
+/// ```
+///
+/// `From<f32>` ⇒ **四角相同**，所以 `with_radius(8.0)` 这类既有调用点不用改。
+///
+/// ⚠ 与 [`DrawKind::RoundedRect`] 的 `corners: [Color; 4]` **顺序不同**：颜色数组是
+/// `[TL, TR, BL, BR]`（历史约定，与四边形顶点一致），本类型是**具名字段**故无歧义。
+/// 镶嵌器内部按屏幕顺时针 TL → TR → BR → BL 遍历。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CornerRadius {
+    pub tl: f32,
+    pub tr: f32,
+    pub br: f32,
+    pub bl: f32,
+}
+
+impl Default for CornerRadius {
+    #[inline]
+    fn default() -> Self {
+        Self::all(0.0)
+    }
+}
+
+impl From<f32> for CornerRadius {
+    #[inline]
+    fn from(r: f32) -> Self {
+        Self::all(r)
+    }
+}
+
+/// 与标量比较（**四角相同**才算相等）——让 `assert_eq!(style.radius, 8.0)` 这类
+/// 断言与用户代码可直接写；四角不同的值不等于任何标量（更不会误判为"没设圆角"）。
+impl PartialEq<f32> for CornerRadius {
+    #[inline]
+    fn eq(&self, other: &f32) -> bool {
+        self.uniform() == Some(*other)
+    }
+}
+
+impl From<(f32, f32, f32, f32)> for CornerRadius {
+    /// `(tl, tr, br, bl)`——与字段顺序一致（**不是**颜色数组的 `[TL,TR,BL,BR]`）。
+    #[inline]
+    fn from((tl, tr, br, bl): (f32, f32, f32, f32)) -> Self {
+        Self { tl, tr, br, bl }
+    }
+}
+
+impl CornerRadius {
+    /// 四角相同。
+    #[inline]
+    pub const fn all(r: f32) -> Self {
+        Self { tl: r, tr: r, br: r, bl: r }
+    }    /// 四角相同则返回该值（否则 `None`）——用于"能否走更省的路径"之类的判断。
+    #[inline]
+    pub fn uniform(self) -> Option<f32> {
+        (self.tl == self.tr && self.tl == self.br && self.tl == self.bl).then_some(self.tl)
+    }
+    /// 四角全为 0（纯直角）。
+    #[inline]
+    pub fn is_zero(self) -> bool {
+        self.tl <= 0.0 && self.tr <= 0.0 && self.br <= 0.0 && self.bl <= 0.0
+    }
+    /// 最大 / 最小角半径（镶嵌时用最大角定弧的段数，取最细）。
+    #[inline]
+    pub fn max(self) -> f32 {
+        self.tl.max(self.tr).max(self.br).max(self.bl)
+    }
+    /// 最小角半径。
+    #[inline]
+    pub fn min(self) -> f32 {
+        self.tl.min(self.tr).min(self.br).min(self.bl)
+    }
+    /// 逐角变换。
+    #[inline]
+    pub fn map(self, f: impl Fn(f32) -> f32) -> Self {
+        let (tl, tr, br, bl) = (self.tl, self.tr, self.br, self.bl);
+        Self { tl: f(tl), tr: f(tr), br: f(br), bl: f(bl) }
+    }
+    /// 逐角缩放（不取整）——DPI 物理化用。
+    #[inline]
+    pub fn scaled(self, s: f32) -> Self {
+        self.map(|r| r * s)
+    }
+    /// 逐角缩放并**取整**（`Size::Logical` 的 DPI 换算，与其它尺寸字段一致）。
+    #[inline]
+    pub fn scaled_rounded(self, s: f32) -> Self {
+        self.map(|r| (r * s).round())
+    }
+    /// 逐角 clamp 到 `[0, limit]`。
+    #[inline]
+    pub fn clamped(self, limit: f32) -> Self {
+        self.map(|r| r.clamp(0.0, limit.max(0.0)))
+    }
+    /// **按 CSS `border-radius` 的规则收缩**，使四角互不重叠地放进 `(w, h)` 的盒子。
+    ///
+    /// 两条边上的半径之和不得超过该边长：`tl + tr ≤ w`、`bl + br ≤ w`、
+    /// `tl + bl ≤ h`、`tr + br ≤ h`。若违反，**四角按同一比例缩小**（保持相对比例），
+    /// 而不是各自独立 clamp（后者会让"大圆角"变成"圆角被削平"，形状会突变）。
+    #[inline]
+    pub fn fit(self, w: f32, h: f32) -> Self {
+        let f = self.fit_factor(w, h);
+        if f >= 1.0 {
+            return self;
+        }
+        self.scaled(f)
+    }
+
+    /// [`Self::fit`] 用的收缩比例（`≥ 1` 表示无需收缩）。
+    #[inline]
+    pub fn fit_factor(self, w: f32, h: f32) -> f32 {
+        let mut f = 1.0f32;
+        let mut edge = |a: f32, b: f32, len: f32| {
+            let s = a + b;
+            if s > 0.0 && len > 0.0 {
+                f = f.min(len / s);
+            }
+        };
+        edge(self.tl, self.tr, w);
+        edge(self.bl, self.br, w);
+        edge(self.tl, self.bl, h);
+        edge(self.tr, self.br, h);
+        f
+    }
+}
+
 impl Size<Vec2> {
     #[inline]
     pub fn to_physical(self, scale: f32) -> Vec2 {
@@ -130,6 +279,22 @@ impl From<Vec2> for Size<Vec2> {
     #[inline]
     fn from(v: Vec2) -> Self {
         Size::Logical(v)
+    }
+}
+
+/// `Size<CornerRadius>` 的构造糖：`Button::radius(6.0)` / `radius(CornerRadius { .. })`
+/// 都按**逻辑像素**处理（需物理像素时显式 `Size::Physical(..)`）。
+impl From<CornerRadius> for Size<CornerRadius> {
+    #[inline]
+    fn from(v: CornerRadius) -> Self {
+        Size::Logical(v)
+    }
+}
+
+impl From<f32> for Size<CornerRadius> {
+    #[inline]
+    fn from(v: f32) -> Self {
+        Size::Logical(CornerRadius::all(v))
     }
 }
 
@@ -481,17 +646,17 @@ pub enum DrawKind {
     Solid(Color),
     /// **圆角矩形**（背景填充；`radius` 物理像素，CPU 镶嵌成三角形，颜色走顶点色）。
     ///
-    /// `corners` = `[TL, TR, BL, BR]`：纯色时四者相同；两端色渐变时各异
-    /// ⇒「圆角 + 渐变」不需要任何专门着色器或渐变纹理。
-    RoundedRect { corners: [Color; 4], radius: f32 },
+    /// `corners` = `[TL, TR, BL, BR]`（⚠ **不是** [`CornerRadius`] 的 `tl/tr/br/bl` 顺序）：
+    /// 纯色时四者相同；两端色渐变时各异 ⇒「圆角 + 渐变」不需要任何专门着色器或渐变纹理。
+    RoundedRect { corners: [Color; 4], radius: CornerRadius },
     /// **矩形渐变**（四角颜色；顶点色插值，**无纹理**）。
     Rect(Gradient),
     /// 矩形边框（画在 `rect` 内缘）。
     ///
-    /// `radius > 0` 时是**圆角环带**（外轮廓半径 `radius`、内轮廓半径
-    /// `max(0, radius - width)`；见 `crate::tess::push_rounded_ring`），
-    /// 与 [`Self::RoundedRect`] 的圆角语义一致。
-    Border { color: Color, width: f32, radius: f32 },
+    /// `radius` 非零时是**圆角环带**（外轮廓半径 `radius`、内轮廓半径
+    /// `max(0, radius - width)` 逐角计算；见 `crate::tess::push_rounded_ring`），
+    /// 与 [`Self::RoundedRect`] 的圆角语义一致（四角可各自独立）。
+    Border { color: Color, width: f32, radius: CornerRadius },
     /// 文本（绘制时经 `rjw_text` 责任链渲染）。
     Text {
         /// 文本内容（`Arc<str>`：命令间共享，避免每命令 String 克隆）。
@@ -616,6 +781,78 @@ pub fn text_cmd(
             clip,
             buf,
         },
+    }
+}
+
+#[cfg(test)]
+mod corner_radius_tests {
+    use super::*;
+
+    #[test]
+    fn from_scalar_is_uniform_and_compares_against_scalars() {
+        let r: CornerRadius = 8.0.into();
+        assert_eq!(r, CornerRadius::all(8.0));
+        assert_eq!(r.uniform(), Some(8.0));
+        assert_eq!(r, 8.0, "四角相同才等于该标量");
+        // 四角不同 ⇒ 不等于任何标量（避免把"只圆上面两角"误判成"没设圆角"）
+        let tab = CornerRadius { tl: 8.0, tr: 8.0, br: 0.0, bl: 0.0 };
+        assert_eq!(tab.uniform(), None);
+        assert_ne!(tab, 8.0);
+        assert_ne!(tab, 0.0);
+        assert!(CornerRadius::all(0.0).is_zero());
+        assert!(!tab.is_zero());
+    }
+
+    #[test]
+    fn tuple_constructor_is_tl_tr_br_bl() {
+        // `(tl, tr, br, bl)` —— 与字段顺序一致，**不是**颜色数组的 `[TL,TR,BL,BR]`。
+        let r: CornerRadius = (1.0, 2.0, 3.0, 4.0).into();
+        assert_eq!((r.tl, r.tr, r.br, r.bl), (1.0, 2.0, 3.0, 4.0));
+    }
+
+    #[test]
+    fn map_scaled_and_clamped_are_per_corner() {
+        let r = CornerRadius { tl: 4.0, tr: 8.0, br: 12.0, bl: 16.0 };
+        assert_eq!(r.scaled(0.5), CornerRadius { tl: 2.0, tr: 4.0, br: 6.0, bl: 8.0 });
+        assert_eq!(r.scaled_rounded(0.5), r.scaled(0.5));
+        assert_eq!(r.max(), 16.0);
+        assert_eq!(r.min(), 4.0);
+        assert_eq!(r.clamped(10.0), CornerRadius { tl: 4.0, tr: 8.0, br: 10.0, bl: 10.0 });
+    }
+
+    #[test]
+    fn fit_shrinks_all_corners_by_the_same_factor() {
+        // 宽 40、上下各 30 ⇒ tl + tr = 60 > 40 ⇒ 比例 40/60 = 2/3。
+        let r = CornerRadius { tl: 30.0, tr: 30.0, br: 0.0, bl: 0.0 };
+        let f = r.fit(40.0, 100.0);
+        assert!((f.tl - 20.0).abs() < 1e-4 && (f.tr - 20.0).abs() < 1e-4);
+        assert_eq!((f.br, f.bl), (0.0, 0.0), "0 角缩放后仍是 0");
+        // **等比**而不是各自 clamp：两个 30 变成两个 20（不是 20 + 30 那种削平）。
+        assert!((f.tl - f.tr).abs() < 1e-4);
+        // 受高度限制：h = 10、tl + bl = 30 + 0 = 30 > 10 ⇒ 比例 1/3 ⇒ 30 → 10。
+        assert_eq!(
+            r.fit(100.0, 10.0),
+            CornerRadius { tl: 10.0, tr: 10.0, br: 0.0, bl: 0.0 }
+        );
+        assert_eq!(r.fit(1000.0, 1000.0), r, "放得下就原样");
+    }
+
+    #[test]
+    fn fit_uses_the_most_restrictive_edge() {
+        // 四条边约束里最紧的那条决定比例：w/2 与 h/4 取小。
+        let r = CornerRadius::all(10.0);
+        // w = 40 ⇒ tl+tr = 20 ⇒ 2.0；h = 10 ⇒ tl+bl = 20 ⇒ 0.5 ⇒ 取 0.5
+        let f = r.fit(40.0, 10.0);
+        assert!((f.tl - 5.0).abs() < 1e-4, "应被高度约束收到 5，实际 {}", f.tl);
+        assert_eq!(f.uniform(), Some(f.tl));
+    }
+
+    #[test]
+    fn fit_is_noop_on_degenerate_boxes() {
+        // 0 尺寸 / 无圆角都不得 panic 也不得把半径变成 NaN。
+        let r = CornerRadius::all(8.0);
+        assert_eq!(r.fit(0.0, 0.0), r, "退化盒子不收缩（由上游的 w/h <= 0 早退兜底）");
+        assert!(CornerRadius::default().fit(10.0, 10.0).is_zero());
     }
 }
 

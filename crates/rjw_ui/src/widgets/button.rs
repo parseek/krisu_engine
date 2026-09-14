@@ -6,6 +6,7 @@ use glam::Vec2;
 use rjw_color::Color;
 use rjw_transform::Rect;
 use crate::draw::Size;
+use crate::draw::CornerRadius;
 use crate::style::{Brush, ButtonStyle, Theme};
 use crate::ui::Ui;
 use super::{Response, Widget};
@@ -24,7 +25,7 @@ pub struct Button<'a> {
     border: Option<Color>,
     border_w: Option<Size<f32>>,
     /// 圆角半径（[`Size<f32>`]：逻辑（默认）或物理；0 = 直角）。
-    radius: Option<Size<f32>>,
+    radius: Option<Size<CornerRadius>>,
     /// 内边距（x = 水平，y = 垂直；[`Size<Vec2>`]：逻辑（默认）或物理）。
     padding: Option<Size<Vec2>>,
     font_size: Option<Size<f32>>,
@@ -79,8 +80,10 @@ impl<'a> Button<'a> {
         self.border_w = Some(w.into());
         self
     }
-    /// 圆角半径（[`Size<f32>`]：逻辑（默认）或物理；默认 `ButtonStyle::radius`）。
-    pub fn radius(mut self, r: impl Into<Size<f32>>) -> Self {
+    /// 圆角半径（[`Size<CornerRadius>`]：逻辑（默认）或物理；默认 `ButtonStyle::radius`）。
+    ///
+    /// 接受 `f32`（四角相同）或 [`CornerRadius`]（**只圆某些角**，例如只圆上面两个角）。
+    pub fn radius(mut self, r: impl Into<Size<CornerRadius>>) -> Self {
         self.radius = Some(r.into());
         self
     }

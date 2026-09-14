@@ -23,7 +23,7 @@ use rjw_text::VisualLine;
 use rjw_transform::Rect;
 
 use crate::backend::Tri;
-use crate::draw::{DebugShape, DrawKind, Gradient, UiDraw};
+use crate::draw::{CornerRadius, DebugShape, DrawKind, Gradient, UiDraw};
 use crate::ui::TEXT_LINE_HEIGHT_VERSION;
 
 // ─── 分组维度 ─────────────────────────────────────────────────
@@ -264,7 +264,7 @@ impl QuadCollector {
         win: u32,
         table: &crate::tess::CornerTable,
         rect: Rect,
-        radius: f32,
+        radius: CornerRadius,
         feather: f32,
         corners: [Color; 4],
     ) -> crate::tess::TessOutput {
@@ -288,7 +288,7 @@ impl QuadCollector {
         win: u32,
         table: &crate::tess::CornerTable,
         rect: Rect,
-        radius: f32,
+        radius: CornerRadius,
         width: f32,
         feather: f32,
         color: Color,
@@ -462,7 +462,10 @@ pub(crate) fn cmd_sig_hash(h: &mut std::collections::hash_map::DefaultHasher, d:
             for c in corners {
                 color_bits(*c).hash(h);
             }
-            radius.to_bits().hash(h);
+            radius.tl.to_bits().hash(h);
+            radius.tr.to_bits().hash(h);
+            radius.br.to_bits().hash(h);
+            radius.bl.to_bits().hash(h);
         }
         DrawKind::Rect(g) => {
             6u8.hash(h);
@@ -476,7 +479,10 @@ pub(crate) fn cmd_sig_hash(h: &mut std::collections::hash_map::DefaultHasher, d:
             1u8.hash(h);
             color_bits(*color).hash(h);
             width.to_bits().hash(h);
-            radius.to_bits().hash(h);
+            radius.tl.to_bits().hash(h);
+            radius.tr.to_bits().hash(h);
+            radius.br.to_bits().hash(h);
+            radius.bl.to_bits().hash(h);
         }
         DrawKind::Text {
             text,
@@ -679,6 +685,7 @@ mod batch_contract_tests {
     #[test]
     fn solid_geometry_samples_the_white_texel() {
         use super::QuadCollector;
+        use crate::draw::CornerRadius;
         use crate::tess::{RoundedRectSpec, TessCache};
         use glam::Vec2;
         use rjw_color::Color;
@@ -692,8 +699,8 @@ mod batch_contract_tests {
 
         // 圆角矩形 + 圆角边框环带都会写入同一段几何。
         let f = crate::tess::DEFAULT_FEATHER;
-        q.push_rounded(1, &table, Rect::new(0.0, 0.0, 60.0, 36.0), 8.0, f, [Color::RED; 4]);
-        q.push_rounded_ring(1, &table, Rect::new(0.0, 0.0, 60.0, 36.0), 8.0, 1.0, f, Color::BLUE);
+        q.push_rounded(1, &table, Rect::new(0.0, 0.0, 60.0, 36.0), 8.0.into(), f, [Color::RED; 4]);
+        q.push_rounded_ring(1, &table, Rect::new(0.0, 0.0, 60.0, 36.0), 8.0.into(), 1.0, f, Color::BLUE);
 
         let geom = q.quads.values().next().expect("至少一段几何");
         assert!(geom.verts.len() > 40, "应有镶嵌顶点");
@@ -711,7 +718,7 @@ mod batch_contract_tests {
         // `RoundedRectSpec` 仍要求显式 UV 与羽化宽：遗漏即编译错误。
         let _ = RoundedRectSpec {
             rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-            radius: 0.0,
+            radius: CornerRadius::default(),
             feather: 0.0,
             corners: [Color::WHITE; 4],
             uv: [1.0, 1.0],

@@ -41,7 +41,7 @@ use std::time::Instant;
 
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
-use rjw_krusie::ui::{FontModal, IdAbsolute, Label, Palette};
+use rjw_krusie::ui::{CornerRadius, FontModal, IdAbsolute, Label, Palette};
 
 /// 顶部状态栏模块：FPS / 点击次数标签 + 字体按钮（打开 Modal）+ 玩家名输入框 + 字体 Modal。
 struct TopBar {
@@ -305,14 +305,19 @@ impl Windows {
         self.auto_tick = self.auto_tick.wrapping_add(1);
     }
 
-    /// 全部窗口 + 整窗 FX + 可调大小文本输入框。`t` 为帧时间基准（`drag_t0` 起），
-    /// 供 FX 动画与 auto_drag 用。
-    fn ui(&mut self, ui: &mut Ui, clicks: &mut u32, t: f64) {
+    /// 全部窗口 + 整窗 FX + 可调大小文本输入框。
+    ///
+    /// 不再收帧时间：`win_b` 的浮动 / 淡入淡出已去掉，剩下唯一的 FX（赤石旋转 + 染色）
+    /// 由用户拖滑块驱动；自动摆动在 `update` 里经 `tick_auto` 单独驱动。
+    fn ui(&mut self, ui: &mut Ui, clicks: &mut u32) {
         // 窗口 A：固定宽（右下角缩放柄）+ 逐窗口样式 + 位置 clamp。
         //
         // 逐窗口覆盖**从当前主题派生**（`ui.theme().panel`）再改背景与圆角——
         // 只覆盖想改的字段，边框 / 内边距等仍跟主题走。若写死 `PanelStyle::default()`
         // 就是拿**浅色**默认当基底，切到深色主题后这个窗口会与其它窗口不一致。
+        //
+        // 圆角用 [`CornerRadius`]：**只圆上面两个角**（标签页 / 附着在工具栏下方的面板
+        // 就是这么做的），下面两个角贴齐直角。
         let panel_a = ui.theme().panel.clone();
         ui.window("win_a")
             .pos(self.win_a_pos)
@@ -320,7 +325,7 @@ impl Windows {
             .style(
                 panel_a
                     .with_bg(Color::rgba_u8(40, 44, 62, 255))
-                    .with_radius(8.0),
+                    .with_radius(CornerRadius { tl: 12.0, tr: 12.0, br: 0.0, bl: 0.0 }),
             )
             .clamp(WindowClamp::Screen)
             .show(|w| {
@@ -390,18 +395,12 @@ impl Windows {
             transform: Some(Transform2D::IDENTITY.with_rot(self.cshi_num.to_radians())),
             anchor: Vec2::new(0.5, 0.5),
         });
-        // 窗口级 FX（window_fx）：win_b 整窗淡入淡出 + 轻微上浮动画。
-        let fx_alpha = 0.75 + 0.25 * (t * 1.5).sin() as f32;
-        ui.window_fx(
-            "win_b",
-            WindowFx {
-                tint: Color::rgba_u8(255, 255, 255, (fx_alpha * 255.0) as u8),
-                transform: Some(
-                    Transform2D::IDENTITY.with_pos(Vec2::new(0.0, 5.0 * (t * 1.2).sin() as f32)),
-                ),
-                anchor: Vec2::new(0.5, 0.5), // 旋转/缩放绕窗口中心
-            },
-        );
+        // 窗口级 FX 只演示「赤石」这一个窗口（整窗旋转 + RGBA 染色）。
+        //
+        // win_b 原本还有"整窗淡入淡出 + 轻微上浮"的 FX —— **已去掉**：持续运动会让人
+        // 以为窗口在抖，干扰对布局 / 圆角 / 边框的观察；而"旋转 + 染色绕锚点"这一条
+        // 已经完整覆盖了 `WindowFx` 的能力（顶点缓存不变、仅提交时应用）。
+        // 想看淡入淡出，把这里的 tint alpha 换成随时间变化的量即可。
         // 可调整大小 TextArea / 宽度 TextInput（右下角缩放柄拖拽；尺寸责任链可覆盖）。
         // 复用 win_b 的备注字符串（同内容两处编辑演示）。
         ui.label_at(Vec2::new(880.0, 618.0), "可调大小 TextArea / 宽度 TextInput（右下角拖拽）");
@@ -1006,7 +1005,7 @@ impl App for UiApp {
             self.top.ui(ui, fps, clicks, &mut self.theme_tuner);
             self.menu.ui(ui, &mut clicks);
             self.inventory.ui(ui);
-            self.windows.ui(ui, &mut clicks, t);
+            self.windows.ui(ui, &mut clicks);
             self.right.ui(ui, &mut clicks, &prev_press, prev_blocked);
             self.theme_tuner.ui(ui);
 

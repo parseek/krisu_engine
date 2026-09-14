@@ -5,6 +5,8 @@ use std::sync::Arc;
 use rjw_color::Color;
 use rjw_text::Align;
 
+use crate::draw::CornerRadius;
+
 /// **背景刷**：纯色 / 两端色渐变。
 ///
 /// # 为什么只有"两端色"
@@ -148,7 +150,7 @@ pub struct ComboStyle {
     /// 浮层面板边框。
     pub menu_border: Color,
     /// 浮层圆角（小圆角，如 6）。
-    pub menu_radius: f32,
+    pub menu_radius: CornerRadius,
     /// 浮层上下留白（让菜单"飘"起来）。
     pub menu_pad_v: f32,
     /// 菜单项 hover 整行高亮（浅蓝）。
@@ -172,7 +174,7 @@ impl Default for ComboStyle {
         Self {
             menu_bg: Color::rgba_u8(250, 250, 252, 255),
             menu_border: Color::rgba_u8(180, 185, 195, 255),
-            menu_radius: 6.0,
+            menu_radius: CornerRadius::all(6.0),
             menu_pad_v: 4.0,
             item_hover: Color::rgba_u8(230, 242, 255, 255),
             item_selected: Color::rgba_u8(208, 228, 255, 255),
@@ -209,7 +211,7 @@ impl PanelStyle {
         let m = |v: f32| (v * s).round();
         self.border_w = m(self.border_w);
         self.padding = m(self.padding);
-        self.radius = m(self.radius);
+        self.radius = self.radius.scaled_rounded(s);
         self
     }
 }
@@ -222,7 +224,7 @@ impl ButtonStyle {
         }
         let m = |v: f32| (v * s).round();
         self.border_w = m(self.border_w);
-        self.radius = m(self.radius);
+        self.radius = self.radius.scaled_rounded(s);
         self.padding.x = m(self.padding.x);
         self.padding.y = m(self.padding.y);
         self.font_size = m(self.font_size);
@@ -254,7 +256,7 @@ impl InputStyle {
         let m = |v: f32| (v * s).round();
         self.border_w = m(self.border_w);
         self.padding_x = m(self.padding_x);
-        self.radius = m(self.radius);
+        self.radius = self.radius.scaled_rounded(s);
         self.height = m(self.height);
         self.min_w = m(self.min_w);
         self.font_size = m(self.font_size);
@@ -270,7 +272,7 @@ impl CheckboxStyle {
         }
         let m = |v: f32| (v * s).round();
         self.box_size = m(self.box_size);
-        self.radius = m(self.radius);
+        self.radius = self.radius.scaled_rounded(s);
         self.border_w = m(self.border_w);
         self.font_size = m(self.font_size);
         self.gap = m(self.gap);
@@ -334,7 +336,7 @@ impl ComboStyle {
             return self;
         }
         let m = |v: f32| (v * s).round();
-        self.menu_radius = m(self.menu_radius);
+        self.menu_radius = self.menu_radius.scaled_rounded(s);
         self.menu_pad_v = m(self.menu_pad_v);
         self.item_pad_x = m(self.item_pad_x);
         self.item_min_w = m(self.item_min_w);
@@ -721,8 +723,8 @@ pub struct PanelStyle {
     pub border_w: f32,
     /// 内容区内边距（像素）。
     pub padding: f32,
-    /// 圆角半径（**逻辑像素**；0 = 直角）。背景与边框都按此半径 9-patch 绘制。
-    pub radius: f32,
+    /// 圆角半径（**逻辑像素**；0 = 直角；四角可各自不同，见 [`CornerRadius`]）。
+    pub radius: CornerRadius,
 }
 
 impl Default for PanelStyle {
@@ -732,7 +734,7 @@ impl Default for PanelStyle {
             border: Color::rgba_u8(180, 180, 180, 255),
             border_w: 1.0,
             padding: 8.0,
-            radius: 0.0,
+            radius: CornerRadius::default(),
         }
     }
 }
@@ -750,8 +752,8 @@ pub struct ButtonStyle {
     pub fg: Color,
     pub border: Color,
     pub border_w: f32,
-    /// 圆角半径（**逻辑像素**；0 = 直角）。
-    pub radius: f32,
+    /// 圆角半径（**逻辑像素**；0 = 直角；四角可各自不同，见 [`CornerRadius`]）。
+    pub radius: CornerRadius,
     /// 内边距（x = 水平，y = 垂直）。
     pub padding: glam::Vec2,
     pub font_size: f32,
@@ -767,7 +769,7 @@ impl Default for ButtonStyle {
             fg: Color::rgba_u8(30, 30, 30, 255),
             border: Color::rgba_u8(150, 150, 150, 255),
             border_w: 1.0,
-            radius: 0.0,
+            radius: CornerRadius::default(),
             padding: glam::Vec2::new(12.0, 6.0),
             font_size: 14.0,
             font_family: None,
@@ -825,8 +827,8 @@ pub struct InputStyle {
     pub border_w: f32,
     /// 内容水平内边距。
     pub padding_x: f32,
-    /// 圆角半径（**逻辑像素**；0 = 直角）。
-    pub radius: f32,
+    /// 圆角半径（**逻辑像素**；0 = 直角；四角可各自不同，见 [`CornerRadius`]）。
+    pub radius: CornerRadius,
     /// 控件总高。
     pub height: f32,
     /// 控件最小宽。
@@ -848,7 +850,7 @@ impl Default for InputStyle {
             resize_handle: Color::rgba_u8(120, 130, 150, 255),
             border_w: 1.0,
             padding_x: 6.0,
-            radius: 0.0,
+            radius: CornerRadius::default(),
             height: 26.0,
             min_w: 140.0,
             font_size: 14.0,
@@ -883,11 +885,11 @@ impl Default for DividerStyle {
 pub struct CheckboxStyle {
     /// 方框边长。
     pub box_size: f32,
-    /// 方框圆角半径（**逻辑像素**；0 = 直角）。
+    /// 方框圆角半径（**逻辑像素**；0 = 直角；四角可各自不同，见 [`CornerRadius`]）。
     ///
     /// 无边框（`border_w == 0`）时无效——此时填充是直角小方块。由
     /// [`Theme::with_radius`] 级联为全局半径的一半（勾选框比按钮小，同半径会显得过圆）。
-    pub radius: f32,
+    pub radius: CornerRadius,
     pub box_border: Color,
     /// 方框边框宽（逻辑像素；中心填充 = 外框 shrink(border_w + [`CHECKBOX_INNER`](crate::ui) 内边距)）。
     pub border_w: f32,
@@ -903,7 +905,7 @@ impl Default for CheckboxStyle {
     fn default() -> Self {
         Self {
             box_size: 16.0,
-            radius: 0.0,
+            radius: CornerRadius::default(),
             box_border: Color::rgba_u8(140, 140, 140, 255),
             border_w: 1.0,
             checked_fill: Color::rgba_u8(80, 140, 220, 255),
@@ -999,8 +1001,8 @@ impl PanelStyle {
         self
     }
     /// 圆角半径（**逻辑像素**；0 = 直角）。
-    pub fn with_radius(mut self, r: f32) -> Self {
-        self.radius = r;
+    pub fn with_radius(mut self, r: impl Into<CornerRadius>) -> Self {
+        self.radius = r.into();
         self
     }
 }
@@ -1035,8 +1037,8 @@ impl ButtonStyle {
         self
     }
     /// 圆角半径（**逻辑像素**；0 = 直角）。
-    pub fn with_radius(mut self, r: f32) -> Self {
-        self.radius = r;
+    pub fn with_radius(mut self, r: impl Into<CornerRadius>) -> Self {
+        self.radius = r.into();
         self
     }
     /// 内边距（x = 水平，y = 垂直）。
@@ -1146,8 +1148,8 @@ impl InputStyle {
         self
     }
     /// 圆角半径（**逻辑像素**；0 = 直角）。
-    pub fn with_radius(mut self, r: f32) -> Self {
-        self.radius = r;
+    pub fn with_radius(mut self, r: impl Into<CornerRadius>) -> Self {
+        self.radius = r.into();
         self
     }
     /// 控件总高。
@@ -1371,20 +1373,28 @@ impl Theme {
         self
     }
 
-    /// **圆角半径**（逻辑像素；0 = 直角）。
+    /// **圆角半径**（逻辑像素；0 = 直角；可传 `f32` 或 [`CornerRadius`] 指定**只圆某些角**）。
     ///
     /// 级联到**全部有圆角的子样式**：`panel` / `button` / `input` / `checkbox` /
     /// `combo.menu_radius`。此前只覆盖前三个，于是"全局设了圆角但勾选框 / 下拉菜单
     /// 仍是直角"，看起来像 bug。
     ///
-    /// 浮层（`combo`）用的是**更小的**圆角：`min(radius, 6)`——菜单是贴边弹出的浮层，
+    /// 浮层（`combo`）用的是**更小的**圆角：逐角 `min(r, 6)`——菜单是贴边弹出的浮层，
     /// 与按钮同半径会显得笨重。
-    pub fn with_radius(mut self, radius: f32) -> Self {
-        self.panel.radius = radius;
-        self.button.radius = radius;
-        self.input.radius = radius;
-        self.checkbox.radius = radius * 0.5;
-        self.combo.menu_radius = radius.min(6.0);
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{CornerRadius, Theme};
+    /// // 只圆上面两个角（标签页 / 附着在工具栏下方的面板）
+    /// let theme = Theme::dark().with_radius(CornerRadius { tl: 8.0, tr: 8.0, br: 0.0, bl: 0.0 });
+    /// # let _ = theme;
+    /// ```
+    pub fn with_radius(mut self, radius: impl Into<CornerRadius>) -> Self {
+        let r = radius.into();
+        self.panel.radius = r;
+        self.button.radius = r;
+        self.input.radius = r;
+        self.checkbox.radius = r.map(|v| v * 0.5);
+        self.combo.menu_radius = r.map(|v| v.min(6.0));
         self
     }
 

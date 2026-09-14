@@ -63,6 +63,7 @@ use rjw_color::Color;
 use rjw_transform::Rect;
 
 use crate::backend::Tri;
+use crate::draw::CornerRadius;
 
 /// 细表取样点数（每个四分之一圆弧）。2 的幂 —— `stride` 取 2 的幂即可整除本值。
 pub(crate) const N_FINE: u32 = 32;
@@ -163,18 +164,21 @@ impl TessCache {
 pub(crate) struct RoundedRectSpec {
     /// 目标矩形（局部 / 屏幕物理像素；左上原点）。
     pub rect: Rect,
-    /// 圆角半径（物理像素，逻辑半径已由调用方换算）。
-    pub radius: f32,
+    /// **四角各自的圆角半径**（物理像素，逻辑半径已由调用方换算）。四角可以不同——
+    /// 常见需求是"只圆上面两个角"（标签页 / 附着在工具栏下方的面板）。
+    ///
+    /// 镶嵌器内部按 CSS `border-radius` 规则把四角**等比收缩**（`tl + tr ≤ w` 等），
+    /// 见 [`CornerRadius::fit`]。
+    pub radius: CornerRadius,
     /// **边缘羽化宽度**（物理像素，0 = 不羽化 ⇒ 硬边）。来自
     /// [`crate::style::Theme::feather`]（逻辑像素）× DPI。
     ///
     /// 梯度以几何边缘为中心（硬体内缩 `f/2`、外环外扩 `f/2`），因此视觉尺寸恒等于
     /// `rect`；`1.0` 物理像素 ≈ 标准 1px 抗锯齿，调大即"更软"。
     pub feather: f32,
-    /// 四角色 `[TL, TR, BL, BR]`。
+    /// 四角色 `[TL, TR, BL, BR]`（⚠ 与 `radius` 的具名字段顺序不同，注意别串）。
     ///
-    /// **必须支持四角各异**——这正是「圆角 + 渐变」需要逐顶点色、不能走实例单色的原因：
-    /// 硬体四角各取本角颜色，中心取四角均值，光栅化器在扇形三角形内做重心插值。
+    /// **必须支持四角各异**——这正是「圆角 + 渐变」需要逐顶点色、不能走实例单色的原因。
     pub corners: [Color; 4],
     /// **采样 UV**（所有顶点同值）。
     ///
@@ -325,26 +329,28 @@ fn grow(r: Rect, d: f32) -> Rect {
 }
 
 
-/// 四角（顺时针 TL → TR → BR → BL）的圆心与基向量。
+/// 四角（屏幕顺时针 TL → TR → BR → BL）的圆心与基向量。
 ///
-/// `radius` 已 clamp 过，调用方保证 `0 < radius ≤ min(w, h) / 2`。
-/// **不带颜色**——每个顶点的颜色由 [`push_outline`] 的 `color_at` 按**位置**算
+/// `radii` 已 clamp / [`CornerRadius::fit`] 过（四角可**各自不同**）。**不带颜色**——
+/// 每个顶点的颜色由 [`push_outline`] 的 `color_at` 按**位置**算
 /// （见 [`bilinear_color`]）；四角颜色是"颜色场"的参数，不是"角"的属性。
 #[inline]
-fn corners_of(rect: Rect, radius: f32) -> [Corner; 4] {
+fn corners_of(rect: Rect, radii: CornerRadius) -> [Corner; 4] {
     let Rect { x, y, w, h } = rect;
+    let (tl, tr, br, bl) = (radii.tl, radii.tr, radii.br, radii.bl);
     let centers = [
-        Vec2::new(x + radius, y + radius),                 // TL
-        Vec2::new(x + w - radius, y + radius),             // TR
-        Vec2::new(x + w - radius, y + h - radius),         // BR
-        Vec2::new(x + radius, y + h - radius),             // BL
+        Vec2::new(x + tl, y + tl),                 // TL
+        Vec2::new(x + w - tr, y + tr),             // TR
+        Vec2::new(x + w - br, y + h - br),         // BR
+        Vec2::new(x + bl, y + h - bl),             // BL
     ];
+    let rs = [tl, tr, br, bl];
     let mut a = Vec2::new(-1.0, 0.0);
     let mut b = Vec2::new(0.0, -1.0);
-    let mut out = [Corner { center: Vec2::ZERO, radius, a, b }; 4];
+    let mut out = [Corner { center: Vec2::ZERO, radius: 0.0, a, b }; 4];
     for (i, slot) in out.iter_mut().enumerate() {
         slot.center = centers[i];
-        slot.radius = radius;
+        slot.radius = rs[i];
         slot.a = a;
         slot.b = b;
         // 顺时针转 90°：`(a, b) ← (b, -a)`。
@@ -418,15 +424,20 @@ pub(crate) fn push_rounded_rect(
     if w <= 0.0 || h <= 0.0 {
         return TessOutput { verts: 0, tris: 0 };
     }
-    let radius = spec.radius.clamp(0.0, w.min(h) * 0.5);
-    if radius <= 0.0 {
+    // 四角按 CSS 规则收缩（`tl + tr ≤ w` 等），保证弧互不重叠。
+    let radii = spec.radius.fit(w, h);
+    if radii.is_zero() {
         return push_plain_quad(verts, tris, spec.rect, spec.corners, spec.uv);
     }
     let uv = spec.uv;
 
-    // 羽化宽：小控件自动收紧（避免糊成一团），且必须放得下两个同心轮廓。
+    // 羽化宽：小控件自动收紧（避免糊成一团）。
     let f = spec.feather.min(w.min(h) * 0.25);
-    let aa = f > 0.0 && radius - f * 0.5 >= MIN_AA_RADIUS;
+    // 直角（半径 0）的角也要参与带状化，否则两级轮廓的**点数不一致**、带状会错位。
+    // 给它 0.5px 的下限：1× 下看不出圆，但点数与其它角一致。
+    let floor = |r: f32| if r > 0.0 { r.max(MIN_AA_RADIUS) } else { MIN_AA_RADIUS };
+    let radii = radii.map(floor);
+    let aa = f > 0.0 && (radii.min() - f * 0.5) >= 0.0;
 
     let verts_before = verts.len();
     let tris_before = tris.len();
@@ -434,9 +445,10 @@ pub(crate) fn push_rounded_rect(
     // 硬体（alpha = 1）与外环（alpha = 0）都锚在 `rect` 的边缘上。
     let half = if aa { f * 0.5 } else { 0.0 };
     let hard_rect = grow(spec.rect, -half);
-    let hard_radius = (radius - half).max(0.0);
-    let hard = corners_of(hard_rect, hard_radius);
-    let stride = table.stride_for(radius + half);
+    let hard_radii = radii.map(|r| (r - half).max(MIN_AA_RADIUS));
+    let hard = corners_of(hard_rect, hard_radii);
+    // 段数由**最大的角**决定（最细），四角共用同一 `segs`——两级轮廓必须逐点对应。
+    let stride = table.stride_for(radii.max() + half);
     let segs = CornerTable::segs_of(stride);
     let n = (4 * (segs + 1)) as u16;
 
@@ -469,7 +481,7 @@ pub(crate) fn push_rounded_rect(
     // ── 羽化带：外环 alpha = 0（颜色照抄硬体同序号点），沿**整圈**成带 ──
     if aa {
         let outer_rect = grow(spec.rect, half);
-        let outer = corners_of(outer_rect, radius + half);
+        let outer = corners_of(outer_rect, radii.map(|r| r + half));
         let fade = copy_colors(verts, hard_start, n, 0.0);
         let outer_start =
             push_outline(verts, table, stride, segs, &outer, uv, |i, _p| fade[i]);
@@ -527,7 +539,7 @@ pub(crate) fn push_rounded_ring(
     tris: &mut Vec<Tri>,
     table: &CornerTable,
     rect: Rect,
-    radius: f32,
+    radius: CornerRadius,
     width: f32,
     feather: f32,
     color: Color,
@@ -538,7 +550,8 @@ pub(crate) fn push_rounded_ring(
         return TessOutput { verts: 0, tris: 0 };
     }
     let width = width.min(w.min(h) * 0.5);
-    let ro = radius.clamp(0.0, w.min(h) * 0.5);
+    // 四角按 CSS 规则收缩后，内轮廓 = 各角半径减 `width`（与 CSS 内侧半径同规则）。
+    let ro = radius.fit(w, h);
     let inner_rect = rect.shrink(width);
 
     let verts_before = verts.len();
@@ -552,13 +565,12 @@ pub(crate) fn push_rounded_ring(
             verts,
             tris,
             table,
-            RoundedRectSpec { rect, radius, feather, corners: [color; 4], uv },
+            RoundedRectSpec { rect, radius: ro, feather, corners: [color; 4], uv },
         );
     }
-    let ri_raw = (ro - width).max(0.0).min(inner_rect.w.min(inner_rect.h) * 0.5);
 
     // 直角边框：四条轴对齐矩形条（圆弧带子在零半径下会退化成重合点）。
-    if ro <= 0.0 {
+    if ro.is_zero() {
         let mut col: [f32; 4] = color.into();
         col[3] = 1.0;
         let push = |r: Rect, verts: &mut Vec<VertexP3U2C4>, tris: &mut Vec<Tri>| {
@@ -585,16 +597,16 @@ pub(crate) fn push_rounded_ring(
         };
     }
 
-    // 内半径太小 ⇒ 内角是直角。夹到一个可见但非零的小半径，避免内圈点重合导致
-    // 零面积三角形（视觉上与直角无异）。
-    let ri = ri_raw.max(MIN_AA_RADIUS.min(ro * 0.5));
+    // 内半径太小 ⇒ 内角是直角。夹到 0.5px（视觉上与直角无异），避免内圈点重合导致
+    // 零面积三角形、以及两级轮廓点数不一致。
+    let ri = ro.map(|r| (r - width).max(MIN_AA_RADIUS)).fit(inner_rect.w, inner_rect.h);
     let f = feather.max(0.0).min(w.min(h) * 0.25);
     let half = f * 0.5;
     // 内羽化需要 `ri - half` 仍是有效半径（否则跳过内羽化，只保外羽化）。
-    let inner_aa = half > 0.0 && ri - half >= MIN_AA_RADIUS;
+    let inner_aa = half > 0.0 && ri.min() - half >= 0.0;
     let outer_aa = half > 0.0;
 
-    let stride = table.stride_for(ro + half);
+    let stride = table.stride_for(ro.max() + half);
     let segs = CornerTable::segs_of(stride);
     let n = (4 * (segs + 1)) as u16;
     let mut solid: [f32; 4] = color.into();
@@ -623,14 +635,14 @@ pub(crate) fn push_rounded_ring(
         flat,
     );
     let a_start = if outer_aa {
-        let cs = corners_of(grow(rect, half), ro + half);
+        let cs = corners_of(grow(rect, half), ro.map(|r| r + half));
         let fade = copy_colors(verts, b_start, n, 0.0);
         Some(push_outline(verts, table, stride, segs, &cs, uv, |i, _p| fade[i]))
     } else {
         None
     };
     let d_start = if inner_aa {
-        let cs = corners_of(grow(inner_rect, -half), (ri - half).max(0.0));
+        let cs = corners_of(grow(inner_rect, -half), ri.map(|r| (r - half).max(MIN_AA_RADIUS)));
         let fade = copy_colors(verts, c_start, n, 0.0);
         Some(push_outline(verts, table, stride, segs, &cs, uv, |i, _p| fade[i]))
     } else {
@@ -667,7 +679,7 @@ mod tests {
     fn spec(w: f32, h: f32, r: f32) -> RoundedRectSpec {
         RoundedRectSpec {
             rect: Rect::new(3.0, 5.0, w, h),
-            radius: r,
+            radius: r.into(),
             feather: DEFAULT_FEATHER,
             corners: [Color::RED, Color::GREEN, Color::BLUE, Color::YELLOW],
             uv: TEST_UV,
@@ -748,7 +760,7 @@ mod tests {
             &t,
             RoundedRectSpec {
                 rect,
-                radius: 18.0,
+                radius: 18.0.into(),
                 feather: 0.0,
                 corners: [l, r, l, r],
                 uv: TEST_UV,
@@ -787,7 +799,7 @@ mod tests {
             &t,
             RoundedRectSpec {
                 rect,
-                radius: 8.0,
+                radius: 8.0.into(),
                 feather: 0.0,
                 corners: [top, top, bot, bot],
                 uv: TEST_UV,
@@ -817,7 +829,7 @@ mod tests {
             &t,
             RoundedRectSpec {
                 rect: Rect::new(0.0, 0.0, 120.0, 40.0),
-                radius: 10.0,
+                radius: 10.0.into(),
                 feather: f,
                 corners: [Color::RED, Color::BLUE, Color::RED, Color::BLUE],
                 uv: TEST_UV,
@@ -897,7 +909,7 @@ mod tests {
             &mut v,
             &mut tr,
             &t,
-            RoundedRectSpec { rect, radius: 10.0, feather: f, corners: [Color::WHITE; 4], uv: TEST_UV },
+            RoundedRectSpec { rect, radius: 10.0.into(), feather: f, corners: [Color::WHITE; 4], uv: TEST_UV },
         );
         let xs: Vec<f32> = v.iter().map(|x| x.pos[0]).collect();
         let (min, max) = (
@@ -939,8 +951,9 @@ mod tests {
     }
 
     #[test]
-    fn tiny_radius_skips_aa_instead_of_degenerating() {
-        // 半径小到放不下两个同心轮廓时退回不羽化，而不是产生零面积三角形。
+    fn tiny_radius_is_floored_and_stays_well_formed() {
+        // 极小的圆角被夹到 0.5px（1× 下看不出圆），但**照样走羽化**：四级轮廓的点数一致，
+        // 不会像早期实现那样在半径塌缩时产生零面积三角形 / 绕序翻反。
         let t = table();
         for (r, f) in [(0.3_f32, 1.0_f32), (0.5, 2.0), (0.4, 0.5)] {
             let mut v = Vec::new();
@@ -948,12 +961,25 @@ mod tests {
             let mut s = spec(40.0, 24.0, r);
             s.feather = f;
             push_rounded_rect(&mut v, &mut tr, &t, s);
+            assert!(!v.is_empty() && !tr.is_empty());
             assert_well_formed(&v, &tr);
-            assert!(
-                v.iter().all(|x| x.color[3] == 1.0),
-                "半径 {r} + 羽化 {f}：应退回不羽化（全 alpha = 1）"
-            );
+            assert!(v.iter().all(|x| x.color[3] == 0.0 || x.color[3] == 1.0));
+            for tri in &tr {
+                assert!(cross(&v, tri) >= 0.0, "半径 {r} 羽化 {f}：出现负面积三角形");
+            }
         }
+    }
+
+    #[test]
+    fn all_zero_radius_is_a_plain_quad_without_aa() {
+        // 四角**全**为 0 ⇒ 纯直角四边形（不镶嵌、不羽化）——保持既有语义。
+        let t = table();
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        let out = push_rounded_rect(&mut v, &mut tr, &t, spec(40.0, 24.0, 0.0));
+        assert_eq!(out.verts, 4);
+        assert_eq!(out.tris, 2);
+        assert!(v.iter().all(|x| x.color[3] == 1.0));
     }
 
     #[test]
@@ -974,7 +1000,7 @@ mod tests {
 
             let mut v = Vec::new();
             let mut tr = Vec::new();
-            push_rounded_ring(&mut v, &mut tr, &t, Rect::new(3.0, 5.0, w, h), r, 2.0, f, Color::WHITE, TEST_UV);
+            push_rounded_ring(&mut v, &mut tr, &t, Rect::new(3.0, 5.0, w, h), r.into(), 2.0, f, Color::WHITE, TEST_UV);
             assert_well_formed(&v, &tr);
             for tri in &tr {
                 assert!(cross(&v, tri) > 0.0, "环带三角形 {tri:?} 绕序反了");
@@ -997,7 +1023,7 @@ mod tests {
                 &t,
                 RoundedRectSpec {
                     rect: Rect::new(0.0, 0.0, 40.0, 40.0),
-                    radius: r,
+                    radius: r.into(),
                     feather: f,
                     corners: [Color::WHITE; 4],
                     uv: TEST_UV,
@@ -1010,7 +1036,7 @@ mod tests {
                 &mut tr,
                 &t,
                 Rect::new(0.0, 0.0, 40.0, 40.0),
-                r,
+                r.into(),
                 bw,
                 f,
                 Color::WHITE,
@@ -1034,7 +1060,7 @@ mod tests {
         // 环带：边框宽 2 ⇒ 上边中点的中心线在 y = 1 处。
         let mut v = Vec::new();
         let mut tr = Vec::new();
-        push_rounded_ring(&mut v, &mut tr, &t, rect, 8.0, 2.0, DEFAULT_FEATHER, Color::WHITE, TEST_UV);
+        push_rounded_ring(&mut v, &mut tr, &t, rect, 8.0.into(), 2.0, DEFAULT_FEATHER, Color::WHITE, TEST_UV);
         for p in [
             Vec2::new(30.0, 1.0),  // 上边
             Vec2::new(30.0, 39.0), // 下边
@@ -1059,7 +1085,7 @@ mod tests {
             &mut v,
             &mut tr,
             &t,
-            RoundedRectSpec { rect, radius: 8.0, feather: DEFAULT_FEATHER, corners: [Color::WHITE; 4], uv: TEST_UV },
+            RoundedRectSpec { rect, radius: 8.0.into(), feather: DEFAULT_FEATHER, corners: [Color::WHITE; 4], uv: TEST_UV },
         );
         for p in [
             Vec2::new(30.0, 0.75),
@@ -1254,7 +1280,109 @@ mod tests {
         assert_eq!(a.pts.len(), N_FINE as usize + 1, "表含两端点");
     }
 
-    // ─── 采样 UV（曾经让所有镶嵌图形整块变透明的 BUG） ────────
+    // ─── 四角各自的半径 ────────────────────────────────────
+
+    /// 离某个角最近的顶点距离（用于区分"这个角是圆的还是直的"）。
+    fn nearest_vertex_dist(v: &[VertexP3U2C4], corner: Vec2) -> f32 {
+        v.iter()
+            .map(|x| (Vec2::new(x.pos[0], x.pos[1]) - corner).length())
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    #[test]
+    fn only_some_corners_are_rounded() {
+        // 「只圆上面两个角」：TL / TR 有 12px 弧，BL / BR 是直角。
+        // 判据：圆角的最近顶点离角 = `r(√2 - 1)` ≈ 0.414r（12px ⇒ 4.97px）；
+        // 直角的几乎贴角（≈ 0.2px，来自 0.5px 的半径下限）。
+        let t = table();
+        let rect = Rect::new(0.0, 0.0, 120.0, 60.0);
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        push_rounded_rect(
+            &mut v,
+            &mut tr,
+            &t,
+            RoundedRectSpec {
+                rect,
+                radius: CornerRadius { tl: 12.0, tr: 12.0, br: 0.0, bl: 0.0 },
+                feather: 0.0,
+                corners: [Color::WHITE; 4],
+                uv: TEST_UV,
+            },
+        );
+        assert_well_formed(&v, &tr);
+        let dg = |c: Vec2| nearest_vertex_dist(&v, c);
+        let tl = dg(Vec2::new(rect.x, rect.y));
+        let br = dg(Vec2::new(rect.x + rect.w, rect.y + rect.h));
+        let bl = dg(Vec2::new(rect.x, rect.y + rect.h));
+        assert!(tl > 3.0, "TL 应为 12px 圆角（最近顶点距离 {tl}）");
+        assert!(br < 1.5, "BR 应为直角（最近顶点距离 {br}）");
+        assert!(bl < 1.5, "BL 应为直角（最近顶点距离 {bl}）");
+        // 弧位于上边：`x = 12` 处的上边点必须存在（圆角切掉了左上角）。
+        assert!(vertex_at(&v, Vec2::new(12.0, 0.0)).is_some(), "TL 弧的上端点应存在");
+        assert!(vertex_at(&v, Vec2::new(108.0, 0.0)).is_some(), "TR 弧的上端点应存在");
+        // 包围盒仍等于 rect（直角那两角把外沿顶满）。
+        let xs: Vec<f32> = v.iter().map(|x| x.pos[0]).collect();
+        let ys: Vec<f32> = v.iter().map(|x| x.pos[1]).collect();
+        assert!((xs.iter().copied().fold(f32::INFINITY, f32::min) - rect.x).abs() < 1e-3);
+        assert!((xs.iter().copied().fold(f32::NEG_INFINITY, f32::max) - (rect.x + rect.w)).abs() < 1e-3);
+        assert!((ys.iter().copied().fold(f32::NEG_INFINITY, f32::max) - (rect.y + rect.h)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn oversized_corner_radii_shrink_equally() {
+        // 四角之和超过边长 ⇒ 等比收缩（不是各自 clamp 把形状削平）。
+        // 40 宽 + 上下各 30 ⇒ 比例 2/3 ⇒ 20/20。
+        let t = table();
+        let rect = Rect::new(0.0, 0.0, 40.0, 40.0);
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        push_rounded_rect(
+            &mut v,
+            &mut tr,
+            &t,
+            RoundedRectSpec {
+                rect,
+                radius: CornerRadius { tl: 30.0, tr: 30.0, br: 30.0, bl: 30.0 },
+                feather: 0.0,
+                corners: [Color::WHITE; 4],
+                uv: TEST_UV,
+            },
+        );
+        assert_well_formed(&v, &tr);
+        // 收缩到 r = 20 ⇒ 左上角的最近顶点距离 = 20(√2 - 1) ≈ 8.28（未收缩的 30 会是 12.4）。
+        let d = nearest_vertex_dist(&v, Vec2::new(0.0, 0.0));
+        assert!((d - 8.284).abs() < 0.5, "收缩后应为 r=20 的弧（距离 {d}）");
+    }
+
+    #[test]
+    fn ring_supports_per_corner_radii() {
+        let t = table();
+        for radii in [
+            CornerRadius { tl: 10.0, tr: 10.0, br: 0.0, bl: 0.0 },
+            CornerRadius { tl: 12.0, tr: 0.0, br: 12.0, bl: 0.0 },
+            CornerRadius::all(8.0),
+        ] {
+            let mut v = Vec::new();
+            let mut tr = Vec::new();
+            push_rounded_ring(
+                &mut v,
+                &mut tr,
+                &t,
+                Rect::new(0.0, 0.0, 80.0, 40.0),
+                radii,
+                2.0,
+                DEFAULT_FEATHER,
+                Color::WHITE,
+                TEST_UV,
+            );
+            assert!(!v.is_empty() && !tr.is_empty());
+            assert_well_formed(&v, &tr);
+            for tri in &tr {
+                assert!(cross(&v, tri) >= 0.0, "环带出现负面积：{tri:?}");
+            }
+        }
+    }
 
     #[test]
     fn every_vertex_carries_the_given_uv() {
@@ -1290,7 +1418,7 @@ mod tests {
                 &mut tr,
                 &t,
                 Rect::new(0.0, 0.0, 40.0, 24.0),
-                r,
+                r.into(),
                 bw,
                 DEFAULT_FEATHER,
                 Color::WHITE,
@@ -1330,7 +1458,7 @@ mod tests {
             &mut tr,
             &t,
             Rect::new(0.0, 0.0, 40.0, 20.0),
-            0.0,
+            0.0.into(),
             2.0,
             DEFAULT_FEATHER,
             Color::WHITE,
@@ -1361,7 +1489,7 @@ mod tests {
                 &mut tr,
                 &t,
                 Rect::new(2.0, 3.0, w, h),
-                r,
+                r.into(),
                 bw,
                 DEFAULT_FEATHER,
                 Color::WHITE,
@@ -1385,7 +1513,7 @@ mod tests {
             &mut tr,
             &t,
             Rect::new(0.0, 0.0, 100.0, 40.0),
-            12.0,
+            12.0.into(),
             1.0,
             DEFAULT_FEATHER,
             Color::WHITE,
@@ -1408,7 +1536,7 @@ mod tests {
                 &mut tr,
                 &t,
                 Rect::new(0.0, 0.0, w, h),
-                4.0,
+                4.0.into(),
                 bw,
                 DEFAULT_FEATHER,
                 Color::WHITE,
