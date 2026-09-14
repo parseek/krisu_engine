@@ -1020,6 +1020,23 @@ impl PanelStyle {
 }
 
 impl ButtonStyle {
+    /// **按交互态挑背景刷**：按下 > 悬停 > 常态。
+    ///
+    /// 抽成一个方法而不是各处手写 `if`：下拉框触发按钮曾写成
+    /// `if open { bg_pressed } else { bg }`——**完全没有 hover 反馈**，鼠标移上去毫无
+    /// 变化，与按钮 / 滑条的观感不一致。现在按钮与下拉框共用这一处，漏掉悬停态会在
+    /// 两边同时暴露。
+    #[inline]
+    pub fn pick_bg(&self, pressed: bool, hovered: bool) -> Brush {
+        if pressed {
+            self.bg_pressed
+        } else if hovered {
+            self.bg_hover
+        } else {
+            self.bg
+        }
+    }
+
     /// 常态背景刷（接受 [`Color`] 或 [`Brush`]）。
     pub fn with_bg(mut self, c: impl Into<Brush>) -> Self {
         self.bg = c.into();
@@ -1773,6 +1790,22 @@ mod tests {
         assert_eq!(t.combo.menu_radius, 6.0, "浮层圆角上限 6");
         // 小半径时浮层跟随全局半径
         assert_eq!(Theme::dark().with_radius(3.0).combo.menu_radius, 3.0);
+    }
+
+    #[test]
+    fn pick_bg_covers_all_three_interaction_states() {
+        // 回归：下拉框触发按钮曾写成 `if open { bg_pressed } else { bg }` ⇒ 没有悬停反馈。
+        // 三态必须各自可达，且优先级 = 按下 > 悬停 > 常态。
+        let s = ButtonStyle {
+            bg: Brush::Solid(Color::RED),
+            bg_hover: Brush::Solid(Color::GREEN),
+            bg_pressed: Brush::Solid(Color::BLUE),
+            ..ButtonStyle::default()
+        };
+        assert_eq!(s.pick_bg(false, false), Color::RED, "常态");
+        assert_eq!(s.pick_bg(false, true), Color::GREEN, "**悬停必须可达**");
+        assert_eq!(s.pick_bg(true, false), Color::BLUE, "按下");
+        assert_eq!(s.pick_bg(true, true), Color::BLUE, "按下优先于悬停");
     }
 
     #[test]

@@ -226,6 +226,7 @@ impl<'a> UiInit<'a> {
             mouse_in_window,
             any_pressed: false,
             press_claimed: false,
+            next_input_corners: None,
             drag_panel: None,
             win_press_top: None,
             win_origins: std::collections::HashMap::new(),
@@ -390,6 +391,10 @@ pub struct Ui<'a> {
     /// 输入框/TextArea 在按下响应时置位，`window_at` / `panel_impl` 据此**不建立**
     /// 拖拽基准——从输入框上拖拽 = 选择文本，而不是拖动窗口。
     press_claimed: bool,
+    /// **一次性**覆盖下一个输入框面板的圆角（[`Self::text_input_corners`] 写入、
+    /// `text_input_at` 读后即清）。`NumberInput` 靠它让文本框只圆左侧两角，
+    /// 与右侧拖拽手柄拼成一条直边。
+    next_input_corners: Option<CornerRadius>,
     /// 当前拖拽中的面板 / 窗口 **绝对 ID**（拖动期间抑制子控件交互）。
     drag_panel: Option<IdAbsolute<'static>>,
     /// 本帧按下命中的**最上层窗口**（重叠点击裁决：只让最高 z 窗口拖拽与置顶）。
@@ -4390,10 +4395,13 @@ impl Ui<'_> {
                 self.state.combo_open = None;
             }
         }
-        // 按钮绘制（展开时用 pressed 态背景）。
+        // 按钮绘制（三态：按下 / 展开 > 悬停 > 常态）。
+        //
+        // ⚠ 早先只有 `if open { bg_pressed } else { bg }` ——**整个控件没有 hover 反馈**，
+        // 鼠标移上去毫无变化（与按钮 / 滑条的观感不一致）。
         let style = self.theme.button.clone();
         let elem = self.seq + 1;
-        let bg = if open { style.bg_pressed } else { style.bg };
+        let bg = style.pick_bg(ev.pressed || open, hit);
         self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
         let text_rect = Rect::new(
             rect.x + style.padding.x,
@@ -4647,13 +4655,7 @@ impl Ui<'_> {
             }
             let (pressed, hovered) = (ws.pressed, ws.hovered);
             // 记录绘制（ws 借用已结束）
-            let bg = if pressed {
-                style.bg_pressed
-            } else if hovered {
-                style.bg_hover
-            } else {
-                style.bg
-            };
+            let bg = style.pick_bg(pressed, hovered);
             let depth = self.depth;
             let win = self.cur_win;
             let elem = self.seq + 1;
@@ -4881,7 +4883,7 @@ impl Ui<'_> {
             let ws = self.state.widgets.get(abs.as_str()).expect("checkbox ws");
             (ws.hovered, ws.pressed)
         };
-        self.draw_check_common(rect, label, checked, style);
+        self.draw_check_common(rect, label, checked, hovered, style);
         CheckboxState {
             hovered,
             pressed,
@@ -4939,11 +4941,11 @@ impl Ui<'_> {
             .get(group)
             .is_some_and(|s| s.as_str() == abs.as_str());
         let style = self.theme.checkbox.clone();
-        self.draw_check_common(rect, label, checked, &style);
         let (hovered, pressed) = {
             let ws = self.state.widgets.get(abs.as_str()).expect("radio ws");
             (ws.hovered, ws.pressed)
         };
+        self.draw_check_common(rect, label, checked, hovered, &style);
         CheckboxState {
             hovered,
             pressed,
@@ -4954,7 +4956,14 @@ impl Ui<'_> {
     }
 
     /// 勾选框 / 单选公共绘制：方框 +（选中时）填充 + 标签文本（样式可覆盖）。
-    fn draw_check_common(&mut self, rect: Rect, label: &str, checked: bool, style: &CheckboxStyle) {
+    fn draw_check_common(
+        &mut self,
+        rect: Rect,
+        label: &str,
+        checked: bool,
+        hovered: bool,
+        style: &CheckboxStyle,
+    ) {
         let depth = self.depth;
         let win = self.cur_win;
         let elem = self.seq + 1;
@@ -4973,7 +4982,9 @@ impl Ui<'_> {
             rect: box_rect,
             clip: self.clip,
             kind: DrawKind::Border {
-                color: style.box_border,
+                // 悬停时方框描边转向强调色——与按钮 / 下拉框的悬停反馈一致
+                // （此前勾选框 hover 毫无变化，鼠标移上去看不出"可以点"）。
+                color: if hovered { self.theme.focus.color } else { style.box_border },
                 width: style.border_w,
                 radius: style.radius,
             },
@@ -5147,9 +5158,18 @@ impl Ui<'_> {
     /// - **文本选择**：按住拖拽选择（`WidgetState::sel_anchor`），选择优先于窗口/面板拖拽
     ///   （按下时置位 `press_claimed`）；Ctrl+C/V/X 复制/粘贴/剪切；选择后打字/退格替换选择；
     /// - **IME 组合候选移入浮动提示框**：组合串（preedit）画在输入框下方浮动小框中（不再占行内）。
+    ///
+    /// **一次性**覆盖下一个输入框面板的圆角（下一次 [`Self::text_input_at`] 读后即清）。
+    ///
+    /// 给"文本框要和别的东西拼成一条直边"的场景用——内置 `NumberInput` 让文本框
+    /// 只圆**左侧**两角，右侧与拖拽手柄拼平（否则文本框自己的圆角会在手柄左缘
+    /// 留下一个缺口）。普通调用方不需要它。
+    pub(crate) fn text_input_corners(&mut self, radius: CornerRadius) {
+        self.next_input_corners = Some(radius);
+    }
+
     pub fn text_input_at(&mut self, id: &str, rect: Rect, value: &mut String) {
         let id_for = self.id_for(id);
-
         let hit = self.hit_abs(&rect);
         if hit {
             // 鼠标悬停在输入框上 → 本帧系统光标设为 I 型（finish 统一设置）
@@ -5310,7 +5330,10 @@ impl Ui<'_> {
         let saved_clip = self.clip;
         self.clip = clip_for_view(saved_clip, box_clip, ViewMode::Clip);
         // 背景 + 边框（radius > 0 走圆角双层矩形）。
-        self.push_panel_like(rect, style.bg, border, style.border_w, style.radius, elem);
+        // 圆角可以被**一次性**覆盖（[`Self::text_input_corners`]）——`NumberInput` 靠它让
+        // 文本框只圆左侧两角，从而与右侧拖拽手柄拼成一条直边。
+        let panel_radius = self.next_input_corners.take().unwrap_or(style.radius);
+        self.push_panel_like(rect, style.bg, border, style.border_w, panel_radius, elem);
         let content_w = (rect.w - style.padding_x * 2.0).max(0.0);
         let content_rect = Rect::new(rect.x + style.padding_x, rect.y, content_w, rect.h);
         // **IME 组合内联融入**：显示串 = value[..caret] + preedit + value[caret..]——

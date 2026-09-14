@@ -115,9 +115,19 @@ impl Widget for NumberInput<'_> {
             .as_ref()
             .is_some_and(|f| f.as_str() == id_for.as_str());
 
-        const GRIP_W: f32 = 16.0;
+        // 手柄宽度：16px 太窄（`≡` 几乎贴边、并与文本框的圆角打架），20px 更从容。
+        const GRIP_W: f32 = 20.0;
         let grip = Rect::new(rect.x + rect.w - GRIP_W, rect.y, GRIP_W, rect.h);
         let text_rect = Rect::new(rect.x, rect.y, (rect.w - GRIP_W).max(0.0), rect.h);
+        // 文本框**只圆左侧两角**：右侧要与手柄拼成一条直边，否则它自己的圆角会在
+        // 手柄左缘处留下一个缺口（"两个方块错位"的观感就是这么来的）。
+        let in_radius = ui.theme.input.radius;
+        ui.text_input_corners(CornerRadius {
+            tl: in_radius.tl,
+            tr: 0.0,
+            br: 0.0,
+            bl: in_radius.bl,
+        });
         let grip_hit = ui.hit_abs(&grip);
         let btn = ui.mouse_left();
         ui.register_focus(&id_for, rect, FocusKind::TextInput);
