@@ -5,6 +5,101 @@ use std::sync::Arc;
 use rjw_color::Color;
 use rjw_text::Align;
 
+/// **背景刷**：纯色 / 两端色渐变。
+///
+/// # 为什么只有"两端色"
+///
+/// 渐变由光栅化器对**顶点色**做双线性插值产生——`DrawKind::Rect` 走四边形四角色，
+/// 圆角走 CPU 镶嵌的逐顶点色（见 `crate::tess`）。**不需要任何渐变纹理**，
+/// 因此背景刷不引入新的纹理 / 图集压力。
+///
+/// 只有两端色是刻意的：多段色标（stops）的能力在 [`crate::Gradient`]（显式绘制原语，
+/// 支持 `rotated`）与 `rjw_text::Gradient`（文字，支持多段 + 逐字形 / 逐行 / 整块）。
+/// 单控件背景刷要的是"一个便宜的默认值"，多了反而让主题维护成本翻倍。
+///
+/// # 与圆角共存
+///
+/// `Brush` 给出**四角颜色**；圆角镶嵌直接吃四角色 ⇒ 「圆角 + 渐变」自然成立。
+/// 需要四角各异（对角渐变）时用 [`crate::Gradient::corners`] 走绘制原语，
+/// 不在主题里表达。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Brush {
+    /// 纯色（直角时只产生 4 个顶点，最省）。
+    Solid(Color),
+    /// 垂直两端色（**上 → 下**）。
+    Vertical(Color, Color),
+    /// 水平两端色（**左 → 右**）。
+    Horizontal(Color, Color),
+}
+
+impl Brush {
+    /// 四角颜色 `[TL, TR, BL, BR]`——所有绘制路径的统一输入。
+    #[inline]
+    pub fn corners(self) -> [Color; 4] {
+        match self {
+            Brush::Solid(c) => [c; 4],
+            Brush::Vertical(t, b) => [t, t, b, b],
+            Brush::Horizontal(l, r) => [l, r, l, r],
+        }
+    }
+
+    /// 与纯色等价时返回该颜色（否则 `None`）——用于选更省的绘制路径 / 诊断。
+    #[inline]
+    pub fn as_solid(self) -> Option<Color> {
+        match self {
+            Brush::Solid(c) => Some(c),
+            Brush::Vertical(t, b) if t == b => Some(t),
+            Brush::Horizontal(l, r) if l == r => Some(l),
+            _ => None,
+        }
+    }
+
+    /// 换一个"整体色调"：纯色直接替换；渐变把两端色都替换为该色（= 退化成纯色）。
+    /// 供主题级 `with_*` 便捷方法使用。
+    #[inline]
+    pub fn map_colors(self, f: impl Fn(Color) -> Color) -> Self {
+        match self {
+            Brush::Solid(c) => Brush::Solid(f(c)),
+            Brush::Vertical(t, b) => Brush::Vertical(f(t), f(b)),
+            Brush::Horizontal(l, r) => Brush::Horizontal(f(l), f(r)),
+        }
+    }
+}
+
+impl From<Color> for Brush {
+    #[inline]
+    fn from(c: Color) -> Self {
+        Brush::Solid(c)
+    }
+}
+
+/// 与纯色比较（渐变在与两端同色时也等价于纯色）——让 `theme.panel.bg == Color::RED`
+/// 这类断言与用户代码直接可写。
+impl PartialEq<Color> for Brush {
+    #[inline]
+    fn eq(&self, other: &Color) -> bool {
+        self.as_solid() == Some(*other)
+    }
+}
+
+impl Default for Brush {
+    fn default() -> Self {
+        Brush::Solid(Color::WHITE)
+    }
+}
+
+/// 垂直两端色渐变刷（上 → 下）的便捷构造糖。
+#[inline]
+pub fn vgrad(top: Color, bottom: Color) -> Brush {
+    Brush::Vertical(top, bottom)
+}
+
+/// 水平两端色渐变刷（左 → 右）的便捷构造糖。
+#[inline]
+pub fn hgrad(left: Color, right: Color) -> Brush {
+    Brush::Horizontal(left, right)
+}
+
 /// 全局 UI 主题：所有控件样式 + 通用间距。
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -246,10 +341,13 @@ impl LabelStyle {
 }
 
 impl PanelStyle {
-    /// 深色主题预设：深灰面板 + 边框。
+    /// 深色主题预设：深灰面板 + 边框，背景带**极轻的纵向渐变**（上亮下暗）。
+    ///
+    /// 纯平色在深色主题下边界"糊"，一点明暗差即可把面板从背景里"抬"起来，
+    /// 且不引入任何纹理（四角色走顶点色，见 [`Brush`]）。
     pub fn dark() -> Self {
         Self {
-            bg: Color::rgba_u8(38, 42, 52, 255),
+            bg: Brush::Vertical(Color::rgba_u8(40, 44, 54, 255), Color::rgba_u8(32, 35, 44, 255)),
             border: Color::rgba_u8(70, 78, 96, 255),
             ..Self::default()
         }
@@ -257,12 +355,18 @@ impl PanelStyle {
 }
 
 impl ButtonStyle {
-    /// 深色主题预设：深色三态背景。
+    /// 深色主题预设：深色三态背景（各带轻微纵向渐变，按下时更亮、更"凸"）。
     pub fn dark() -> Self {
         Self {
-            bg: Color::rgba_u8(52, 58, 70, 255),
-            bg_hover: Color::rgba_u8(66, 76, 96, 255),
-            bg_pressed: Color::rgba_u8(90, 110, 150, 255),
+            bg: Brush::Vertical(Color::rgba_u8(58, 64, 78, 255), Color::rgba_u8(46, 51, 63, 255)),
+            bg_hover: Brush::Vertical(
+                Color::rgba_u8(72, 82, 104, 255),
+                Color::rgba_u8(58, 66, 84, 255),
+            ),
+            bg_pressed: Brush::Vertical(
+                Color::rgba_u8(84, 102, 142, 255),
+                Color::rgba_u8(64, 80, 116, 255),
+            ),
             fg: Color::rgba_u8(230, 230, 230, 255),
             border: Color::rgba_u8(90, 98, 118, 255),
             ..Self::default()
@@ -285,9 +389,12 @@ impl SliderStyle {
 
 impl InputStyle {
     /// 深色主题预设：深色输入框 + 亮边框 / 光标 / 选择。
+    ///
+    /// 背景带**反向**纵向渐变（上暗下亮）——与面板/按钮相反的方向给出"凹陷"感，
+    /// 这是深色 UI 里区分可编辑区域与按钮的最小手段。
     pub fn dark() -> Self {
         Self {
-            bg: Color::rgba_u8(28, 32, 40, 255),
+            bg: Brush::Vertical(Color::rgba_u8(22, 25, 32, 255), Color::rgba_u8(30, 34, 42, 255)),
             border: Color::rgba_u8(80, 88, 104, 255),
             border_focus: Color::rgba_u8(110, 160, 230, 255),
             fg: Color::rgba_u8(230, 230, 230, 255),
@@ -397,7 +504,8 @@ impl Default for LabelStyle {
 /// 面板（背景 + 边框）样式。
 #[derive(Clone, Debug)]
 pub struct PanelStyle {
-    pub bg: Color,
+    /// 背景刷（纯色 / 两端色渐变；与 `radius` 组合即「圆角 + 渐变」）。
+    pub bg: Brush,
     pub border: Color,
     pub border_w: f32,
     /// 内容区内边距（像素）。
@@ -409,7 +517,7 @@ pub struct PanelStyle {
 impl Default for PanelStyle {
     fn default() -> Self {
         Self {
-            bg: Color::rgba_u8(245, 245, 245, 255),
+            bg: Brush::Solid(Color::rgba_u8(245, 245, 245, 255)),
             border: Color::rgba_u8(180, 180, 180, 255),
             border_w: 1.0,
             padding: 8.0,
@@ -421,9 +529,13 @@ impl Default for PanelStyle {
 /// 按钮样式（normal / hover / pressed 三态）。
 #[derive(Clone, Debug)]
 pub struct ButtonStyle {
-    pub bg: Color,
-    pub bg_hover: Color,
-    pub bg_pressed: Color,
+    /// 常态背景刷。默认给一点纵向微渐变：纯平色在深色主题下偏死板，
+    /// 一点明暗差即有体积感，且**零纹理成本**。
+    pub bg: Brush,
+    /// 悬停背景刷。
+    pub bg_hover: Brush,
+    /// 按下背景刷。
+    pub bg_pressed: Brush,
     pub fg: Color,
     pub border: Color,
     pub border_w: f32,
@@ -438,9 +550,9 @@ pub struct ButtonStyle {
 impl Default for ButtonStyle {
     fn default() -> Self {
         Self {
-            bg: Color::rgba_u8(225, 225, 225, 255),
-            bg_hover: Color::rgba_u8(205, 225, 250, 255),
-            bg_pressed: Color::rgba_u8(170, 200, 235, 255),
+            bg: Brush::Solid(Color::rgba_u8(225, 225, 225, 255)),
+            bg_hover: Brush::Solid(Color::rgba_u8(205, 225, 250, 255)),
+            bg_pressed: Brush::Solid(Color::rgba_u8(170, 200, 235, 255)),
             fg: Color::rgba_u8(30, 30, 30, 255),
             border: Color::rgba_u8(150, 150, 150, 255),
             border_w: 1.0,
@@ -487,7 +599,8 @@ impl Default for SliderStyle {
 /// 文本输入框样式。
 #[derive(Clone, Debug)]
 pub struct InputStyle {
-    pub bg: Color,
+    /// 背景刷（默认略微纵向渐变的凹陷感）。
+    pub bg: Brush,
     pub border: Color,
     pub border_focus: Color,
     pub fg: Color,
@@ -514,7 +627,7 @@ pub struct InputStyle {
 impl Default for InputStyle {
     fn default() -> Self {
         Self {
-            bg: Color::rgba_u8(255, 255, 255, 255),
+            bg: Brush::Solid(Color::rgba_u8(255, 255, 255, 255)),
             border: Color::rgba_u8(160, 160, 160, 255),
             border_focus: Color::rgba_u8(80, 140, 220, 255),
             fg: Color::rgba_u8(30, 30, 30, 255),
@@ -644,8 +757,9 @@ impl LabelStyle {
 }
 
 impl PanelStyle {
-    pub fn with_bg(mut self, c: Color) -> Self {
-        self.bg = c;
+    /// 背景刷（接受 [`Color`] 或 [`Brush`]：`Color: Into<Brush>` 等价纯色）。
+    pub fn with_bg(mut self, c: impl Into<Brush>) -> Self {
+        self.bg = c.into();
         self
     }
     pub fn with_border(mut self, c: Color) -> Self {
@@ -669,19 +783,19 @@ impl PanelStyle {
 }
 
 impl ButtonStyle {
-    /// 常态背景。
-    pub fn with_bg(mut self, c: Color) -> Self {
-        self.bg = c;
+    /// 常态背景刷（接受 [`Color`] 或 [`Brush`]）。
+    pub fn with_bg(mut self, c: impl Into<Brush>) -> Self {
+        self.bg = c.into();
         self
     }
-    /// 悬停背景。
-    pub fn with_bg_hover(mut self, c: Color) -> Self {
-        self.bg_hover = c;
+    /// 悬停背景刷。
+    pub fn with_bg_hover(mut self, c: impl Into<Brush>) -> Self {
+        self.bg_hover = c.into();
         self
     }
-    /// 按下背景。
-    pub fn with_bg_pressed(mut self, c: Color) -> Self {
-        self.bg_pressed = c;
+    /// 按下背景刷。
+    pub fn with_bg_pressed(mut self, c: impl Into<Brush>) -> Self {
+        self.bg_pressed = c.into();
         self
     }
     /// 文本前景色。
@@ -762,8 +876,9 @@ impl SliderStyle {
 }
 
 impl InputStyle {
-    pub fn with_bg(mut self, c: Color) -> Self {
-        self.bg = c;
+    /// 背景刷（接受 [`Color`] 或 [`Brush`]）。
+    pub fn with_bg(mut self, c: impl Into<Brush>) -> Self {
+        self.bg = c.into();
         self
     }
     pub fn with_border(mut self, c: Color) -> Self {
@@ -1137,7 +1252,7 @@ mod tests {
     #[test]
     fn with_substyle_replaces_whole_style() {
         let mut button = Theme::dark().button;
-        button.bg = Color::RED;
+        button.bg = Color::RED.into();
         let t = Theme::dark().with_button(button);
         assert_eq!(t.button.bg, Color::RED);
         // 未替换的子样式仍是 dark 预设
@@ -1194,6 +1309,74 @@ mod tests {
         assert_eq!(m.size, Some(glam::Vec2::new(100.0, 80.0)));
         // with_fullscreen 恢复全屏遮罩。
         assert_eq!(ModalStyle::default().with_fullscreen().size, None);
+    }
+
+    // ─── Brush（背景刷） ──────────────────────────────────────
+
+    #[test]
+    fn brush_corners_map_endpoints_to_the_right_quadrants() {
+        let (t, b) = (Color::RED, Color::BLUE);
+        // 垂直 = 上 → 下：TL/TR 取上端色，BL/BR 取下端色
+        assert_eq!(
+            Brush::Vertical(t, b).corners(),
+            [t, t, b, b],
+            "垂直渐变的两端必须落在上下两行"
+        );
+        // 水平 = 左 → 右：TL/BL 取左端色，TR/BR 取右端色
+        assert_eq!(
+            Brush::Horizontal(t, b).corners(),
+            [t, b, t, b],
+            "水平渐变的两端必须落在左右两列"
+        );
+        assert_eq!(Brush::Solid(t).corners(), [t; 4]);
+    }
+
+    #[test]
+    fn brush_as_solid_detects_degenerate_gradients() {
+        assert_eq!(Brush::Solid(Color::RED).as_solid(), Some(Color::RED));
+        // 两端同色的渐变等价于纯色（用于挑更省的绘制路径）
+        assert_eq!(Brush::Vertical(Color::RED, Color::RED).as_solid(), Some(Color::RED));
+        assert_eq!(Brush::Horizontal(Color::RED, Color::RED).as_solid(), Some(Color::RED));
+        assert_eq!(Brush::Vertical(Color::RED, Color::BLUE).as_solid(), None);
+    }
+
+    #[test]
+    fn brush_compares_against_plain_color() {
+        // 主题断言 / 用户代码可直接与 Color 比：纯色等价才算相等。
+        assert_eq!(Brush::Solid(Color::RED), Color::RED);
+        assert_ne!(Brush::Vertical(Color::RED, Color::BLUE), Color::RED);
+        assert_eq!(Brush::Vertical(Color::RED, Color::RED), Color::RED);
+    }
+
+    #[test]
+    fn brush_from_color_and_map_colors() {
+        let b: Brush = Color::GREEN.into();
+        assert_eq!(b, Color::GREEN);
+        // map_colors 对渐变逐端施加
+        let mapped = Brush::Vertical(Color::RED, Color::BLUE).map_colors(|_| Color::BLACK);
+        assert_eq!(mapped, Brush::Vertical(Color::BLACK, Color::BLACK));
+    }
+
+    #[test]
+    fn dark_theme_backgrounds_are_gradients_not_flat() {
+        // 深色主题的默认背景是**纵向微渐变**（上亮下暗 / 输入框反向）。
+        let t = Theme::dark();
+        let panel = t.panel.bg.corners();
+        assert_eq!(panel[0], panel[1], "面板上沿同色");
+        assert_eq!(panel[2], panel[3], "面板下沿同色");
+        assert_ne!(panel[0], panel[2], "面板上下不同色（确有渐变）");
+        // 输入框反向：上暗下亮
+        let input = t.input.bg.corners();
+        assert!(luma(input[0]) < luma(input[2]), "输入框应上暗下亮（凹陷感）");
+        // 按钮正向：上亮下暗
+        let btn = t.button.bg.corners();
+        assert!(luma(btn[0]) > luma(btn[2]), "按钮应上亮下暗（凸起感）");
+    }
+
+    /// 近似亮度（仅用于比较明暗方向）。
+    fn luma(c: Color) -> f32 {
+        let a: [f32; 4] = c.into();
+        0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]
     }
 
     #[test]

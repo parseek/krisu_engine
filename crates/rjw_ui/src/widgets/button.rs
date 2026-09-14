@@ -6,7 +6,7 @@ use glam::Vec2;
 use rjw_color::Color;
 use rjw_transform::Rect;
 use crate::draw::Size;
-use crate::style::{ButtonStyle, Theme};
+use crate::style::{Brush, ButtonStyle, Theme};
 use crate::ui::Ui;
 use super::{Response, Widget};
 
@@ -18,9 +18,9 @@ pub struct Button<'a> {
     label: &'a str,
     /// 文本色（默认 `ButtonStyle::fg`）。
     color: Option<Color>,
-    bg: Option<Color>,
-    bg_hover: Option<Color>,
-    bg_pressed: Option<Color>,
+    bg: Option<Brush>,
+    bg_hover: Option<Brush>,
+    bg_pressed: Option<Brush>,
     border: Option<Color>,
     border_w: Option<Size<f32>>,
     /// 圆角半径（[`Size<f32>`]：逻辑（默认）或物理；0 = 直角）。
@@ -54,19 +54,19 @@ impl<'a> Button<'a> {
         self.color = Some(c);
         self
     }
-    /// 常态背景（默认 `ButtonStyle::bg`）。
-    pub fn bg(mut self, c: Color) -> Self {
-        self.bg = Some(c);
+    /// 常态背景刷（默认 `ButtonStyle::bg`；接受 [`Color`] 或 [`Brush`]）。
+    pub fn bg(mut self, c: impl Into<Brush>) -> Self {
+        self.bg = Some(c.into());
         self
     }
-    /// 悬停背景（默认 `ButtonStyle::bg_hover`）。
-    pub fn bg_hover(mut self, c: Color) -> Self {
-        self.bg_hover = Some(c);
+    /// 悬停背景刷（默认 `ButtonStyle::bg_hover`）。
+    pub fn bg_hover(mut self, c: impl Into<Brush>) -> Self {
+        self.bg_hover = Some(c.into());
         self
     }
-    /// 按下背景（默认 `ButtonStyle::bg_pressed`）。
-    pub fn bg_pressed(mut self, c: Color) -> Self {
-        self.bg_pressed = Some(c);
+    /// 按下背景刷（默认 `ButtonStyle::bg_pressed`）。
+    pub fn bg_pressed(mut self, c: impl Into<Brush>) -> Self {
+        self.bg_pressed = Some(c.into());
         self
     }
     /// 边框颜色（默认 `ButtonStyle::border`）。

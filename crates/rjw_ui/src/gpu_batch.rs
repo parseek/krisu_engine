@@ -365,6 +365,24 @@ pub(crate) fn resample_gradient(gradient: Gradient, local: Rect, orig: Rect) -> 
     [at(l, t), at(r, t), at(l, b), at(r, b)]
 }
 
+/// **局部空间的渐变重采样**（[`resample_gradient`] 的调用点助手）。
+///
+/// `local` 是**窗口局部**物理矩形（已减 `anchor_px`），而调用点手里通常只有命令的
+/// **绝对**矩形 `abs`。必须先把 `abs` 换算到同一空间再重采样：
+/// ⚠ 直接把绝对矩形当 `orig` 传给 [`resample_gradient`]，`u = (local.x - orig.x)/w`
+/// 就会整体偏心 `anchor_px`（窗口内容的渐变被平移，甚至外推出界——`lerp_color`
+/// 不过滤，颜色会越界）。这条不变量集中在这里，避免两个调用点各错一次。
+#[inline]
+pub(crate) fn resample_gradient_local(
+    gradient: Gradient,
+    local: Rect,
+    abs: Rect,
+    anchor_px: Vec2,
+) -> [Color; 4] {
+    let orig = Rect::new(abs.x - anchor_px.x, abs.y - anchor_px.y, abs.w, abs.h);
+    resample_gradient(gradient, local, orig)
+}
+
 // ─── 内容签名（窗口顶点缓存失效判定） ─────────────────────────
 
 /// **窗口/放置内容签名哈希**（提取为自由函数，便于无 `Ui` 实例的单元测试）。
@@ -386,9 +404,11 @@ pub(crate) fn cmd_sig_hash(h: &mut std::collections::hash_map::DefaultHasher, d:
             0u8.hash(h);
             color_bits(*c).hash(h);
         }
-        DrawKind::RoundedRect { color, radius } => {
+        DrawKind::RoundedRect { corners, radius } => {
             5u8.hash(h);
-            color_bits(*color).hash(h);
+            for c in corners {
+                color_bits(*c).hash(h);
+            }
             radius.to_bits().hash(h);
         }
         DrawKind::Rect(g) => {
@@ -630,5 +650,52 @@ mod batch_contract_tests {
         assert!(g.is_empty(), "只有顶点没有三角形不算几何");
         g.tris.push([0, 0, 0]);
         assert!(!g.is_empty());
+    }
+
+    /// **局部 / 绝对空间不变量**：渐变重采样结果不得随窗口原点（`anchor_px`）变化。
+    ///
+    /// 回归：曾把命令的**绝对**矩形直接当 `orig` 传给 `resample_gradient`，而
+    /// `local` 已减去 `anchor_px` ⇒ u/v 整体偏心窗口原点，窗口内渐变被平移 / 外推出界。
+    #[test]
+    fn gradient_resample_is_anchor_invariant() {
+        use super::resample_gradient_local;
+        use crate::draw::Gradient;
+        use glam::Vec2;
+        use rjw_color::Color;
+        use rjw_transform::Rect;
+        let g = Gradient::horizontal(Color::RED, Color::BLUE);
+        let size = Vec2::new(200.0, 40.0);
+        // 未裁剪：四角色必须恰好是渐变两端色，与窗口原点无关。
+        for anchor in [Vec2::ZERO, Vec2::new(37.0, 11.0), Vec2::new(-500.0, 250.0)] {
+            let abs = Rect::new(anchor.x + 10.0, anchor.y + 5.0, size.x, size.y);
+            let local = Rect::new(10.0, 5.0, size.x, size.y);
+            let c = resample_gradient_local(g, local, abs, anchor);
+            assert_eq!(c[0], Color::RED, "左上应为左端色（anchor={anchor:?}）");
+            assert_eq!(c[2], Color::RED, "左下应为左端色");
+            assert_eq!(c[1], Color::BLUE, "右上应为右端色");
+            assert_eq!(c[3], Color::BLUE, "右下应为右端色");
+        }
+    }
+
+    /// 裁剪后颜色仍锚定在**原矩形**上（不随裁剪平移）。
+    #[test]
+    fn gradient_resample_stays_anchored_when_clipped() {
+        use super::resample_gradient_local;
+        use crate::draw::Gradient;
+        use glam::Vec2;
+        use rjw_color::Color;
+        use rjw_transform::Rect;
+        let g = Gradient::horizontal(Color::RED, Color::BLUE);
+        // 原矩形宽 200，裁掉左边 100 ⇒ 剩下右半，左边界应恰为 50% 混色。
+        let local = Rect::new(100.0, 0.0, 100.0, 10.0);
+        let orig = Rect::new(0.0, 0.0, 200.0, 10.0);
+        let c = resample_gradient_local(g, local, orig, Vec2::ZERO);
+        let mid = crate::draw::lerp_color(Color::RED, Color::BLUE, 0.5);
+        let a: [f32; 4] = c[0].into();
+        let b: [f32; 4] = mid.into();
+        for i in 0..4 {
+            assert!((a[i] - b[i]).abs() < 1e-4, "裁剪后左边界应为 50% 混色，实际 {a:?}");
+        }
+        assert_eq!(c[1], Color::BLUE, "裁剪后右边界仍是右端色");
     }
 }

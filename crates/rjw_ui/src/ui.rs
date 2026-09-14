@@ -40,7 +40,7 @@ use crate::draw::{
 // 顶点收集 / 合批机制（原在此文件，见 `gpu_batch` 模块文档）。
 use crate::gpu_batch::{
     CacheStats, CachedQuad, Geom, QuadCollector, cmd_sig_hash, debug_layout_outline, line_row_at_y,
-    resample_gradient, safe_line_slice, segment_runs, vertex_p3u2c4,
+    resample_gradient, resample_gradient_local, safe_line_slice, segment_runs, vertex_p3u2c4,
 };
 use crate::edit::{
     byte_to_char, caret_at_visual_click, caret_index_by_width, char_to_byte, insert_char_at,
@@ -892,7 +892,7 @@ impl<'a> Ui<'a> {
         let size = size.into().to_physical(self.scale);
         let radius = radius.into().to_physical(self.scale);
         self.push_draw(
-            DrawKind::RoundedRect { color, radius },
+            DrawKind::RoundedRect { corners: [color; 4], radius },
             Rect::new(pos.x, pos.y, size.x, size.y),
         );
     }
@@ -946,26 +946,42 @@ impl<'a> Ui<'a> {
         self.queue.push(UiDraw { depth, seq, win, elem: 0, rect, clip: self.clip, kind });
     }
 
-    /// 按样式 push **背景 + 边框**（`radius > 0` 走双层圆角矩形：外圈 border 色、
-    /// 内圈 bg 色内缩 `border_w`，近似圆角边框；否则原 Solid + Border 路径）。
+    /// 按样式 push **背景 + 边框**。
+    ///
+    /// - `radius > 0`：外圈 border 色圆角 + 内圈背景刷圆角（内缩 `border_w`），
+    ///   即"圆角边框"。两层都由 CPU 镶嵌（`crate::tess`），因此**圆角与渐变可共存**。
+    /// - `radius == 0`：`Solid` + `Border`；背景刷为渐变时走 `Rect(Gradient)`。
+    ///
+    /// `bg` 接受 [`Color`] 或 [`crate::Brush`]。渐变**锚定在 `rect` 上**——
+    /// 内圈即使内缩 `border_w`，颜色按其在 `rect` 中的相对位置重采样，
+    /// 不会整体平移（`resample_gradient`）。
+    ///
     /// `elem`：元素序（装饰背景传 0；控件背景传 `self.seq + 1`）。
     /// **控件作者绘制原语**（逻辑坐标，内部 ×scale 取整到物理像素）。
     #[allow(clippy::too_many_arguments)]
     pub fn push_panel_like(
         &mut self,
         rect: Rect,
-        bg: Color,
+        bg: impl Into<crate::style::Brush>,
         border: Color,
         border_w: f32,
         radius: f32,
         elem: u32,
     ) {
+        let bg = bg.into();
         let seq = self.next_seq();
         let depth = self.depth;
         let win = self.cur_win;
         let clip = self.clip;
+        // 渐变锚定在 `rect` 上（内圈重采样用）。
+        let grad = Gradient::corners(
+            bg.corners()[0],
+            bg.corners()[1],
+            bg.corners()[2],
+            bg.corners()[3],
+        );
         if radius > 0.0 {
-            // 圆角边框 ≈ 外圈 border 色圆角 + 内圈 bg 色圆角（内缩 border_w）。
+            // 圆角边框 ≈ 外圈 border 色圆角 + 内圈背景刷圆角（内缩 border_w）。
             self.queue.push(UiDraw {
                 depth,
                 seq,
@@ -973,7 +989,10 @@ impl<'a> Ui<'a> {
                 elem,
                 rect,
                 clip,
-                kind: DrawKind::RoundedRect { color: border, radius: radius + border_w },
+                kind: DrawKind::RoundedRect {
+                    corners: [border; 4],
+                    radius: radius + border_w,
+                },
             });
             let bw = border_w.min(rect.w * 0.5).min(rect.h * 0.5);
             let inner = Rect::new(
@@ -990,19 +1009,33 @@ impl<'a> Ui<'a> {
                     elem,
                     rect: inner,
                     clip,
-                    kind: DrawKind::RoundedRect { color: bg, radius },
+                    kind: DrawKind::RoundedRect {
+                        corners: resample_gradient(grad, inner, rect),
+                        radius,
+                    },
                 });
             }
         } else {
-            self.queue.push(UiDraw {
-                depth,
-                seq,
-                win,
-                elem,
-                rect,
-                clip,
-                kind: DrawKind::Solid(bg),
-            });
+            match bg.as_solid() {
+                Some(c) => self.queue.push(UiDraw {
+                    depth,
+                    seq,
+                    win,
+                    elem,
+                    rect,
+                    clip,
+                    kind: DrawKind::Solid(c),
+                }),
+                None => self.queue.push(UiDraw {
+                    depth,
+                    seq,
+                    win,
+                    elem,
+                    rect,
+                    clip,
+                    kind: DrawKind::Rect(grad),
+                }),
+            }
             if border_w > 0.0 {
                 self.queue.push(UiDraw {
                     depth,
@@ -3216,7 +3249,7 @@ impl<'a> Ui<'a> {
                         }
                     }
                 }
-                DrawKind::RoundedRect { color, radius } => {
+                DrawKind::RoundedRect { corners, radius } => {
                     let pr = snap_rect(&d.rect);
                     if let Some(local) = clipped(pr, clip_abs).map(|r| {
                         Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
@@ -3227,10 +3260,12 @@ impl<'a> Ui<'a> {
                             // 半径不做取整 / 9-patch clamp——镶嵌器接受任意半径并把
                             // 超出半高的半径 clamp 成胶囊；羽化带随控件尺寸自动收紧。
                             //
-                            // 裁剪后的矩形：四角色同一（`color`），故裁剪不影响颜色锚定。
-                            // 半径同样需要按裁剪**重算**：被裁小的一侧圆角会更小，
-                            // 但 UI 的裁剪多为矩形硬裁（可见部分本来就会被切掉），
-                            // 保持原半径与旧 9-patch 路径视觉一致。
+                            // 四角可各异 ⇒「圆角 + 渐变」自然成立。裁剪时按四角在
+                            // **原矩形**中的相对位置重采样，保证渐变锚定不被裁剪平移。
+                            let grad = Gradient::corners(
+                                corners[0], corners[1], corners[2], corners[3],
+                            );
+                            let c = resample_gradient_local(grad, local, pr, anchor_px);
                             let table = self.state.tess.table();
                             quads.push_rounded(
                                 win,
@@ -3238,7 +3273,7 @@ impl<'a> Ui<'a> {
                                 crate::tess::RoundedRectSpec {
                                     rect: local,
                                     radius: *radius,
-                                    corners: [*color; 4],
+                                    corners: c,
                                 },
                             );
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
@@ -3253,7 +3288,7 @@ impl<'a> Ui<'a> {
                             // **无纹理**：四角颜色直接进顶点色（光栅化器双线性插值）。
                             // 裁剪后的矩形按它在**原矩形**中的相对位置重采样四角色，
                             // 保证渐变锚定在原矩形上（裁剪不会让颜色整体平移）。
-                            let c = resample_gradient(*gradient, local, pr);
+                            let c = resample_gradient_local(*gradient, local, pr, anchor_px);
                             quads.push_white_quad(win, local, c);
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
@@ -4386,7 +4421,7 @@ impl Ui<'_> {
             }
             // 浮层窗口背景 = 菜单面板样式（window builder `.style` 覆盖默认 Theme::panel）。
             let panel_style = PanelStyle {
-                bg: cs.menu_bg,
+                bg: cs.menu_bg.into(),
                 border: cs.menu_border,
                 border_w: 1.0,
                 padding: 0.0,

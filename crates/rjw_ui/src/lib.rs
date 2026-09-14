@@ -156,7 +156,7 @@ pub use id::{IdAbsolute, IdRelative, IdStack};
 pub use hit::{hit_test, InteractEvents};
 pub use layout::{Child, PackSide};
 pub use state::{ButtonState, CheckboxState, TextFocus, UiState, UiStats, WidgetState};
-pub use style::{ButtonStyle, CheckboxStyle, ComboStyle, DividerStyle, InputStyle, LabelStyle, ModalStyle, PanelStyle, SliderStyle, Theme};
+pub use style::{Brush, ButtonStyle, CheckboxStyle, ComboStyle, DividerStyle, InputStyle, LabelStyle, ModalStyle, PanelStyle, SliderStyle, Theme};
 pub use input::{KeyboardSnapshot, MouseSnapshot};
 pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Placement, Resize, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
 pub use view::{ViewCtx, ViewMode};

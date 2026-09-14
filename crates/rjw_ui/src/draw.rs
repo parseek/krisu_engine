@@ -479,8 +479,11 @@ pub fn lerp_color(a: Color, b: Color, k: f32) -> Color {
 pub enum DrawKind {
     /// 实心矩形。
     Solid(Color),
-    /// **圆角矩形**（背景填充；`radius` 逻辑像素，9-patch 绘制，颜色顶点色 tint）。
-    RoundedRect { color: Color, radius: f32 },
+    /// **圆角矩形**（背景填充；`radius` 物理像素，CPU 镶嵌成三角形，颜色走顶点色）。
+    ///
+    /// `corners` = `[TL, TR, BL, BR]`：纯色时四者相同；两端色渐变时各异
+    /// ⇒「圆角 + 渐变」不需要任何专门着色器或渐变纹理。
+    RoundedRect { corners: [Color; 4], radius: f32 },
     /// **矩形渐变**（四角颜色；顶点色插值，**无纹理**）。
     Rect(Gradient),
     /// 矩形边框（画在 rect 内缘）。
