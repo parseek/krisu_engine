@@ -200,6 +200,12 @@ pub struct UiState {
     /// 用——按 **id** 而非窗口 z 索引：**点击置顶 z+1 后尺寸不丢** → clamp 边界稳定
     /// （消除"按下即跳变"）；`window_rects[z]` 仅作兜底。
     pub(crate) window_sizes: HashMap<IdAbsolute<'static>, Vec2>,
+    /// **可拖拽面板的结算尺寸**（**绝对 ID** → 物理尺寸，跨帧持久）。
+    ///
+    /// 用途与 `window_sizes` 同：命中 / 拖拽 / clamp 用**上一帧屏幕上那个矩形**
+    /// （鼠标事件是针对它产生的），从而 `abs_base` 与本帧 `display_pos` 一致——
+    /// 面板内文本框在**拖动面板**时不会落后一帧（见 `Ui::panel_impl`）。
+    pub(crate) panel_sizes: HashMap<IdAbsolute<'static>, Vec2>,
     /// **用户拖拽缩放的控件尺寸**（[`Ui::resize_handle`]：**绝对 ID** → 逻辑尺寸，跨帧持久）。
     /// 可缩放 widget 的 `size()` 优先读它（首次 = 内容自然尺寸）。
     pub sizes: HashMap<IdAbsolute<'static>, Vec2>,
@@ -257,6 +263,7 @@ impl UiState {
         self.radio_groups.clear();
         self.grid_cells.clear();
         self.panel_pos.clear();
+        self.panel_sizes.clear();
         self.window_z.clear();
         self.window_rects.clear();
         self.text_buffers.clear();

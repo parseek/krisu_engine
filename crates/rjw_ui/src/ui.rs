@@ -2125,7 +2125,36 @@ impl<'a> Ui<'a> {
             .unwrap_or_else(|| self.theme.panel.clone());
         let (pad_total, gap) = (style.padding + style.border_w, self.theme.gap);
         let saved_base = self.abs_base;
-        self.abs_base = saved_base + origin;
+        // ─── ① 位置与交互**先于内容录制**求解（同 `window_impl`）──────────
+        // 鼠标事件是针对**屏幕上已有的几何**（上一帧结算的 `panel_sizes`）产生的，
+        // 故命中 / 拖拽基准用上一帧矩形；由此 `display_pos` 在录制前已知，
+        // `abs_base` 与随后 `translate(display_pos)` 的几何**当帧一致**。
+        // 旧实现 `abs_base` 用上一帧位置、几何用本帧位置：拖动面板时面板内文本框
+        // 的 `box_clip` / 光标 / 滑块基准落后一帧（快速拖动时文字被裁、点击错位）。
+        let prev_size = abs
+            .as_ref()
+            .and_then(|a| self.state.panel_sizes.get(a.as_str()).copied());
+        let panel_rect = prev_size.map(|ps| Rect::new(origin.x, origin.y, ps.x, ps.y));
+        let btn = self.mouse_left();
+        // 窗口遮挡：面板是 win=0 内容（绘制在所有窗口之下），被任意窗口覆盖时不可拖拽。
+        // 首帧无 `prev_size` ⇒ 本帧不参与交互（面板尚未被看到）。
+        let hit = panel_rect.is_some_and(|r| {
+            hit_test(&r, self.mouse_logical)
+                && self.mouse_in_window
+                && !window_occluded(0, self.mouse_logical, self.window_rects_iter())
+        });
+        let press_here = btn.down_edge() && hit;
+        // 拖拽交互：**物理像素粒度**拖动基准（见下方说明）。按下帧先无条件建立
+        // 基准；面板内子控件随后声明本次按下（`press_claimed`）时在 ② 清除。
+        let (active, display_pos) = match abs.as_ref() {
+            Some(a) => {
+                let ws = self.state.widgets.entry(a.to_static()).or_default();
+                resolve_drag(ws, hit, btn, self.mouse_screen, origin)
+            }
+            None => (false, origin),
+        };
+        // 内容基准 = **本帧显示基准**（`display_pos`）——录制期的绝对空间量与几何一致。
+        self.abs_base = saved_base + display_pos;
         self.frames.push(Frame::new_stack(PackSide::Top, gap, pad_total));
         self.depth += 1;
         let mut panel = Panel { ui: self };
@@ -2134,53 +2163,22 @@ impl<'a> Ui<'a> {
         let size = frame.settle_size();
         self.depth -= 1;
         self.abs_base = saved_base;
-        // 拖拽交互：**物理像素粒度**拖动基准（见下方说明）。
-        // `display_pos`：本帧实际使用的面板位置（拖拽中 = 新位置，当帧生效，无帧延迟）。
-        let display_pos = if let Some(a) = abs.as_ref() {
-            let panel_rect = Rect::new(origin.x, origin.y, size.x, size.y);
-            // 窗口遮挡：面板是 win=0 内容（绘制在所有窗口之下），被任意窗口覆盖时不可拖拽。
-            let hit = hit_test(&panel_rect, self.mouse_logical)
-                && self.mouse_in_window
-                && !window_occluded(0, self.mouse_logical, self.window_rects_iter());
-            let btn = self.mouse_left();
-            let press_here = btn.down_edge() && hit;
-            // 输入框按下（选择拖拽）不建立面板拖拽基准。
-            let drag_here = press_here && !self.press_claimed;
-            let (active, new_pos) = {
+        // ─── ② 内容录完后：按下裁决 + 位置持久 ──────────────────────────
+        if let Some(a) = abs.as_ref() {
+            if press_here {
                 let ws = self.state.widgets.entry(a.to_static()).or_default();
-                let dragging = update_drag(ws, hit, btn);
-                if drag_here {
-                    // 拖动基准：面板位置（逻辑）+ 鼠标物理坐标（**取整**）。
-                    // 取整消除鼠标静止噪声（滞回）；拖拽中按**物理像素增量**移动：
-                    // 粒度 1 物理 px，DPI 1.5 下也不会出现"移动 1.5px 才动"的粘滞感。
-                    ws.press_panel = Some(panel_rect.min());
-                    ws.press_mouse = Some(self.mouse_screen.round());
-                } else if press_here {
-                    // 文本框等子控件按下：清除旧拖拽基准（防窗口"瞬移"，见 window_at）。
-                    ws.press_panel = None;
-                    ws.press_mouse = None;
+                if self.press_claimed {
+                    // 文本框等子控件按下（选择拖拽优先）：清除基准（见 `window_impl`）。
+                    clear_drag_base(ws);
                 }
-                // 拖拽需实际位移（≥ DRAG_ACTIVATE_PX）且**有本帧基准**才激活：纯点击不拖拽，
-                // 面板内子控件（按钮/勾选/输入框）正常响应（见 hit_abs 抑制条件）。
-                let active = dragging
-                    && ws.press_mouse.is_some()
-                    && drag_moved(self.mouse_screen.round(), ws.press_mouse);
-                let np = if active {
-                    let pp = ws.press_panel.unwrap_or(origin);
-                    let pm = ws.press_mouse.unwrap_or(self.mouse_screen);
-                    // 物理像素增量（round：对噪声滞回，静止时不变）→ 物理位移
-                    let d = (self.mouse_screen - pm).round();
-                    pp + d
-                } else {
-                    origin
-                };
-                (active, np)
-            };
+            }
+            // 结算尺寸跨帧持久：下帧命中 / 拖拽基准 = 屏幕上那个矩形。
+            self.state.panel_sizes.insert(a.to_static(), size);
             if active {
                 self.drag_panel = Some(a.to_static());
                 // 仅位置变化时写入（滞回：同一位置不重写）
-                if self.state.panel_pos.get(a.as_str()) != Some(&new_pos) {
-                    self.state.panel_pos.insert(a.to_static(), new_pos);
+                if self.state.panel_pos.get(a.as_str()) != Some(&display_pos) {
+                    self.state.panel_pos.insert(a.to_static(), display_pos);
                 }
             } else if self
                 .drag_panel
@@ -2197,10 +2195,7 @@ impl<'a> Ui<'a> {
             if active {
                 self.cursor_window_drag = true;
             }
-            new_pos
-        } else {
-            origin
-        };
+        }
         // 背景 + 边框（depth = 进入前深度，画在子控件之下；radius > 0 走圆角双层矩形）
         let bg_rect = Rect::new(0.0, 0.0, size.x, size.y);
         self.push_panel_like(bg_rect, style.bg, style.border, style.border_w, style.radius, 0);
@@ -2313,18 +2308,83 @@ impl<'a> Ui<'a> {
                     .get(&z)
                     .map(|r| Vec2::new(r.w, r.h))
             });
-        // 命中 / 内容基准 = 显示基准：非首帧用持久尺寸 clamp（主窗口缩小 / 内容
-        // 变化后窗口被拉回屏幕内 → 照常可点可拖）；**首帧（尺寸未知）不 clamp**——
-        // 窗口出现在应用指定位置，当帧显示已 clamp，次帧收敛一致（消除首帧跳变）。
-        let base_pos = if clamp == WindowClamp::Screen {
-            match prev_size {
-                Some(ps) => clamp_window_pos(saved_base + origin, ps, sw, sh) - saved_base,
-                None => origin,
+        // ─── ① 位置与交互**先于内容录制**求解 ────────────────────────────
+        // 鼠标事件是针对**屏幕上已有的几何**（上一帧结算的 `prev_size`）产生的，
+        // 故命中 / 拖拽 / clamp 全用 `prev_size`；由此 `display_pos` 在录制前已知，
+        // `abs_base` 与随后 `translate(display_pos)` 的几何**当帧一致**。
+        //
+        // ⚠ 旧实现 `abs_base` 取自上一帧位置（`base_pos`）、几何用本帧位置
+        // （`display_pos`），于是**拖拽期间**每个走 `abs_base` 的绝对空间量都落后
+        // 一帧：文本/多行框的 `box_clip`（文字被裁）、IME 光标定位、滑块拖拽基准、
+        // 下拉浮层位置。位移越大错得越多 → 快速拖动时"文字/点击瞬间偏移"。
+        //
+        // 非首帧用持久尺寸 clamp（主窗口缩小 / 内容变化后窗口被拉回屏幕内 → 照常
+        // 可点可拖）；**首帧（尺寸未知）不 clamp**——窗口出现在应用指定位置，当帧
+        // 显示已 clamp，次帧收敛一致（消除首帧跳变）。
+        let base_pos = match (clamp, prev_size) {
+            (WindowClamp::Screen, Some(ps)) => {
+                clamp_window_pos(saved_base + origin, ps, sw, sh) - saved_base
             }
-        } else {
-            origin
+            _ => origin,
         };
-        self.abs_base = saved_base + base_pos;
+        // 命中矩形 = 屏幕上那个矩形（首帧无 `prev_size` ⇒ 本帧不参与交互）。
+        let panel_rect = prev_size.map(|ps| Rect::new(base_pos.x, base_pos.y, ps.x, ps.y));
+        // 固定宽窗口：右下角**缩放柄**（鼠标拖动改宽度，高度自动；跨帧持久于
+        // `UiState::window_widths`）。⚠ 交互须在窗口拖拽判定**之前**（claim_press
+        // 阻止按下缩放柄时同时建立窗口拖拽基准）。基于通用 [`Self::resize_handle`]。
+        // handle 为**外层容器局部坐标**（此处 abs_base 仍为外层原点）；用 clamp 后
+        // 位置 `base_pos`（而非 origin）——与显示一致，贴边窗口缩放柄可命中。
+        if let (Some(w), Some(ps)) = (width, prev_size) {
+            let hw = 14.0_f32;
+            let handle = Rect::new(base_pos.x + ps.x - hw, base_pos.y + ps.y - hw, hw, hw);
+            let h_id = format!("{id}::resize");
+            if let Some(new_size) = self.resize_handle(
+                &h_id,
+                handle,
+                Vec2::new(w, ps.y),
+                Vec2::new(120.0, ps.y),
+                crate::UiCursor::EwResize,
+            ) {
+                // 新宽度下帧生效（`width` 于本函数开头读取）——与旧版一致，避免
+                // 同帧内布局宽度与 clamp 尺寸互相矛盾。
+                self.state.window_widths.insert(id_for.to_static(), new_size.x);
+            }
+        }
+        let btn = self.mouse_left();
+        // 窗口遮挡：被更高 z 的窗口覆盖的区域，本窗口不响应拖拽 / 置顶 /
+        // 子控件交互（点击穿透修复——重叠区域只让最上层窗口可交互）。
+        let hit = panel_rect.is_some_and(|r| hit_test(&r, self.mouse_logical))
+            && self.mouse_in_window
+            && !window_occluded(z, self.mouse_logical, self.window_rects_iter());
+        let press_here = btn.down_edge() && hit;
+        // 拖拽基准：按下帧**先无条件**建立（基准 = 屏幕上那个矩形）。窗口内子控件
+        // （输入框选择 / 滑块 / 滚动条）随后声明本次按下（`press_claimed`）时，
+        // 在内容录制后清除基准（见 ②）——判定顺序与旧版一致。
+        let (active, new_pos, drag_clamp_size) = if clamp == WindowClamp::Locked {
+            // 锁定：位置固定（不建立拖拽基准、不激活拖拽；点击置顶 / 子控件仍有效）。
+            (false, origin, prev_size)
+        } else {
+            let ws = self.state.widgets.entry(id_for.to_static()).or_default();
+            let (active, pos) = resolve_drag(ws, hit, btn, self.mouse_screen, base_pos);
+            // 拖拽中 clamp 边界 = 按下帧尺寸（固定）→ 位置纯跟手、不因内容尺寸
+            // 变化被推回（消除"拖动单帧跳变"）；非拖拽帧用持久尺寸（命中基准一致）。
+            let clamp_size = if active { ws.press_size.or(prev_size) } else { prev_size };
+            (active, pos, clamp_size)
+        };
+        // **Screen 限位**：窗口 clamp 到画面（窗口客户区）内——拖拽 / 脚本定位后
+        // 的位置都被限制（绝对坐标 clamp 后回容器局部）；`Free` / `Locked` 不 clamp
+        // （Locked 本身位置固定）。**clamp 尺寸**：拖拽中 = 按下帧尺寸（固定，
+        // 边界稳定 → 无单帧跳变）；非拖拽 = 持久尺寸（与命中基准一致，
+        // 主窗口缩小 / 窗口比画面大也不会"看得见拖不动"）；首帧无记录 = 本帧
+        // 显示不 clamp（与旧版一致：`prev_size` 为 `None` ⇒ 用 `origin`）。
+        let display_pos = match (clamp, drag_clamp_size) {
+            (WindowClamp::Screen, Some(cs)) => {
+                clamp_window_pos(saved_base + new_pos, cs, sw, sh) - saved_base
+            }
+            _ => new_pos,
+        };
+        // 内容基准 = **本帧显示基准**（`display_pos`）——录制期的绝对空间量与几何一致。
+        self.abs_base = saved_base + display_pos;
         let mut frame = Frame::new_stack(PackSide::Top, gap, pad_total);
         if let Some(w) = width {
             frame.set_fixed_w(w);
@@ -2345,97 +2405,35 @@ impl<'a> Ui<'a> {
         self.abs_base = saved_base;
         // 记录窗口尺寸（按 id 持久；点击置顶 z 变化后下帧 prev_size 仍可取）。
         self.state.window_sizes.insert(id_for.to_static(), size);
-        // 拖拽 + 按下裁决（物理像素粒度拖动基准，同 panel_impl）：
-        // 重叠区域点击按下时，记录"本帧按下命中的**最上层**窗口"（win_press_top），
-        // `finish::resolve_win_press` 只保留它的拖拽与置顶——避免同时拖动多个窗口。
-        // 命中 / 拖拽基准用 clamp 后位置（`base_pos`）——与显示一致。
-        let panel_rect = Rect::new(base_pos.x, base_pos.y, size.x, size.y);
-        // 固定宽窗口：右下角**缩放柄**（鼠标拖动改宽度，高度自动；跨帧持久于
-        // `UiState::window_widths`）。⚠ 交互须在窗口拖拽判定**之前**（claim_press
-        // 阻止按下缩放柄时同时建立窗口拖拽基准）。基于通用 [`Self::resize_handle`]。
-        if let Some(w) = width {
-            let hw = 14.0_f32;
-            // handle 为**外层容器局部坐标**（此处 abs_base 已恢复为外层原点）。
-            // 用 clamp 后位置 `base_pos`（而非 origin）——与显示一致，贴边窗口缩放柄可命中。
-            let handle = Rect::new(base_pos.x + size.x - hw, base_pos.y + size.y - hw, hw, hw);
-            let h_id = format!("{id}::resize");
-            if let Some(new_size) = self.resize_handle(
-                &h_id,
-                handle,
-                Vec2::new(w, size.y),
-                Vec2::new(120.0, size.y),
-                crate::UiCursor::EwResize,
-            ) {
-                self.state.window_widths.insert(id_for.to_static(), new_size.x);
-            }
-        }
-        // 窗口遮挡：被更高 z 的窗口覆盖的区域，本窗口不响应拖拽 / 置顶 /
-        // 子控件交互（点击穿透修复——重叠区域只让最上层窗口可交互）。
-        let hit = hit_test(&panel_rect, self.mouse_logical)
-            && self.mouse_in_window
-            && !window_occluded(z, self.mouse_logical, self.window_rects_iter());
-        let btn = self.mouse_left();
-        let press_here = btn.down_edge() && hit;
-        // 输入框等文本控件按下时置位 press_claimed：**不建立窗口拖拽基准**
-        // （从输入框上拖拽 = 选择文本；窗口改从空白/标题区拖动）。
-        let drag_here = press_here && !self.press_claimed;
-        // 点击置顶（modal 对话框**不主动置顶**——它已最上，且避免 z 漂移/与浮层冲突）
-        if topmost && press_here
-            && self                .win_press_top
-                .as_ref()
-                .is_none_or(|(_, top_z)| self.cur_win > *top_z)
-            {
-                self.win_press_top = Some((id_for.to_static(), self.cur_win));
-            }
-        let (active, new_pos, drag_clamp_size) = if clamp == WindowClamp::Locked {
-            // 锁定：位置固定（不建立拖拽基准、不激活拖拽；点击置顶 / 子控件仍有效）。
-            (false, origin, prev_size)
-        } else {
+        // ─── ② 内容录完后：按下裁决 ──────────────────────────────────────
+        // 窗口内子控件（文本框选择 / 滑块 / 滚动条）在录制期可能已声明本次按下
+        // （`press_claimed`）——此时**清除**拖拽基准，否则 `update_drag` 已置
+        // dragging=true，残留的 press_mouse 会被 drag_moved 当作基准算出巨大位移
+        // → 窗口"瞬移"（从输入框上拖拽 = 选择文本；窗口改从空白/标题区拖动）。
+        if press_here {
             let ws = self.state.widgets.entry(id_for.to_static()).or_default();
-            let dragging = update_drag(ws, hit, btn);
-            if drag_here {
-                ws.press_panel = Some(panel_rect.min());
-                ws.press_mouse = Some(self.mouse_screen.round());
-                // 按下帧窗口尺寸：拖拽中 clamp 边界**固定**——内容尺寸变化不推窗。
-                ws.press_size = Some(size);
-            } else if press_here {
-                // 文本框等子控件按下（选择拖拽优先）：**清除旧拖拽基准**——
+            if self.press_claimed {
+                // 输入框等文本控件按下（选择拖拽优先）：**清除拖拽基准**——
                 // 否则 `update_drag` 已置 dragging=true，残留的 press_mouse 会被
                 // drag_moved 当作基准，算出巨大位移 → 窗口"瞬移"。
-                ws.press_panel = None;
-                ws.press_mouse = None;
-                ws.press_size = None;
-            }
-            // 拖拽需实际位移（≥ DRAG_ACTIVATE_PX）且**有本帧基准**才激活：纯点击不拖拽，
-            // 窗口内子控件（按钮/勾选/输入框）正常响应（见 hit_abs 抑制条件）。
-            let active = dragging
-                && ws.press_mouse.is_some()
-                && drag_moved(self.mouse_screen.round(), ws.press_mouse);
-            let np = if active {
-                let pp = ws.press_panel.unwrap_or(origin);
-                let pm = ws.press_mouse.unwrap_or(self.mouse_screen);
-                let d = (self.mouse_screen - pm).round();
-                pp + d
+                clear_drag_base(ws);
             } else {
-                origin
-            };
-            // 拖拽中 clamp 边界 = 按下帧尺寸（固定）→ 位置纯跟手、不因内容尺寸
-            // 变化被推回（消除"拖动单帧跳变"）；非拖拽帧用持久尺寸（命中基准一致）。
-            let clamp_size = if active { ws.press_size.or(prev_size) } else { prev_size };
-            (active, np, clamp_size)
-        };
-        // **Screen 限位**：窗口 clamp 到画面（窗口客户区）内——拖拽 / 脚本定位后
-        // 的位置都被限制（绝对坐标 clamp 后回容器局部）；`Free` / `Locked` 不 clamp
-        // （Locked 本身位置固定）。**clamp 尺寸**：拖拽中 = 按下帧尺寸（固定，
-        // 边界稳定 → 无单帧跳变）；非拖拽 = 持久尺寸（与命中基准 base_pos 一致，
-        // 主窗口缩小 / 窗口比画面大也不会"看得见拖不动"）；首帧无记录 = 本帧结算
-        // 尺寸（窗口首次显示在 clamp 后位置，次帧命中基准收敛一致）。
-        let display_pos = if clamp == WindowClamp::Screen {
-            let cs = drag_clamp_size.unwrap_or(size);
-            clamp_window_pos(saved_base + new_pos, cs, sw, sh) - saved_base
-        } else {
-            new_pos
-        };
+                // 按下帧窗口尺寸：拖拽中 clamp 边界**固定**——内容尺寸变化不推窗。
+                ws.press_size = Some(size);
+            }
+        }
+        // 点击置顶（modal 对话框**不主动置顶**——它已最上，且避免 z 漂移/与浮层冲突）。
+        // 重叠区域点击按下时记录"本帧按下命中的**最上层**窗口"（win_press_top），
+        // `finish::resolve_win_press` 只保留它的拖拽与置顶——避免同时拖动多个窗口。
+        if topmost
+            && press_here
+            && self
+                .win_press_top
+                .as_ref()
+                .is_none_or(|(_, top_z)| self.cur_win > *top_z)
+        {
+            self.win_press_top = Some((id_for.to_static(), self.cur_win));
+        }
         if active {
             self.drag_panel = Some(id_for.to_static());
             // 持久化 **clamp 后**的位置（下帧 origin 已限位，视觉与状态一致）。
@@ -3789,6 +3787,56 @@ fn drag_moved(current_px: Vec2, press_px: Option<Vec2>) -> bool {
         }
         None => false,
     }
+}
+
+/// **窗口 / 可拖拽面板的位置求解**（纯函数，`window_impl` / `panel_impl` 共用）。
+///
+/// - `origin`：责任链（脚本 → 拖拽状态 → 传入 pos）解析出的本帧基准位置；
+/// - `mouse_screen`：本帧鼠标物理坐标；
+/// - `hit`：鼠标是否在本体（由**上一帧结算尺寸**构造的矩形判定，见调用方）。
+///
+/// 语义：
+/// 1. 按下帧（`down_edge && hit`）**先无条件**建立拖拽基准
+///    `(press_panel = origin, press_mouse = 本帧鼠标)`；内容录制后若发现子控件
+///    声明了本次按下（`press_claimed`），调用方须 [`clear_drag_base`] 清除
+///    ——这样"从输入框上拖拽 = 选择文本"与"窗口从空白处拖动"两者都对，且
+///    基准判定不依赖内容录制（`display_pos` 得以在录制**前**求出）。
+/// 2. `active` = 拖动标记（[`crate::hit::update_drag`]）+ **有基准** +
+///    位移 ≥ [`DRAG_ACTIVATE_PX`]（纯点击不拖拽）。
+/// 3. 位置**只由按下帧基准 + 当前鼠标位移决定**，与上一帧位置无关——这是
+///    `abs_base` 能与几何（`translate(pos)`）当帧一致、拖拽不落后一帧的前提。
+fn resolve_drag(
+    ws: &mut WidgetState,
+    hit: bool,
+    btn: KeyState,
+    mouse_screen: Vec2,
+    origin: Vec2,
+) -> (bool, Vec2) {
+    let dragging = update_drag(ws, hit, btn);
+    if btn.down_edge() && hit {
+        // 物理像素粒度基准（取整消除鼠标静止噪声；DPI 1.5 下也不会"移动 1.5px 才动"）。
+        ws.press_panel = Some(origin);
+        ws.press_mouse = Some(mouse_screen.round());
+    }
+    let active =
+        dragging && ws.press_mouse.is_some() && drag_moved(mouse_screen.round(), ws.press_mouse);
+    let pos = if active {
+        let pp = ws.press_panel.unwrap_or(origin);
+        let pm = ws.press_mouse.unwrap_or(mouse_screen);
+        // 物理像素增量（round：对噪声滞回，静止时不变）→ 物理位移
+        pp + (mouse_screen - pm).round()
+    } else {
+        origin
+    };
+    (active, pos)
+}
+
+/// **清除拖拽基准**：本帧按下被窗口 / 面板内的子控件声明（`press_claimed`——
+/// 输入框选择、滑块调值、滚动条拖拽），窗口 / 面板**不得**跟随移动。
+fn clear_drag_base(ws: &mut WidgetState) {
+    ws.press_panel = None;
+    ws.press_mouse = None;
+    ws.press_size = None;
 }
 
 // ─── 容器控件 API（UiAdd trait，替代旧的 widget_api! 宏） ─────────

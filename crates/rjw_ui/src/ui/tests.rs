@@ -292,25 +292,26 @@ fn window_drag_clamp_size_fixed_during_drag() {
 
 #[test]
 fn window_first_frame_position_converges() {
-    // 首帧（prev_size 未知）：命中基准 = origin（不 clamp）；显示 = clamp(origin, size)。
-    // 次帧：prev_size = size → base_pos = clamp(origin, size) = **首帧显示位置**
-    // → 命中/显示收敛、位置无跳（消除"窗口刚出现就按下 → 按下瞬间跳变"）。
+    // 首帧（`prev_size` 未知）：命中矩形 / 显示位置都用 `origin`（**不 clamp**）——
+    // 屏幕上还没有这个窗口，"上一帧的矩形"无从谈起。次帧：`prev_size = size`
+    // → 位置 = `clamp(origin, size)`，此后每帧一致（命中基准与显示同一个值）。
+    // 之所以把 clamp 起点放在次帧，是为了让 `abs_base` 与几何**当帧一致**（见
+    // `resolve_drag` 文档）；旧实现首帧"几何 clamp、`abs_base` 用 origin"，本身
+    // 就是不一致的（首帧内容绝对空间错位）。
     let origin = Vec2::new(700.0, 300.0); // 窗口内容大，origin 超出真实 clamp 边界
     let size = Vec2::new(300.0, 100.0);
     let sw = 800.0;
     let sh = 600.0;
-    let first_display = clamp_window_pos(origin, size, sw, sh);
-    assert_eq!(first_display.x, 500.0, "首帧显示 clamp 到 [0, sw-size]=500");
-    // 次帧命中基准 = clamp(origin, size)（首帧显示位置）→ 一致。
-    let second_base = clamp_window_pos(origin, size, sw, sh);
-    assert_eq!(second_base, first_display, "次帧命中基准 = 首帧显示位置（无跳变）");
-    // 次帧后 origin 已持久化为 clamp 后位置 → 再 clamp 不变。
-    let origin2 = first_display;
+    // 次帧起：clamp(origin, size) 生效，且**再 clamp 不变**（收敛，无逐帧跳变）。
+    let settled = clamp_window_pos(origin, size, sw, sh);
+    assert_eq!(settled.x, 500.0, "次帧 clamp 到 [0, sw-size]=500");
     assert_eq!(
-        clamp_window_pos(origin2, size, sw, sh),
-        origin2,
-        "已 clamp 位置再 clamp 不变"
+        clamp_window_pos(settled, size, sw, sh),
+        settled,
+        "已 clamp 位置再 clamp 不变（收敛、无跳变）"
     );
+    // 首帧命中基准 = origin（未 clamp）：首帧按下不会因"基准/显示不一致"而跳变。
+    assert_eq!(origin.x, 700.0);
 }
 
 #[test]
@@ -387,6 +388,89 @@ fn drag_needs_movement_so_clicks_work() {
     );
     // 无按下基准（如窗口未命中时）：不激活
     assert!(!drag_moved(press, None), "无按下基准不激活");
+}
+
+/// 主键状态（`pressed` / 本帧边沿）——构造 `resolve_drag` 的输入。
+fn mouse_btn(pressed: bool, edge: bool) -> rjw_keystate::KeyState {
+    use rjw_keystate::{
+        KEY_STATE_DOWN_EDGE, KEY_STATE_PRESSING, KEY_STATE_RELEASED, KEY_STATE_UP_EDGE,
+    };
+    match (pressed, edge) {
+        (true, true) => KEY_STATE_DOWN_EDGE,
+        (true, false) => KEY_STATE_PRESSING,
+        (false, true) => KEY_STATE_UP_EDGE,
+        (false, false) => KEY_STATE_RELEASED,
+    }
+}
+
+#[test]
+fn window_or_panel_drag_position_has_no_frame_lag() {
+    // 回归：**拖动窗口 / 可拖拽面板时，`abs_base` 落后几何一帧**——`abs_base` 取上一帧
+    // 位置、几何按本帧 `display_pos` 平移，于是拖拽期间一切走 `abs_base` 的绝对空间量
+    // （文本 `box_clip` / IME 光标 / 滑块基准）都错一帧的位移量：位移越大越明显
+    // （"高速拖动过程瞬间偏移"）。
+    //
+    // 修复的**结构前提**（本测试锁定它）：位置只由**按下帧基准 + 当前鼠标位移**决定，
+    // 与上一帧位置无关 —— 因此 `display_pos` 能在内容录制前求出，`abs_base` 与几何
+    // 用同一个值。
+    let origin = Vec2::new(100.0, 40.0);
+    let mut ws = WidgetState::default();
+    // ① 按下帧（down_edge + 命中）：建立基准，纯点击不激活。
+    let (active, pos) = resolve_drag(&mut ws, true, mouse_btn(true, true), Vec2::new(150.0, 90.0), origin);
+    assert!(!active, "按下帧不激活");
+    assert_eq!(pos, origin, "按下帧位置 = origin");
+    assert_eq!(ws.press_mouse, Some(Vec2::new(150.0, 90.0)), "基准 = 按下帧鼠标");
+    // ② 拖拽中（每帧位移 40px：模拟"高速拖动"）：位置 = 基准 + 当前位移，
+    //    与上一帧位置无关 —— 若实现改成"上一帧位置 + 帧增量"，这里就会累积误差。
+    for step in 1..=5 {
+        let m = Vec2::new(150.0 + 40.0 * step as f32, 90.0);
+        let (active, pos) = resolve_drag(&mut ws, true, mouse_btn(true, false), m, origin);
+        assert!(active, "帧 {step}: 位移 ≥ 阈值应激活");
+        assert_eq!(
+            pos,
+            origin + Vec2::new(40.0 * step as f32, 0.0),
+            "帧 {step}: 位置 = 按下基准 + 鼠标总位移（无逐帧累积误差）"
+        );
+    }
+    // ③ 释放：拖拽结束（基准保留但不再激活）。
+    let (active, pos) = resolve_drag(&mut ws, true, mouse_btn(false, true), Vec2::new(350.0, 90.0), origin);
+    assert!(!active, "释放后不激活");
+    assert_eq!(pos, origin);
+}
+
+#[test]
+fn child_press_claim_clears_drag_base() {
+    // 回归：窗口 / 面板内输入框按下（选择文本）或滑块按下（调值）时，外层**不得**
+    // 跟随拖动。子控件在录制期调用 `claim_press`，外层在本帧按下帧清除基准。
+    let origin = Vec2::new(100.0, 40.0);
+    let mut ws = WidgetState::default();
+    // 按下（命中窗口空白处）：基准先无条件建立……
+    let _ = resolve_drag(&mut ws, true, mouse_btn(true, true), Vec2::new(150.0, 90.0), origin);
+    assert!(ws.press_mouse.is_some(), "按下帧先建立基准（判定在内容录制后）");
+    // ……随后子控件声明本次按下 → 清除基准。
+    clear_drag_base(&mut ws);
+    assert!(ws.press_mouse.is_none() && ws.press_panel.is_none() && ws.press_size.is_none());
+    // 之后鼠标大幅移动（按钮仍按住）也不得拖动窗口（"从输入框上拖拽 = 选择文本"）。
+    for step in 1..=5 {
+        let m = Vec2::new(150.0 + 50.0 * step as f32, 90.0);
+        let (active, pos) = resolve_drag(&mut ws, true, mouse_btn(true, false), m, origin);
+        assert!(!active, "帧 {step}: 无基准不得激活拖拽");
+        assert_eq!(pos, origin, "帧 {step}: 窗口不动");
+    }
+}
+
+#[test]
+fn drag_outside_press_does_not_establish_base() {
+    // 体外按下（`hit = false`，如点在窗口外的桌面区域 / 被更高 z 窗口遮挡）：
+    // 不建立基准 → 拖入窗口内也不会把窗口拖走。
+    let origin = Vec2::new(100.0, 40.0);
+    let mut ws = WidgetState::default();
+    let (active, _) = resolve_drag(&mut ws, false, mouse_btn(true, true), Vec2::new(10.0, 10.0), origin);
+    assert!(!active);
+    assert!(ws.press_mouse.is_none(), "体外按下不建立基准");
+    let (active, pos) = resolve_drag(&mut ws, true, mouse_btn(true, false), Vec2::new(120.0, 60.0), origin);
+    assert!(!active, "无基准不激活");
+    assert_eq!(pos, origin);
 }
 
 #[test]

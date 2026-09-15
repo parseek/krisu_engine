@@ -1350,4 +1350,5 @@ clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位�
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。
 - 新增**交互**控件时必须调用 `register_focus(&id_for, rect, FocusKind::X)`（键盘导航 / 焦点描边；`id_for = ui.id_for(id)` 为**绝对 ID**）；需要 Enter/Space 激活的控件用 `key_click(&id_for, kind)` 合成点击。持久状态一律经 `state_mut().widget(&id_for)` 读写（绝对 ID）。
 - 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
+- **可拖拽容器**（窗口 / 面板）另有一条硬约定：`abs_base` 必须等于本帧实际平移量（`display_pos`），且**交互（命中 / 拖拽基准 / clamp）先于内容录制求解**——命中矩形取**上一帧结算尺寸**（`UiState::window_sizes` / `panel_sizes`，鼠标事件正是针对屏幕上那个矩形产生的）。若像早期实现那样"`abs_base` 用上一帧位置、几何用本帧位置"，拖拽期间一切走 `abs_base` 的绝对空间量（文本 `box_clip`、IME 光标、滑块基准）都会落后一帧（快速拖动时文字被裁 / 点击偏移）。位置求解复用 `ui::resolve_drag`（纯函数，可单测）。
 - 网格 cell 缓存（`UiState::grid_cells`）保证跨帧布局稳定；无缓存首帧渐进扩展，次帧起稳定。
