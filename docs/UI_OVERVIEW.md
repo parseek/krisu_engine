@@ -70,6 +70,14 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 `Ui::add` 统一 clamp + 膨胀调整。`LimitedInParent` 取 min(内容, 父级可用宽
 `Ui::avail_w()`)，超出由控件自洽（Label 换行 / 省略、Button 省略、TextArea 滚动）。
 
+**容器尺寸必须包住子控件**：`grid_at` / `pack_at` / `add_at` 这类**绝对放置**不占光标，
+若容器只按流内子项结算尺寸，内容就会"长到容器外"——画得出来却不在窗口矩形里（拖不动、
+被别的窗口穿透）。`Frame::content_bounds` 记录每处子项矩形（含 `Child::Expand` 的子项、
+绝对容器整体、`add_at` 控件），`settle_size` = 自然尺寸 ∪ 内容包围盒；**固定轴**
+（`fixed_w` / `fixed_h`）例外，那一轴由调用方定死、超出交给 `Clip` 语义。
+即便真的溢出，窗口遮挡矩形 = 盒子 ∪ 子控件命中区（`Ui::win_hit_bounds`），
+"看得见就能点、被压住就不响应"仍然成立。
+
 ### 4. 命中与交互状态机（`hit.rs` + `WidgetState`）
 
 控件交互三件套：`hit_abs(&id, &rect)`（矩形命中 + 窗口遮挡 + **控件级遮挡** + **强制层

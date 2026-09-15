@@ -76,6 +76,16 @@ pub(crate) struct Frame {
     /// **容器固定宽度**（`window_at_w` 等；覆盖 `settle_size` 的自然宽度，
     /// 子项宽度 clamp 到该值——内容按固定宽排布、高度自然，如同 egui）。
     fixed_w: Option<f32>,
+    /// **绝对放置内容的包围盒**（`*_at` / `add_at` / 控件命中区 的矩形并集；
+    /// **相对容器 origin**，与 `child_rect` 同一空间）。
+    ///
+    /// [`Self::settle_size`] 把它并入自然尺寸 ⇒ **容器尺寸包住子控件**。
+    ///
+    /// 没有它时，`grid_at` / `add_at` 这类**不占光标**的绝对放置不进容器的自然尺寸：
+    /// 内容画得出来，却在窗口矩形之外 ⇒ **不在窗口 z-order / 遮挡 / 拖拽判定里**
+    /// （示例"背包按钮超出窗口"就是这么来的：窗口只有标题栏那么高，格子全在框外，
+    /// 于是重叠的另一个窗口反而盖住了它们、拖窗口也拖不动它们）。
+    content_bounds: Option<Rect>,
 }
 
 impl Frame {
@@ -93,6 +103,7 @@ impl Frame {
             force_h_all: None,
             fixed_h: None,
             fixed_w: None,
+            content_bounds: None,
         }
     }
 
@@ -110,6 +121,7 @@ impl Frame {
             force_h_all: None,
             fixed_h: None,
             fixed_w: None,
+            content_bounds: None,
         }
     }
 
@@ -170,6 +182,28 @@ impl Frame {
         self.max_child.x
     }
 
+    /// **记入一处内容矩形**（相对本容器 origin，与 `child_rect` 同空间）：
+    /// 容器结算尺寸**至少包住它**（见 [`Self::content_bounds`]）。
+    ///
+    /// 调用方：`Ui::container` / `Ui::flex_at`（绝对容器整体）、`Ui::add_at`
+    /// （绝对放置控件）、`Ui::hit_abs`（任何可交互控件的命中区——**交互范围必须落在
+    /// 容器内**，否则"看得见点得着却不在窗口矩形里"）。
+    pub(crate) fn note_content(&mut self, rect: Rect) {
+        self.content_bounds = Some(match self.content_bounds {
+            Some(b) => b.union(&rect),
+            None => rect,
+        });
+    }
+
+    /// 本容器已记入的内容包围盒（**相对本容器 origin**；`None` = 没记过）。
+    ///
+    /// 容器弹出时把它平移到父级空间并 `note_content` 上去——**必须**这样做：
+    /// grid / pack 的自然尺寸只统计"单元格 × 列数"，子控件若比单元格宽（内容变了、
+    /// 单元格缓存还是上一帧的值），自然尺寸会**低估**子控件的实际范围。
+    pub(crate) fn content_bounds(&self) -> Option<Rect> {
+        self.content_bounds
+    }
+
     /// 为尺寸 `(w, h)` 的子项分配一个局部矩形，并推进光标 / 更新统计
     /// （**撑大父级**；等价 `child_rect_exp(w, h, true)`）。
     ///
@@ -225,7 +259,7 @@ impl Frame {
             Some(fw) if fw > 0.0 => w.min(fw),
             _ => w,
         };
-        match &mut self.kind {
+        let placed = match &mut self.kind {
             FrameKind::Stack { side, gap } => {
                 let local = self.cursor;
                 match side {
@@ -287,11 +321,48 @@ impl Frame {
                     h,
                 )
             }
+        };
+        // **每处子项矩形都进内容包围盒**（仅 `Child::Expand`——`Fit` /
+        // `DisableAutoExpansion` 的语义就是"**不**撑大父级"）。
+        // grid 的自然尺寸是"列数 × 单元格缓存"，单元格比子项窄时（内容刚变宽、
+        // 缓存还是上一帧的值）会**低估**子项范围 ⇒ 子项"长到容器外"，交互随之失真。
+        // ⚠ 必须在此处（布局期、与鼠标无关）记，不能在命中测试里记——否则容器尺寸
+        // 会随鼠标位置变化。
+        if track_max {
+            self.note_content(placed);
         }
+        placed
     }
 
-    /// 结算容器自然尺寸（含 pad_total 外扩；相对容器 origin）。
+    /// 结算容器**总尺寸**（含 pad_total 外扩；相对容器 origin）：
+    /// 自然尺寸 ∪ 绝对放置内容的包围盒（[`Self::content_bounds`]）。
     pub(crate) fn settle_size(&self) -> Vec2 {
+        let natural = self.natural_size();
+        let Some(b) = self.content_bounds else {
+            return natural;
+        };
+        // 内容包围盒的**右下角** + 另一侧 padding（左上溢出无法让容器"向左上长"，
+        // 那部分仍旧溢出——但**往右/往下**放的内容一律被包住）。
+        //
+        // ⚠ **固定轴不参与**：`fixed_w` / `fixed_h`（窗口固定宽 / flex 定高）表示
+        // "这一轴由调用方定死"，内容按它排布、超出由 `Clip` 语义处理；若这里也并进
+        // 包围盒，固定宽窗口会被宽内容硬撑开（`modal` 的按钮行 spacer 就是这种内容）。
+        let far = b.max() + Vec2::splat(self.pad_total);
+        Vec2::new(
+            if self.fixed_w.is_some() {
+                natural.x
+            } else {
+                natural.x.max(far.x)
+            },
+            if self.fixed_h.is_some() {
+                natural.y
+            } else {
+                natural.y.max(far.y)
+            },
+        )
+    }
+
+    fn natural_size(&self) -> Vec2 {
         match &self.kind {
             FrameKind::Stack { side, gap } => {
                 if self.count == 0 {
@@ -468,8 +539,77 @@ mod tests {
     }
 
     #[test]
-    fn force_next_h_overrides_measured_height() {
+    fn content_bounds_make_container_cover_absolute_placements() {
+        // 绝对放置（`*_at` / `add_at`）不占光标：若不记内容包围盒，容器**只有标题那么高**
+        // ⇒ 控件"长到窗口外"（画得出来但不在窗口矩形 / 遮挡判定里）。
         let mut f = Frame::new_stack(PackSide::Top, 6.0, 0.0);
+        assert_eq!(f.child_rect(100.0, 20.0), Rect::new(0.0, 0.0, 100.0, 20.0));
+        assert_eq!(f.settle_size(), Vec2::new(100.0, 20.0), "只有流内子项时尺寸不变");
+        // 绝对放置在 (0, 28) 处、尺寸 200×120
+        f.note_content(Rect::new(0.0, 28.0, 200.0, 120.0));
+        assert_eq!(f.settle_size(), Vec2::new(200.0, 148.0), "尺寸撑到包住它");
+        // 再记一个往右下更远的矩形：取并集右下角
+        f.note_content(Rect::new(40.0, 60.0, 260.0, 40.0));
+        assert_eq!(f.settle_size(), Vec2::new(300.0, 148.0));
+        // 往左上溢出的部分无法让容器"向左上长"（只取右下）
+        f.note_content(Rect::new(-20.0, -10.0, 30.0, 30.0));
+        assert_eq!(f.settle_size(), Vec2::new(300.0, 148.0));
+    }
+
+    #[test]
+    fn grid_child_wider_than_cached_cell_is_covered() {
+        // grid 的自然尺寸 = 列数 × **单元格缓存**；子控件比缓存宽时（内容刚变宽）会低估
+        // 范围 ⇒ 必须靠"每处子项矩形都进包围盒"兜住。
+        let mut f = Frame::new_grid(3, Vec2::new(50.0, 20.0), 0.0);
+        // 三个子项都请求 80 宽（> 缓存 50）⇒ 就地扩格到 80
+        for _ in 0..3 {
+            f.child_rect(80.0, 20.0);
+        }
+        let size = f.settle_size();
+        assert_eq!(size.x, 240.0, "三列 × 80（就地扩格后的单元格）");
+        // 单元格缓存比子项宽的**反向**情况（子项 30 宽、缓存 50）：
+        let mut g = Frame::new_grid(2, Vec2::new(50.0, 20.0), 0.0);
+        g.child_rect(30.0, 20.0);
+        g.child_rect(30.0, 20.0);
+        // 单元格仍是 50（不缩）⇒ 自然尺寸 100 已覆盖子项；内容包围盒不小于它
+        assert_eq!(g.settle_size().x, 100.0);
+        assert!(g.content_bounds().is_some_and(|b| b.max().x <= 100.0));
+    }
+
+    #[test]
+    fn note_content_survives_settle_and_exposes_bounds() {
+        let mut f = Frame::new_stack(PackSide::Top, 0.0, 10.0);
+        f.note_content(Rect::new(0.0, 0.0, 60.0, 40.0));
+        assert_eq!(f.content_bounds(), Some(Rect::new(0.0, 0.0, 60.0, 40.0)));
+        // pad_total 在另一侧外扩（右下角 + pad）
+        assert_eq!(f.settle_size(), Vec2::new(70.0, 50.0));
+        // **固定轴不参与**：固定宽容器不能被宽内容撑开（固定宽 = 按该宽排布，
+        // 超出交给 Clip 语义；`modal` 的按钮行 spacer 就是这种"宽内容"）。
+        let mut g = Frame::new_stack(PackSide::Top, 0.0, 0.0);
+        g.set_fixed_w(200.0);
+        g.child_rect(200.0, 20.0);
+        g.note_content(Rect::new(0.0, 30.0, 600.0, 20.0));
+        assert_eq!(g.settle_size(), Vec2::new(200.0, 50.0), "宽锁在 200，高仍被内容撑开");
+    }
+
+    #[test]
+    fn fit_child_does_not_grow_container() {
+        // `Child::Fit`（`DisableAutoExpansion`）语义 = **不撑大父级** ⇒ 不进内容包围盒。
+        // （Stack 的光标照常前进 → 高度仍会长；这里是**宽**不被撑开。）
+        let mut f = Frame::new_stack(PackSide::Top, 0.0, 0.0);
+        f.child_rect(50.0, 20.0);
+        f.child_rect_exp(400.0, 20.0, false); // Fit：故意超宽
+        assert_eq!(f.settle_size().x, 50.0, "Fit 子项不撑宽容器");
+        assert!(f.content_bounds().is_none_or(|b| b.max().x <= 50.0));
+        // 对照组：Expand 的超宽子项**必须**撑宽容器（否则内容长到外面）
+        let mut g = Frame::new_stack(PackSide::Top, 0.0, 0.0);
+        g.child_rect(50.0, 20.0);
+        g.child_rect(400.0, 20.0);
+        assert_eq!(g.settle_size().x, 400.0);
+    }
+
+    #[test]
+    fn force_next_h_overrides_measured_height() {        let mut f = Frame::new_stack(PackSide::Top, 6.0, 0.0);
         f.force_next_h(60.0);
         assert_eq!(f.child_rect(50.0, 20.0), Rect::new(0.0, 0.0, 50.0, 60.0), "高度被强制为 60");
         assert_eq!(f.child_rect(50.0, 20.0), Rect::new(0.0, 66.0, 50.0, 20.0), "一次性，后续恢复自然");

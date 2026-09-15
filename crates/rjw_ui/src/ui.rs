@@ -230,6 +230,7 @@ impl<'a> UiInit<'a> {
             depth: 0,
             seq: 0,
             cur_win: 0,
+            win_hit_bounds: None,
             z0_ranges: Vec::new(),
             cur_z0_group: 0,
             // 鼠标屏幕坐标：物理（拖拽 / IME 基准与命中测试统一物理像素，无逻辑之分）
@@ -385,6 +386,18 @@ pub struct Ui<'a> {
     seq: u32,
     /// 当前窗口 z 序（[`Self::window`]；非窗口内容 = 0）。
     cur_win: u32,
+    /// **当前窗口内"可交互控件的命中区"并集**（绝对坐标）：窗口退出时与窗口盒子
+    /// 并起来写进 `UiState::window_rects[z]` ⇒ **遮挡判定按"看得见的范围"走**。
+    ///
+    /// 为什么需要：窗口盒子与"实际可见 / 可点的内容"可能不一致（绝对放置的内容、
+    /// 固定尺寸容器里溢出的控件）。若遮挡矩形只取盒子，则
+    /// 1. 盒子**外**的控件会被**更高 z 窗口**正确拦下（它确实压在内容上），却会被
+    ///    **更低 z 窗口**"穿透"——同一处交互随 z 变化而失真；
+    /// 2. `window_under_mouse()` / 诊断面板也会指错窗口。
+    ///
+    /// 记录子控件命中区（而不是所有绘制命令）是**有意为之**：装饰（阴影 / 描边）
+    /// 不该扩大交互范围。窗口进入时保存、退出时恢复（浮层是嵌套窗口）。
+    win_hit_bounds: Option<Rect>,
     /// **本帧 win=0（非窗口）放置子槽分组**：`(组号, 起始seq, 结束seq)`。
     /// 由顶层放置入口在 `depth == 0` 时记录（[`Self::begin_top_placement`]）；
     /// `finish` 按 `seq` 把 win=0 命令归入对应子槽，逐槽做**全量签名**顶点缓存，
@@ -1539,6 +1552,20 @@ impl<'a> Ui<'a> {
         self.mouse.button(MouseButton::Left)
     }
 
+    /// **记入当前容器**：绝对放置的控件矩形也要算进容器尺寸（`Frame::content_bounds`）。
+    ///
+    /// 所有"显式 rect"的公开控件入口（`button_at_styled` / `slider_at_drag` /
+    /// `checkbox_at_styled` / `radio_at` / `text_input_at` / `text_area_impl` /
+    /// `label_at`）都调它——这样"把控件放在容器外"这件事**要么让容器长大、要么
+    /// 被 `Clip` 裁掉**，不会出现"看得见点得着却不在容器矩形里"的中间态。
+    /// 与鼠标无关（布局期调用），故布局不会随鼠标漂移。
+    #[inline]
+    fn note_placed(&mut self, rect: Rect) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.note_content(rect);
+        }
+    }
+
     /// 鼠标绝对坐标 → 当前容器局部坐标（逻辑像素，字段运算避免方法借用）。
     ///
     /// **控件作者公开面**：自定义拖拽区（如取色器的 SV 平面 / 色相条）拿它做
@@ -1629,6 +1656,13 @@ impl<'a> Ui<'a> {
         let Some(owner) = owner else {
             return true;
         };
+        // 当前窗口的**可见交互范围**并集（`window_rects[z]` 用它扩展，见字段文档）。
+        // ⚠ 这里只做"遮挡范围"的记录，**不**参与容器尺寸（容器尺寸由
+        // `Frame::note_content` 在布局期记，与鼠标无关——否则布局会随鼠标漂移）。
+        self.win_hit_bounds = Some(match self.win_hit_bounds {
+            Some(b) => b.union(&abs),
+            None => abs,
+        });
         // **控件级遮挡**：登记自己（供下一帧判定"谁盖住谁"），并检查上一帧里是否有
         // 更上层的别的控件覆盖此处。登记只在"几何命中"之后发生——遮挡判定只关心
         // 鼠标下那一处，鼠标不在自己矩形内时无需登记。
@@ -1736,7 +1770,12 @@ impl<'a> Ui<'a> {
     ) -> crate::widgets::Response {
         let pos = pos.into().to_physical(self.scale);
         let (size, _) = self.widget_size(&w);
-        w.ui(self, Rect::new(pos.x, pos.y, size.x, size.y))
+        let rect = Rect::new(pos.x, pos.y, size.x, size.y);
+        // 绝对放置的控件也要算进当前容器的尺寸（见 `Frame::content_bounds`）。
+        if let Some(frame) = self.frames.last_mut() {
+            frame.note_content(rect);
+        }
+        w.ui(self, rect)
     }
 
     /// 测量控件最终放置尺寸：`size()` 自然值 → `SizeConstraints` clamp → 按
@@ -1775,10 +1814,19 @@ impl<'a> Ui<'a> {
         let frame = self.frames.pop().expect("container frame");
         let size = frame.settle_size();
         let max_child = frame.max_child;
+        let inner_bounds = frame.content_bounds();
         self.depth -= 1;
         self.abs_base = saved_base;
         for d in &mut self.queue[start..] {
             d.translate(pos);
+        }
+        // 绝对放置的容器整体也要算进**父级**尺寸（否则父容器/窗口仍会"只有标题那么高"）；
+        // 连同容器**内部**的内容包围盒一起平移上报（自然尺寸可能低估子控件范围）。
+        if let Some(parent) = self.frames.last_mut() {
+            parent.note_content(Rect::new(pos.x, pos.y, size.x, size.y));
+            if let Some(ib) = inner_bounds {
+                parent.note_content(Rect::new(ib.x + pos.x, ib.y + pos.y, ib.w, ib.h));
+            }
         }
         self.end_top_placement(g);
         (size, max_child)
@@ -2171,6 +2219,7 @@ impl<'a> Ui<'a> {
         let style = self.theme.label.clone();
         let size = self.text_size(text, style.font_size, style.font_family.as_deref());
         let rect = Rect::new(pos.x, pos.y, size.x, size.y);
+        self.note_placed(rect);
         self.queue.push(text_cmd(
             self.depth,
             seq,
@@ -2202,6 +2251,7 @@ impl<'a> Ui<'a> {
         let style = self.theme.label.clone();
         let size = self.text_size_wrap(text, style.font_size, style.font_family.as_deref(), max_w);
         let rect = Rect::new(pos.x, pos.y, size.x, size.y);
+        self.note_placed(rect);
         // 换行标签：直接传预排版缓冲（渲染与测量同一缓冲）——否则绘制期按不换行
         // 排版，长文本会单行溢出而非自动换行。
         let buf = if max_w > 0.0 {
@@ -2504,6 +2554,9 @@ impl<'a> Ui<'a> {
             *self.state.window_z.entry(id_for.to_static()).or_insert(max_z + 1)
         };
         let saved_win = std::mem::replace(&mut self.cur_win, z);
+        // 当前窗口的"可交互内容范围"并集：进入时从零开始，退出时并进遮挡矩形
+        // （浮层是嵌套窗口 ⇒ 保存/恢复，浮层的内容不该算进外层窗口）。
+        let saved_hit_bounds = self.win_hit_bounds.take();
         let saved_clip = self.clip;
         // 位置经**责任链**解析（脚本处理器 → 用户拖拽状态 → 传入 pos，见 pos_handler）
         let origin = self.resolve_pos(&id_for, pos);
@@ -2686,17 +2739,22 @@ impl<'a> Ui<'a> {
         // 局部坐标，须加容器绝对原点（`saved_base`）——否则遮挡判定用绝对鼠标
         // 比局部矩形恒不命中，浮层背后的控件仍响应 hover/click（"下拉菜单选项
         // 悬停时背后按钮一起 Hover"）。
-        self.state
-            .window_rects
-            .insert(
-                z,
-                Rect::new(
-                    saved_base.x + display_pos.x,
-                    saved_base.y + display_pos.y,
-                    size.x,
-                    size.y,
-                ),
-            );
+        //
+        // **遮挡矩形 = 窗口盒子 ∪ 本帧子控件的命中区**（`win_hit_bounds`）：
+        // 容器尺寸已保证包住子控件（见 `Frame::content_bounds`），这里是**兜底**——
+        // 固定尺寸容器 / 有意溢出的装饰 / 未来新增的绝对放置 API 都还能保住
+        // "看得见就能点"：遮挡判定按内容的实际范围走，而不是按边框盒子。
+        let win_abs = Rect::new(
+            saved_base.x + display_pos.x,
+            saved_base.y + display_pos.y,
+            size.x,
+            size.y,
+        );
+        let occl = match self.win_hit_bounds {
+            Some(b) => win_abs.union(&b),
+            None => win_abs,
+        };
+        self.state.window_rects.insert(z, occl);
         // 严格裁剪（`window_at_strict`）：窗口内容**强制裁剪**到窗口矩形——结算后
         // 统一改写本窗口命令的裁剪层（录制期窗口尺寸未知，背景/子控件命令都覆盖；
         // 命中裁剪由窗口遮挡机制负责）。默认窗口为 Expand 语义（不裁剪）。
@@ -2729,6 +2787,8 @@ impl<'a> Ui<'a> {
             d.translate(display_pos);
         }
         self.cur_win = saved_win;
+        // 恢复外层窗口的"可交互内容范围"（本窗口已并进自己的遮挡矩形）。
+        self.win_hit_bounds = saved_hit_bounds;
         size
     }
 
@@ -2917,10 +2977,17 @@ impl<'a> Ui<'a> {
         }
         let frame = self.frames.pop().expect("flex frame");
         let size = frame.settle_size();
+        let inner_bounds = frame.content_bounds();
         self.depth -= 1;
         self.abs_base = saved_base;
         for d in &mut self.queue[start..] {
             d.translate(pos);
+        }
+        if let Some(parent) = self.frames.last_mut() {
+            parent.note_content(Rect::new(pos.x, pos.y, size.x, size.y));
+            if let Some(ib) = inner_bounds {
+                parent.note_content(Rect::new(ib.x + pos.x, ib.y + pos.y, ib.w, ib.h));
+            }
         }
         self.end_top_placement(g);
         size
@@ -4243,7 +4310,8 @@ pub trait UiAdd<'a> {
     /// **自动换行标签**（占光标）：`max_w` 逻辑像素内按词/字换行；
     /// 返回自然尺寸（宽 = min(自然宽, max_w)，高 = 行数 × 行高）。
     /// `max_w <= 0` = 不换行（同 `label`）。
-    fn label_wrap(&mut self, max_w: f32, text: &str) -> Vec2 {        let ui = self.ui_mut();
+    fn label_wrap(&mut self, max_w: f32, text: &str) -> Vec2 {
+        let ui = self.ui_mut();
         let style = ui.theme.label.clone();
         let size = ui.text_size_wrap(text, style.font_size, style.font_family.as_deref(), max_w);
         let rect = ui.child_rect(size.x, size.y, Child::Expand);
@@ -5087,6 +5155,7 @@ impl Ui<'_> {
     ) -> ButtonState {
         let id_for = self.id_for(id);
 
+        self.note_placed(rect);
         let hit = self.hit_abs(&id_for, &rect);
         let btn = self.mouse_left();
         // 登记焦点链（键盘导航：Tab/方向键可到；Enter/Space 激活 —— 见 `key_click`）。
@@ -5198,6 +5267,7 @@ impl Ui<'_> {
     ) -> f32 {
         let id_for = self.id_for(id);
 
+        self.note_placed(rect);
         let hit = self.hit_abs(&id_for, &rect);
         let btn = self.mouse_left();
         // 登记焦点链（键盘导航：Tab 可到；焦点下左右方向键调值 —— 见下方键盘分支）。
@@ -5346,6 +5416,7 @@ impl Ui<'_> {
         style: &CheckboxStyle,
     ) -> CheckboxState {
         let abs = self.id_for(id);
+        self.note_placed(rect);
         let hit = self.hit_abs(&abs, &rect);
         let btn = self.mouse_left();
         // 登记焦点链（键盘导航：Tab 可到；Enter/Space 切换）。
@@ -5392,6 +5463,7 @@ impl Ui<'_> {
     ) -> CheckboxState {
         // 单选 id 也参与命名空间（组名 `group` 不前缀——跨窗口复用组语义保留）。
         let abs = self.id_for(id);
+        self.note_placed(rect);
         let hit = self.hit_abs(&abs, &rect);
         let btn = self.mouse_left();
         // 登记焦点链（键盘导航：Tab 可到；Enter/Space 选中）。
@@ -5659,6 +5731,7 @@ impl Ui<'_> {
 
     pub fn text_input_at(&mut self, id: &str, rect: Rect, value: &mut String) {
         let id_for = self.id_for(id);
+        self.note_placed(rect);
         let hit = self.hit_abs(&id_for, &rect);
         if hit {
             // 鼠标悬停在输入框上 → 本帧系统光标设为 I 型（finish 统一设置）
@@ -6068,6 +6141,7 @@ impl Ui<'_> {
     fn text_area_impl(&mut self, id: &str, rect: Rect, value: &mut String, wrap: bool) {
         let id_for = self.id_for(id);
 
+        self.note_placed(rect);
         let hit = self.hit_abs(&id_for, &rect);
         if hit {
             // 鼠标悬停在输入框上 → 本帧系统光标设为 I 型（finish 统一设置）
