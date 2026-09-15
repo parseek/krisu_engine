@@ -372,6 +372,26 @@ impl Windows {
                 *clicks += 1;
             }
         });
+        // 矢量图标演示：内置 [`Icon`] 全是**画出来的几何**（单位方框内的凸分片 +
+        // 边缘羽化），与字体完全无关——换字体 / 字体缺字形都不会变形或缺字。
+        // `icon` 占光标，`row` 内连续调用即得一条工具栏。
+        let icon_fg = ui.theme().label.color;
+        ui.window("icons").pos(Vec2::new(560.0, 300.0)).show(|w| {
+            w.label("矢量图标（画出来的几何，与字体无关）");
+            w.row(|r| {
+                for ic in [
+                    Icon::Check,
+                    Icon::ChevronUp,
+                    Icon::ChevronDown,
+                    Icon::ChevronLeft,
+                    Icon::ChevronRight,
+                    Icon::Grip,
+                ] {
+                    r.icon(Vec2::new(18.0, 18.0), ic, icon_fg);
+                }
+            });
+            w.label("绝对定位版：ui.icon_at(pos, size, icon, color)");
+        });
         // 赤石窗口：整窗旋转（角度 = cshi_num）+ RGBA 染色（4 个 slider 调）。
         let mut r = 1.0;
         let mut g = 1.0;

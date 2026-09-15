@@ -328,6 +328,98 @@ fn grow(r: Rect, d: f32) -> Rect {
     Rect::new(r.x - d, r.y - d, r.w + d * 2.0, r.h + d * 2.0)
 }
 
+// ─── 凸多边形（图标等任意形状）────────────────────────────────
+
+/// **凸多边形 + 边缘羽化**（图标 / 箭头 / 勾选等任意形状）。
+///
+/// `points` 必须是**凸**多边形且按**屏幕顺时针**（Y 向下）给出——与圆角矩形同一套
+/// 约定（扇形三角形 `(pᵢ, pᵢ₊₁, 重心)` 的叉积为正）。
+///
+/// # 羽化怎么做（与圆角矩形完全同一套机制）
+///
+/// 硬体 = 原多边形（`alpha = 1`），外环 = 每个顶点沿**角平分线**外扩 `feather`
+/// （`alpha = 0`），两者沿**整圈**配成带状三角形（复用 [`push_band`]）⇒ 由光栅化器
+/// 插值出 `1 → 0` 的过渡。同样**不改着色器**。
+///
+/// 顶点外扩量按**真 Minkowski 偏移**算：沿角平分线走 `feather / cos(θ)`（`θ` = 该顶点
+/// 的角平分线与边法线的夹角），于是外环与每条边相距**恰好** `feather`（不是"每个顶点
+/// 都走 feather"，那会让尖角处外环距离变远、羽化宽度不均）。尖角处按 `MAX_MITER`
+/// 截断（避免长针状外环）。
+pub(crate) fn push_convex(
+    verts: &mut Vec<VertexP3U2C4>,
+    tris: &mut Vec<Tri>,
+    points: &[Vec2],
+    feather: f32,
+    color: Color,
+    uv: [f32; 2],
+) -> TessOutput {
+    if points.len() < 3 {
+        return TessOutput { verts: 0, tris: 0 };
+    }
+    let mut col: [f32; 4] = color.into();
+    col[3] = 1.0;
+    let mut fade = col;
+    fade[3] = 0.0;
+
+    let verts_before = verts.len();
+    let tris_before = tris.len();
+    let n = points.len() as u16;
+
+    // 硬体：轮廓 + 重心（扇形三角化的轴）。
+    let hard_start = verts.len() as u16;
+    for p in points {
+        verts.push(VertexP3U2C4 { pos: [p.x, p.y, 0.0], uv, color: col });
+    }
+    let centroid = points.iter().fold(Vec2::ZERO, |a, p| a + *p) / points.len() as f32;
+    let center_idx = verts.len() as u16;
+    verts.push(VertexP3U2C4 { pos: [centroid.x, centroid.y, 0.0], uv, color: col });
+    for i in 0..n {
+        tris.push([hard_start + i, hard_start + (i + 1) % n, center_idx]);
+    }
+
+    // 外环（alpha = 0）：沿角平分线做真偏移。
+    let f = feather.max(0.0);
+    if f > 0.0 {
+        let outer_start = verts.len() as u16;
+        for (i, p) in points.iter().enumerate() {
+            // 相邻两条边的**单位外法线**。顺时针（Y 向下）时，边 `a → b` 的外法线
+            // 是 `(dy, -dx)` 归一化（与 `CHECK_L` 等图标表的构造同一约定，有单测钉住）。
+            let prev = points[(i + points.len() - 1) % points.len()];
+            let next = points[(i + 1) % points.len()];
+            let n_prev = outward_normal(*p - prev);
+            let n_next = outward_normal(next - *p);
+            let bis = n_prev + n_next;
+            let bis = if bis.length_squared() < 1e-8 { n_next } else { bis.normalize() };
+            // 沿平分线走多少才让"到两条边的距离"都等于 f：`f / cos(θ)`，`θ` 是平分线与
+            // 法线的夹角。`dot` 就是 `cos θ`，下限 0.35 ≈ 70° 的半角（即尖角 20°）。
+            let k = (1.0 / bis.dot(n_next).max(0.35)).min(MAX_MITER);
+            let off = *p + bis * (f * k);
+            verts.push(VertexP3U2C4 { pos: [off.x, off.y, 0.0], uv, color: fade });
+        }
+        push_band(tris, hard_start, outer_start, n);
+    }
+
+    TessOutput {
+        verts: verts.len() - verts_before,
+        tris: tris.len() - tris_before,
+    }
+}
+
+/// 顺时针（Y 向下）多边形的边 `d` 的**单位外法线**。
+#[inline]
+fn outward_normal(d: Vec2) -> Vec2 {
+    let l = d.length();
+    if l < 1e-6 {
+        Vec2::ZERO
+    } else {
+        Vec2::new(d.y, -d.x) / l
+    }
+}
+
+/// 尖角处外环的**斜接上限**（`miter limit`）：顶点最远只外扩 `feather × 此值`，
+/// 避免锐角处外环被拉成长针（同 Canvas 的 `miterLimit` 语义）。
+const MAX_MITER: f32 = 2.0;
+
 
 /// 四角（屏幕顺时针 TL → TR → BR → BL）的圆心与基向量。
 ///
@@ -1335,6 +1427,76 @@ mod tests {
                     v[tri[2] as usize].pos
                 );
             }
+        }
+    }
+
+    #[test]
+    fn convex_icons_are_clockwise_and_feather_outward() {
+        // 图标几何从 `Icon::parts()` 来（单位方框）；这里验证**每一个**分片都满足
+        // 镶嵌器的前提：凸多边形的绕序为正，且羽化外环确实在外面。
+        for icon in [
+            crate::draw::Icon::ChevronDown,
+            crate::draw::Icon::ChevronUp,
+            crate::draw::Icon::ChevronLeft,
+            crate::draw::Icon::ChevronRight,
+            crate::draw::Icon::Check,
+            crate::draw::Icon::Grip,
+        ] {
+            for part in icon.parts() {
+                // 缩放到 20×20 的方框。
+                let pts: Vec<Vec2> = part
+                    .iter()
+                    .map(|p| Vec2::new(p.x * 20.0, p.y * 20.0))
+                    .collect();
+                let mut v = Vec::new();
+                let mut tr = Vec::new();
+                push_convex(&mut v, &mut tr, &pts, DEFAULT_FEATHER, Color::WHITE, TEST_UV);
+                assert_well_formed(&v, &tr);
+                for tri in &tr {
+                    assert!(
+                        cross(&v, tri) > 0.0,
+                        "{icon:?} 的分片绕序反了：{tri:?}"
+                    );
+                }
+                // 顶点数 = 硬体 (n + 1 重心) + 外环 n
+                assert_eq!(v.len(), pts.len() * 2 + 1, "{icon:?} 顶点数");
+                // 外环（alpha = 0）必须落在硬体**之外**：逐点距离应大于 0。
+                let m = pts.len();
+                for i in 0..m {
+                    let d = (Vec2::new(v[m + 1 + i].pos[0], v[m + 1 + i].pos[1])
+                        - Vec2::new(v[i].pos[0], v[i].pos[1]))
+                    .length();
+                    assert!(d > 0.0, "{icon:?} 第 {i} 点外环没外扩");
+                    assert!(d <= DEFAULT_FEATHER * MAX_MITER + 1e-3, "斜接超上限");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn convex_without_feather_is_just_the_polygon() {
+        let pts = [Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(5.0, 8.0)];
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        let out = push_convex(&mut v, &mut tr, &pts, 0.0, Color::WHITE, TEST_UV);
+        assert_eq!(out.verts, 4, "3 顶点 + 重心");
+        assert_eq!(out.tris, 3);
+        assert!(v.iter().all(|x| x.color[3] == 1.0), "不羽化 ⇒ 无 alpha=0 顶点");
+        // 退化输入：点数 < 3 不产生几何。
+        let out = push_convex(&mut v, &mut tr, &pts[..2], 1.0, Color::WHITE, TEST_UV);
+        assert_eq!(out.verts, 0);
+    }
+
+    #[test]
+    fn outward_normal_points_out_of_a_clockwise_polygon() {
+        // 顺时针（Y 向下）三角形的边 `a → b`：外法线应背离重心。
+        let pts = [Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(5.0, 8.0)];
+        let c = Vec2::new(5.0, 8.0 / 3.0);
+        for i in 0..3 {
+            let (a, b) = (pts[i], pts[(i + 1) % 3]);
+            let n = outward_normal(b - a);
+            let mid = (a + b) * 0.5;
+            assert!((mid + n - c).length() > (mid - c).length(), "法线应朝外");
         }
     }
 

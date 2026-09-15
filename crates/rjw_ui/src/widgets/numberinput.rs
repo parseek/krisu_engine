@@ -15,7 +15,7 @@
 use glam::Vec2;
 use rjw_transform::Rect;
 
-use crate::draw::CornerRadius;
+use crate::draw::{CornerRadius, Icon, Position, Size};
 use crate::hit::update_drag;
 use crate::id::IdAbsolute;
 use crate::{FocusKind, Response, Ui, UiCursor, Widget};
@@ -272,13 +272,12 @@ impl Widget for NumberInput<'_> {
         //   （`CornerRadius` 的具名字段在这里正好用上）；
         // - 底色用按钮刷（略高于输入框的"可按"暗示），边框色只作**左缘分隔线**，
         //   不再整块刷成边框色（旧样子像"两个独立的深色方块"）。
-        let (grip_bg, sep, glyph, font_size, radius) = {
+        let (grip_bg, sep, glyph, radius) = {
             let st = &ui.theme.input;
             (
                 ui.theme.button.bg,
                 st.border,
                 st.fg,
-                st.font_size,
                 CornerRadius { tl: 0.0, tr: st.radius.tr, br: st.radius.br, bl: 0.0 },
             )
         };
@@ -291,16 +290,12 @@ impl Widget for NumberInput<'_> {
             CornerRadius::default(),
             1,
         );
-        ui.push_text_rect(
-            grip,
-            "≡",
-            font_size,
+        // 手柄图标用**矢量三横**（`≡` 字形会随字体变宽变高，甚至缺字形）。
+        ui.icon_at(
+            Position::Physical(Vec2::new(grip.x + (grip.w - 12.0) * 0.5, grip.y + (grip.h - 14.0) * 0.5)),
+            Size::Physical(Vec2::new(12.0, 14.0)),
+            Icon::Grip,
             glyph,
-            None,
-            crate::TextAlign::Center,
-            crate::draw::TextVAlign::Center,
-            None,
-            None,
         );
         Response::default()
     }

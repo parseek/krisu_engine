@@ -95,6 +95,22 @@ ui.finish();
 - `flex_at(pos, total_h, weights, |f, i| ...)`：固定总高按权重等分
 - `row(|r| ...)`：水平等高管线，占一行
 
+## 绘制原语（圆角 / 渐变 / 矢量图标）
+
+控件之外，`Ui` 直接暴露一组**绘制原语**（绝对定位 + 占光标两种写法）：
+
+```rust
+ui.rounded_rect_at(pos, size, 8.0, Color::RED);                       // 圆角（radius: f32 或 CornerRadius）
+ui.rounded_rect_at(pos, size, CornerRadius { tl: 10.0, tr: 10.0, br: 0.0, bl: 0.0 }, Color::RED);
+ui.gradient_rect_at(pos, size, Gradient::vertical(Color::RED, Color::BLUE)); // 渐变（无纹理，顶点色插值）
+ui.icon_at(pos, Vec2::splat(16.0), Icon::ChevronDown, Color::WHITE);  // 矢量图标（不用字体字形）
+ui.row(|r| r.icon(Vec2::splat(18.0), Icon::Check, Color::WHITE));     // 占光标 → 工具栏
+```
+
+- 圆角 / 羽化 / 渐变全部在 **CPU 镶嵌**（[`crate::tess`]）成三角形，无额外纹理、无额外 draw call；
+- [`Icon`] 是**画出来的几何**（`Check` / `ChevronUp` / `ChevronDown` / `ChevronLeft` /
+  `ChevronRight` / `Grip`），与字体无关，缺字形也不会变形。
+
 ## 依赖
 
 `rjw_2d_render`（绘制）/ `rjw_text`（测量与渲染）/ `rjw_transform`（屏幕固定变换）/ `rjw_color` / `rjw_mouse`（鼠标）/ `rjw_keyboard`（字符输入）/ `glam`

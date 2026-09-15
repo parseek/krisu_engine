@@ -1006,15 +1006,24 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 - 输入框按下时置位 `press_claimed`：窗口/面板**不建立拖拽基准**（选择拖拽优先；窗口从空白/标题区拖动），并清除旧拖拽基准（防"瞬移"）；
 - 主题：`InputStyle::sel_bg`（选择高亮色，默认浅蓝 / dark 深蓝）。
 
-### 渲染增强（圆角 / 渐变）
+### 渲染增强（圆角 / 渐变 / 矢量图标）
 
 | 函数 | 签名 | 说明 |
 |---|---|---|
 | `rounded_rect_at` | `ui.rounded_rect_at(pos, size, radius, color)` | 圆角矩形背景原语（radius 逻辑像素；CPU 镶嵌成三角形 + 1px 羽化，无纹理） |
 | `gradient_rect_at` | `ui.gradient_rect_at(pos, size, gradient)` | **矩形渐变**原语（绝对定位）。`gradient` 接受 `Gradient` 或 `Color`（`Into`） |
 | `gradient_rect` | `ui.gradient_rect(size, gradient)` | 同上，但位置来自当前容器游标（随布局流） |
+| `icon_at` | `ui.icon_at(pos, size, icon, color)` | **矢量图标**（绝对定位；`size` 为方框，非方形时按 `min(w,h)` 居中等比） |
+| `icon` | `ui.icon(size, icon, color)` | 同上，但位置来自当前容器游标——`row` 内连续调用即得工具栏 |
+| `Icon` | `Check` / `ChevronUp` / `ChevronDown` / `ChevronLeft` / `ChevronRight` / `Grip` | **画出来的几何**（单位方框 `[0,1]²` 内的凸分片，`Icon::parts()` 公开） |
 | `Gradient` | `pure(c)` / `vertical(top, bottom)` / `horizontal(left, right)` / `rotated(from, to, angle)` / `corners(tl, tr, bl, br)` | **四角颜色**（`pub tl/tr/bl/br`）；`From<Color>` 给纯色 |
 | `lerp_color` | `lerp_color(a, b, k)` | 颜色线性插值（`Gradient` 构造器与四角采样的基础） |
+
+**矢量图标不需要字体**：`▾` / `✓` / `≡` 这类字符的可用性、宽度、基线全由字体决定
+（缺字形会走 fallback，甚至会因字体不同而宽高不一）。`Icon` 改为在单位方框内给出
+**凸多边形分片**，由 `crate::tess::push_convex` 扇形三角化 + 按 `Theme::feather`
+做边缘羽化（与圆角矩形同一套顶点 alpha 插值机制，`DrawKind::Icon` 走同一条批）。
+自定义图标请按 `Icon::parts()` 的形状（单位方框、**凸**、屏幕顺时针）提供分片。
 
 ```rust
 // 使用前
@@ -1028,6 +1037,9 @@ ui.gradient_rect_at(pos, size, Gradient::horizontal(Color::RED, Color::BLUE));
 ui.gradient_rect_at(pos, size, Gradient::rotated(Color::RED, Color::BLUE, 0.5));
 // 4) 四角各异（双线性；1D 纹理表达不了）
 ui.gradient_rect_at(pos, size, Gradient::corners(a, b, c, d));
+// 5) 矢量图标
+ui.icon_at(pos, Vec2::splat(16.0), Icon::Check, Color::WHITE);
+ui.row(|r| r.icon(Vec2::splat(18.0), Icon::ChevronDown, Color::WHITE)); // 工具栏
 ```
 
 **渐变不需要纹理**（v0.3 起）：顶点格式 `VertexP3U2C4` 自带 4 分量顶点色，

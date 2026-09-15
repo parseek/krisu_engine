@@ -40,6 +40,14 @@ pub fn snap_rect(r: &Rect) -> Rect {
     Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
 }
 
+/// **居中正方形**（边长 = `min(w, h)`）：矢量图标（[`Icon`]）的定义域是**单位方框**，
+/// 直接映射到非方形框会把笔画拉扁（`row` 的等高约束就会给出 18×26 这类框）。
+#[inline]
+pub(crate) fn centered_square(r: Rect) -> Rect {
+    let side = r.w.min(r.h);
+    Rect::new(r.x + (r.w - side) * 0.5, r.y + (r.h - side) * 0.5, side, side)
+}
+
 /// **物理 / 逻辑单位包装**（DPI 边界类型）。
 ///
 /// 内部计算一律使用**物理像素**（渲染取整 / 命中 / 滚动都在物理侧），逻辑单位只在
@@ -657,6 +665,9 @@ pub enum DrawKind {
     /// `max(0, radius - width)` 逐角计算；见 `crate::tess::push_rounded_ring`），
     /// 与 [`Self::RoundedRect`] 的圆角语义一致（四角可各自独立）。
     Border { color: Color, width: f32, radius: CornerRadius },
+    /// **矢量图标**（画出来的几何，与字体无关）：`rect` 是图标方框，几何取
+    /// [`Icon::parts`] 的单位坐标映射进去，并按 `Theme::feather` 做边缘羽化。
+    Icon { icon: Icon, color: Color },
     /// 文本（绘制时经 `rjw_text` 责任链渲染）。
     Text {
         /// 文本内容（`Arc<str>`：命令间共享，避免每命令 String 克隆）。
@@ -695,9 +706,121 @@ pub enum TextVAlign {
     Center,
 }
 
+// ─── 矢量图标（画出来的几何，与字体无关） ──────────────────────
+
+/// 图标笔画在**单位方框** `[0,1]²` 内的顶点表（Y 向下）。
+///
+/// 每个分片都必须是**凸**多边形且按**屏幕顺时针**给出（与 `Quad` 的 `(TL,TR,BR)`
+/// 同向）——镶嵌器据此做扇形三角化 + 边缘羽化。多分片表示"一笔一个凸多边形"
+/// （勾选的"✓"是两笔，`Grip` 是三横）。
+type IconPart = &'static [Vec2];
+
+/// 勾选"✓"的左笔（短促的下行）。
+const CHECK_L: IconPart = &[
+    Vec2::new(0.177, 0.463),
+    Vec2::new(0.417, 0.703),
+    Vec2::new(0.303, 0.817),
+    Vec2::new(0.063, 0.577),
+];
+/// 勾选"✓"的右笔（长上行）。
+const CHECK_R: IconPart = &[
+    Vec2::new(0.268, 0.599),
+    Vec2::new(0.828, 0.119),
+    Vec2::new(0.932, 0.241),
+    Vec2::new(0.372, 0.721),
+];
+/// 拖拽手柄：三横（每横一个凸四边形）。
+const GRIP_1: IconPart = &[
+    Vec2::new(0.25, 0.25),
+    Vec2::new(0.75, 0.25),
+    Vec2::new(0.75, 0.35),
+    Vec2::new(0.25, 0.35),
+];
+const GRIP_2: IconPart = &[
+    Vec2::new(0.25, 0.45),
+    Vec2::new(0.75, 0.45),
+    Vec2::new(0.75, 0.55),
+    Vec2::new(0.25, 0.55),
+];
+const GRIP_3: IconPart = &[
+    Vec2::new(0.25, 0.65),
+    Vec2::new(0.75, 0.65),
+    Vec2::new(0.75, 0.75),
+    Vec2::new(0.25, 0.75),
+];
+/// 箭头（下 / 上 / 左 / 右）——等腰三角形。
+const TRI_DOWN: IconPart = &[
+    Vec2::new(0.15, 0.32),
+    Vec2::new(0.85, 0.32),
+    Vec2::new(0.50, 0.72),
+];
+const TRI_UP: IconPart = &[
+    Vec2::new(0.15, 0.68),
+    Vec2::new(0.50, 0.28),
+    Vec2::new(0.85, 0.68),
+];
+const TRI_RIGHT: IconPart = &[
+    Vec2::new(0.32, 0.15),
+    Vec2::new(0.72, 0.50),
+    Vec2::new(0.32, 0.85),
+];
+const TRI_LEFT: IconPart = &[
+    Vec2::new(0.68, 0.15),
+    Vec2::new(0.68, 0.85),
+    Vec2::new(0.28, 0.50),
+];
+
+/// **矢量图标**：内置图元一律用**画出来的几何**，不用字体字形。
+///
+/// # 为什么不用字形
+///
+/// `▾` / `▼` / `✓` / `≡` 这类字符的可用性、宽度、基线**全由字体决定**——字体缺字形
+/// 就走 fallback（豆腐块 / 尺寸不对），同一套 UI 换个字体图标就跑偏。图标是**几何**，
+/// 应该与字体无关。
+///
+/// # 为什么用枚举而不是任意点表
+///
+/// 图标是**有限且固定**的一组，用 `Copy` 枚举：
+/// - 内容签名（`cmd_sig_hash`）只需哈希一个小整数，不必逐点哈希；
+/// - 几何是 `const` 表（零分配、可单测）；
+/// - 调用点写 `Icon::Check` 而不是一串魔数坐标。
+///
+/// 需要任意多边形/曲线时用 [`Ui::polygon_at`](crate::ui::Ui::polygon_at)（凸多边形）——
+/// 图标走枚举是为了"常用形状便宜且统一"。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Icon {
+    /// 向下箭头（下拉框 / 展开的取色器）。
+    ChevronDown,
+    /// 向上箭头（已展开）。
+    ChevronUp,
+    /// 向左箭头。
+    ChevronLeft,
+    /// 向右箭头。
+    ChevronRight,
+    /// 勾选（下拉菜单选中标记）。
+    Check,
+    /// 拖拽手柄（三横）。
+    Grip,
+}
+
+impl Icon {
+    /// 单位方框内的**凸**分片（顺时针，Y 向下）——镶嵌器的输入。
+    #[inline]
+    pub fn parts(self) -> &'static [IconPart] {
+        match self {
+            Icon::ChevronDown => &[TRI_DOWN],
+            Icon::ChevronUp => &[TRI_UP],
+            Icon::ChevronLeft => &[TRI_LEFT],
+            Icon::ChevronRight => &[TRI_RIGHT],
+            Icon::Check => &[CHECK_L, CHECK_R],
+            Icon::Grip => &[GRIP_1, GRIP_2, GRIP_3],
+        }
+    }
+}
+
 impl DrawKind {
     /// 类别分组（同一 layer 内"**背景/图形 → 文字**"排序用）：
-    /// - `0`：背景 / 图形（Solid / Border / Caret）——先画；
+    /// - `0`：背景 / 图形（Solid / Border / Caret / Icon）——先画；
     /// - `1`：文字（Text）——后画（覆盖在图形之上）。
     /// - `2`：调试图元（Debug）——内容排序时不会出现（走独立调试队列，恒最后提交）。
     ///
@@ -876,6 +999,22 @@ mod tests {
         assert_eq!(clipped(Rect::new(0.0, 0.0, 5.0, 5.0), None), Some(Rect::new(0.0, 0.0, 5.0, 5.0)));
         assert_eq!(clipped(Rect::new(0.0, 0.0, 5.0, 5.0), Some(Rect::new(2.0, 2.0, 10.0, 10.0))), Some(Rect::new(2.0, 2.0, 3.0, 3.0)));
         assert_eq!(clipped(Rect::new(0.0, 0.0, 5.0, 5.0), Some(Rect::new(9.0, 9.0, 10.0, 10.0))), None);
+    }
+
+    #[test]
+    fn centered_square_keeps_icons_undistorted() {
+        // 已是方形：原样（浮点精确相等在这里成立：min 取其一，偏移恰为 0）。
+        let sq = Rect::new(3.0, 4.0, 16.0, 16.0);
+        assert_eq!(centered_square(sq), sq);
+        // 非方形（row 等高约束给的 18×26）：取 min = 18 的居中方块 —— 笔画不形变。
+        let tall = centered_square(Rect::new(10.0, 20.0, 18.0, 26.0));
+        assert_eq!(tall, Rect::new(10.0, 24.0, 18.0, 18.0), "高框 → 居中正方形");
+        let wide = centered_square(Rect::new(10.0, 20.0, 26.0, 18.0));
+        assert_eq!(wide, Rect::new(14.0, 20.0, 18.0, 18.0), "宽框 → 居中正方形");
+        // 退化：0 尺寸不 panic、不产生负宽高。
+        let zero = centered_square(Rect::new(5.0, 5.0, 0.0, 12.0));
+        assert_eq!(zero.w, 0.0);
+        assert!(zero.h >= 0.0 && zero.x.is_finite());
     }
 
     #[test]

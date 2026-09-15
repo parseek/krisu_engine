@@ -33,12 +33,10 @@ use winit::window::Window as WinitWindow;
 
 use crate::backend::{UiBackend, UiBatch, UiBatchSource};
 use crate::draw::{
-    CornerRadius,
-    border_rects, clipped, debug_shape_segments, intersect_rect, screen_fixed_tf, snap_rect,
-    text_block_offset, text_cmd, DebugShape, DrawKind, Gradient, Position, Size, TextAlign,
-    TextVAlign, UiDraw,
-};
-// 顶点收集 / 合批机制（原在此文件，见 `gpu_batch` 模块文档）。
+    CornerRadius, DebugShape, DrawKind, Gradient, Icon, Position, Size, TextAlign, TextVAlign,
+    UiDraw, border_rects, centered_square, clipped, debug_shape_segments, intersect_rect,
+    screen_fixed_tf, snap_rect, text_block_offset, text_cmd,
+};// 顶点收集 / 合批机制（原在此文件，见 `gpu_batch` 模块文档）。
 use crate::gpu_batch::{
     CacheStats, CachedQuad, Geom, QuadCollector, cmd_sig_hash, debug_layout_outline, line_row_at_y,
     resample_gradient_local, safe_line_slice, segment_runs, vertex_p3u2c4,
@@ -920,6 +918,52 @@ impl<'a> Ui<'a> {
         );
     }
 
+    /// **矢量图标**（绝对定位；`size` 为图标方框）。
+    ///
+    /// 图标是**画出来的几何**（[`Icon`]，单位方框内的凸多边形分片），与字体无关——
+    /// `▾` / `✓` / `≡` 这类字符的可用性与宽度全由字体决定，字体缺字形就走 fallback。
+    /// 几何按 [`Theme::feather`] 做边缘羽化（与圆角矩形同一套顶点 alpha 插值）。
+    ///
+    /// 框非方形时按 `min(w, h)` **居中等比**（图标永不形变）。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{Icon, Position, Size, Ui};
+    /// # fn demo(ui: &mut Ui, pos: Position, size: Size<glam::Vec2>) {
+    /// ui.icon_at(pos, size, Icon::ChevronDown, rjw_color::Color::WHITE);
+    /// # }
+    /// ```
+    pub fn icon_at(
+        &mut self,
+        pos: impl Into<Position>,
+        size: impl Into<Size<Vec2>>,
+        icon: Icon,
+        color: Color,
+    ) {
+        let pos = pos.into().to_physical(self.scale);
+        let size = size.into().to_physical(self.scale);
+        self.push_draw(
+            DrawKind::Icon { icon, color },
+            Rect::new(pos.x, pos.y, size.x, size.y),
+        );
+    }
+
+    /// **矢量图标**（随布局流排布；与 [`Self::icon_at`] 同语义，位置来自当前容器游标）。
+    ///
+    /// 在 [`crate::UiAdd::row`] 容器内连续调用即得一条工具栏；`size` 决定图标方框
+    /// （非方形时按 `min(w, h)` 居中等比，笔画不形变）。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{Icon, Ui};
+    /// # fn demo(ui: &mut Ui, c: rjw_color::Color) {
+    /// ui.icon(glam::Vec2::new(16.0, 16.0), Icon::Check, c);
+    /// # }
+    /// ```
+    pub fn icon(&mut self, size: impl Into<Size<Vec2>>, icon: Icon, color: Color) {
+        let size = size.into().to_physical(self.scale);
+        let pos = self.child_rect(size.x, size.y, Child::Expand).min();
+        self.push_draw(DrawKind::Icon { icon, color }, Rect::new(pos.x, pos.y, size.x, size.y));
+    }
+
     /// **矩形渐变**（绝对定位；背景填充原语）。
     ///
     /// `gradient` 接受 [`Gradient`] 或 `Color`（`Color: Into<Gradient>`，等价纯色）：
@@ -962,7 +1006,7 @@ impl<'a> Ui<'a> {
     }
 
     /// 录制一条绘制命令（`elem = 0` 装饰层，画在本窗口元素之下——如背景/边框）。
-    fn push_draw(&mut self, kind: DrawKind, rect: Rect) {
+    pub(crate) fn push_draw(&mut self, kind: DrawKind, rect: Rect) {
         let seq = self.next_seq();
         let depth = self.depth;
         let win = self.cur_win;
@@ -3354,6 +3398,26 @@ impl<'a> Ui<'a> {
                         debug_layout_outline(quads, win, anchor_px, pr, dbg);
                     }
                 }
+                DrawKind::Icon { icon, color } => {
+                    // 矢量图标：单位方框内的凸分片映射到 `rect`（窗口局部），
+                    // 并按 `Theme::feather` 做边缘羽化——与圆角矩形同一套 AA 机制。
+                    let pr = snap_rect(&d.rect);
+                    if let Some(local) = clipped(pr, clip_abs).map(|r| {
+                        Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
+                    })
+                        && local.w > 0.0 && local.h > 0.0 {
+                            // **等比**：图标分片画在 `[0,1]²` 的方形域里，把 `rect` 直接映射过去
+                            // 会在非方形框里被拉扁（`row` 内 `force_h_all` 就会把 18×26 的框
+                            // 交给这里）。故取 `min(w,h)` 的**居中方块**——图标永不形变。
+                            quads.push_icon(
+                                win,
+                                centered_square(local),
+                                *icon,
+                                *color,
+                                self.theme.feather,
+                            );
+                        }
+                }
                 DrawKind::Text {
                     text,
                     size,
@@ -3782,6 +3846,17 @@ pub trait UiAdd<'a> {
     /// 绝对定位标签（`pos` 相对当前容器内容原点）。
     fn label_at(&mut self, pos: impl Into<Position>, text: &str) -> Vec2 {
         self.ui_mut().label_at(pos, text)
+    }
+
+    /// **矢量图标**（占光标）：容器内按当前游标放置，方块 `size`（等比缩放笔画）。
+    /// 与 [`crate::Ui::icon`] 同语义——`row` 内连续调用即得一条工具栏。
+    fn icon(&mut self, size: impl Into<Size<Vec2>>, icon: Icon, color: Color) {
+        self.ui_mut().icon(size, icon, color)
+    }
+
+    /// **矢量图标**（绝对定位；`pos` 相对当前容器内容原点）。
+    fn icon_at(&mut self, pos: impl Into<Position>, size: impl Into<Size<Vec2>>, icon: Icon, color: Color) {
+        self.ui_mut().icon_at(pos, size, icon, color)
     }
 
     /// **自动换行标签**（占光标）：`max_w` 逻辑像素内按词/字换行；
@@ -4439,24 +4514,18 @@ impl Ui<'_> {
             self.clip,
         None,
         ));
-        let arrow_rect = Rect::new(rect.x + rect.w - 18.0, rect.y, 18.0, rect.h);
+        // 箭头用**矢量图标**画（不再用 "▼" 字形：字体缺字形会走 fallback，宽度也随字体变）。
+        let arrow = Rect::new(rect.x + rect.w - 18.0, rect.y, 18.0, rect.h);
         let seq = self.next_seq();
-        self.queue.push(text_cmd(
-            self.depth,
+        self.queue.push(UiDraw {
+            depth: self.depth,
             seq,
-            self.cur_win,
+            win: self.cur_win,
             elem,
-            arrow_rect,
-            Arc::from("▼"),
-            style.font_size,
-            style.fg,
-            TextAlign::Center,
-            TextVAlign::Center,
-            None,
-            None,
-            self.clip,
-        None,
-        ));
+            rect: arrow,
+            clip: self.clip,
+            kind: DrawKind::Icon { icon: Icon::ChevronDown, color: style.fg },
+        });
         // 展开的选项浮层：临时窗口，**显式置顶**（z = WIN_TOPMOST → 覆盖一切，
         // 不受其他窗口置顶书签影响）。**现代右键菜单外观**：浮层面板（细边框 + 小圆角）
         // + 扁平列表项（hover / 选中整行高亮、✓ 选中标记、无边框）。
@@ -4525,16 +4594,15 @@ impl Ui<'_> {
                             item_rect.h,
                         );
                         if sel {
-                            ui.push_text_rect(
-                                text_rect,
-                                "✓",
-                                cs.font_size,
+                            // 选中标记用**矢量图标**（不再用 "✓" 字形）。
+                            ui.icon_at(
+                                Position::Physical(Vec2::new(
+                                    text_rect.x,
+                                    text_rect.y + (text_rect.h - cs.font_size) * 0.5,
+                                )),
+                                Size::Physical(Vec2::splat(cs.font_size)),
+                                Icon::Check,
                                 cs.fg_mark,
-                                cs.font_family.clone(),
-                                TextAlign::Left,
-                                TextVAlign::Center,
-                                None,
-                                None,
                             );
                             ui.push_text_rect(
                                 Rect::new(

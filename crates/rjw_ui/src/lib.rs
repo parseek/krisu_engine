@@ -159,7 +159,7 @@ pub mod widgets;
 pub(crate) mod ui_types;
 
 pub use backend::{RecordingBackend, Tri, UiBackend, UiBatch, UiBatchSource};
-pub use draw::{CornerRadius, Gradient, Metric, Position, Size, TextAlign, lerp_color};
+pub use draw::{CornerRadius, Gradient, Icon, Metric, Position, Size, TextAlign, lerp_color};
 pub use focus::FocusKind;
 pub use id::{IdAbsolute, IdRelative, IdStack};
 pub use hit::{hit_test, InteractEvents};

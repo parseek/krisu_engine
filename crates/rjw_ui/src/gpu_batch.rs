@@ -23,7 +23,7 @@ use rjw_text::VisualLine;
 use rjw_transform::Rect;
 
 use crate::backend::Tri;
-use crate::draw::{CornerRadius, DebugShape, DrawKind, Gradient, UiDraw};
+use crate::draw::{CornerRadius, DebugShape, DrawKind, Gradient, Icon, UiDraw};
 use crate::ui::TEXT_LINE_HEIGHT_VERSION;
 
 // ─── 分组维度 ─────────────────────────────────────────────────
@@ -309,9 +309,41 @@ impl QuadCollector {
         )
     }
 
+    /// **CPU 镶嵌的矢量图标**（图形组；白纹理 + 纯色）。
+    ///
+    /// 每个分片是单位方框里的**凸**多边形，这里映射到 `rect` 再交给
+    /// [`crate::tess::push_convex`]（硬体 + 沿角平分线外扩的羽化环）。
+    pub(crate) fn push_icon(
+        &mut self,
+        win: u32,
+        rect: Rect,
+        icon: Icon,
+        color: Color,
+        feather: f32,
+    ) -> crate::tess::TessOutput {
+        let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
+        let uv = self.white_uv_center();
+        let g = self.geom(key);
+        let v0 = g.verts.len();
+        let t0 = g.tris.len();
+        for part in icon.parts() {
+            if part.len() < 3 {
+                continue;
+            }
+            let pts: Vec<Vec2> = part
+                .iter()
+                .map(|p| Vec2::new(rect.x + p.x * rect.w, rect.y + p.y * rect.h))
+                .collect();
+            crate::tess::push_convex(&mut g.verts, &mut g.tris, &pts, feather, color, uv);
+        }
+        crate::tess::TessOutput {
+            verts: g.verts.len() - v0,
+            tris: g.tris.len() - t0,
+        }
+    }
+
     /// 追加一个带 UV 的四边形（字形用；文字组）。
-    pub(crate) fn push_tex_quad(&mut self, win: u32, tex: u64, quad: [VertexP3U2C4; 4]) {
-        let key = (win, self.cur_elem, GROUP_TEXT, tex);
+    pub(crate) fn push_tex_quad(&mut self, win: u32, tex: u64, quad: [VertexP3U2C4; 4]) {        let key = (win, self.cur_elem, GROUP_TEXT, tex);
         self.geom(key).push_quad(&quad);
     }
 
@@ -474,6 +506,11 @@ pub(crate) fn cmd_sig_hash(h: &mut std::collections::hash_map::DefaultHasher, d:
             color_bits(g.tr).hash(h);
             color_bits(g.bl).hash(h);
             color_bits(g.br).hash(h);
+        }
+        DrawKind::Icon { icon, color } => {
+            8u8.hash(h);
+            (*icon as u8).hash(h);
+            color_bits(*color).hash(h);
         }
         DrawKind::Border { color, width, radius } => {
             1u8.hash(h);

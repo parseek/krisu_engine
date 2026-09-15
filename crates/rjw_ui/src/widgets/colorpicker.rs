@@ -41,7 +41,7 @@ use glam::Vec2;
 use rjw_color::Color;
 use rjw_transform::Rect;
 
-use crate::draw::{CornerRadius, Position, TextVAlign};
+use crate::draw::{CornerRadius, DrawKind, Icon, Position, TextVAlign};
 use crate::id::IdAbsolute;
 use crate::layout::Child;
 use crate::style::PanelStyle;
@@ -221,16 +221,13 @@ impl Widget for ColorPicker<'_> {
         }
         push_swatch(ui, rect, color_in, alpha, label_fs);
         let ink = ink_on(color_in);
-        ui.push_text_rect(
-            Rect::new(rect.x + rect.w - 14.0, rect.y, 12.0, rect.h),
-            if open { "▴" } else { "▾" },
-            label_fs,
-            ink,
-            None,
-            TextAlign::Center,
-            TextVAlign::Center,
-            None,
-            None,
+        // 展开箭头用**矢量图标**（与字体无关）。
+        ui.push_draw(
+            DrawKind::Icon {
+                icon: if open { Icon::ChevronUp } else { Icon::ChevronDown },
+                color: ink,
+            },
+            Rect::new(rect.x + rect.w - 16.0, rect.y + (rect.h - 12.0) * 0.5, 12.0, 12.0),
         );
 
         // 点色块 = 开关面板。`claim_press` 阻止外层窗口把这次按下当作窗口拖拽基准。
