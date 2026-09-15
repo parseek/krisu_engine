@@ -921,14 +921,29 @@ fn block_delta(content_size: Vec2, at: Vec2, anchor: Vec2, offset: Vec2) -> Vec2
 
 /// 确保 `buffer` 的全部字形已入图集，并同步去碎片重排后的区域。
 fn rasterize_all(text: &mut Text, buffer: &Buffer) {
+    // **先**同步：图集整理过 ⇒ 已被逐出的字形位置会被丢弃（其槽位可能已被别的字形
+    // 复用），下面的循环据此重新光栅化，避免把**指向别人像素**的旧 UV 再烘进顶点。
+    text.sync_atlas_regions();
     for run in buffer.layout_runs() {
         for glyph in run.glyphs.iter() {
             let cache_key = glyph.physical((0.0, 0.0), 1.0).cache_key;
-            if !text.locations.contains_key(&cache_key) && !text.no_image.contains(&cache_key) {
+            if text.no_image.contains(&cache_key) {
+                continue;
+            }
+            // 位置存在**且**图集里还在才算可用：只查 `locations` 会漏掉"条目被逐出、
+            // 槽位被复用"（缓存 UV 采样到别的字形 → 陈旧文字）。
+            let usable = location_usable(
+                text.locations.contains_key(&cache_key),
+                text.glyph_cache
+                    .region_peek(&crate::AtlasKey::Glyph(cache_key))
+                    .is_some(),
+            );
+            if !usable {
                 text.rasterize_and_pack(cache_key);
             }
         }
     }
+    // 本次插入可能触发整理（搬动 / 页回收）⇒ **再**同步一次，吸收搬动后的区域。
     text.sync_atlas_regions();
 }
 
@@ -1199,6 +1214,17 @@ impl Resolved<'_> {
 }
 
 // ─── 排版 + 收集 ───────────────────────────────────────────────
+
+/// 缓存的字形位置是否**仍可用**——`cached`（位置表里有）与 `atlas_has`（图集里还在）
+/// **两者都成立**才可直接复用。
+///
+/// 只查位置表会漏掉"条目被逐出、槽位被别的字形复用"：此时旧 `AtlasRegion` 会采样到
+/// **别人的像素**（表现为"陈旧文字"），而命令内容签名不变、UI 顶点缓存也不会失效。
+/// 只要图集里没了，就必须重新光栅化（重新入图集 + 取新区域）。
+#[inline]
+pub(crate) fn location_usable(cached: bool, atlas_has: bool) -> bool {
+    cached && atlas_has
+}
 
 /// 把排版结果收集进 `glyphs` / `lines`（先 clear，复用容量），返回内容宽高与测量。
 ///

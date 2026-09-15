@@ -166,6 +166,11 @@ pub struct UiState {
     /// ⚠ 签名必须是**逐命令全量哈希**（含颜色 / 边框宽 / 圆角 / 对齐 / 光标 / 选择）——
     /// 轻量摘要曾漏掉颜色位，hover/click 变色被误判"内容未变" → 复用陈旧顶点，
     /// 窗口内交互效果不刷新（下拉框 / 背包 / 窗口按钮失效）。
+    ///
+    /// ⚠ 签名还必须**并入字形图集的区域失效世代号**（`rjw_text::Text::atlas_revision`）：
+    /// 顶点烘的是最终 UV，图集重排 / 复用已逐出条目的槽位会让旧 UV 指向别的像素
+    /// （"陈旧文字" / "背景消失"），而命令内容不变 ⇒ 只靠命令哈希永不失效。
+    /// 见 [`crate::ui::geom_cache_sig`](crate::ui) 与 `crate::Ui` 的 `hash_cmds`。
     pub(crate) window_quads:
         HashMap<IdAbsolute<'static>, (u64, Vec<(u32, u8, u64, crate::gpu_batch::Geom)>)>,
     /// **非窗口（win=0）内容的按放置子槽几何缓存**：放置子槽组号 → (内容签名, 局部几何)。

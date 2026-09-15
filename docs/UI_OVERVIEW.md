@@ -283,6 +283,11 @@ impl Widget for MyButton<'_> {
   每 120 帧打印 `[perf]` 均值，`--auto-drag` 走"拖动中内容逐帧变化"最坏路径。
 - 文本缓冲缓存（`UiState::text_buffers`，帧级近似 LRU）：静态标签每帧命中零排版；
   动态文本（FPS/日志）不会冲掉静态缓存。
+- **窗口顶点缓存键 = 命令全量签名 ⊕ 字形图集区域失效世代号**（`rjw_text::Text::atlas_revision`
+  = `rjw_atlas::DynamicAtlas::revision`）。顶点里烘着**最终 UV**（字形与 WHITE 基础纹理都取自
+  字形图集），图集一旦重排或复用已逐出条目的槽位，旧 UV 就指向别的像素（"陈旧文字"/"背景
+  消失"），而命令内容没变 ⇒ 必须靠世代号强制重建。重建期由 `rjw_text` 重新校验字形
+  （位置表 **且** 图集仍在才算可用，见 `chain::location_usable`）并重新光栅化缺失字形。
 
 ---
 

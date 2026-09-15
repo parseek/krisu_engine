@@ -17,6 +17,11 @@ English：
   动态源用 `insert_dynamic(key, size, SpriteSource)`。
 - 打包器：`Guillotine` 空闲矩形列表（best-fit + 古莱丁切分），按行堆放，混合尺寸也不会碎片化到“页未满却开新页”。
 - 去碎片重排：`compact()` 把带源条目全量重排到最少页并重传纹理；`generation()` 世代号供缓存区域者刷新。
+- **区域失效世代号 `revision()`**：`generation()` 的**超集**——"搬动条目"**或**"让空闲槽位重新
+  可分配（去碎片重建空闲矩形 ⇒ 后续插入可能复用已逐出条目的槽位）"都 +1。
+  **缓存了 UV 的消费者必须把它并入缓存键**：只跟 `generation()` 会漏掉"逐出 + 槽位复用"，
+  旧 UV 会采样到别的字形像素（表现为"陈旧文字 / 背景消失"）而缓存永不失效。
+  另提供不刷新寿命的只读查询 `region_peek()`（校验缓存区域用）。
 - 寿命管理：`region()` 刷新寿命，**`tick()`**（引擎每渲染帧调用）到期转墓碑，`region_or_revive()` 自动重插。
 - `SpriteSource`：被逐出精灵可通过生成器按需重新光栅化（原 `TextureRegenerator`）。
 - **绘制直达**：`atlas.sprite(&handle)` 产出 `AtlasSprite`（区域 + 页纹理），交给 `Render2D::region(..)` 一次提交。
@@ -33,6 +38,11 @@ English：
   with `insert_dynamic(key, size, SpriteSource)` for regenerable sources.
 - Packer: `Guillotine` free-rect list (best-fit + guillotine split), row-based stacking.
 - Defragmentation: `compact()` re-packs source-backed entries into the fewest pages; `generation()` bumps for cached-region holders.
+- **`revision()`** (superset of `generation()`): bumps when entries move **or** freed slots become
+  allocatable again (defrag rebuilds the free-rect lists, so a later insert may reuse an evicted
+  entry's pixels). **Consumers that cache UVs must fold it into their cache key** — `generation()`
+  alone misses evict-then-reuse, leaving stale UVs pointing at another glyph's pixels.
+  `region_peek()` is a non-refreshing read-only query for cache validation.
 - Lifetime: `region()` refreshes, **`tick()`** (called by the engine every rendered frame) tombstones expired entries, `region_or_revive()` re-inserts.
 - **Draw-ready**: `atlas.sprite(&handle)` yields `AtlasSprite` (region + page texture) for `Render2D::region(..)`.
 - `AtlasStats` via `stats()`; `Index`/`IndexMut`; TOML under feature `toml`.

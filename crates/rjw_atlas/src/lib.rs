@@ -397,6 +397,15 @@ pub struct DynamicAtlas<K = String> {
     dirty: bool,
     /// 去碎片重排世代号：每次 `compact` 真正搬动条目时 +1，持有缓存区域者据此刷新。
     generation: u64,
+    /// **区域失效世代号**（`generation` 的超集）：任何**可能让已发出的 [`AtlasRegion`]
+    /// 指向别的像素**的操作都 +1——搬动（重排）**或**让空闲槽位重新可分配（去碎片
+    /// 重建空闲矩形 ⇒ 后续插入可能复用已逐出条目的槽位）。
+    ///
+    /// 为什么需要它：`generation` 只覆盖"搬动"，而**逐出 + 槽位复用**不改世代号——
+    /// 缓存了 UV 的消费者（`rjw_ui` 的窗口顶点缓存 / `rjw_text` 的字形位置）会继续
+    /// 采样**别的字形**的像素（陈旧文字 / 背景消失）。把 `revision` 并入缓存键即可
+    /// 自动重建（见 [`crate::DynamicAtlas::revision`]）。
+    revision: u64,
     device: wgpu::Device,
     queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
@@ -431,7 +440,7 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
         let textures = gpu.texture_registry().clone();
         let page_size = config.page_size;
         let page = AtlasPage::new(&device, &queue, &layout, page_size, &textures);
-        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, device, queue, layout, textures, next_region_id: 1, by_id: HashMap::new(), white: None, white_alloc: None }
+        Self { pages: vec![page], entries: HashMap::new(), tombstones: HashMap::new(), config, page_size, dirty: false, generation: 0, revision: 0, device, queue, layout, textures, next_region_id: 1, by_id: HashMap::new(), white: None, white_alloc: None }
     }
 
     /// 便捷插入：`insert(key, Rgba8::new(&rgba, (w, h)))`（默认 clamp_margin、非常驻、原点 0）。
@@ -554,6 +563,25 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
 
     /// 去碎片重排世代号（每次搬动条目 +1；未搬动则不变）。
     pub fn generation(&self) -> u64 { self.generation }
+
+    /// **区域失效世代号**：`generation` 的**超集**——搬动条目（重排）**或**让空闲槽位
+    /// 重新可分配（去碎片重建空闲矩形：后续插入可能复用已逐出条目的槽位）都会 +1。
+    ///
+    /// **缓存 UV 的消费者必须把它并入缓存键**（`rjw_ui` 的窗口顶点缓存即如此）：
+    /// 只跟 `generation()` 会漏掉"逐出 + 槽位复用"——已缓存的 UV 会采样到**别的**
+    /// 字形像素（表现为"陈旧文字 / 背景消失"），而世代号没变 ⇒ 缓存永远不重建。
+    ///
+    /// 成本：只在 `compact_inner`（分配失败触发的整理）时变化，不是每帧变化。
+    pub fn revision(&self) -> u64 { self.revision }
+
+    /// 只读查询区域（**不刷新寿命**、不复活）：条目已逐出 ⇒ `None`。
+    ///
+    /// 与 [`Self::region`] 的区别：`region` 会刷新寿命（"使用"语义），本方法只回答
+    /// "这个键现在还在吗、区域在哪"——供**校验缓存**用（如 `rjw_text` 在收集前确认
+    /// 缓存字形仍在图集中）。
+    pub fn region_peek(&self, key: &K) -> Option<AtlasRegion> {
+        self.entries.get(key).map(|e| e.region)
+    }
 
     /// 当前 Region 的页纹理 uid（低层）。
     pub fn texture_uid_of(&self, key: &K) -> Option<u64> { self.entries.get(key).map(|e| e.region.page_uid) }
@@ -683,6 +711,10 @@ impl<K: Hash + Eq + Clone> DynamicAtlas<K> {
     /// 去碎片整理：优先尝试**全量重排**（所有带源条目按面积降序重排到最少页，真正消除碎片）；
     /// 若存在无法搬动的无源条目（永久精灵）则退回按页重建空闲矩形（配合 [`Guillotine::from_occupied`]）。
     fn compact_inner(&mut self) {
+        // 整理会让**已发出的 region 可能失效**：重排分支搬动条目位置，重建空闲矩形
+        // 分支则让已逐出条目的槽位重新可分配（后续插入直接复用那些像素）——两条路径
+        // 都必须推进 `revision`，否则缓存 UV 的消费者会继续采样别的像素。
+        self.revision += 1;
         if self.repack_all() {
             self.dirty = false;
             return;

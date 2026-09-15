@@ -782,3 +782,33 @@ fn safe_line_slice_never_panics_on_stale_byte_ranges() {
     let ok = VisualLine { byte_start: 0, byte_end: 6, top: 0.0, width: 10.0 };
     assert_eq!(safe_line_slice(value, &ok), "窗口");
 }
+
+#[test]
+fn geometry_cache_signature_tracks_atlas_revision() {
+    // 回归：**字形图集重排 / 复用已逐出槽位后，窗口顶点缓存不失效** ⇒ 缓存的 UV
+    // 采样到别的字形像素（"陈旧文字 200 帧后出现" / "背景消失"）。命令内容没变，
+    // 只靠命令哈希永远命中原顶点，故缓存键必须并入图集区域失效世代号。
+    let cmds = 0xABCD_1234_u64;
+    // 同一帧内容 + 同一世代价：签名必须一致（否则缓存永不命中，每帧全量重建）。
+    assert_eq!(
+        geom_cache_sig(cmds, 7),
+        geom_cache_sig(cmds, 7),
+        "同内容同世代 ⇒ 同签名（缓存可命中）"
+    );
+    // 内容不变、只图集世代推进：签名必须变（否则缓存永不失效 → 陈旧 UV）。
+    assert_ne!(
+        geom_cache_sig(cmds, 7),
+        geom_cache_sig(cmds, 8),
+        "图集世代推进 ⇒ 签名必须变化（强制重建、重新解析字形区域）"
+    );
+    // 不同内容仍必须区分（世代号不能吞掉命令哈希的区分度）。
+    assert_ne!(
+        geom_cache_sig(cmds, 7),
+        geom_cache_sig(cmds ^ 1, 7),
+        "世代号不得掩盖内容差异"
+    );
+    // 世代号在低位/高位都参与：单调推进的整数不能因哈希碰撞而互相抵消。
+    let revs: std::collections::HashSet<u64> =
+        (0..64).map(|r| geom_cache_sig(cmds, r)).collect();
+    assert_eq!(revs.len(), 64, "64 个连续世代应给出 64 个不同签名");
+}

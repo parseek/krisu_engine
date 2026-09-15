@@ -150,7 +150,10 @@ pub struct TileMap {
     solid_cache: RefCell<Vec<Rect>>,
     /// solid 缓存脏标记（`Cell`：`solid_rects` 只收 `&self`）。
     solid_dirty: Cell<bool>,
-    /// 上次 chunk mesh 重建时的图集 generation（重排后自动重建）。
+    /// 上次 chunk mesh 重建时的图集**区域失效世代号**
+    /// （`DynamicAtlas::revision`：重排搬动**或**空闲槽位重新可分配都会推进）——
+    /// 网格里烘着 UV，图集一变就必须重建（用 `generation()` 会漏掉"逐出 + 槽位复用"，
+    /// 导致贴片采样到别的精灵像素）。
     atlas_gen: Option<u64>,
     /// 每帧可见网格的复用缓冲（避免与 `r2d` 的可变借用冲突，且零分配）。
     draw_buf: Vec<(u64, MeshId, f32)>,
@@ -320,7 +323,7 @@ impl TileMap {
             return;
         }
         // 重建预生成网格（结构 / 内容变更，或图集重排导致 UV 过期）。
-        if self.mesh_dirty || self.atlas_gen != Some(atlas.generation()) {
+        if self.mesh_dirty || self.atlas_gen != Some(atlas.revision()) {
             self.rebuild_meshes(r2d, atlas);
         }
         let base: f64 = layer.into().as_f64();
@@ -429,7 +432,7 @@ impl TileMap {
             }
         }
         self.mesh_dirty = false;
-        self.atlas_gen = Some(atlas.generation());
+        self.atlas_gen = Some(atlas.revision());
     }
 }
 

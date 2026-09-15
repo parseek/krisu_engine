@@ -3061,13 +3061,19 @@ impl<'a> Ui<'a> {
     }
 
     /// 对一组命令做**全量内容签名**（`cmd_sig` 哈希）：窗口 / win=0 子槽顶点缓存的 key。
+    ///
+    /// 签名里**并入字形图集的区域失效世代号**（[`rjw_text::Text::atlas_revision`]）：
+    /// 本缓存烘的是**最终 UV**（字形 + WHITE 基础纹理都取自字形图集），图集一旦重排
+    /// 或复用已逐出字形的槽位，旧 UV 就指向**别的像素**（"陈旧文字"/"背景消失"），
+    /// 而命令内容没变 ⇒ 只靠命令哈希永远不失效。世代号只由图集整理（分配失败触发）
+    /// 推进，不是每帧变化。
     fn hash_cmds<'c>(&self, cmds: impl IntoIterator<Item = &'c UiDraw>) -> u64 {
         use std::hash::Hasher;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         for d in cmds {
             self.cmd_sig(&mut h, d);
         }
-        h.finish()
+        geom_cache_sig(h.finish(), self.text.atlas_revision())
     }
 
     /// **提交顶点**（`finish` 的提交步骤）：把"本帧重建 + 缓存命中"的顶点统一排序
@@ -3776,6 +3782,22 @@ impl<'a> Ui<'a> {
 /// 纯点击（无位移）不激活拖拽 → 窗口 / 可拖拽面板内的子控件（按钮 / 勾选框 /
 /// 输入框等）**正常响应点击**；真正拖动中才抑制子控件交互（防止误触）。
 const DRAG_ACTIVATE_PX: f32 = 3.0;
+
+/// **几何缓存签名** = 命令内容哈希 ⊕ 字形图集区域失效世代号
+/// （[`rjw_text::Text::atlas_revision`](rjw_text::Text::atlas_revision)）。
+///
+/// 窗口 / win=0 子槽的顶点缓存烘的是**最终 UV**（字形 + WHITE 基础纹理都取自字形
+/// 图集）。图集一旦**重排**（搬动区域）或**复用已逐出条目的槽位**，旧 UV 就指向
+/// 别的像素（"陈旧文字" / "背景消失"），而命令内容没变 ⇒ 只靠命令哈希**永远不失效**。
+/// 故把世代号并入缓存键：图集一变，全部几何缓存自动重建（重建期会重新解析字形区域）。
+#[inline]
+fn geom_cache_sig(cmd_hash: u64, atlas_revision: u64) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_u64(cmd_hash);
+    h.write_u64(atlas_revision);
+    h.finish()
+}
 
 /// 是否已产生足以激活拖拽的位移（`current_px` / `press_px` 均为**物理像素**，
 /// 已取整；`None` = 无按下基准，未激活）。

@@ -344,8 +344,8 @@ pub struct Text {
     buf: TextBuffer,
     /// 排版结果缓存（LRU）：同一 (文本, 字号, 行高, 对齐, attrs) 跨帧复用，跳过重复整形。
     layout_cache: LayoutCache,
-    /// 上次同步过的字形图集重排世代号（见 [`Self::sync_atlas_regions`]）。
-    atlas_generation: u64,
+    /// 上次同步过的字形图集**区域失效世代号**（见 [`Self::sync_atlas_regions`]）。
+    atlas_revision: u64,
 }
 
 impl Text {
@@ -380,7 +380,7 @@ impl Text {
             style: TextStyle::default(),
             buf: TextBuffer::default(),
             layout_cache: LayoutCache::new(),
-            atlas_generation: 0,
+            atlas_revision: 0,
         }
     }
 
@@ -489,22 +489,41 @@ impl Text {
         )
     }
 
-    /// 若字形图集发生过“去碎片重排”（[`rjw_atlas::DynamicAtlas::generation`] 变化），
-    /// 从图集重新拉取所有已缓存字形的 `AtlasRegion`，避免旧区域指向已搬动的像素。
+    /// **字形图集的区域失效世代号**（[`rjw_atlas::DynamicAtlas::revision`]）。
     ///
-    /// 在排版/光栅化循环之后（`buffer_origin` / 收集字形之前）调用。
+    /// 缓存了**字形 UV** 的消费者（`rjw_ui` 的窗口顶点缓存）必须把它并入缓存键：
+    /// 图集一旦重排或复用已逐出字形的槽位，旧 UV 就会采样到**别的**字形像素
+    /// （"陈旧文字"），而命令内容签名不会变化 ⇒ 缓存永远不失效。
+    pub fn atlas_revision(&self) -> u64 {
+        self.glyph_cache.revision()
+    }
+
+    /// 字形图集发生**区域失效**（重排搬动 / 逐出后槽位重新可分配）时，刷新已缓存
+    /// 字形的 `AtlasRegion`，并**丢弃已被逐出的字形位置**——后者是"陈旧文字"的关键：
+    /// 位置还在、区域却被别的字形复用 ⇒ 必须重新光栅化，否则收集期会把旧 UV 再烘一遍。
+    ///
+    /// 在排版/光栅化循环前后各调用一次（`chain::rasterize_all`）：**前**一次让被逐出的
+    /// 字形重新入图集，**后**一次吸收本次插入触发的整理（搬动）结果。
     fn sync_atlas_regions(&mut self) {
-        let generation = self.glyph_cache.generation();
-        if generation == self.atlas_generation {
+        let revision = self.glyph_cache.revision();
+        if revision == self.atlas_revision {
             return;
         }
-        self.atlas_generation = generation;
+        self.atlas_revision = revision;
         let keys: Vec<cosmic_text::CacheKey> = self.locations.keys().copied().collect();
         for key in keys {
-            if let Some(region) = self.glyph_cache.region(&AtlasKey::Glyph(key))
-                && let Some(loc) = self.locations.get_mut(&key) {
-                    loc.region = *region;
+            match self.glyph_cache.region_peek(&AtlasKey::Glyph(key)) {
+                // 仍在图集（可能被搬动）：取最新区域。
+                Some(region) => {
+                    if let Some(loc) = self.locations.get_mut(&key) {
+                        loc.region = region;
+                    }
                 }
+                // 已被逐出（像素槽位可能已被别的字形复用）→ 丢弃位置，下次收集重新光栅化。
+                None => {
+                    self.locations.remove(&key);
+                }
+            }
         }
     }
 
@@ -772,6 +791,21 @@ impl Text {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glyph_location_needs_both_table_and_atlas() {
+        // 回归（"陈旧文字"）：只查位置表 `locations` 判断"字形已就绪"是不够的——
+        // 图集条目被逐出后其像素槽位可能已被**别的字形**复用，此时旧 `AtlasRegion`
+        // 会采样到别人的像素，而命令内容签名不变 ⇒ UI 顶点缓存不失效、永不重建。
+        // 二者都成立才算可用（否则重新光栅化）。
+        assert!(crate::chain::location_usable(true, true), "位置在 + 图集在 ⇒ 可用");
+        assert!(
+            !crate::chain::location_usable(true, false),
+            "位置在但图集条目已被逐出 ⇒ 必须重新光栅化（槽位可能已被复用）"
+        );
+        assert!(!crate::chain::location_usable(false, true), "位置缺失 ⇒ 必须光栅化");
+        assert!(!crate::chain::location_usable(false, false));
+    }
 
     fn shaped(text: &str, size: f32, line_height: f32, align: Align) -> Buffer {
         let mut fs = FontSystem::new();
