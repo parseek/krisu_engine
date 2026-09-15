@@ -3324,12 +3324,16 @@ impl<'a> Ui<'a> {
                     let pr = snap_rect(&d.rect);
                     if let Some(r) = clipped(pr, clip_abs) {
                         let local = Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h);
-                        // 是否被裁剪过（尺寸真的变小）：被裁掉一侧时圆角环带的
-                        // 外/内轮廓半径关系不再成立，退回直角四边条更稳。
-                        let trimmed = local.w < pr.w - 0.01 || local.h < pr.h - 0.01;
-                        if !radius.is_zero() && !trimmed {
+                        if !radius.is_zero() {
                             // 圆角环带：只画一次边界，圆角处不会像"外圈实心 + 内圈实心"
                             // 那样把抗锯齿边缘混合两次。
+                            //
+                            // ⚠ **不要**因为"矩形被裁剪过"就退回直角四边条：窗口被拖到
+                            // 视口边缘（或父裁剪区内侧）时被裁掉一部分，退回直角会让
+                            // **整个窗口的边框瞬间变方**（"拖动变方"）。裁剪后的矩形交给
+                            // 环带自己处理即可——`push_rounded_ring` 内部会
+                            // `CornerRadius::fit(w, h)` 把半径夹到放得下，内轮廓塌缩时
+                            // 也会退化成一块实心圆角矩形。
                             let table = self.state.tess.table();
                             quads.push_rounded_ring(
                                 win,
@@ -5417,9 +5421,9 @@ impl Ui<'_> {
             };
             let sel_rect = Rect::new(
                 content_rect.x + lo_x + text_dx,
-                content_rect.y + 1.0,
+                content_rect.y + 3.0,
                 (hi_x - lo_x).max(0.0) + space_w,
-                (content_rect.h - 2.0).max(0.0),
+                (content_rect.h - 6.0).max(0.0),
             );
             if sel_rect.w > 0.0 && sel_rect.h > 0.0 {
                 let seq = self.next_seq();
@@ -5431,7 +5435,13 @@ impl Ui<'_> {
                     rect: sel_rect,
                     // 选择高亮受输入框强制裁剪（不溢出输入框 / 外层滚动容器）。
                     clip: self.clip,
-                    kind: DrawKind::Solid(style.sel_bg),
+                    // **圆角 + 上下留白**：原来是整块无圆角实心（上下各只缩 1px），
+                    // 在圆角输入框里看起来就是一个"方框顶着边框"。现在贴近文字行高，
+                    // 小圆角（顺带吃到羽化抗锯齿）。
+                    kind: DrawKind::RoundedRect {
+                        corners: [style.sel_bg; 4],
+                        radius: CornerRadius::all((sel_rect.h * 0.22).min(4.0)),
+                    },
                 });
             }
         }
@@ -6017,7 +6027,11 @@ impl Ui<'_> {
                         elem,
                         rect: sel_rect,
                         clip: self.clip,
-                        kind: DrawKind::Solid(style.sel_bg),
+                        // 与单行输入框一致：圆角高亮（不是硬边实心块）。
+                        kind: DrawKind::RoundedRect {
+                            corners: [style.sel_bg; 4],
+                            radius: CornerRadius::all((sel_rect.h * 0.22).min(4.0)),
+                        },
                     });
                 }
             }

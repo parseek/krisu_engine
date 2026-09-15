@@ -425,18 +425,19 @@ pub(crate) fn push_rounded_rect(
         return TessOutput { verts: 0, tris: 0 };
     }
     // 四角按 CSS 规则收缩（`tl + tr ≤ w` 等），保证弧互不重叠。
-    let radii = spec.radius.fit(w, h);
-    if radii.is_zero() {
+    // 直角（半径 0）的角也要参与带状化，否则两级轮廓的**点数不一致**、带状会错位；
+    // 给它 0.5px 的下限（1× 下看不出圆，但点数与其它角一致）。
+    if spec.radius.is_zero() {
         return push_plain_quad(verts, tris, spec.rect, spec.corners, spec.uv);
     }
+    let floor = |r: f32| if r > 0.0 { r.max(MIN_AA_RADIUS) } else { MIN_AA_RADIUS };
+    // ⚠ 顺序：**先抬下限，再 `fit`**。反过来的话下限会把已经收缩好的半径又抬回超界值，
+    // 于是"两角半径之和 > 边长"、角心次序颠倒、轮廓变逆时针 ⇒ 负面积三角形。
+    let radii = spec.radius.map(floor).fit(w, h);
     let uv = spec.uv;
 
     // 羽化宽：小控件自动收紧（避免糊成一团）。
     let f = spec.feather.min(w.min(h) * 0.25);
-    // 直角（半径 0）的角也要参与带状化，否则两级轮廓的**点数不一致**、带状会错位。
-    // 给它 0.5px 的下限：1× 下看不出圆，但点数与其它角一致。
-    let floor = |r: f32| if r > 0.0 { r.max(MIN_AA_RADIUS) } else { MIN_AA_RADIUS };
-    let radii = radii.map(floor);
     let aa = f > 0.0 && (radii.min() - f * 0.5) >= 0.0;
 
     let verts_before = verts.len();
@@ -445,7 +446,9 @@ pub(crate) fn push_rounded_rect(
     // 硬体（alpha = 1）与外环（alpha = 0）都锚在 `rect` 的边缘上。
     let half = if aa { f * 0.5 } else { 0.0 };
     let hard_rect = grow(spec.rect, -half);
-    let hard_radii = radii.map(|r| (r - half).max(MIN_AA_RADIUS));
+    let hard_radii = radii
+        .map(|r| (r - half).max(MIN_AA_RADIUS))
+        .fit(hard_rect.w, hard_rect.h);
     let hard = corners_of(hard_rect, hard_radii);
     // 段数由**最大的角**决定（最细），四角共用同一 `segs`——两级轮廓必须逐点对应。
     let stride = table.stride_for(radii.max() + half);
@@ -481,7 +484,11 @@ pub(crate) fn push_rounded_rect(
     // ── 羽化带：外环 alpha = 0（颜色照抄硬体同序号点），沿**整圈**成带 ──
     if aa {
         let outer_rect = grow(spec.rect, half);
-        let outer = corners_of(outer_rect, radii.map(|r| r + half));
+        // ⚠ **加完 `half` 必须重新 `fit`**：`radii` 的那次 `fit` 是对**原位图**做的，
+        // 加宽后若不再夹一次，很窄的矩形会拿到"两角半径之和 > 边长"的外圈 ⇒ 角心次序
+        // 颠倒 ⇒ 外圈变成逆时针 ⇒ 带状三角形出现负面积（条纹/黑洞）。
+        let outer_radii = radii.map(|r| r + half).fit(outer_rect.w, outer_rect.h);
+        let outer = corners_of(outer_rect, outer_radii);
         let fade = copy_colors(verts, hard_start, n, 0.0);
         let outer_start =
             push_outline(verts, table, stride, segs, &outer, uv, |i, _p| fade[i]);
@@ -635,14 +642,19 @@ pub(crate) fn push_rounded_ring(
         flat,
     );
     let a_start = if outer_aa {
-        let cs = corners_of(grow(rect, half), ro.map(|r| r + half));
+        let orc = grow(rect, half);
+        let cs = corners_of(orc, ro.map(|r| r + half).fit(orc.w, orc.h));
         let fade = copy_colors(verts, b_start, n, 0.0);
         Some(push_outline(verts, table, stride, segs, &cs, uv, |i, _p| fade[i]))
     } else {
         None
     };
     let d_start = if inner_aa {
-        let cs = corners_of(grow(inner_rect, -half), ri.map(|r| (r - half).max(MIN_AA_RADIUS)));
+        let irc = grow(inner_rect, -half);
+        let cs = corners_of(
+            irc,
+            ri.map(|r| (r - half).max(MIN_AA_RADIUS)).fit(irc.w, irc.h),
+        );
         let fade = copy_colors(verts, c_start, n, 0.0);
         Some(push_outline(verts, table, stride, segs, &cs, uv, |i, _p| fade[i]))
     } else {
@@ -1278,6 +1290,52 @@ mod tests {
         let b = cache.table();
         assert!(Rc::ptr_eq(&a, &b), "同一缓存必须复用同一张表");
         assert_eq!(a.pts.len(), N_FINE as usize + 1, "表含两端点");
+    }
+
+    #[test]
+    fn ring_handles_heavily_trimmed_rects() {
+        // **回归（"窗口被拖到视口边缘时整个边框变方"）**：环带必须自己在窄矩形里把半径
+        // 夹进去，而不是让调用方"被裁剪了就退回直角四边条"。调用方那条 `trimmed`
+        // 判断实际上**几乎总是成立**——文本输入框把 `self.clip` 设成自己的矩形（未取整），
+        // 而 `collect_cmds` 用 `snap_rect` 取整过的矩形求交，1px 的差就足以判定"被裁剪"，
+        // 于是输入框的聚焦边框一直是 4 条直角边条（截图里的"这个框是方形的"）。
+        let t = table();
+        for (w, h, r, bw) in [
+            (2.0, 30.0, 8.0, 1.0),
+            (30.0, 2.0, 8.0, 1.0),
+            (3.0, 3.0, 8.0, 1.0),
+            (40.0, 1.0, 12.0, 1.0),
+            (1.0, 1.0, 4.0, 2.0),
+            (100.0, 30.0, 40.0, 1.0),
+        ] {
+            let mut v = Vec::new();
+            let mut tr = Vec::new();
+            push_rounded_ring(
+                &mut v,
+                &mut tr,
+                &t,
+                Rect::new(0.0, 0.0, w, h),
+                r.into(),
+                bw,
+                DEFAULT_FEATHER,
+                Color::WHITE,
+                TEST_UV,
+            );
+            assert!(!v.is_empty() && !tr.is_empty(), "w={w} h={h} 应仍产生几何");
+            assert_well_formed(&v, &tr);
+            for tri in &tr {
+                // 半径恰好等于半宽时相邻轮廓点会**重合**（胶囊的左右两端），此时三角形
+                // 面积恒为 0，符号由浮点噪声决定（实测 -1e-6 量级）⇒ 留一个与像素尺度
+                // 无关的绝对容差。真正"绕序翻反"的三角形面积在 1 量级以上，不会被放过。
+                assert!(
+                    cross(&v, tri) >= -1e-3,
+                    "窄矩形 {w}×{h} 出现负面积：{tri:?} = {:?} / {:?} / {:?}",
+                    v[tri[0] as usize].pos,
+                    v[tri[1] as usize].pos,
+                    v[tri[2] as usize].pos
+                );
+            }
+        }
     }
 
     // ─── 四角各自的半径 ────────────────────────────────────

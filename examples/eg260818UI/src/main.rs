@@ -526,6 +526,10 @@ struct ThemeTuner {
     /// 强调色；hover / active 由它派生。
     accent: Color,
     /// 强调色的十六进制编辑缓冲（[`ColorPicker::with_hex`] 用；跨帧持有）。
+    ///
+    /// 本处**不直接读**它——`ColorPicker` 每帧重写并解析它（它的用途正是跨帧保留
+    /// "正在输入"的文本），故显式允许未读。
+    #[allow(dead_code)]
     accent_hex: String,
     /// 是否显示本窗口。
     open: bool,
@@ -656,7 +660,7 @@ impl ThemeTuner {
                     w.add(
                         ColorPicker::new("th_accent", &mut self.accent)
                             .alpha(true)
-                            .with_hex(&mut self.accent_hex),
+//                          .with_hex(&mut self.accent_hex),
                     );
                 });
                 w.row(|w| {

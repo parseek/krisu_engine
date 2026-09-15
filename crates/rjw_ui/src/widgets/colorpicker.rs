@@ -311,7 +311,8 @@ impl Widget for ColorPicker<'_> {
                         None,
                         None,
                     );
-                    let bar = Rect::new(POPUP_PAD + LABEL_W, y, (body_w - LABEL_W).max(1.0), row);
+                    const SLIDER_DIST: f32 = 3.0;
+                    let bar = Rect::new(POPUP_PAD + LABEL_W + SLIDER_DIST, y, (body_w - LABEL_W - SLIDER_DIST).max(1.0), row);
                     let sid = format!("{id}::{}", lab.to_ascii_lowercase());
                     c[i] = ui.slider_at(&sid, bar, 0.0..=1.0, c[i]);
                     y += row;
