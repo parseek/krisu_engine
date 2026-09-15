@@ -45,12 +45,19 @@ const PAD: f32 = 6.0;
 const GAP: f32 = 6.0;
 /// 通道标签宽度（物理像素）。
 const LABEL_W: f32 = 14.0;
-/// SV 平面高度（物理像素）。
-const SV_H: f32 = 110.0;
 /// 色相条宽度（物理像素）。
 const HUE_W: f32 = 14.0;
 /// 通道滑块的最小宽（物理像素）——决定面板最小宽的一部分。
 const SLIDER_MIN_W: f32 = 90.0;
+/// SV 平面的最小边长（物理像素）——窄面板下也不至于被压成一条。
+const SV_MIN_SIDE: f32 = 90.0;
+
+/// **SV 平面边长**：平面取**正方形**（HSV 选择器的通行形态，也与设计稿一致）——
+/// 边长 = 面板内容宽去掉色相条与间隙。于是"面板越宽，平面越大"，不用手调常量。
+#[inline]
+fn sv_side(body_w: f32) -> f32 {
+    (body_w - HUE_W - GAP).max(SV_MIN_SIDE)
+}
 
 /// 弹出面板：尺寸解算 + 置顶窗口 + 主体录制。
 ///
@@ -74,12 +81,14 @@ pub(super) fn show_popup(
     let body_min = PAD * 2.0 + LABEL_W + GAP + SLIDER_MIN_W + GAP + field_w;
     let pw = popup_w.unwrap_or_else(|| (anchor.w * 1.9).max(body_min));
     let n_ch = 3 + if alpha { 1 } else { 0 };
+    // SV 平面取正方（见 `sv_side`）：面板高随之变化，故先算边长再算高。
+    let sv = sv_side(pw - PAD * 2.0);
     let ph = PAD * 2.0
         + row
         + GAP
         + input_h
         + GAP
-        + SV_H
+        + sv
         + GAP
         + row * n_ch as f32;
     let popup_pos = Vec2::new(anchor.x, anchor.y + anchor.h + 2.0);
@@ -168,9 +177,10 @@ fn popup_body(
     y += row + GAP;
 
     // ── ③ HSV 区（先求值：见模块文档的"求值顺序"）──
-    let sv_w = (body_w - HUE_W - GAP).max(1.0);
-    let sv_rect = Rect::new(PAD, y + input_h + GAP, sv_w, SV_H);
-    let hue_rect = Rect::new(PAD + sv_w + GAP, y + input_h + GAP, HUE_W, SV_H);
+    // 平面与色相条**同高**，且平面取正方 ⇒ 两者拼成一块方形选择区。
+    let sv = sv_side(body_w);
+    let sv_rect = Rect::new(PAD, y + input_h + GAP, sv, sv);
+    let hue_rect = Rect::new(PAD + sv + GAP, y + input_h + GAP, HUE_W, sv);
     let mut hsv = {
         let st = &ui.state().color_picker;
         if st.hsv_src == color_in {
@@ -210,7 +220,7 @@ fn popup_body(
     for (cell, corners) in sv_plane_cells(sv_rect, hsv[0]) {
         ui.push_draw(DrawKind::Rect(Gradient::corners(corners[0], corners[1], corners[2], corners[3])), cell, ui.elem_hint());
     }
-    let seg_h = SV_H / HUE_SEGS as f32;
+    let seg_h = sv / HUE_SEGS as f32;
     for i in 0..HUE_SEGS {
         let seg = Rect::new(hue_rect.x, hue_rect.y + i as f32 * seg_h, HUE_W, seg_h);
         let (top, bot) = hue_seg_colors(i);
@@ -224,6 +234,10 @@ fn popup_body(
         );
     }
     // 当前位置标记：平面上一个小方框（描边取底色的可读墨色）+ 色相条上一道横线。
+    //
+    // ⚠ 元素序必须取 `elem_hint()`（画在平面 / 色相条**之上**）：写死 `1` 时平面
+    // （`elem = seq + 1`，大得多）会盖住标记 —— 表现就是"指针在色带后面"
+    // （色相条上的标记只剩两侧露出的两个小角）。
     let cur = hsv_to_rgb(hsv[0], hsv[1], hsv[2], 1.0);
     let mark = Rect::new(
         sv_rect.x + hsv[1] * sv_rect.w - 3.0,
@@ -237,7 +251,7 @@ fn popup_body(
         super::format::ink_on(cur),
         2.0,
         CornerRadius::all(3.0),
-        1,
+        ui.elem_hint(),
     );
     let hue_mark = Rect::new(
         hue_rect.x - 2.0,
@@ -251,7 +265,7 @@ fn popup_body(
         Color::WHITE,
         2.0,
         CornerRadius::all(1.5),
-        1,
+        ui.elem_hint(),
     );
 
     // ── ② 文本框（按模式呈现 + 自动识别格式 + 非法时的警告按钮） ──
@@ -305,7 +319,16 @@ fn popup_body(
         } else {
             ui.theme.button.bg
         };
-        ui.push_panel_like(wrect, bg, danger, 1.0, CornerRadius::all(SWATCH_RADIUS), 1);
+        // ⚠ 元素序同样取 `elem_hint()`：警告按钮画在文本框**之后**（文本框用
+        // `elem = seq + 1`，写死 `1` 会被它压住）。
+        ui.push_panel_like(
+            wrect,
+            bg,
+            danger,
+            1.0,
+            CornerRadius::all(SWATCH_RADIUS),
+            ui.elem_hint(),
+        );
         ui.icon_at(
             Position::Physical(Vec2::new(
                 wrect.x + (wrect.w - 14.0) * 0.5,
@@ -329,7 +352,7 @@ fn popup_body(
     y += input_h + GAP;
 
     // ── ④ 通道行：颜色滑块（渐变轨）+ NumberInput ──
-    y += SV_H + GAP;
+    y += sv + GAP;
     let labels = ["R", "G", "B", "A"];
     let int_mode = mode.integer_channels();
     let lfs = ui.theme.label.font_size;

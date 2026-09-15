@@ -283,8 +283,10 @@ struct Windows {
     win_b_note_area: String,
     /// 多行文本域是否自动换行（false = 不换行 + 水平滚动）。
     ta_wrap: bool,
-    /// chishi（旋转 + RGBA 染色窗口）数值。
+    /// chishi（旋转 + 染色窗口）数值。
     cshi_num: f32,
+    /// chishi 的整窗染色（由窗口内的 `ColorPicker` 调）——演示"窗口内取色器"。
+    cshi_tint: Color,
     /// --auto-drag：每帧递增的帧序号（强制窗口内容每帧变化 → 缓存 miss 重建）。
     auto_tick: u64,
     /// **背景图**（`init` 里建的棋盘纹理）——四个窗口分别演示四种铺排（`ImageFit`）。
@@ -302,6 +304,7 @@ impl Windows {
             win_b_note_area: "多行备注：\nEnter 换行，↑↓ 跨行，Home/End 行首尾，\n拖选文本后 Ctrl+C/V/X 复制/粘贴/剪切。".to_owned(),
             ta_wrap: true,
             cshi_num: 0.,
+            cshi_tint: Color::WHITE,
             auto_tick: 0,
             bg_image: None,
         }
@@ -439,26 +442,18 @@ impl Windows {
             );
             ui.label_at(Vec2::new(16.0, 536.0), "image_at：Stretch（左）/ Center 半透明（右）");
         }
-        // 赤石窗口：整窗旋转（角度 = cshi_num）+ RGBA 染色（4 个 slider 调）。
-        let mut r = 1.0;
-        let mut g = 1.0;
-        let mut b = 1.0;
-        let mut a = 1.0;
+        // 赤石窗口：整窗旋转（角度 = cshi_num）+ 染色（**用 ColorPicker 调**：
+        // 一个控件顶掉原来那 4 条 RGBA 滑条，alpha 也由面板的 A 行负责）。
         ui.window("chishi").pos(vec2(155., 32.)).show(|w| {
             w.label("赤石");
             w.add(NumberInput::new("chisN1", &mut self.cshi_num).step(0.1));
             self.cshi_num = w.slider("sb", 0.0..=360., self.cshi_num);
-            w.row(|w| {
-                w.label("HP:");
-                r = w.slider("CSHI_r", 0.0..=1.0, r);
-                g = w.slider("CSHI_g", 0.0..=1.0, g);
-                b = w.slider("CSHI_b", 0.0..=1.0, b);
-                a = w.slider("CSHI_a", 0.0..=1.0, a);
-            });
+            w.label("整窗染色");
+            w.add(ColorPicker::new("cshi_tint", &mut self.cshi_tint).alpha(true));
         });
         // 赤石整窗 FX：旋转绕窗口中心；顶点缓存不变，仅提交时应用 tint/transform。
         ui.window_fx("chishi", WindowFx {
-            tint: Color::rgba(r, g, b, a),
+            tint: self.cshi_tint,
             transform: Some(Transform2D::IDENTITY.with_rot(self.cshi_num.to_radians())),
             anchor: Vec2::new(0.5, 0.5),
         });
@@ -1006,8 +1001,8 @@ impl App for UiApp {
             let n = f.frames();
             let theme = self.theme_tuner.theme(self.top.font_name());
             // 取色面板内部的固定常量（与 `panel.rs` 一致）+ 主题尺寸 × DPI。
-            let (pad, gap, sv_h, hue_w, label_w, slider_min) =
-                (6.0f32, 6.0f32, 110.0f32, 14.0f32, 14.0f32, 90.0f32);
+            let (pad, gap, hue_w, label_w, slider_min) =
+                (6.0f32, 6.0f32, 14.0f32, 14.0f32, 90.0f32);
             let (row, input_h, field_w) = (
                 theme.row_h * scale,
                 theme.input.height * scale,
@@ -1021,7 +1016,9 @@ impl App for UiApp {
             let mode_w = (body_w - gap * 2.0) / 3.0;
             let text_y = origin.y + pad + row + gap;
             let sv_y = text_y + input_h + gap;
+            // SV 平面是**正方形**（边长 = 内容宽去掉色相条与间隙），与 `panel.rs` 一致。
             let sv_w = body_w - hue_w - gap;
+            let sv_h = sv_w;
             let mode = |i: usize| {
                 Vec2::new(
                     origin.x + pad + (mode_w + gap) * i as f32 + mode_w * 0.5,

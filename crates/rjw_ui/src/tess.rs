@@ -379,7 +379,12 @@ pub(crate) fn push_convex(
     }
 
     // 外环（alpha = 0）：沿角平分线做真偏移。
-    let f = feather.max(0.0);
+    //
+    // ⚠ **羽化宽必须按形状厚度夹一次**：图标常是"细条"（`Grip` 的三横在 12px 图标上
+    // 只有 ~1.2px 高），若照搬 `Theme::feather`（1.0~1.5px），AA 斜坡会和形状本身的
+    // 粗细同量级甚至更宽 ⇒ 整个笔画被"糊"成一片渐变（用户描述："图标像是近视一样"）。
+    // 夹到**到边距离的一半**：斜坡最多占到形状厚度的一半，剩下仍是实心。
+    let f = feather.max(0.0).min(min_edge_distance(points) * 0.5);
     if f > 0.0 {
         let outer_start = verts.len() as u16;
         for (i, p) in points.iter().enumerate() {
@@ -415,6 +420,28 @@ fn outward_normal(d: Vec2) -> Vec2 {
     } else {
         Vec2::new(d.y, -d.x) / l
     }
+}
+
+/// 重心到各边的**最小距离**（≈ 形状的"半厚"；细条上就是半宽）。
+///
+/// 用途：[`push_convex`] 的羽化宽按它夹一次——AA 斜坡不能和形状本身一样宽，
+/// 否则细笔画被糊成一片（"图标像是近视一样"）。
+#[inline]
+fn min_edge_distance(points: &[Vec2]) -> f32 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let c = points.iter().fold(Vec2::ZERO, |a, p| a + *p) / points.len() as f32;
+    let mut min = f32::INFINITY;
+    for i in 0..points.len() {
+        let a = points[i];
+        let b = points[(i + 1) % points.len()];
+        let d = (b - a).normalize_or_zero();
+        // 点到直线 ab 的距离（凸多边形内点到边的最短距离 = 垂距）。
+        let n = Vec2::new(d.y, -d.x);
+        min = min.min((c - a).dot(n).abs());
+    }
+    if min.is_finite() { min } else { 0.0 }
 }
 
 /// 尖角处外环的**斜接上限**（`miter limit`）：顶点最远只外扩 `feather × 此值`，
@@ -1542,6 +1569,49 @@ mod tests {
         // 退化输入：点数 < 3 不产生几何。
         let out = push_convex(&mut v, &mut tr, &pts[..2], 1.0, Color::WHITE, TEST_UV);
         assert_eq!(out.verts, 0);
+    }
+
+    #[test]
+    fn convex_feather_is_clamped_on_thin_shapes() {
+        // 回归："图标像是近视一样"——细笔画（`Icon::Grip` 的三横在 12px 图标上只有
+        // ~1.2px 高）若照搬 `Theme::feather`（1.0~1.5px），AA 斜坡会和笔画本身一样宽，
+        // 整条笔画被糊成一片渐变。羽化宽必须夹到"到边距离的一半"，给实心留一半。
+        let thin_h = 1.2f32;
+        let bar = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(6.0, 0.0),
+            Vec2::new(6.0, thin_h),
+            Vec2::new(0.0, thin_h),
+        ];
+        assert!((min_edge_distance(&bar) - thin_h * 0.5).abs() < 1e-4, "细条半厚 = {thin_h}/2");
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        push_convex(&mut v, &mut tr, &bar, 1.5, Color::WHITE, TEST_UV);
+        // 外环（alpha = 0）相对硬体的外扩量 ≤ 半厚（而不是 1.5px）。
+        let n = bar.len();
+        let mut max_off = 0.0f32;
+        for i in 0..n {
+            let a = Vec2::new(v[i].pos[0], v[i].pos[1]);
+            let b = Vec2::new(v[n + 1 + i].pos[0], v[n + 1 + i].pos[1]);
+            max_off = max_off.max((b - a).length());
+        }
+        assert!(
+            max_off <= thin_h * 0.5 * 1.05,
+            "细条的羽化外扩应被夹到半厚以内，实际 {max_off:.3}px（原 feather = 1.5px）"
+        );
+        // 粗形状不受影响：羽化仍按原值走（三角形内切半径足够大）。
+        let big = [Vec2::new(0.0, 0.0), Vec2::new(40.0, 0.0), Vec2::new(20.0, 30.0)];
+        let mut v2 = Vec::new();
+        let mut tr2 = Vec::new();
+        push_convex(&mut v2, &mut tr2, &big, 1.5, Color::WHITE, TEST_UV);
+        let max2 = (0..3)
+            .map(|i| {
+                let a = Vec2::new(v2[i].pos[0], v2[i].pos[1]);
+                let b = Vec2::new(v2[4 + i].pos[0], v2[4 + i].pos[1]);
+                (b - a).length()
+            })
+            .fold(0.0f32, f32::max);
+        assert!(max2 >= 1.4, "粗形状的羽化外扩应接近 1.5px，实际 {max2:.3}px");
     }
 
     #[test]
