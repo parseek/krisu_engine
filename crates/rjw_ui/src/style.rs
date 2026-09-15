@@ -731,6 +731,12 @@ pub struct PanelStyle {
     pub padding: f32,
     /// 圆角半径（**逻辑像素**；0 = 直角；四角可各自不同，见 [`CornerRadius`]）。
     pub radius: CornerRadius,
+    /// **背景图**（可选）：画在 `bg` **之上**、内容**之下**，用面板矩形与 `radius`
+    /// 作为圆角遮罩（`ImageBg::radius` 被忽略、恒用面板的 `radius`）。
+    ///
+    /// 典型用途：窗口 / 面板的纹理底（木纹、纸张、渐变图、平铺图案）。`bg` 仍可
+    /// 作为底色（图片半透明时透出）。
+    pub bg_image: Option<crate::draw::ImageBg>,
 }
 
 impl Default for PanelStyle {
@@ -741,6 +747,7 @@ impl Default for PanelStyle {
             border_w: 1.0,
             padding: 8.0,
             radius: CornerRadius::default(),
+            bg_image: None,
         }
     }
 }
@@ -1015,6 +1022,11 @@ impl PanelStyle {
     /// 圆角半径（**逻辑像素**；0 = 直角）。
     pub fn with_radius(mut self, r: impl Into<CornerRadius>) -> Self {
         self.radius = r.into();
+        self
+    }
+    /// **背景图**（画在 `bg` 之上、内容之下；圆角遮罩恒用面板 `radius`）。
+    pub fn with_bg_image(mut self, img: crate::draw::ImageBg) -> Self {
+        self.bg_image = Some(img);
         self
     }
 }

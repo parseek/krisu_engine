@@ -23,7 +23,7 @@ use rjw_text::VisualLine;
 use rjw_transform::Rect;
 
 use crate::backend::Tri;
-use crate::draw::{CornerRadius, DebugShape, DrawKind, Gradient, Icon, UiDraw};
+use crate::draw::{CornerRadius, DebugShape, DrawKind, Gradient, Icon, ImageBg, UiDraw};
 use crate::ui::TEXT_LINE_HEIGHT_VERSION;
 
 // ─── 分组维度 ─────────────────────────────────────────────────
@@ -279,6 +279,77 @@ impl QuadCollector {
         )
     }
 
+    /// **背景图**（图形组；用户纹理 + 逐顶点 UV 的仿射映射）。
+    ///
+    /// 与实心圆角矩形**同一条镶嵌路径**（[`crate::tess::push_rounded_rect_uv`]）：
+    /// - `Stretch` / `Fill` / `Center`：UV 是位置的仿射函数 ⇒ 扇形三角化的重心插值
+    ///   精确再现映射，因此**贴图与圆角遮罩共存**且只多一个四边形的几何；
+    /// - `Tile`：1:1 平铺 = `tile × tile` 个四边形（每块 UV `0..1`），`radius` 被忽略
+    ///   （UV 需要环绕才能让圆角扇形正确取样，见 [`ImageFit::Tile`]）。
+    ///
+    /// 顶点色恒为 `bg.tint`（乘在纹理上）；羽化带的 alpha 斜坡照旧 ⇒ 圆角边缘是
+    /// **图片 alpha 渐隐**（真正的圆角遮罩，而不是把直角图片贴在圆角上）。
+    pub(crate) fn push_image(
+        &mut self,
+        win: u32,
+        table: &crate::tess::CornerTable,
+        rect: Rect,
+        bg: ImageBg,
+        feather: f32,
+    ) -> crate::tess::TessOutput {
+        let Some(layout) = bg.layout(rect) else {
+            return crate::tess::TessOutput { verts: 0, tris: 0 };
+        };
+        let mut total = crate::tess::TessOutput { verts: 0, tris: 0 };
+        // `spec.uv` 恒不被使用（逐顶点 UV 优先），但**必须给合法值**——「绝不写 (0,0)」
+        // 是这条路径的硬约定（写错会静默采到字形像素）。
+        let fallback_uv = self.white_uv_center();
+        let g = self.geom((win, self.cur_elem, GROUP_GRAPHIC, bg.tex));
+        // 铺排矩形左上角 → UV 的线性映射（`uv_at(p) = uv0 + (p - min) * k`）。
+        let uv_at = move |p: Vec2| {
+            let k = Vec2::new(
+                (layout.uv1.x - layout.uv0.x) / layout.rect.w.max(f32::EPSILON),
+                (layout.uv1.y - layout.uv0.y) / layout.rect.h.max(f32::EPSILON),
+            );
+            let u = layout.uv0 + (p - layout.rect.min()) * k;
+            [u.x, u.y]
+        };
+        match layout.tile.and_then(|t| crate::draw::tile_grid(rect, t)) {
+            // ── 平铺：逐块四边形（UV 恒 0..1；部分块按比例截断）──
+            Some(grid) => {
+                for (tr, uv1) in grid {
+                    let out = crate::tess::push_plain_uv(
+                        &mut g.verts,
+                        &mut g.tris,
+                        tr,
+                        [bg.tint; 4],
+                        Vec2::ZERO,
+                        uv1,
+                    );
+                    total.verts += out.verts;
+                    total.tris += out.tris;
+                }
+            }
+            // ── 拉伸 / 裁剪 / 居中：圆角（+羽化）路径 ──
+            None => {
+                total = crate::tess::push_rounded_rect_uv(
+                    &mut g.verts,
+                    &mut g.tris,
+                    table,
+                    crate::tess::RoundedRectSpec {
+                        rect: layout.rect,
+                        radius: bg.radius,
+                        feather,
+                        corners: [bg.tint; 4],
+                        uv: fallback_uv,
+                    },
+                    &uv_at,
+                );
+            }
+        }
+        total
+    }
+
     /// **CPU 镶嵌的圆角边框（环带）**（图形组；白纹理 + 纯色）。
     ///
     /// `feather` 同 [`crate::tess::RoundedRectSpec::feather`]：边框的**内外两条边界**
@@ -511,6 +582,18 @@ pub(crate) fn cmd_sig_hash(h: &mut std::collections::hash_map::DefaultHasher, d:
             8u8.hash(h);
             (*icon as u8).hash(h);
             color_bits(*color).hash(h);
+        }
+        DrawKind::Image(bg) => {
+            9u8.hash(h);
+            bg.tex.hash(h);
+            bg.texel.x.to_bits().hash(h);
+            bg.texel.y.to_bits().hash(h);
+            (bg.fit as u8).hash(h);
+            color_bits(bg.tint).hash(h);
+            bg.radius.tl.to_bits().hash(h);
+            bg.radius.tr.to_bits().hash(h);
+            bg.radius.br.to_bits().hash(h);
+            bg.radius.bl.to_bits().hash(h);
         }
         DrawKind::Border { color, width, radius } => {
             1u8.hash(h);

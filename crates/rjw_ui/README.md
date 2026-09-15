@@ -105,11 +105,20 @@ ui.rounded_rect_at(pos, size, CornerRadius { tl: 10.0, tr: 10.0, br: 0.0, bl: 0.
 ui.gradient_rect_at(pos, size, Gradient::vertical(Color::RED, Color::BLUE)); // 渐变（无纹理，顶点色插值）
 ui.icon_at(pos, Vec2::splat(16.0), Icon::ChevronDown, Color::WHITE);  // 矢量图标（不用字体字形）
 ui.row(|r| r.icon(Vec2::splat(18.0), Icon::Check, Color::WHITE));     // 占光标 → 工具栏
+
+// 背景图（tex = TextureWrapped::uid，texel = 纹理纹素尺寸）
+let bg = ImageBg::new(tex, Vec2::new(64.0, 64.0));
+ui.image_at(pos, size, bg.fit(ImageFit::Fill).radius(8.0));   // 等比覆盖 + 圆角遮罩
+ui.image_at(pos, size, bg.fit(ImageFit::Tile));               // 1:1 平铺
+ui.window("w").style(ui.theme().panel.clone().with_bg_image(bg)); // 窗口/面板底图
 ```
 
-- 圆角 / 羽化 / 渐变全部在 **CPU 镶嵌**（[`crate::tess`]）成三角形，无额外纹理、无额外 draw call；
+- 圆角 / 羽化 / 渐变 / **背景图**全部在 **CPU 镶嵌**（[`crate::tess`]）成三角形，
+  无额外纹理、无额外 draw call；
 - [`Icon`] 是**画出来的几何**（`Check` / `ChevronUp` / `ChevronDown` / `ChevronLeft` /
-  `ChevronRight` / `Grip`），与字体无关，缺字形也不会变形。
+  `ChevronRight` / `Grip`），与字体无关，缺字形也不会变形；
+- [`ImageBg`] 的 `Stretch` / `Fill` / `Center` 走**仿射 UV 映射**，因此能与圆角遮罩
+  共存；`Tile` 用 1:1 图块四边形（不支持圆角，见 `ImageFit::Tile` 文档）。
 
 ## 依赖
 

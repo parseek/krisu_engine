@@ -266,6 +266,7 @@ impl Widget for ColorPicker<'_> {
             border_w: 1.0,
             padding: 0.0,
             radius: cs.menu_radius,
+            bg_image: None,
         };
         // 面板内容是否被点中（用于"点外部收起"）——闭包外读取。
         let mut inside = false;

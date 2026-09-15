@@ -278,6 +278,8 @@ struct Windows {
     cshi_num: f32,
     /// --auto-drag：每帧递增的帧序号（强制窗口内容每帧变化 → 缓存 miss 重建）。
     auto_tick: u64,
+    /// **背景图**（`init` 里建的棋盘纹理）——四个窗口分别演示四种铺排（`ImageFit`）。
+    bg_image: Option<ImageBg>,
 }
 
 impl Windows {
@@ -292,6 +294,7 @@ impl Windows {
             ta_wrap: true,
             cshi_num: 0.,
             auto_tick: 0,
+            bg_image: None,
         }
     }
 
@@ -392,6 +395,41 @@ impl Windows {
             });
             w.label("绝对定位版：ui.icon_at(pos, size, icon, color)");
         });
+        // ── 背景图（`ImageBg`）：四种铺排 ─────────────────────────────
+        // 棋盘纹理在 `init` 里建（`Gfx::texture`），这里只拿 uid + 纹素尺寸。
+        // 窗口背景图经 `PanelStyle::with_bg_image`（画在背景刷之上、内容之下，
+        // 圆角遮罩**恒用面板 radius**——所以下面这个圆角窗口的图也被圆角裁掉）。
+        if let Some(bg) = self.bg_image {
+            let base = ui.theme().panel.clone().with_radius(10.0);
+            ui.window("img_fill")
+                .pos(Vec2::new(16.0, 300.0))
+                .width(200.0)
+                .style(base.clone().with_bg_image(bg.fit(ImageFit::Fill)))
+                .show(|w| {
+                    w.label("背景图：Fill（等比覆盖 + 圆角遮罩）");
+                    w.label("窗口拉大 / 缩小，图不变形");
+                });
+            ui.window("img_tile")
+                .pos(Vec2::new(16.0, 400.0))
+                .width(200.0)
+                // 平铺不支持圆角（UV 需要环绕才能配合扇形三角化）→ 直角 + 边框
+                .style(base.clone().with_radius(0.0).with_bg_image(bg.fit(ImageFit::Tile)))
+                .show(|w| {
+                    w.label("背景图：Tile（1:1 平铺，直角）");
+                });
+            // 绝对定位原语：Stretch / Center 各来一块（不带窗口）
+            ui.image_at(
+                Vec2::new(16.0, 470.0),
+                Vec2::new(90.0, 60.0),
+                bg.fit(ImageFit::Stretch).radius(6.0),
+            );
+            ui.image_at(
+                Vec2::new(116.0, 470.0),
+                Vec2::new(90.0, 60.0),
+                bg.fit(ImageFit::Center).tint(Color::rgba(1.0, 1.0, 1.0, 0.6)),
+            );
+            ui.label_at(Vec2::new(16.0, 536.0), "image_at：Stretch（左）/ Center 半透明（右）");
+        }
         // 赤石窗口：整窗旋转（角度 = cshi_num）+ RGBA 染色（4 个 slider 调）。
         let mut r = 1.0;
         let mut g = 1.0;
@@ -914,6 +952,26 @@ impl App for UiApp {
         // 其余长期资源（RenderContext / 世界层与 UI 层 Render2D / 画面矩形）由运行时持有，
         // 应用不再自建（UI 层排序已由运行时关闭，无需 `set_sort_mode(SortMode::None)`）。
         self.font = Some(gfx.text());
+        // **背景图演示用的棋盘纹理**：8×8 格、每格 4px ⇒ 32×32。
+        // `Gfx::texture` 会把它注册进纹理表 → UI 侧只持 **uid**（`ImageBg::tex`），
+        // 后端按 uid 解析（`UiBackend::texture`）。对角线染色便于看清平铺接缝。
+        const TEX: u32 = 32;
+        let mut px = vec![0u8; (TEX * TEX * 4) as usize];
+        for y in 0..TEX {
+            for x in 0..TEX {
+                let dark = ((x / 4) + (y / 4)) % 2 == 0;
+                let i = ((y * TEX + x) * 4) as usize;
+                let c: [u8; 4] = if dark {
+                    [70, 110, 170, 255]
+                } else {
+                    [40, 60, 100, 255]
+                };
+                px[i..i + 4].copy_from_slice(&c);
+            }
+        }
+        let tex = gfx.texture("eg260818UI.pattern", Rgba8::new(&px, (TEX, TEX)));
+        self.windows.bg_image =
+            Some(ImageBg::new(tex.uid, Vec2::new(TEX as f32, TEX as f32)));
         Ok(())
     }
 

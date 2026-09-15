@@ -33,7 +33,8 @@ use winit::window::Window as WinitWindow;
 
 use crate::backend::{UiBackend, UiBatch, UiBatchSource};
 use crate::draw::{
-    CornerRadius, DebugShape, DrawKind, Gradient, Icon, Position, Size, TextAlign, TextVAlign,
+    CornerRadius, DebugShape, DrawKind, Gradient, Icon, ImageBg, Position, Size, TextAlign,
+    TextVAlign,
     UiDraw, border_rects, centered_square, clipped, debug_shape_segments, intersect_rect,
     screen_fixed_tf, snap_rect, text_block_offset, text_cmd,
 };// 顶点收集 / 合批机制（原在此文件，见 `gpu_batch` 模块文档）。
@@ -964,6 +965,38 @@ impl<'a> Ui<'a> {
         self.push_draw(DrawKind::Icon { icon, color }, Rect::new(pos.x, pos.y, size.x, size.y));
     }
 
+    /// **背景图**（绝对定位；`ImageBg` 决定铺排 / 染色 / 圆角遮罩）。
+    ///
+    /// 与 [`Self::rounded_rect_at`] 同一条 CPU 镶嵌路径：`Stretch` / `Fill` / `Center`
+    /// 的 UV 是仿射映射 ⇒ **贴图与圆角遮罩共存**，且不额外产生 draw call（图片按纹理
+    /// 切段，与字形 / 白纹理各一段）。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{ImageBg, ImageFit, Position, Size, Ui};
+    /// # fn demo(ui: &mut Ui, pos: Position, size: Size<glam::Vec2>, tex: u64) {
+    /// // 等比覆盖 + 圆角遮罩
+    /// let bg = ImageBg::new(tex, glam::Vec2::new(64.0, 64.0)).fit(ImageFit::Fill).radius(8.0);
+    /// ui.image_at(pos, size, bg);
+    /// # }
+    /// ```
+    pub fn image_at(
+        &mut self,
+        pos: impl Into<Position>,
+        size: impl Into<Size<Vec2>>,
+        bg: ImageBg,
+    ) {
+        let pos = pos.into().to_physical(self.scale);
+        let size = size.into().to_physical(self.scale);
+        self.push_draw(DrawKind::Image(bg), Rect::new(pos.x, pos.y, size.x, size.y));
+    }
+
+    /// **背景图**（随布局流排布；与 [`Self::image_at`] 同语义，位置来自当前容器游标）。
+    pub fn image(&mut self, size: impl Into<Size<Vec2>>, bg: ImageBg) {
+        let size = size.into().to_physical(self.scale);
+        let pos = self.child_rect(size.x, size.y, Child::Expand).min();
+        self.push_draw(DrawKind::Image(bg), Rect::new(pos.x, pos.y, size.x, size.y));
+    }
+
     /// **矩形渐变**（绝对定位；背景填充原语）。
     ///
     /// `gradient` 接受 [`Gradient`] 或 `Color`（`Color: Into<Gradient>`，等价纯色）：
@@ -1035,9 +1068,31 @@ impl<'a> Ui<'a> {
         radius: impl Into<CornerRadius>,
         elem: u32,
     ) {
+        self.push_panel_like_img(rect, bg, None, border, border_w, radius, elem);
+    }
+
+    /// 同 [`Self::push_panel_like`]，另带可选**背景图**（[`ImageBg`]）。
+    ///
+    /// 绘制层次：**背景刷 → 背景图 → 边框**（图在刷之上，半透明图能透出底色；边框
+    /// 恒盖住图的边缘）。圆角遮罩**恒用面板 `radius`**（图片自带的 `radius` 被忽略，
+    /// 免得"图与面板圆角不一致"这种要靠肉眼发现的错）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_panel_like_img(
+        &mut self,
+        rect: Rect,
+        bg: impl Into<crate::style::Brush>,
+        img: Option<ImageBg>,
+        border: Color,
+        border_w: f32,
+        radius: impl Into<CornerRadius>,
+        elem: u32,
+    ) {
         let bg = bg.into();
         let radius = radius.into();
         let seq = self.next_seq();
+        // 背景图的 seq 夹在"背景刷"与"边框"之间（同 elem 内按 seq 排序 ⇒ 层次正确）。
+        let img_seq = seq + 1;
+        let border_seq = if img.is_some() { seq + 2 } else { seq + 1 };
         let depth = self.depth;
         let win = self.cur_win;
         let clip = self.clip;
@@ -1077,18 +1132,31 @@ impl<'a> Ui<'a> {
                     },
                 }),
             }
-            if border_w > 0.0 {
-                self.queue.push(UiDraw {
-                    depth,
-                    seq: seq + 1,
-                    win,
-                    elem,
-                    rect,
-                    clip,
-                    kind: DrawKind::Border { color: border, width: border_w, radius },
-                });
-            }
-        } else {
+        // **背景图**（背景刷之上、边框之下）：圆角遮罩用面板 radius。
+        if let Some(mut img) = img {
+            img.radius = radius;
+            self.queue.push(UiDraw {
+                depth,
+                seq: img_seq,
+                win,
+                elem,
+                rect,
+                clip,
+                kind: DrawKind::Image(img),
+            });
+        }
+        if border_w > 0.0 {
+            self.queue.push(UiDraw {
+                depth,
+                seq: border_seq,
+                win,
+                elem,
+                rect,
+                clip,
+                kind: DrawKind::Border { color: border, width: border_w, radius },
+            });
+        }
+    } else {
             match bg.as_solid() {
                 Some(c) => self.queue.push(UiDraw {
                     depth,
@@ -1112,7 +1180,7 @@ impl<'a> Ui<'a> {
             if border_w > 0.0 {
                 self.queue.push(UiDraw {
                     depth,
-                    seq: seq + 1,
+                    seq: border_seq,
                     win,
                     elem,
                     rect,
@@ -2198,7 +2266,7 @@ impl<'a> Ui<'a> {
         }
         // 背景 + 边框（depth = 进入前深度，画在子控件之下；radius > 0 走圆角双层矩形）
         let bg_rect = Rect::new(0.0, 0.0, size.x, size.y);
-        self.push_panel_like(bg_rect, style.bg, style.border, style.border_w, style.radius, 0);
+        self.push_panel_like_img(bg_rect, style.bg, style.bg_image, style.border, style.border_w, style.radius, 0);
         // 平移全部（子命令 + 背景/边框）：
         // 用 `display_pos`（拖拽中 = 本帧新位置）→ 文字/矩形**当帧生效**。
         for d in &mut self.queue[start..] {
@@ -2490,7 +2558,7 @@ impl<'a> Ui<'a> {
         }
         // 背景 + 边框（win = z，画在窗口子控件之下；radius > 0 走圆角双层矩形）
         let bg_rect = Rect::new(0.0, 0.0, size.x, size.y);
-        self.push_panel_like(bg_rect, style.bg, style.border, style.border_w, style.radius, 0);
+        self.push_panel_like_img(bg_rect, style.bg, style.bg_image, style.border, style.border_w, style.radius, 0);
         // 固定宽窗口：右下角缩放柄图案（3 条递减小斜杠；窗口局部坐标，随窗口平移）
         if width.is_some() {
             let grip = style.border;
@@ -3460,6 +3528,19 @@ impl<'a> Ui<'a> {
                     let pr = snap_rect(&d.rect);
                     debug_layout_outline(quads, win, anchor_px, pr, dbg);
                 }
+                DrawKind::Image(bg) => {
+                    // 背景图：与实心背景同一条镶嵌路径（CPU 直出三角形 + 羽化），
+                    // 只多一个"逐顶点 UV 的仿射映射"（见 `QuadCollector::push_image`）。
+                    let pr = snap_rect(&d.rect);
+                    if let Some(local) = clipped(pr, clip_abs).map(|r| {
+                        Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
+                    })
+                        && local.w > 0.0 && local.h > 0.0 {
+                            let table = self.state.tess.table();
+                            quads.push_image(win, &table, local, *bg, self.theme.feather);
+                            debug_layout_outline(quads, win, anchor_px, pr, dbg);
+                        }
+                }
                 DrawKind::Caret { color, width } => {
                     let r = Rect::new(d.rect.x, d.rect.y, *width, d.rect.h);
                     let pr = snap_rect(&r);
@@ -3927,6 +4008,16 @@ pub trait UiAdd<'a> {
     /// **矢量图标**（绝对定位；`pos` 相对当前容器内容原点）。
     fn icon_at(&mut self, pos: impl Into<Position>, size: impl Into<Size<Vec2>>, icon: Icon, color: Color) {
         self.ui_mut().icon_at(pos, size, icon, color)
+    }
+
+    /// **背景图**（占光标）：容器内按当前游标放置，尺寸 `size`。
+    fn image(&mut self, size: impl Into<Size<Vec2>>, bg: ImageBg) {
+        self.ui_mut().image(size, bg)
+    }
+
+    /// **背景图**（绝对定位；`pos` 相对当前容器内容原点）。
+    fn image_at(&mut self, pos: impl Into<Position>, size: impl Into<Size<Vec2>>, bg: ImageBg) {
+        self.ui_mut().image_at(pos, size, bg)
     }
 
     /// **自动换行标签**（占光标）：`max_w` 逻辑像素内按词/字换行；
@@ -4621,6 +4712,7 @@ impl Ui<'_> {
                 border_w: 1.0,
                 padding: 0.0,
                 radius: cs.menu_radius,
+                bg_image: None,
             };
             let popup_size = self
                 .window(&popup_id)

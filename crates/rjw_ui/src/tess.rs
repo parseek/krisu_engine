@@ -270,7 +270,7 @@ fn push_outline<F>(
     stride: u32,
     segs: u32,
     corners: &[Corner; 4],
-    uv: [f32; 2],
+    uv_at: &dyn Fn(Vec2) -> [f32; 2],
     color_at: F,
 ) -> u16
 where
@@ -284,7 +284,7 @@ where
             let pos = c.center + c.dir(cos_t, sin_t) * c.radius;
             verts.push(VertexP3U2C4 {
                 pos: [pos.x, pos.y, 0.0],
-                uv,
+                uv: uv_at(pos),
                 color: color_at(i, pos),
             });
             i += 1;
@@ -462,15 +462,50 @@ fn push_plain_quad(
     tris: &mut Vec<Tri>,
     rect: Rect,
     corners: [Color; 4],
-    uv: [f32; 2],
+    uv_at: &dyn Fn(Vec2) -> [f32; 2],
 ) -> TessOutput {
     let Rect { x, y, w, h } = rect;
     let base = verts.len() as u16;
     let [tl, tr, bl, br] = corners.map(Into::<[f32; 4]>::into);
-    verts.push(VertexP3U2C4 { pos: [x, y, 0.0], uv, color: tl });
-    verts.push(VertexP3U2C4 { pos: [x + w, y, 0.0], uv, color: tr });
-    verts.push(VertexP3U2C4 { pos: [x, y + h, 0.0], uv, color: bl });
-    verts.push(VertexP3U2C4 { pos: [x + w, y + h, 0.0], uv, color: br });
+    // UV 逐点：纯色（白纹理）四个角同值；贴图时四角各异——一个四边形即可精确承载
+    // **仿射** UV 映射（拉伸 / 等比裁剪 / 居中都属此类）。
+    let (vtl, vtr, vbl, vbr) = (
+        uv_at(Vec2::new(x, y)),
+        uv_at(Vec2::new(x + w, y)),
+        uv_at(Vec2::new(x, y + h)),
+        uv_at(Vec2::new(x + w, y + h)),
+    );
+    verts.push(VertexP3U2C4 { pos: [x, y, 0.0], uv: vtl, color: tl });
+    verts.push(VertexP3U2C4 { pos: [x + w, y, 0.0], uv: vtr, color: tr });
+    verts.push(VertexP3U2C4 { pos: [x, y + h, 0.0], uv: vbl, color: bl });
+    verts.push(VertexP3U2C4 { pos: [x + w, y + h, 0.0], uv: vbr, color: br });
+    tris.push([base, base + 1, base + 3]);
+    tris.push([base + 3, base + 2, base]);
+    TessOutput { verts: 4, tris: 2 }
+}
+
+/// **带子区域 UV 的矩形四边形**（贴图**平铺**的单块）：UV 起点 / 终点显式给出——
+/// 平铺时每块恒取 `0..1`，边缘的**部分块**按比例截断（`uv1 < 1`）。
+///
+/// 返回的 `TessOutput` 恒为 `{ verts: 4, tris: 2 }`（尺寸退化时为 0）。
+pub(crate) fn push_plain_uv(
+    verts: &mut Vec<VertexP3U2C4>,
+    tris: &mut Vec<Tri>,
+    rect: Rect,
+    corners: [Color; 4],
+    uv0: Vec2,
+    uv1: Vec2,
+) -> TessOutput {
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return TessOutput { verts: 0, tris: 0 };
+    }
+    let Rect { x, y, w, h } = rect;
+    let base = verts.len() as u16;
+    let [tl, tr, bl, br] = corners.map(Into::<[f32; 4]>::into);
+    verts.push(VertexP3U2C4 { pos: [x, y, 0.0], uv: [uv0.x, uv0.y], color: tl });
+    verts.push(VertexP3U2C4 { pos: [x + w, y, 0.0], uv: [uv1.x, uv0.y], color: tr });
+    verts.push(VertexP3U2C4 { pos: [x, y + h, 0.0], uv: [uv0.x, uv1.y], color: bl });
+    verts.push(VertexP3U2C4 { pos: [x + w, y + h, 0.0], uv: [uv1.x, uv1.y], color: br });
     tris.push([base, base + 1, base + 3]);
     tris.push([base + 3, base + 2, base]);
     TessOutput { verts: 4, tris: 2 }
@@ -512,6 +547,23 @@ pub(crate) fn push_rounded_rect(
     table: &CornerTable,
     spec: RoundedRectSpec,
 ) -> TessOutput {
+    let uv = spec.uv;
+    push_rounded_rect_uv(verts, tris, table, spec, &move |_p| uv)
+}
+
+/// 同 [`push_rounded_rect`]，但**每个顶点按自己的位置取 UV**（`uv_at`）——**贴图**用
+/// （实心背景恒走 [`RoundedRectSpec::uv`] 的定值版本）。
+///
+/// 线性 UV 映射（拉伸 / 等比裁剪 / 居中，即 [`crate::draw::ImageFit`] 的前三种）在
+/// 扇形三角化下的重心插值是**精确**的（仿射映射），因此贴图与圆角遮罩天然共存、
+/// 零额外 draw call、零着色器改动（与「圆角 + 渐变」同一套机制）。
+pub(crate) fn push_rounded_rect_uv(
+    verts: &mut Vec<VertexP3U2C4>,
+    tris: &mut Vec<Tri>,
+    table: &CornerTable,
+    spec: RoundedRectSpec,
+    uv_at: &dyn Fn(Vec2) -> [f32; 2],
+) -> TessOutput {
     let Rect { w, h, .. } = spec.rect;
     if w <= 0.0 || h <= 0.0 {
         return TessOutput { verts: 0, tris: 0 };
@@ -520,13 +572,12 @@ pub(crate) fn push_rounded_rect(
     // 直角（半径 0）的角也要参与带状化，否则两级轮廓的**点数不一致**、带状会错位；
     // 给它 0.5px 的下限（1× 下看不出圆，但点数与其它角一致）。
     if spec.radius.is_zero() {
-        return push_plain_quad(verts, tris, spec.rect, spec.corners, spec.uv);
+        return push_plain_quad(verts, tris, spec.rect, spec.corners, uv_at);
     }
     let floor = |r: f32| if r > 0.0 { r.max(MIN_AA_RADIUS) } else { MIN_AA_RADIUS };
     // ⚠ 顺序：**先抬下限，再 `fit`**。反过来的话下限会把已经收缩好的半径又抬回超界值，
     // 于是"两角半径之和 > 边长"、角心次序颠倒、轮廓变逆时针 ⇒ 负面积三角形。
     let radii = spec.radius.map(floor).fit(w, h);
-    let uv = spec.uv;
 
     // 羽化宽：小控件自动收紧（避免糊成一团）。
     let f = spec.feather.min(w.min(h) * 0.25);
@@ -550,7 +601,7 @@ pub(crate) fn push_rounded_rect(
     // 每个顶点按**自己在 rect 中的位置**取色（不是按角取色）。
     let rect = spec.rect;
     let cols = spec.corners;
-    let hard_start = push_outline(verts, table, stride, segs, &hard, uv, |_i, p| {
+    let hard_start = push_outline(verts, table, stride, segs, &hard, uv_at, |_i, p| {
         let mut c: [f32; 4] = bilinear_color(cols, rect, p).into();
         c[3] = 1.0;
         c
@@ -564,7 +615,7 @@ pub(crate) fn push_rounded_rect(
     let center_idx = verts.len() as u16;
     verts.push(VertexP3U2C4 {
         pos: [center.x, center.y, 0.0],
-        uv,
+        uv: uv_at(center),
         color: bilinear_color(cols, rect, center).into(),
     });
     for i in 0..n {
@@ -583,7 +634,7 @@ pub(crate) fn push_rounded_rect(
         let outer = corners_of(outer_rect, outer_radii);
         let fade = copy_colors(verts, hard_start, n, 0.0);
         let outer_start =
-            push_outline(verts, table, stride, segs, &outer, uv, |i, _p| fade[i]);
+            push_outline(verts, table, stride, segs, &outer, uv_at, |i, _p| fade[i]);
         // `hard` 半径更小 ⇒ 是 inner。
         push_band(tris, hard_start, outer_start, n);
     }
@@ -721,7 +772,7 @@ pub(crate) fn push_rounded_ring(
         stride,
         segs,
         &corners_of(rect, ro),
-        uv,
+        &|_p| uv,
         flat,
     );
     let c_start = push_outline(
@@ -730,14 +781,14 @@ pub(crate) fn push_rounded_ring(
         stride,
         segs,
         &corners_of(inner_rect, ri),
-        uv,
+        &|_p| uv,
         flat,
     );
     let a_start = if outer_aa {
         let orc = grow(rect, half);
         let cs = corners_of(orc, ro.map(|r| r + half).fit(orc.w, orc.h));
         let fade = copy_colors(verts, b_start, n, 0.0);
-        Some(push_outline(verts, table, stride, segs, &cs, uv, |i, _p| fade[i]))
+        Some(push_outline(verts, table, stride, segs, &cs, &|_p| uv, |i, _p| fade[i]))
     } else {
         None
     };
@@ -748,7 +799,7 @@ pub(crate) fn push_rounded_ring(
             ri.map(|r| (r - half).max(MIN_AA_RADIUS)).fit(irc.w, irc.h),
         );
         let fade = copy_colors(verts, c_start, n, 0.0);
-        Some(push_outline(verts, table, stride, segs, &cs, uv, |i, _p| fade[i]))
+        Some(push_outline(verts, table, stride, segs, &cs, &|_p| uv, |i, _p| fade[i]))
     } else {
         None
     };
@@ -1662,6 +1713,73 @@ mod tests {
         let feather = v.iter().filter(|x| x.color[3] == 0.0).count();
         assert!(hard > 0 && feather > 0);
         assert_eq!(hard + feather, v.len(), "只应有 alpha 1 与 0 两类顶点");
+    }
+
+    // ─── 背景图（逐顶点 UV 的仿射映射） ───────────────────────
+
+    #[test]
+    fn per_vertex_uv_is_affine_through_the_rounded_path() {
+        // 贴图与圆角遮罩共存的前提：**每个顶点**的 UV 等于它自己在 rect 中的线性映射。
+        // 仿射映射在扇形三角化下由重心插值**精确**再现（无需细分、无需着色器），
+        // 因此圆角处的 UV 也是对的（图片在圆角边缘被 alpha 羽化裁掉，而不是被拉伸）。
+        let t = table();
+        let rect = Rect::new(10.0, 20.0, 100.0, 50.0);
+        let (uv0, uv1) = (Vec2::new(0.25, 0.5), Vec2::new(0.75, 1.0));
+        let uv_at = move |p: Vec2| {
+            let k = Vec2::new((uv1.x - uv0.x) / rect.w, (uv1.y - uv0.y) / rect.h);
+            let u = uv0 + (p - rect.min()) * k;
+            [u.x, u.y]
+        };
+        for radius in [0.0f32, 8.0] {
+            let mut v = Vec::new();
+            let mut tr = Vec::new();
+            let out = push_rounded_rect_uv(
+                &mut v,
+                &mut tr,
+                &t,
+                RoundedRectSpec {
+                    rect,
+                    radius: radius.into(),
+                    feather: 1.0,
+                    corners: [Color::WHITE; 4],
+                    uv: TEST_UV, // 逐顶点 UV 生效时该兜底值不应出现在任何顶点上
+                },
+                &uv_at,
+            );
+            assert!(out.verts > 0 && out.tris > 0, "radius={radius}: 应有几何");
+            assert_well_formed(&v, &tr);
+            for x in &v {
+                let p = Vec2::new(x.pos[0], x.pos[1]);
+                let want = uv_at(p);
+                assert!(
+                    (x.uv[0] - want[0]).abs() < 1e-5 && (x.uv[1] - want[1]).abs() < 1e-5,
+                    "radius={radius}: 顶点 {p:?} 的 UV 应为线性映射值 {want:?}，实际 {:?}",
+                    x.uv
+                );
+                assert_ne!(x.uv, TEST_UV, "绝不能落到兜底 UV（那是字形页的采样点）");
+            }
+            // radius = 0 走四边形捷径：四角 UV 恰好是 (uv0, uv0/uv1, uv1)。
+            if radius == 0.0 {
+                assert_eq!(out.verts, 4, "直角贴图 = 一个四边形");
+                let corner = |x: f32, y: f32| uv_at(Vec2::new(x, y));
+                assert_eq!(vertex_at(&v, rect.min()).map(|q| q.uv), Some(corner(rect.x, rect.y)));
+                assert_eq!(
+                    vertex_at(&v, Vec2::new(rect.x + rect.w, rect.y + rect.h)).map(|q| q.uv),
+                    Some(corner(rect.x + rect.w, rect.y + rect.h))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_uv_still_applies_when_no_per_vertex_map_is_used() {
+        // 非贴图路径（纯色 / 白纹理）必须继续**逐顶点同值**——回归"所有顶点都带调用方给的
+        // 采样点"（曾有 UV 写死 (0,0) → 圆角背景整体消失的 bug）。
+        let t = table();
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        push_rounded_rect(&mut v, &mut tr, &t, spec(60.0, 36.0, 8.0));
+        assert!(v.iter().all(|x| x.uv == TEST_UV), "定值路径：全部顶点同一个 UV");
     }
 
     // ─── 圆角环带（边框） ────────────────────────────────────

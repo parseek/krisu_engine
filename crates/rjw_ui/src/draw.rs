@@ -647,6 +647,179 @@ pub fn lerp_color(a: Color, b: Color, k: f32) -> Color {
     Color::from(o)
 }
 
+// ─── 背景图（ImageBg） ────────────────────────────────────────
+
+/// 背景图**铺排方式**（[`ImageBg::fit`]）。
+///
+/// 前三种（`Stretch` / `Fill` / `Center`）的 UV 映射是**仿射**的：扇形三角化下的
+/// 重心插值**精确**，因此能和圆角遮罩（`ImageBg::radius`）共存、且只花一个四边形的
+/// 几何（`radius > 0` 时是圆角硬体 + 羽化带，与实心背景同一条路径）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ImageFit {
+    /// **拉伸填满**（各向异性缩放；会变形）。
+    #[default]
+    Stretch,
+    /// **等比放大到覆盖整块区域**（保持宽高比；超出的部分按**居中**裁剪，不变形）。
+    Fill,
+    /// **原始尺寸居中**（纹素 = 逻辑像素，1:1；放不下时居中裁剪，最远端先丢）。
+    Center,
+    /// **1:1 平铺**（纹素 = 逻辑像素，不平滑缩放；最后一行/列是**部分块**，UV 按比例截断）。
+    ///
+    /// ⚠ 两个已知边界：
+    /// 1. **不支持圆角遮罩**（`radius` 被忽略）：圆角靠"逐顶点 UV 的仿射映射 + 扇形
+    ///    三角化"实现，而平铺需要 UV **环绕**（`u > 1`）——除非给批次换成 `Repeat`
+    ///    采样器（需 `UiBatch` 携带 `RStates`，属引擎级改动）。需要圆角用 `Fill`。
+    /// 2. 平铺块数有上限（[`MAX_IMAGE_TILES`]），超限**退化为 [`ImageFit::Stretch`]**
+    ///    （避免 1px 图块在大面板上生成上万顶点）。
+    Tile,
+}
+
+/// 平铺块数上限（`Tile` 单块四边形 = 4 顶点；上限 × 4 顶点要远小于 `u16` 索引域）。
+pub const MAX_IMAGE_TILES: u32 = 2048;
+
+/// **背景图**：纹理 uid + 纹素尺寸 + 铺排 + 染色 + 圆角遮罩。
+///
+/// 纹理按 **uid** 引用（[`rjw_render::TextureWrapped::uid`]；后端按 uid 解析），
+/// `texel` = 纹理的**纹素**尺寸——`Center` / `Tile` 恒按 1:1 铺排，必须靠它换算。
+///
+/// ```no_run
+/// # use rjw_ui::{ImageBg, ImageFit};
+/// # let tex_uid: u64 = 1;
+/// let bg = ImageBg::new(tex_uid, glam::Vec2::new(64.0, 64.0))
+///     .fit(ImageFit::Fill)
+///     .radius(8.0)
+///     .tint(rjw_color::Color::WHITE);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageBg {
+    /// 纹理 uid（`TextureWrapped::uid`）。
+    pub tex: u64,
+    /// 纹理**纹素**尺寸（物理像素；`Center` / `Tile` 的 1:1 基准）。
+    pub texel: Vec2,
+    /// 铺排方式。
+    pub fit: ImageFit,
+    /// 顶点色（乘在纹理上；alpha < 1 = 整块半透明）。
+    pub tint: Color,
+    /// **圆角遮罩**半径（物理像素；0 = 直角，不裁）。`Tile` 忽略它（见 [`ImageFit::Tile`]）。
+    pub radius: CornerRadius,
+}
+
+/// 铺排解算结果（纯几何；[`ImageBg::layout`]）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageLayout {
+    /// 图片实际绘制矩形（`Center` 可能小于输入 `rect`，`Fill` 恒等于输入 `rect`）。
+    pub rect: Rect,
+    /// `rect` 左上角 / 右下角对应的 **UV**。
+    pub uv0: Vec2,
+    pub uv1: Vec2,
+    /// `Some(tile)` = 平铺：按 `tile`（= 纹素尺寸）切网格，每块 UV 恒 `0..1`。
+    pub tile: Option<Vec2>,
+}
+
+impl ImageBg {
+    /// 拉伸填满（默认）。
+    #[inline]
+    pub fn new(tex: u64, texel: Vec2) -> Self {
+        Self { tex, texel, fit: ImageFit::Stretch, tint: Color::WHITE, radius: CornerRadius::default() }
+    }
+
+    /// 设置铺排方式。
+    #[inline]
+    pub fn fit(mut self, fit: ImageFit) -> Self {
+        self.fit = fit;
+        self
+    }
+
+    /// 设置圆角遮罩（`f32` = 四角同半径；`CornerRadius` = 逐角）。
+    #[inline]
+    pub fn radius(mut self, radius: impl Into<CornerRadius>) -> Self {
+        self.radius = radius.into();
+        self
+    }
+
+    /// 设置顶点色（乘在纹理上）。
+    #[inline]
+    pub fn tint(mut self, tint: Color) -> Self {
+        self.tint = tint;
+        self
+    }
+
+    /// **铺排解算**（纯函数）：输入目标矩形，输出"画在哪、取哪块 UV"。
+    ///
+    /// `None` = 没有可画的东西（尺寸退化 / 纹素尺寸为 0）。
+    pub fn layout(&self, rect: Rect) -> Option<ImageLayout> {
+        if rect.w <= 0.0 || rect.h <= 0.0 || self.texel.x <= 0.0 || self.texel.y <= 0.0 {
+            return None;
+        }
+        match self.fit {
+            ImageFit::Stretch => Some(ImageLayout {
+                rect,
+                uv0: Vec2::ZERO,
+                uv1: Vec2::ONE,
+                tile: None,
+            }),
+            ImageFit::Fill => {
+                // 等比放大到覆盖：`scale = max(覆盖所需的两轴比例)`；缩放后按居中裁剪，
+                // 于是**可见矩形 = 输入 rect**，UV 只取中间那块。
+                let s = (rect.w / self.texel.x).max(rect.h / self.texel.y);
+                let shown = Vec2::new(rect.w / (self.texel.x * s), rect.h / (self.texel.y * s));
+                let off = (Vec2::ONE - shown) * 0.5;
+                Some(ImageLayout {
+                    rect,
+                    uv0: off,
+                    uv1: off + shown,
+                    tile: None,
+                })
+            }
+            ImageFit::Center | ImageFit::Tile => {
+                // 1:1 居中：可见尺寸 = min(纹素, 可用区)。
+                let shown_px = Vec2::new(rect.w.min(self.texel.x), rect.h.min(self.texel.y));
+                let img = Rect::new(
+                    rect.x + (rect.w - shown_px.x) * 0.5,
+                    rect.y + (rect.h - shown_px.y) * 0.5,
+                    shown_px.x,
+                    shown_px.y,
+                );
+                // 放不下时居中裁剪：只取中央那块 UV。
+                let scale = Vec2::new(shown_px.x / self.texel.x, shown_px.y / self.texel.y);
+                let off = (Vec2::ONE - scale) * 0.5;
+                Some(ImageLayout {
+                    rect: img,
+                    uv0: off,
+                    uv1: off + scale,
+                    tile: matches!(self.fit, ImageFit::Tile).then_some(self.texel),
+                })
+            }
+        }
+    }
+}
+
+/// **平铺网格**（纯函数）：把 `rect` 按 `tile` 切成 1:1 图块，返回每块的
+/// `(矩形, UV 终点)`——UV 起点恒 `(0,0)`，终点 < `(1,1)` 表示**边缘的部分块**
+/// （按比例截断，不会把整块图压进去）。
+///
+/// 超过 [`MAX_IMAGE_TILES`] 时返回 `None`（调用方退化为拉伸）。
+pub fn tile_grid(rect: Rect, tile: Vec2) -> Option<impl Iterator<Item = (Rect, Vec2)> + use<>> {
+    if tile.x <= 0.0 || tile.y <= 0.0 || rect.w <= 0.0 || rect.h <= 0.0 {
+        return None;
+    }
+    let cols = (rect.w / tile.x).ceil().max(1.0) as u32;
+    let rows = (rect.h / tile.y).ceil().max(1.0) as u32;
+    if cols.saturating_mul(rows) > MAX_IMAGE_TILES {
+        return None;
+    }
+    Some((0..rows).flat_map(move |r| {
+        (0..cols).map(move |c| {
+            let x = rect.x + c as f32 * tile.x;
+            let y = rect.y + r as f32 * tile.y;
+            let w = tile.x.min(rect.x + rect.w - x);
+            let h = tile.y.min(rect.y + rect.h - y);
+            let uv1 = Vec2::new(w / tile.x, h / tile.y);
+            (Rect::new(x, y, w, h), uv1)
+        })
+    }))
+}
+
 /// 绘制命令种类（记录式；`Ui::finish` 逐条提交到 `Render2D`）。
 #[derive(Clone, Debug)]
 pub enum DrawKind {
@@ -668,6 +841,11 @@ pub enum DrawKind {
     /// **矢量图标**（画出来的几何，与字体无关）：`rect` 是图标方框，几何取
     /// [`Icon::parts`] 的单位坐标映射进去，并按 `Theme::feather` 做边缘羽化。
     Icon { icon: Icon, color: Color },
+    /// **背景图**（[`ImageBg`]）：`rect` 是目标区域，铺排 / 染色 / 圆角遮罩由 `bg` 决定。
+    ///
+    /// 与实心背景同一条镶嵌路径（CPU 直出三角形 + 羽化），因此**不额外增加 draw call**：
+    /// 图片落在自己纹理的批次里（按纹理切段，与字形/白纹理各一段）。
+    Image(ImageBg),
     /// 文本（绘制时经 `rjw_text` 责任链渲染）。
     Text {
         /// 文本内容（`Arc<str>`：命令间共享，避免每命令 String 克隆）。

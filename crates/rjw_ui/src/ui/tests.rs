@@ -94,6 +94,42 @@ fn cmd_sig_invalidates_on_content_change() {
 }
 
 #[test]
+fn cmd_sig_covers_image_fields() {
+    // 背景图的每个渲染输入都必须进签名：否则改铺排 / 染色 / 圆角 / 换纹理时
+    // 窗口顶点缓存会误判"内容未变"而继续用旧顶点（图片不刷新）。
+    use std::hash::Hasher;
+    fn sig(d: &UiDraw) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        cmd_sig_hash(&mut h, d);
+        h.finish()
+    }
+    let mk = |bg: ImageBg| UiDraw {
+        depth: 0,
+        seq: 1,
+        win: 0,
+        elem: 0,
+        rect: Rect::new(0.0, 0.0, 100.0, 50.0),
+        clip: None,
+        kind: DrawKind::Image(bg),
+    };
+    let base = ImageBg::new(7, Vec2::new(64.0, 64.0));
+    assert_eq!(sig(&mk(base)), sig(&mk(base)), "同参数签名确定");
+    assert_ne!(sig(&mk(base)), sig(&mk(base.tint(Color::RED))), "染色必须进签名");
+    assert_ne!(
+        sig(&mk(base)),
+        sig(&mk(base.fit(crate::draw::ImageFit::Fill))),
+        "铺排方式必须进签名"
+    );
+    assert_ne!(sig(&mk(base)), sig(&mk(base.radius(6.0))), "圆角遮罩必须进签名");
+    assert_ne!(sig(&mk(base)), sig(&mk(ImageBg { tex: 8, ..base })), "纹理必须进签名");
+    assert_ne!(
+        sig(&mk(base)),
+        sig(&mk(ImageBg { texel: Vec2::new(32.0, 64.0), ..base })),
+        "纹素尺寸必须进签名（Center/Tile 的 1:1 基准）"
+    );
+}
+
+#[test]
 fn draw_kind_group_graphic_before_text() {
     // 同一 layer 内：图形（Solid/Border/Caret）分组 0，文字（Text）分组 1
     assert_eq!(DrawKind::Solid(Color::WHITE).group(), 0);
@@ -781,6 +817,77 @@ fn safe_line_slice_never_panics_on_stale_byte_ranges() {
     // 正常区间原样返回（0..6 = "窗口"）
     let ok = VisualLine { byte_start: 0, byte_end: 6, top: 0.0, width: 10.0 };
     assert_eq!(safe_line_slice(value, &ok), "窗口");
+}
+
+#[test]
+fn image_bg_layout_covers_all_four_fits() {
+    // 铺排是**纯数学**（不碰 GPU）——四种方式的"画在哪、取哪块 UV"全部可断言。
+    let rect = Rect::new(10.0, 20.0, 200.0, 100.0);
+    let texel = Vec2::new(64.0, 64.0);
+    // ① 拉伸：恒等于目标矩形，UV 取满。
+    let l = ImageBg::new(1, texel).layout(rect).expect("拉伸");
+    assert_eq!(l.rect, rect);
+    assert_eq!((l.uv0, l.uv1), (Vec2::ZERO, Vec2::ONE));
+    assert!(l.tile.is_none());
+    // ② 等比覆盖：`scale = max(200/64, 100/64) = 3.125` ⇒ 图 200×200、可见中段。
+    //    覆盖的那一轴（宽）正好铺满 ⇒ u 取满；另一轴取中间一半 ⇒ v 取 [0.25, 0.75]。
+    //    ⚠ 等比是关键：Fill 不会把 64×64 压成 200×100（那是 Stretch 的行为）。
+    let l = ImageBg::new(1, texel).fit(crate::draw::ImageFit::Fill).layout(rect).expect("覆盖");
+    assert_eq!(l.rect, rect, "覆盖恒铺满目标矩形（裁剪靠 UV）");
+    assert_eq!(l.uv0, Vec2::new(0.0, 0.25));
+    assert_eq!(l.uv1, Vec2::new(1.0, 0.75));
+    // ③ 原始尺寸居中：64×64 居中放在 200×100 里，UV 取满。
+    let l = ImageBg::new(1, texel).fit(crate::draw::ImageFit::Center).layout(rect).expect("居中");
+    assert_eq!(l.rect, Rect::new(78.0, 38.0, 64.0, 64.0));
+    assert_eq!((l.uv0, l.uv1), (Vec2::ZERO, Vec2::ONE));
+    // ③b 放不下时居中裁剪：可用宽 30 < 64 ⇒ 只取中央 30/64 的 UV。
+    let narrow = Rect::new(0.0, 0.0, 30.0, 100.0);
+    let l = ImageBg::new(1, texel).fit(crate::draw::ImageFit::Center).layout(narrow).expect("裁剪");
+    assert_eq!(l.rect, Rect::new(0.0, 18.0, 30.0, 64.0), "可见区居中且不超过可用区");
+    let half = (1.0 - 30.0 / 64.0) * 0.5;
+    assert!((l.uv0.x - half).abs() < 1e-6 && (l.uv1.x - (1.0 - half)).abs() < 1e-6);
+    assert_eq!((l.uv0.y, l.uv1.y), (0.0, 1.0), "够用的轴不裁");
+    // ④ 平铺：`tile` 有值（= 纹素尺寸，1:1），几何由 `tile_grid` 展开。
+    let l = ImageBg::new(1, texel).fit(crate::draw::ImageFit::Tile).layout(rect).expect("平铺");
+    assert_eq!(l.tile, Some(texel));
+    // 退化输入：空尺寸 / 零纹素 ⇒ 无可绘制。
+    assert!(ImageBg::new(1, texel).layout(Rect::new(0.0, 0.0, 0.0, 10.0)).is_none());
+    assert!(ImageBg::new(1, Vec2::ZERO).layout(rect).is_none());
+}
+
+#[test]
+fn tile_grid_covers_area_with_truncated_partial_blocks() {
+    // 平铺网格：块数 = ceil(w/tile) × ceil(h/tile)；边缘**部分块**按比例截断 UV
+    // （否则整块图会被压缩进残块，图案变形）。
+    let rect = Rect::new(5.0, 7.0, 100.0, 70.0);
+    let tile = Vec2::new(32.0, 32.0);
+    let cells: Vec<_> = crate::draw::tile_grid(rect, tile).expect("网格").collect();
+    // 4 列 × 3 行 = 12 块
+    assert_eq!(cells.len(), 12);
+    // 首块：完整 32×32，UV 取满。
+    assert_eq!(cells[0], (Rect::new(5.0, 7.0, 32.0, 32.0), Vec2::ONE));
+    // 末列（第 4 列）：宽 = 100 - 3×32 = 4 ⇒ u 只取 4/32。
+    let last_col_first = cells[3];
+    assert_eq!(last_col_first.0, Rect::new(5.0 + 96.0, 7.0, 4.0, 32.0));
+    assert!((last_col_first.1.x - 4.0 / 32.0).abs() < 1e-6);
+    assert_eq!(last_col_first.1.y, 1.0);
+    // 末行 / 末列交叉块：宽 4、高 70 - 2×32 = 6 ⇒ 两个方向都截断。
+    let corner = cells[11];
+    assert_eq!(corner.0, Rect::new(5.0 + 96.0, 7.0 + 64.0, 4.0, 6.0));
+    assert!((corner.1.x - 4.0 / 32.0).abs() < 1e-6 && (corner.1.y - 6.0 / 32.0).abs() < 1e-6);
+    // 恰好整除时不留部分块（3 列 × 2 行 = 6 块，全部取满）。
+    let exact: Vec<_> =
+        crate::draw::tile_grid(Rect::new(0.0, 0.0, 96.0, 64.0), tile).expect("整除").collect();
+    assert_eq!(exact.len(), 6);
+    assert!(exact.iter().all(|(_, uv)| *uv == Vec2::ONE), "整除时全是完整块");
+    // 块数上限：1px 图块铺满大面板 ⇒ 退化（`None`），由调用方回退到拉伸。
+    assert!(
+        crate::draw::tile_grid(Rect::new(0.0, 0.0, 4000.0, 4000.0), Vec2::ONE).is_none(),
+        "超上限必须返回 None（避免上万顶点）"
+    );
+    // 退化输入
+    assert!(crate::draw::tile_grid(Rect::new(0.0, 0.0, 10.0, 10.0), Vec2::ZERO).is_none());
+    assert!(crate::draw::tile_grid(Rect::new(0.0, 0.0, 0.0, 10.0), Vec2::ONE).is_none());
 }
 
 #[test]

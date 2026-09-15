@@ -1016,6 +1016,10 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 | `icon_at` | `ui.icon_at(pos, size, icon, color)` | **矢量图标**（绝对定位；`size` 为方框，非方形时按 `min(w,h)` 居中等比） |
 | `icon` | `ui.icon(size, icon, color)` | 同上，但位置来自当前容器游标——`row` 内连续调用即得工具栏 |
 | `Icon` | `Check` / `ChevronUp` / `ChevronDown` / `ChevronLeft` / `ChevronRight` / `Grip` | **画出来的几何**（单位方框 `[0,1]²` 内的凸分片，`Icon::parts()` 公开） |
+| `image_at` | `ui.image_at(pos, size, bg)` | **背景图**（绝对定位；`bg: ImageBg` 决定铺排 / 染色 / 圆角遮罩） |
+| `image` | `ui.image(size, bg)` | 同上，但位置来自当前容器游标 |
+| `ImageBg` | `new(tex, texel)` + `.fit(..)` / `.radius(..)` / `.tint(..)` | 纹理 uid + **纹素尺寸** + 铺排 + 染色 + 圆角遮罩；`PanelStyle::with_bg_image` 可直接当窗口/面板底图 |
+| `ImageFit` | `Stretch` / `Fill` / `Center` / `Tile` | 拉伸 / 等比覆盖（居中裁剪）/ 原始尺寸居中 / 1:1 平铺 |
 | `Gradient` | `pure(c)` / `vertical(top, bottom)` / `horizontal(left, right)` / `rotated(from, to, angle)` / `corners(tl, tr, bl, br)` | **四角颜色**（`pub tl/tr/bl/br`）；`From<Color>` 给纯色 |
 | `lerp_color` | `lerp_color(a, b, k)` | 颜色线性插值（`Gradient` 构造器与四角采样的基础） |
 
@@ -1040,7 +1044,20 @@ ui.gradient_rect_at(pos, size, Gradient::corners(a, b, c, d));
 // 5) 矢量图标
 ui.icon_at(pos, Vec2::splat(16.0), Icon::Check, Color::WHITE);
 ui.row(|r| r.icon(Vec2::splat(18.0), Icon::ChevronDown, Color::WHITE)); // 工具栏
+// 6) 背景图（`tex` = TextureWrapped::uid，`texel` = 纹素尺寸）
+let bg = ImageBg::new(tex, Vec2::new(64.0, 64.0));                     // 默认 Stretch
+ui.image_at(pos, size, bg.fit(ImageFit::Fill).radius(8.0));            // 等比覆盖 + 圆角遮罩
+ui.image_at(pos, size, bg.fit(ImageFit::Tile));                        // 1:1 平铺（直角）
+ui.window("w").style(ui.theme().panel.clone().with_bg_image(bg));      // 当窗口底图
 ```
+
+**背景图与圆角遮罩为什么能共存**：`Stretch` / `Fill` / `Center` 的 UV 是顶点位置的
+**仿射**映射，扇形三角化下的重心插值精确再现它 ⇒ 圆角硬体 + 羽化带上的每个顶点都带
+正确的 UV，边缘由羽化带的 alpha 斜坡裁掉（真正的圆角遮罩，不是把直角图片贴上去）。
+整个特性**零着色器改动、零额外 draw call**（图片按纹理切段，与字形 / 白纹理各一段；
+几何进窗口顶点缓存，跨帧复用）。`Tile` 用逐块四边形实现（1:1，边缘部分块按比例截断
+UV），**不支持圆角遮罩**——平铺需要 UV 环绕（`u > 1`），那要求批次携带 `Repeat`
+采样器（`UiBatch` 目前不带 `RStates`）；块数超 `MAX_IMAGE_TILES` 时退化为拉伸。
 
 **渐变不需要纹理**（v0.3 起）：顶点格式 `VertexP3U2C4` 自带 4 分量顶点色，
 光栅化器本就做重心插值 ⇒ 一个 quad + 白纹理即可，**管线零改动**。这一决定替代了旧实现
