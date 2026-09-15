@@ -1350,6 +1350,11 @@ clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位�
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。
 - 新增**交互**控件时必须调用 `register_focus(&id_for, rect, FocusKind::X)`（键盘导航 / 焦点描边；`id_for = ui.id_for(id)` 为**绝对 ID**）；需要 Enter/Space 激活的控件用 `key_click(&id_for, kind)` 合成点击。持久状态一律经 `state_mut().widget(&id_for)` 读写（绝对 ID）。
 - 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
+- **半透明与元素序**（两条都会静默毁掉画面）：
+  - `tess::push_rounded_rect` / `push_rounded_ring` / `push_convex` 的硬体 alpha **就是调用方给的颜色 alpha**（羽化环从它降到 0）——**不要写死 `alpha = 1`**：曾导致所有半透明圆角矩形 / 图标渲染成不透明（取色器 `#6EA8FF0A` 色块实测像素 = 纯色）。
+  - 组合控件里"画在自家背景之上"的装饰（手柄 / 箭头 / 分隔线）必须传 `ui.elem_hint()` 作为 `elem`（`push_panel_like` 的 `elem` 参数、`push_draw` 的第 3 个参数）：**元素序小的先画**，写死 `0`/`1` 会被本控件自己的背景或文本框整块盖住（`NumberInput` 的拖拽手柄、`ColorPicker` 的展开箭头都曾因此消失）。
+  - 相邻矩形拼成的"多段渐变"（如色相条）要用**纯四边形**（`DrawKind::Rect`）而不是多个带羽化的圆角矩形：两侧羽化的 alpha 斜坡会在共享边都降到 0，透出一条缝。
+  - 四角渐变在一整块几何里只做**逐三角形线性**插值：颜色场含交叉项（如 SV 平面 `V·lerp(白, 色相, S)`）时会出现折痕 ⇒ 切成网格（`colorpicker::hsv::sv_plane_cells`）。
 - **可拖拽容器**（窗口 / 面板）另有一条硬约定：`abs_base` 必须等于本帧实际平移量（`display_pos`），且**交互（命中 / 拖拽基准 / clamp）先于内容录制求解**——命中矩形取**上一帧结算尺寸**（`UiState::window_sizes` / `panel_sizes`，鼠标事件正是针对屏幕上那个矩形产生的）。若像早期实现那样"`abs_base` 用上一帧位置、几何用本帧位置"，拖拽期间一切走 `abs_base` 的绝对空间量（文本 `box_clip`、IME 光标、滑块基准）都会落后一帧（快速拖动时文字被裁 / 点击偏移）。位置求解复用 `ui::resolve_drag`（纯函数，可单测）。
 - 网格 cell 缓存（`UiState::grid_cells`）保证跨帧布局稳定；无缓存首帧渐进扩展，次帧起稳定。
 - **缓存了 UV / 图集区域的跨帧缓存，键里必须并入 `DynamicAtlas::revision()`**（`rjw_ui` 的窗口顶点缓存、`rjw_ui` 的 win=0 子槽缓存即如此）：`generation()` 只覆盖"重排搬动"，漏掉"逐出 + 空闲槽位被复用"——此时旧 UV 采样到别的字形像素（"陈旧文字 / 背景消失"），而内容签名不变 ⇒ 缓存永不失效。校验区域用 `region_peek()`（**不刷新寿命**，别用 `region()`——那会保活被校验的条目）。

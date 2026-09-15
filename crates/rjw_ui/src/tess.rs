@@ -356,8 +356,9 @@ pub(crate) fn push_convex(
     if points.len() < 3 {
         return TessOutput { verts: 0, tris: 0 };
     }
-    let mut col: [f32; 4] = color.into();
-    col[3] = 1.0;
+    // 与圆角矩形同一条约定：硬体的 alpha **就是**调用方给的 alpha（半透明图标必须真的
+    // 半透明），羽化外环再从它降到 0。
+    let col: [f32; 4] = color.into();
     let mut fade = col;
     fade[3] = 0.0;
 
@@ -599,12 +600,15 @@ pub(crate) fn push_rounded_rect_uv(
     let n = (4 * (segs + 1)) as u16;
 
     // 每个顶点按**自己在 rect 中的位置**取色（不是按角取色）。
+    //
+    // ⚠ **不能把 alpha 写死成 1**：硬体的 alpha 就是调用方给的 alpha，羽化带再用
+    // `copy_colors(.., 0.0)` 把它压到 0 ⇒ 抗锯齿斜坡从"该色的 alpha"降到 0。
+    // 曾经这里写死 `c[3] = 1.0`，于是**半透明圆角矩形全部变成不透明**
+    // （取色器的 alpha 色块按 `#RRGGBBAA` 显示却完全不透 —— 实测像素等于纯色）。
     let rect = spec.rect;
     let cols = spec.corners;
     let hard_start = push_outline(verts, table, stride, segs, &hard, uv_at, |_i, p| {
-        let mut c: [f32; 4] = bilinear_color(cols, rect, p).into();
-        c[3] = 1.0;
-        c
+        bilinear_color(cols, rect, p).into()
     });
     debug_assert_eq!((verts.len() as u16) - hard_start, n);
 
@@ -759,8 +763,9 @@ pub(crate) fn push_rounded_ring(
     let stride = table.stride_for(ro.max() + half);
     let segs = CornerTable::segs_of(stride);
     let n = (4 * (segs + 1)) as u16;
-    let mut solid: [f32; 4] = color.into();
-    solid[3] = 1.0;
+    // ⚠ 同 `push_rounded_rect`：硬轮廓的 alpha **就是调用方给的 alpha**（半透明边框
+    // 必须真的半透明），两级羽化圈再用 `copy_colors(.., 0.0)` 压到 0。
+    let solid: [f32; 4] = color.into();
     let flat = |_i: usize, _p: Vec2| solid;
 
     // 由外向内写：A（外羽化，0）→ B（外轮廓，1）→ C（内轮廓，1）→ D（内羽化，0）。
@@ -1705,7 +1710,8 @@ mod tests {
 
     #[test]
     fn hard_body_alpha_is_one_and_feather_is_zero() {
-        // 羽化抗锯齿的前提：硬体 alpha = 1、外环 alpha = 0（光栅化器插值出过渡）。
+        // 羽化抗锯齿的前提：**不透明色**的硬体 alpha = 1、外环 alpha = 0
+        // （光栅化器插值出过渡）。
         let t = table();
         let mut v = Vec::new();
         let mut tr = Vec::new();
@@ -1714,6 +1720,56 @@ mod tests {
         let feather = v.iter().filter(|x| x.color[3] == 0.0).count();
         assert!(hard > 0 && feather > 0);
         assert_eq!(hard + feather, v.len(), "只应有 alpha 1 与 0 两类顶点");
+    }
+
+    #[test]
+    fn translucent_rounded_rect_keeps_its_alpha() {
+        // 回归："半透明不完全"——硬体曾把 alpha 写死成 1，于是**半透明圆角矩形全变成
+        // 不透明**（实测像素：取色器的 `#6EA8FF0A` 色块渲染成纯 `#6EA8FF`，4% 透明度
+        // 完全丢失）。硬体的 alpha 必须**就是**调用方给的值，羽化环再从它降到 0。
+        let t = table();
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        let mut s = spec(60.0, 36.0, 8.0);
+        s.corners = [Color::rgba(1.0, 0.0, 0.0, 0.25); 4];
+        push_rounded_rect(&mut v, &mut tr, &t, s);
+        assert!(!v.is_empty());
+        let solid = v.iter().filter(|x| (x.color[3] - 0.25).abs() < 1e-6).count();
+        let fade = v.iter().filter(|x| x.color[3] == 0.0).count();
+        assert!(solid > 0, "硬体顶点必须保留 0.25 的 alpha");
+        assert!(fade > 0, "羽化环仍是 0");
+        assert_eq!(solid + fade, v.len(), "只应有 0.25 与 0 两类顶点");
+        // 直角（radius = 0）走四边形捷径，同样不能改 alpha。
+        let mut v2 = Vec::new();
+        let mut tr2 = Vec::new();
+        let mut s2 = spec(60.0, 36.0, 0.0);
+        s2.corners = [Color::rgba(0.0, 1.0, 0.0, 0.5); 4];
+        push_rounded_rect(&mut v2, &mut tr2, &t, s2);
+        assert!(v2.iter().all(|x| (x.color[3] - 0.5).abs() < 1e-6), "直角路径也不能改 alpha");
+    }
+
+    #[test]
+    fn translucent_ring_keeps_its_alpha() {
+        // 同一条约定作用于边框环带：半透明边框必须真的半透明。
+        let t = table();
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        push_rounded_ring(
+            &mut v,
+            &mut tr,
+            &t,
+            Rect::new(0.0, 0.0, 60.0, 36.0),
+            CornerRadius::all(8.0),
+            2.0,
+            DEFAULT_FEATHER,
+            Color::rgba(1.0, 1.0, 1.0, 0.5),
+            TEST_UV,
+        );
+        assert!(!v.is_empty());
+        let solid = v.iter().filter(|x| (x.color[3] - 0.5).abs() < 1e-6).count();
+        let fade = v.iter().filter(|x| x.color[3] == 0.0).count();
+        assert!(solid > 0 && fade > 0, "硬轮廓 0.5 / 羽化圈 0");
+        assert_eq!(solid + fade, v.len());
     }
 
     // ─── 背景图（逐顶点 UV 的仿射映射） ───────────────────────

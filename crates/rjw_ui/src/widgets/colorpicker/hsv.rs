@@ -24,7 +24,6 @@ use glam::Vec2;
 use rjw_color::Color;
 use rjw_transform::Rect;
 
-use crate::draw::CornerRadius;
 use crate::hit::{normalize_x, normalize_y};
 
 /// 色相条分段数（红→黄→绿→青→蓝→品红→红 = 6 段 7 个停靠点）。
@@ -107,15 +106,46 @@ pub fn hue_seg_colors(i: usize) -> (Color, Color) {
     )
 }
 
-/// 色相条第 `i` 段的逐角圆角：**只在整体两端**圆外侧两角 ⇒ 6 段拼成一根胶囊。
-#[inline]
-pub fn hue_seg_radius(i: usize, r: f32) -> CornerRadius {
-    CornerRadius {
-        tl: if i == 0 { r } else { 0.0 },
-        tr: if i + 1 == HUE_SEGS { r } else { 0.0 },
-        br: if i + 1 == HUE_SEGS { r } else { 0.0 },
-        bl: if i == 0 { r } else { 0.0 },
+/// SV 平面的**网格列数 / 行数**。
+///
+/// 平面颜色场在 S、V 上都是双线性（有交叉项 `S·V`），而光栅化器只做**逐三角形线性**
+/// 插值：整块画（两个三角形或从中心扇形铺开）会在三角形边界留下可见的**折痕/条纹**。
+/// 切成 `SV_COLS × SV_ROWS` 小格后，每格的交叉项误差按格面积缩小（∝ 1/格数²），
+/// 肉眼即平滑渐变（8×4 = 32 个四边形，全部进窗口顶点缓存）。
+pub const SV_COLS: u32 = 8;
+/// 见 [`SV_COLS`]。
+pub const SV_ROWS: u32 = 4;
+
+/// **SV 平面切成网格**：返回每格的矩形与四角色 `[TL, TR, BL, BR]`（由 HSV 公式精确取值）。
+///
+/// 纯函数（无 `Ui`、无 GPU），可单测"网格化后的最大颜色偏差"。
+pub fn sv_plane_cells(rect: Rect, hue: f32) -> Vec<(Rect, [Color; 4])> {
+    let mut out = Vec::with_capacity((SV_COLS * SV_ROWS) as usize);
+    let cw = rect.w / SV_COLS as f32;
+    let ch = rect.h / SV_ROWS as f32;
+    for r in 0..SV_ROWS {
+        // 行 0 在**顶部** = 明度最高（V 向下递减）。
+        let v_top = 1.0 - r as f32 / SV_ROWS as f32;
+        let v_bot = 1.0 - (r + 1) as f32 / SV_ROWS as f32;
+        for c in 0..SV_COLS {
+            let s0 = c as f32 / SV_COLS as f32;
+            let s1 = (c + 1) as f32 / SV_COLS as f32;
+            let cell = Rect::new(
+                rect.x + cw * c as f32,
+                rect.y + ch * r as f32,
+                cw,
+                ch,
+            );
+            let corners = [
+                hsv_to_rgb(hue, s0, v_top, 1.0), // TL
+                hsv_to_rgb(hue, s1, v_top, 1.0), // TR
+                hsv_to_rgb(hue, s0, v_bot, 1.0), // BL
+                hsv_to_rgb(hue, s1, v_bot, 1.0), // BR
+            ];
+            out.push((cell, corners));
+        }
     }
+    out
 }
 
 #[cfg(test)]
@@ -203,23 +233,134 @@ mod tests {
     }
 
     #[test]
-    fn hue_bar_segments_form_a_capsule_and_close_the_loop() {
-        let r = 3.0;
-        // 首段圆外侧两角（左），末段圆外侧两角（右），中间段直角。
-        assert_eq!(hue_seg_radius(0, r).tl, r);
-        assert_eq!(hue_seg_radius(0, r).bl, r);
-        assert_eq!(hue_seg_radius(0, r).tr, 0.0);
-        assert_eq!(hue_seg_radius(HUE_SEGS - 1, r).tr, r);
-        assert_eq!(hue_seg_radius(HUE_SEGS - 1, r).br, r);
-        assert_eq!(hue_seg_radius(HUE_SEGS - 1, r).tl, 0.0);
-        assert_eq!(hue_seg_radius(2, r), CornerRadius::default(), "中间段直角");
+    fn hue_bar_segments_close_the_loop_without_seams() {
         // 首尾停靠点同色（红）⇒ 色相条首尾无缝。
         assert_eq!(HUE_STOPS[0], HUE_STOPS[HUE_SEGS]);
-        // 相邻段首尾相接：第 i 段的"下" = 第 i+1 段的"上"。
+        // 相邻段首尾相接：第 i 段的"下" = 第 i+1 段的"上"（段间无跳变）。
         for i in 0..HUE_SEGS - 1 {
             let (_, bot) = hue_seg_colors(i);
             let (top, _) = hue_seg_colors(i + 1);
             assert_eq!(bot, top, "第 {i} 段与第 {} 段必须无缝", i + 1);
         }
+    }
+
+    /// 网格化的 SV 平面在某点的颜色——按**光栅化器的真实插值**重建：每格被对角线
+    /// `TL→BR` 切成两个三角形（与 `tess::push_plain_quad` 的 `[TL,TR,BR]` /
+    /// `[BR,BL,TL]` 一致），三角形内是**线性**插值（不是双线性！）。
+    fn sample_grid(cells: &[(Rect, [Color; 4])], p: Vec2, _rect: Rect) -> [f32; 4] {
+        let hit = cells.iter().find(|(cell, _)| {
+            p.x >= cell.x - 1e-4
+                && p.x <= cell.x + cell.w + 1e-4
+                && p.y >= cell.y - 1e-4
+                && p.y <= cell.y + cell.h + 1e-4
+        });
+        let Some((cell, c)) = hit else { return [0.0; 4] };
+        let u = ((p.x - cell.x) / cell.w).clamp(0.0, 1.0);
+        let v = ((p.y - cell.y) / cell.h).clamp(0.0, 1.0);
+        let (tl, tr, bl, br) = (c[0], c[1], c[2], c[3]);
+        if v < u {
+            tri_color(
+                (tl, Vec2::ZERO),
+                (tr, Vec2::new(1.0, 0.0)),
+                (br, Vec2::new(1.0, 1.0)),
+                Vec2::new(u, v),
+            )
+        } else {
+            tri_color(
+                (br, Vec2::new(1.0, 1.0)),
+                (bl, Vec2::new(0.0, 1.0)),
+                (tl, Vec2::ZERO),
+                Vec2::new(u, v),
+            )
+        }
+    }
+
+    /// 三角形 `(a, b, c)` 内 `p` 处的颜色（重心插值）。
+    fn tri_color(a: (Color, Vec2), b: (Color, Vec2), c: (Color, Vec2), p: Vec2) -> [f32; 4] {
+        let (ca, pa) = a;
+        let (cb, pb) = b;
+        let (cc, pc) = c;
+        let (v0, v1, v2) = (pb - pa, pc - pa, p - pa);
+        let den = v0.x * v1.y - v1.x * v0.y;
+        let (u, w) = if den.abs() < 1e-9 {
+            (0.0, 0.0)
+        } else {
+            (
+                (v2.x * v1.y - v1.x * v2.y) / den,
+                (v0.x * v2.y - v2.x * v0.y) / den,
+            )
+        };
+        let fa: [f32; 4] = ca.into();
+        let fb: [f32; 4] = cb.into();
+        let fc: [f32; 4] = cc.into();
+        let mut out = [0.0f32; 4];
+        for k in 0..4 {
+            out[k] = fa[k] * (1.0 - u - w) + fb[k] * u + fc[k] * w;
+        }
+        out
+    }
+
+    #[test]
+    fn sv_plane_grid_keeps_the_gradient_smooth() {
+        // 回归："过渡有问题"——SV 平面曾用**一整块**四角渐变（等于两个三角形），
+        // 而颜色场含交叉项 `S·V`，三角形内的线性插值偏离真实 HSV 值 ⇒ 边界出现折痕。
+        // 网格化后逐点误差应显著下降，且落在肉眼不可见的量级。
+        let rect = Rect::new(10.0, 20.0, 360.0, 110.0);
+        let hue = 0.62; // 蓝紫色相（交叉项强的区域）
+        let max_err = |cells: &[(Rect, [Color; 4])]| {
+            let mut worst = 0.0f32;
+            for i in 0..=40 {
+                for j in 0..=14 {
+                    let p = Vec2::new(
+                        rect.x + rect.w * i as f32 / 40.0,
+                        rect.y + rect.h * j as f32 / 14.0,
+                    );
+                    let got = sample_grid(cells, p, rect);
+                    let s = (p.x - rect.x) / rect.w;
+                    let v = 1.0 - (p.y - rect.y) / rect.h;
+                    let want: [f32; 4] = hsv_to_rgb(hue, s, v, 1.0).into();
+                    for k in 0..3 {
+                        worst = worst.max((got[k] - want[k]).abs());
+                    }
+                }
+            }
+            worst
+        };
+        let coarse = sv_plane_cells_with(rect, hue, 1, 1);
+        let fine = sv_plane_cells(rect, hue);
+        let (e_coarse, e_fine) = (max_err(&coarse), max_err(&fine));
+        assert!(
+            e_fine < e_coarse * 0.2,
+            "网格化应把交叉项误差压到 1/5 以下：粗 {e_coarse:.4} → 细 {e_fine:.4}"
+        );
+        assert!(
+            e_fine < 0.01,
+            "细网格的最大通道偏差应 < 1%（肉眼不可见），实际 {e_fine:.4}"
+        );
+        assert_eq!(fine.len(), (SV_COLS * SV_ROWS) as usize, "格子数 = 列×行");
+    }
+
+    /// 任意列/行的变体（供上面的误差对比用）。
+    fn sv_plane_cells_with(rect: Rect, hue: f32, cols: u32, rows: u32) -> Vec<(Rect, [Color; 4])> {
+        let mut out = Vec::new();
+        let (cw, ch) = (rect.w / cols as f32, rect.h / rows as f32);
+        for r in 0..rows {
+            let v_top = 1.0 - r as f32 / rows as f32;
+            let v_bot = 1.0 - (r + 1) as f32 / rows as f32;
+            for c in 0..cols {
+                let s0 = c as f32 / cols as f32;
+                let s1 = (c + 1) as f32 / cols as f32;
+                out.push((
+                    Rect::new(rect.x + cw * c as f32, rect.y + ch * r as f32, cw, ch),
+                    [
+                        hsv_to_rgb(hue, s0, v_top, 1.0),
+                        hsv_to_rgb(hue, s1, v_top, 1.0),
+                        hsv_to_rgb(hue, s0, v_bot, 1.0),
+                        hsv_to_rgb(hue, s1, v_bot, 1.0),
+                    ],
+                ));
+            }
+        }
+        out
     }
 }

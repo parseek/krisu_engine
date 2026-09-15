@@ -402,6 +402,45 @@ fn submit_order_graphics_before_text_per_window() {
 }
 
 #[test]
+fn decoration_elem_must_follow_its_own_widget_background() {
+    // 回归："图标不见了"——**组合控件里"后画的装饰"必须用比自己背景更大的元素序**。
+    // 排序键是 `(win, depth, elem, group, seq)`：`elem` 是"录制到该元素时的序号"，
+    // 所以元素序小的**先画**。`NumberInput` 的手柄底色 / 分隔线 / `≡` 图标曾写死
+    // `elem = 0/1`，而文本框用 `elem = seq + 1`（大得多）⇒ 整个手柄被文本框盖住，
+    // 看上去就是一个普通输入框；`ColorPicker` 的展开箭头（`push_draw` 默认 `elem = 0`）
+    // 同理被色块盖住。`Ui::elem_hint()` 就是为这条约定提供的（= 当前 `seq + 1`）。
+    //
+    // 用"文本框 + 手柄 + 图标"三个命令的排序模拟一次提交顺序。
+    let elem_field = 40u32; // 文本框：录制时的 seq + 1
+    let mut cmds = [
+        (0u32, 40u32), // 手柄底色：elem 0（错误写法）
+        (1, 41),       // 分隔线：elem 1（错误写法）
+        (0, 42),       // 图标：push_draw 默认 elem 0
+        (elem_field, 10), // 文本框背景
+    ];
+    cmds.sort_by_key(|&(elem, seq)| (elem, seq));
+    assert_eq!(
+        cmds.last().copied(),
+        Some((elem_field, 10)),
+        "写死小元素序的装饰会被文本框盖住（历史 bug 的成因）"
+    );
+    // 正确写法：装饰取 `elem_hint()`（录制到装饰时 seq 已增大）⇒ 排在文本框之后。
+    let mut fixed = [
+        (elem_field, 10), // 文本框背景
+        (41, 41),         // 手柄底色：elem_hint()
+        (41, 42),         // 分隔线：同元素内靠 seq 决定
+        (42, 43),         // 图标：elem_hint()
+    ];
+    fixed.sort_by_key(|&(elem, seq)| (elem, seq));
+    let last_two = &fixed[fixed.len() - 2..];
+    assert_eq!(
+        last_two.iter().map(|&(e, _)| e).collect::<Vec<_>>(),
+        vec![41, 42],
+        "手柄（41）与图标（42）都必须排在文本框（40）之后"
+    );
+}
+
+#[test]
 fn drag_needs_movement_so_clicks_work() {
     // 回归：窗口/可拖拽面板内 CheckBox / 输入框失效——按下即激活拖拽导致
     // `drag_panel` 在释放帧抑制子控件，点击被吞。修复：位移 ≥ DRAG_ACTIVATE_PX

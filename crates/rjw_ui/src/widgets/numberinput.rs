@@ -281,14 +281,18 @@ impl Widget for NumberInput<'_> {
                 CornerRadius { tl: 0.0, tr: st.radius.tr, br: st.radius.br, bl: 0.0 },
             )
         };
-        ui.push_panel_like(grip, grip_bg, sep, 0.0, radius, 1);
+        // ⚠ 元素序必须取**当前录制位置**（`elem_hint`）：手柄与分隔线画在文本框**之上**，
+        // 写死 `1` 会被文本框（`elem = seq + 1`，更大）整块盖住——历史 bug：
+        // 手柄底色 / 分隔线 / `≡` 图标全部看不见，只剩一个普通输入框。
+        let elem = ui.elem_hint();
+        ui.push_panel_like(grip, grip_bg, sep, 0.0, radius, elem);
         ui.push_panel_like(
             Rect::new(grip.x, grip.y, 1.0, grip.h),
             sep,
             sep,
             0.0,
             CornerRadius::default(),
-            1,
+            elem,
         );
         // 手柄图标用**矢量三横**（`≡` 字形会随字体变宽变高，甚至缺字形）。
         ui.icon_at(

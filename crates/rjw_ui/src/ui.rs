@@ -916,6 +916,7 @@ impl<'a> Ui<'a> {
         self.push_draw(
             DrawKind::RoundedRect { corners: [color; 4], radius },
             Rect::new(pos.x, pos.y, size.x, size.y),
+            self.elem_hint(),
         );
     }
 
@@ -945,6 +946,7 @@ impl<'a> Ui<'a> {
         self.push_draw(
             DrawKind::Icon { icon, color },
             Rect::new(pos.x, pos.y, size.x, size.y),
+            self.elem_hint(),
         );
     }
 
@@ -962,7 +964,7 @@ impl<'a> Ui<'a> {
     pub fn icon(&mut self, size: impl Into<Size<Vec2>>, icon: Icon, color: Color) {
         let size = size.into().to_physical(self.scale);
         let pos = self.child_rect(size.x, size.y, Child::Expand).min();
-        self.push_draw(DrawKind::Icon { icon, color }, Rect::new(pos.x, pos.y, size.x, size.y));
+        self.push_draw(DrawKind::Icon { icon, color }, Rect::new(pos.x, pos.y, size.x, size.y), self.elem_hint());
     }
 
     /// **背景图**（绝对定位；`ImageBg` 决定铺排 / 染色 / 圆角遮罩）。
@@ -987,14 +989,14 @@ impl<'a> Ui<'a> {
     ) {
         let pos = pos.into().to_physical(self.scale);
         let size = size.into().to_physical(self.scale);
-        self.push_draw(DrawKind::Image(bg), Rect::new(pos.x, pos.y, size.x, size.y));
+        self.push_draw(DrawKind::Image(bg), Rect::new(pos.x, pos.y, size.x, size.y), self.elem_hint());
     }
 
     /// **背景图**（随布局流排布；与 [`Self::image_at`] 同语义，位置来自当前容器游标）。
     pub fn image(&mut self, size: impl Into<Size<Vec2>>, bg: ImageBg) {
         let size = size.into().to_physical(self.scale);
         let pos = self.child_rect(size.x, size.y, Child::Expand).min();
-        self.push_draw(DrawKind::Image(bg), Rect::new(pos.x, pos.y, size.x, size.y));
+        self.push_draw(DrawKind::Image(bg), Rect::new(pos.x, pos.y, size.x, size.y), self.elem_hint());
     }
 
     /// **矩形渐变**（绝对定位；背景填充原语）。
@@ -1021,6 +1023,7 @@ impl<'a> Ui<'a> {
         self.push_draw(
             DrawKind::Rect(gradient.into()),
             Rect::new(pos.x, pos.y, size.x, size.y),
+            self.elem_hint(),
         );
     }
 
@@ -1035,15 +1038,33 @@ impl<'a> Ui<'a> {
         self.push_draw(
             DrawKind::Rect(gradient.into()),
             Rect::new(pos.x, pos.y, size.x, size.y),
+            self.elem_hint(),
         );
     }
 
-    /// 录制一条绘制命令（`elem = 0` 装饰层，画在本窗口元素之下——如背景/边框）。
-    pub(crate) fn push_draw(&mut self, kind: DrawKind, rect: Rect) {
+    /// **元素序提示**（控件作者用）：取"当前录制位置"的元素序（`seq + 1`）。
+    ///
+    /// `elem` 决定**同一窗口内**命令的绘制顺序（排序键 `(win, depth, elem, group, seq)`）：
+    /// `push_panel_like` / `push_text_rect` / `slider_at` 等原语各自取"录制时的
+    /// `seq + 1`"，而 [`Self::push_draw`] 默认写 `elem = 0`（容器装饰，画在本容器
+    /// **所有元素之下**，如窗口背景/边框）。
+    ///
+    /// **组合控件里"后画的装饰"必须用本方法**：展开箭头、拖拽手柄、分隔线若写死
+    /// `0` / `1`，就会被本控件自己的背景 / 文本框盖住（历史 bug：`NumberInput` 的
+    /// 拖拽手柄与分隔线、`ColorPicker` 的展开箭头整块看不见——元素序小的先画）。
+    #[inline]
+    pub fn elem_hint(&self) -> u32 {
+        self.seq + 1
+    }
+
+    /// 录制一条绘制命令（`elem` 由调用方给：`0` = 容器装饰层，画在本容器元素之下）。
+    ///
+    /// ⚠ 组合控件内"画在自家背景之上"的装饰传 [`Self::elem_hint`]，**不要**写死 `0`。
+    pub(crate) fn push_draw(&mut self, kind: DrawKind, rect: Rect, elem: u32) {
         let seq = self.next_seq();
         let depth = self.depth;
         let win = self.cur_win;
-        self.queue.push(UiDraw { depth, seq, win, elem: 0, rect, clip: self.clip, kind });
+        self.queue.push(UiDraw { depth, seq, win, elem, rect, clip: self.clip, kind });
     }
 
     /// 按样式 push **背景 + 边框**。

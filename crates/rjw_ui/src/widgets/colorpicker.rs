@@ -180,6 +180,7 @@ impl Widget for ColorPicker<'_> {
                 color: ink,
             },
             Rect::new(rect.x + rect.w - 16.0, rect.y + (rect.h - 12.0) * 0.5, 12.0, 12.0),
+            ui.elem_hint(),
         );
 
         // 点色块 = 开关面板。`claim_press` 阻止外层窗口把这次按下当作窗口拖拽基准。

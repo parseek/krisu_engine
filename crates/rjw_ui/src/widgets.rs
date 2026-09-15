@@ -123,6 +123,7 @@
 //! | 文本输入（焦点 / 选择 / IME / 剪贴板全套） | `ui.text_input_at(id, rect, &mut String)`；不想让调用方持有 `String` 就学 `NumberInput`：编辑缓冲 take/写回 `WidgetState` |
 //! | 浮层 / 弹出面板 | `ui.window("id::popup")` + z 哨兵 `WIN_TOPMOST`（`ui.state_mut().window_z.insert(..)`），范例见 `colorpicker/panel.rs` |
 //! | 绘制原语 | `push_panel_like`（圆角 + 刷 + 边框）/ `rounded_rect_at` / `gradient_rect_at` / `icon_at` / `image_at` / `push_text_rect` / `push_solid_rect` / `push_border_rect` / `debug_*` |
+//! | **画在自家背景之上的装饰**（手柄 / 箭头 / 分隔线） | `ui.elem_hint()` + `push_panel_like(.., elem)` —— 见下面第 6 条硬约定 |
 //! | 裁剪 | 容器强制层（`Scroll` / Clip 沙箱）自动生效；`push_text_rect` 另加内容裁剪，自洽内容用 `push_text_rect_noclip` |
 //! | 光标 | `ui.set_cursor(UiCursor::EwResize)`（悬停 / 拖拽时；`finish` 统一落到系统光标） |
 //! | 数值 / 颜色等热路径数学 | 抽成**自由函数**放自己的子模块里单测（范例：`colorpicker/{format,hsv}.rs`） |
@@ -252,6 +253,12 @@
 //!    （窗口里的滑块会连窗口一起动）。反之，纯点击控件**不要**调用它。
 //! 5. **`size()` 每帧都会跑**：别在里面做重活；文本测量走 `ui.text_size`（内部有缓存），
 //!    id 拼接用 `&str` + 必要时一次 `format!`（热路径控件学 `NumberInput`：`fmt_step` 一次成型）。
+//! 6. **"画在自家背景之上"的装饰要取 `ui.elem_hint()`**：`elem` 决定同一窗口内的绘制
+//!    顺序（元素序小的**先画**）。`push_panel_like` / `push_text_rect` / 滑块都取
+//!    "录制时的 `seq + 1`"，而 `push_draw` 默认 `elem = 0`（容器装饰，画在所有元素之下）；
+//!    手柄 / 箭头 / 分隔线若写死 `0` 或 `1`，会被本控件自己的背景或文本框**整块盖住**
+//!    （两个真实 bug：`NumberInput` 的拖拽手柄与分隔线、`ColorPicker` 的展开箭头
+//!    全都看不见）。
 //!
 //! ## 3. 测试与调试
 //!

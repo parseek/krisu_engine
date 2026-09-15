@@ -25,7 +25,7 @@ use rjw_color::Color;
 use rjw_keystate::KeyState;
 use rjw_transform::Rect;
 
-use crate::draw::{CornerRadius, DrawKind, Icon, Position, Size, TextVAlign};
+use crate::draw::{CornerRadius, DrawKind, Gradient, Icon, Position, Size, TextVAlign};
 use crate::hit::update_drag;
 use crate::id::IdAbsolute;
 use crate::layout::Child;
@@ -35,7 +35,9 @@ use crate::{TextAlign, Ui};
 
 use super::SWATCH_RADIUS;
 use super::format::{ColorFormat, format_color, parse_color, rgba, rgba_keep_alpha};
-use super::hsv::{HUE_SEGS, hue_at, hue_seg_colors, hue_seg_radius, hsv_to_rgb, rgb_to_hsv, sv_at};
+use super::hsv::{
+    HUE_SEGS, hue_at, hue_seg_colors, hsv_to_rgb, rgb_to_hsv, sv_at, sv_plane_cells,
+};
 
 /// 面板内边距（物理像素）。
 const PAD: f32 = 6.0;
@@ -196,22 +198,29 @@ fn popup_body(
         // SV / 色相只改 HSV，alpha 保持当前值。
         c = rgba(hsv_to_rgb(hsv[0], hsv[1], hsv[2], c[3]));
     }
-    // 绘制：平面 = `[白, 纯色相, 黑, 黑]` 的四角顶点色（双线性插值恰好是 HSV 公式）。
-    let hue_rgb = hsv_to_rgb(hsv[0], 1.0, 1.0, 1.0);
-    ui.push_draw(
-        DrawKind::RoundedRect {
-            corners: [Color::WHITE, hue_rgb, Color::BLACK, Color::BLACK],
-            radius: CornerRadius::all(SWATCH_RADIUS),
-        },
-        sv_rect,
-    );
+    // 绘制：平面 = 一张 **N×M 网格**的纯渐变四边形（每格四角色由 HSV 公式算出）。
+    //
+    // ⚠ 为什么不是**一块**四角渐变：四角顶点色经光栅化器只做**逐三角形线性**插值，
+    // 而平面的颜色场是 `V·lerp(白, 色相, S)` —— 在 S、V 上都是双线性（有交叉项），
+    // 于是"整块两三角 / 从中心扇形铺开"都会在三角形边界处产生可见的**折痕/条纹**
+    // （对角或放射状），实测用户看到的就是"过渡有问题"。切成小格后每格的交叉项误差
+    // 按格面积缩小（误差 ∝ 1/格数² 量级）⇒ 视觉上就是平滑渐变。
+    // 用**纯四边形**（`DrawKind::Rect`）而不是圆角矩形：同一几何里的相邻格子**零羽化**、
+    // 边缘严格相接，不会像"多个 RoundedRect 拼网格"那样在缝上二次衰减出一条线。
+    for (cell, corners) in sv_plane_cells(sv_rect, hsv[0]) {
+        ui.push_draw(DrawKind::Rect(Gradient::corners(corners[0], corners[1], corners[2], corners[3])), cell, ui.elem_hint());
+    }
     let seg_h = SV_H / HUE_SEGS as f32;
     for i in 0..HUE_SEGS {
         let seg = Rect::new(hue_rect.x, hue_rect.y + i as f32 * seg_h, HUE_W, seg_h);
         let (top, bot) = hue_seg_colors(i);
+        // ⚠ 段间**不羽化**（纯四边形，`DrawKind::Rect`）：相邻段各自带羽化时，两侧的
+        // alpha 斜坡都降到 0 ⇒ 共享边上会透出一条面板底色的缝（"过渡有问题"的另一半）。
+        // 硬边 + 严格相接反而无缝（段内仍是两端色渐变）；代价是色相条两端是直角。
         ui.push_draw(
-            DrawKind::RoundedRect { corners: [top, top, bot, bot], radius: hue_seg_radius(i, SWATCH_RADIUS) },
+            DrawKind::Rect(Gradient::corners(top, top, bot, bot)),
             seg,
+            ui.elem_hint(),
         );
     }
     // 当前位置标记：平面上一个小方框（描边取底色的可读墨色）+ 色相条上一道横线。
@@ -343,10 +352,11 @@ fn popup_body(
             None,
             None,
         );
-        // 颜色滑块：轨道 = 该通道 0 → 最大
+        // 颜色滑块：轨道 = 该通道 0 → 最大，**右端与数值框齐平**（中间不留缝：
+        // 用户看到的就是"条缺了几个像素"——轨道短了一截，行看起来断成两节）。
         let style =
             channel_slider_style(&ui.theme, channel_color(c, i, 0.0), channel_color(c, i, 1.0));
-        let slide_w = (body_w - LABEL_W - GAP - field_w - GAP).max(1.0);
+        let slide_w = (body_w - LABEL_W - GAP - field_w).max(1.0);
         let srect = Rect::new(PAD + LABEL_W + GAP, y, slide_w, row);
         let sid = format!("ch{i}");
         let nv = ui.slider_at_styled(&sid, srect, 0.0..=range_max, val, 1.0, &style);
