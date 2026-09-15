@@ -26,10 +26,6 @@ pub struct WidgetState {
     pub clicked: bool,
     /// 滑块拖拽中。
     pub dragging: bool,
-    /// **本控件的浮层是否展开**（内置 `ColorPicker` 用）：点控件开关、点浮层外或
-    /// `Esc` 收起。与 `UiState::combo_open`（下拉框专用，参与键盘导航）分开存——
-    /// 两者互不干扰，各自只管自己的浮层。
-    pub popup_open: bool,
     /// 面板拖拽基准：按下时面板左上角（**逻辑**坐标）。
     /// 配合 [`Self::press_mouse`]（按下时鼠标**物理**坐标，取整）——
     /// 拖拽中面板位置 = `press_panel + round(鼠标物理增量) / scale`：
@@ -199,6 +195,13 @@ pub struct UiState {
     pub(crate) scrolls: HashMap<IdAbsolute<'static>, ScrollState>,
     /// **下拉框展开状态**：当前展开的 `combo` 的 **绝对 ID**（`None` = 全部收起）。
     pub(crate) combo_open: Option<IdAbsolute<'static>>,
+    /// **颜色选择器的全局跨帧数据**（呈现模式 / 替补输入缓冲 / 展开的面板 / HSV 缓存）。
+    ///
+    /// 类型定义在**控件自己的模块**里（[`crate::widgets::ColorPickerState`]，见
+    /// `widgets/colorpicker/state.rs`）——本文件只放"通用 UI 状态"，控件层的事实不散进来。
+    /// **所有 `ColorPicker` 共用这一份**：呈现模式是用户偏好，替补文本缓冲与展开面板
+    /// 则必须全局唯一（同一时刻只有一个面板，共享缓冲才只有一个所有者）。
+    pub color_picker: crate::widgets::ColorPickerState,
     /// **固定宽窗口的宽度**（`window_at_w` 鼠标缩放：**绝对 ID** → 逻辑宽度，跨帧持久）。
     pub(crate) window_widths: HashMap<IdAbsolute<'static>, f32>,
     /// **窗口结算尺寸**（**绝对 ID** → 物理尺寸，跨帧持久）。clamp（`WindowClamp`）
@@ -279,6 +282,7 @@ impl UiState {
         self.last_press_window = None;
         self.scrolls.clear();
         self.combo_open = None;
+        self.color_picker = crate::widgets::ColorPickerState::default();
         self.sizes.clear();
         self.window_fx.clear();
         self.stats = UiStats::default();

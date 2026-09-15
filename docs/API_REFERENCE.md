@@ -1015,7 +1015,7 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 | `gradient_rect` | `ui.gradient_rect(size, gradient)` | 同上，但位置来自当前容器游标（随布局流） |
 | `icon_at` | `ui.icon_at(pos, size, icon, color)` | **矢量图标**（绝对定位；`size` 为方框，非方形时按 `min(w,h)` 居中等比） |
 | `icon` | `ui.icon(size, icon, color)` | 同上，但位置来自当前容器游标——`row` 内连续调用即得工具栏 |
-| `Icon` | `Check` / `ChevronUp` / `ChevronDown` / `ChevronLeft` / `ChevronRight` / `Grip` | **画出来的几何**（单位方框 `[0,1]²` 内的凸分片，`Icon::parts()` 公开） |
+| `Icon` | `Check` / `ChevronUp` / `ChevronDown` / `ChevronLeft` / `ChevronRight` / `Grip` / `Warning` | **画出来的几何**（单位方框 `[0,1]²` 内的凸分片，`Icon::parts()` 公开） |
 | `image_at` | `ui.image_at(pos, size, bg)` | **背景图**（绝对定位；`bg: ImageBg` 决定铺排 / 染色 / 圆角遮罩） |
 | `image` | `ui.image(size, bg)` | 同上，但位置来自当前容器游标 |
 | `ImageBg` | `new(tex, texel)` + `.fit(..)` / `.radius(..)` / `.tint(..)` | 纹理 uid + **纹素尺寸** + 铺排 + 染色 + 圆角遮罩；`PanelStyle::with_bg_image` 可直接当窗口/面板底图 |
@@ -1058,6 +1058,35 @@ ui.window("w").style(ui.theme().panel.clone().with_bg_image(bg));      // 当窗
 几何进窗口顶点缓存，跨帧复用）。`Tile` 用逐块四边形实现（1:1，边缘部分块按比例截断
 UV），**不支持圆角遮罩**——平铺需要 UV 环绕（`u > 1`），那要求批次携带 `Repeat`
 采样器（`UiBatch` 目前不带 `RStates`）；块数超 `MAX_IMAGE_TILES` 时退化为拉伸。
+
+### 取色器（`ColorPicker`）
+
+内联只占一行（色块 + `#RRGGBB` + 展开箭头），点开是**独立置顶窗口**面板：
+
+| 项 | 签名 | 说明 |
+|---|---|---|
+| `ColorPicker` | `ColorPicker::new(id, &mut Color)` | 主构造（颜色直接写在 `&mut Color` 上，"变没变"由调用方前后比较） |
+| `.alpha(on)` | | 面板里多一行 Alpha（默认只 RGB） |
+| `.with_hex(&mut String)` | | 可选：把顶部文本框绑到调用方缓冲；**不传则用全局跨帧缓冲** |
+| `.popup_width(w)` | | 面板宽（默认 = 内联宽的 1.9 倍与"通道行最小宽"取大） |
+| `ColorFormat` | `U8` / `Hex` / `F` | 文本框呈现格式（全局偏好，所有取色器一致） |
+| `ColorPickerState` | `UiState::color_picker` | **全局跨帧数据**：`mode` / `text`（替补缓冲）/ `open`（同时只有一个面板）/ HSV 缓存 |
+| `format_color` | `format_color(c, mode, with_alpha)` | 按模式呈现（`255, 0, 0` / `#FF00AA` / `1.00, 0.00, 0.00`） |
+| `parse_color` | `parse_color(text, mode)` | **自动识别格式**：先按当前模式，再试另两种；`None` = 不可识别（不改颜色） |
+
+面板内容：模式行（u8/HEX/F）+ 文本框（不可识别时右侧出现 `Icon::Warning` 按钮，按下恢复
+有效值）+ HSV 区（SV 平面 + 6 段色相条）+ 通道行（颜色滑块 + `NumberInput`）+ 可选 A 行。
+**SV 平面 = 一个四角顶点色的圆角矩形**（`[白, 纯色相, 黑, 黑]` 的双线性插值恰好等于
+HSV 公式）⇒ 无纹理、无着色器改动、无额外 draw call。实现按职责拆在
+`widgets/colorpicker/{format,hsv,state,panel}.rs`（纯函数各自带单测）。
+
+```rust
+use rjw_krusie::prelude::*;
+ui.add(ColorPicker::new("tint", &mut color).alpha(true));
+// 只想要文本解析 / 呈现（不画控件）：
+let c = parse_color("#FF00AA", ColorFormat::U8).unwrap();
+assert_eq!(format_color(c, ColorFormat::F, false), "1.00, 0.00, 0.67");
+```
 
 **渐变不需要纹理**（v0.3 起）：顶点格式 `VertexP3U2C4` 自带 4 分量顶点色，
 光栅化器本就做重心插值 ⇒ 一个 quad + 白纹理即可，**管线零改动**。这一决定替代了旧实现

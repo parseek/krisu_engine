@@ -598,8 +598,8 @@ impl SliderStyle {
     /// 从调色板派生：`surface_sunken` 轨道 + 强调色填充 + `handle` 手柄。
     pub fn themed(p: &Palette) -> Self {
         Self {
-            track: p.surface_sunken,
-            fill: p.accent,
+            track: p.surface_sunken.into(),
+            fill: p.accent.into(),
             handle: p.handle,
             handle_border: p.border_strong,
             ..Self::default()
@@ -793,8 +793,13 @@ impl Default for ButtonStyle {
 /// 滑块样式。
 #[derive(Clone, Debug)]
 pub struct SliderStyle {
-    pub track: Color,
-    pub fill: Color,
+    /// 轨道刷（纯色 / 两端色渐变；接受 [`Color`]）。
+    ///
+    /// **渐变轨道**让"颜色滑块"（取色器的通道行）成为可能：轨道画的是该通道
+    /// 0→最大 的颜色斜坡，而值是靠手柄位置读的——不需要任何纹理 / 着色器。
+    pub track: Brush,
+    /// 已填充部分刷。取色器的通道行把它设成**透明**（否则纯色填充会盖掉斜坡）。
+    pub fill: Brush,
     pub handle: Color,
     pub handle_border: Color,
     /// 轨道高度（像素）。
@@ -815,8 +820,8 @@ pub struct SliderStyle {
 impl Default for SliderStyle {
     fn default() -> Self {
         Self {
-            track: Color::rgba_u8(190, 190, 190, 255),
-            fill: Color::rgba_u8(80, 140, 220, 255),
+            track: Color::rgba_u8(190, 190, 190, 255).into(),
+            fill: Color::rgba_u8(80, 140, 220, 255).into(),
             handle: Color::rgba_u8(240, 240, 240, 255),
             handle_border: Color::rgba_u8(120, 120, 120, 255),
             track_h: 6.0,
@@ -1099,14 +1104,14 @@ impl ButtonStyle {
 }
 
 impl SliderStyle {
-    /// 轨道颜色。
-    pub fn with_track(mut self, c: Color) -> Self {
-        self.track = c;
+    /// 轨道刷（接受 [`Color`] 或 [`Brush`]：`Color: Into<Brush>` 等价纯色）。
+    pub fn with_track(mut self, c: impl Into<Brush>) -> Self {
+        self.track = c.into();
         self
     }
-    /// 已填充部分颜色。
-    pub fn with_fill(mut self, c: Color) -> Self {
-        self.fill = c;
+    /// 已填充部分刷（接受 [`Color`] 或 [`Brush`]）。
+    pub fn with_fill(mut self, c: impl Into<Brush>) -> Self {
+        self.fill = c.into();
         self
     }
     /// 手柄颜色。
@@ -1626,6 +1631,16 @@ mod tests {
         assert_eq!(s.handle_border, Color::RED);
         assert_eq!(s.min_w, 200.0);
         assert_eq!(s.height, SliderStyle::default().height, "未设字段回落默认");
+        // 轨道 / 填充是**刷**（纯色或两端色渐变）：默认必须是纯色，
+        // 这样滚动条与普通滑块的绘制仍走最省的 `Solid` 路径（不是渐变四角）。
+        assert!(
+            SliderStyle::default().track.as_solid().is_some(),
+            "默认轨道应为纯色（as_solid 命中）"
+        );
+        // 渐变轨（取色器通道行）用 `with_track(Brush::Horizontal(..))`。
+        let g = SliderStyle::default().with_track(Brush::Horizontal(Color::BLACK, Color::WHITE));
+        assert!(g.track.as_solid().is_none(), "两端色不同 ⇒ 不是纯色");
+        assert_eq!(g.track.corners(), [Color::BLACK, Color::WHITE, Color::BLACK, Color::WHITE]);
 
         let i = InputStyle::default().with_radius(4.0).with_sel_bg(Color::RED);
         assert_eq!(i.radius, 4.0);

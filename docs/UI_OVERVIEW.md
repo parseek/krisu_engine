@@ -225,7 +225,7 @@ ui.finish(r2d_ui);                              // UI 无需相机/视口参数�
 | 容器 | `ui.window(id)`/`ui.panel()`/`ui.modal(id)` builder（选项链 + `.show(..)`，已统一旧的 `window_at*` / `modal_at*`）/ `panel_at` / `pack_at` / `grid_at` / `flex_at` / `scroll_at` / `list_at` / `row` / `view_at` |
 | 占光标便捷 | `p.label` / `p.button` / `p.checkbox(_mut)` / `p.radio` / `p.slider` / `p.text_input` / `p.text_area(_nw)` / `p.combo` / `p.divider` / `p.row` |
 | Widget builder | `Label`（`wrap` / `ellipsis`）/ `Button` / `Checkbox` / `Divider`（`p.add(...)` 放置） |
-| 组合控件 | `NumberInput`（拖动调值 + 输入）/ `ColorPicker`（预览色块 + RGB(A) 滑条 + 十六进制）/ `FontModal`（字体切换） |
+| 组合控件 | `NumberInput`（拖动调值 + 输入）/ `ColorPicker`（内联色块 → 弹出取色面板：u8/HEX/F 呈现 + HSV 平面/色相条 + 通道行 + 可选 A）/ `FontModal`（字体切换） |
 | 绝对定位 | `*_at(pos, …)`、`add_at`、`divider_at`、`anchor_pos(Anchor::…)`（视口锚定） |
 
 ### 输入屏蔽

@@ -947,6 +947,26 @@ const TRI_LEFT: IconPart = &[
     Vec2::new(0.68, 0.85),
     Vec2::new(0.28, 0.50),
 ];
+/// 警告三角（等边感、尖朝上）：外轮廓本身就是**凸**的，可直接作一个分片。
+const WARN_TRI: IconPart = &[
+    Vec2::new(0.50, 0.10),
+    Vec2::new(0.96, 0.88),
+    Vec2::new(0.04, 0.88),
+];
+/// 感叹号竖条（警告三角内部，凸四边形）。
+const WARN_BAR: IconPart = &[
+    Vec2::new(0.44, 0.38),
+    Vec2::new(0.56, 0.38),
+    Vec2::new(0.56, 0.64),
+    Vec2::new(0.44, 0.64),
+];
+/// 感叹号圆点（近似方点即可——12px 图标下看不出差别，且保持"凸分片"前提）。
+const WARN_DOT: IconPart = &[
+    Vec2::new(0.44, 0.70),
+    Vec2::new(0.56, 0.70),
+    Vec2::new(0.56, 0.82),
+    Vec2::new(0.44, 0.82),
+];
 
 /// **矢量图标**：内置图元一律用**画出来的几何**，不用字体字形。
 ///
@@ -979,6 +999,8 @@ pub enum Icon {
     Check,
     /// 拖拽手柄（三横）。
     Grip,
+    /// 警告 / 非法输入（三角 + 感叹号）——错误提示、取色器"文本无法识别"按钮用。
+    Warning,
 }
 
 impl Icon {
@@ -992,6 +1014,7 @@ impl Icon {
             Icon::ChevronRight => &[TRI_RIGHT],
             Icon::Check => &[CHECK_L, CHECK_R],
             Icon::Grip => &[GRIP_1, GRIP_2, GRIP_3],
+            Icon::Warning => &[WARN_TRI, WARN_BAR, WARN_DOT],
         }
     }
 }

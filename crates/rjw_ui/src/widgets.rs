@@ -25,6 +25,245 @@
 //!
 //! `lib.rs` 在 crate 根重导出全部控件（`rjw_ui::Button` 等），下游通常无需直接引用
 //! 本模块路径。
+//!
+//! # 自定义 `Widget` 指南：Easy → Powerful
+//!
+//! ## 0. 30 秒版（Easy）
+//!
+//! 1. `struct MyWidget<'a> { id: &'a str, /* 属性用 Option 存差异 */ }`
+//!    —— **builder 约定**：没设的属性回落 [`Theme`](crate::style::Theme)，于是主题一改
+//!    所有控件一起变（内置控件全是这个形状）；
+//! 2. `impl Widget for MyWidget`，只需要两个方法：
+//!    - `fn size(&self, ui) -> Vec2`：量尺寸（文字用 `ui.text_size`，其它读主题常量）；
+//!    - `fn ui(self, ui, rect) -> Response`：在 `rect` 里画 + 收交互。
+//! 3. 放进去：`ui.add(w)`（容器内占光标）/ `ui.add_at(pos, w)`（绝对定位）；
+//!    容器包装（`Pack` / `Panel` / `Grid` / `Window` / `Scroll`）经
+//!    [`crate::ui::UiAdd`] 提供同样的 `add` / `add_at`。
+//!
+//! **没有宏、没有注册表、没有 trait object、没有生命周期魔法**——就是一个普通 Rust
+//! 结构体 + 一个 trait 实现（这也是旧 `widget_api!` 宏被移除的原因：宏展开的报错
+//! 指向宏内部，而这里报错直接指向你自己的字段）。
+//!
+//! ### 例子：标签块（可直接编译）
+//!
+//! ```no_run
+//! use glam::Vec2;
+//! use rjw_color::Color;
+//! use rjw_transform::Rect;
+//! use rjw_ui::draw::TextVAlign;
+//! use rjw_ui::{Response, TextAlign, Ui, Widget};
+//!
+//! /// 标签块：圆角底 + 居中文字（**最小可用自定义控件**）。
+//! pub struct Tag<'a> {
+//!     text: &'a str,
+//!     /// 逐控件覆盖；`None` = 跟主题。
+//!     fg: Option<Color>,
+//! }
+//!
+//! impl<'a> Tag<'a> {
+//!     pub fn new(text: &'a str) -> Self {
+//!         Self { text, fg: None }
+//!     }
+//!     /// 属性化 builder：只存差异，未设的回落主题。
+//!     pub fn color(mut self, c: Color) -> Self {
+//!         self.fg = Some(c);
+//!         self
+//!     }
+//! }
+//!
+//! impl Widget for Tag<'_> {
+//!     fn size(&self, ui: &mut Ui) -> Vec2 {
+//!         let st = ui.theme().label.clone();
+//!         let t = ui.text_size(self.text, st.font_size, st.font_family.as_deref());
+//!         Vec2::new(t.x + 16.0, ui.theme().row_h) // 文字宽 + 左右内边距
+//!     }
+//!
+//!     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+//!         let hovered = ui.hit_abs(&rect); // 命中（含窗口遮挡 / 强制裁剪层）
+//!         let st = ui.theme().button.clone();
+//!         ui.push_panel_like(rect, st.pick_bg(false, hovered), st.border, st.border_w, st.radius, 1);
+//!         ui.push_text_rect(
+//!             rect,
+//!             self.text,
+//!             st.font_size,
+//!             self.fg.unwrap_or(st.fg),
+//!             None,
+//!             TextAlign::Center,
+//!             TextVAlign::Center,
+//!             None,
+//!             None,
+//!         );
+//!         Response { hovered, ..Default::default() }
+//!     }
+//! }
+//!
+//! # fn demo(ui: &mut Ui) {
+//! ui.add(Tag::new("新").color(Color::WHITE));
+//! # }
+//! ```
+//!
+//! ### 什么时候需要重写 `constraints()` / `expansion()`
+//!
+//! | 需求 | 用 |
+//! |---|---|
+//! | 内容可能超出父级（长文本 / 列表）：取 `min(内容, 可用宽)` 后**自己**自洽绘制 | [`Expansion::LimitedInParent`]（配 `ui.avail_w()` 换行 / 省略） |
+//! | 不撑大父级（分隔线 / 装饰件） | [`Expansion::DisableAutoExpansion`] |
+//! | 有压缩下限 / 上限（可缩放输入框） | [`Widget::constraints`] + [`SizeConstraints`] |
+//!
+//! ## 1. Powerful：把交互做完整
+//!
+//! | 想要 | 用什么 |
+//! |---|---|
+//! | 悬停 / 按下 / 点击 | `ui.hit_abs(&rect)` + `ui.mouse_left()` + [`hit::update_interact`](crate::hit::update_interact) → [`InteractEvents`](crate::hit::InteractEvents) |
+//! | 拖拽（自带语义） | 按下时 `ui.claim_press()` + [`hit::update_drag`](crate::hit::update_drag) + 基准存 `WidgetState::{press_panel, press_mouse}` |
+//! | 2D / 竖向"点哪取哪" | `ui.mouse_local()` + [`hit::normalize_x`](crate::hit::normalize_x) / [`hit::normalize_y`](crate::hit::normalize_y) |
+//! | 键盘 / Tab 导航 | `ui.register_focus(&ui.id_for(id), rect, [`FocusKind`])` + `ui.key_click(&abs, kind)` |
+//! | 跨帧状态（交互） | `ui.state_mut().widget(&abs)` → [`WidgetState`](crate::state::WidgetState)（hovered/pressed/dragging/caret/scroll…） |
+//! | 跨帧数据（**自己的类型**） | 定义在**控件自己的模块**里、挂到 [`UiState`](crate::UiState)（范例：`ColorPickerState`）——别把控件层的事实塞进 `ui.rs` |
+//! | 文本输入（焦点 / 选择 / IME / 剪贴板全套） | `ui.text_input_at(id, rect, &mut String)`；不想让调用方持有 `String` 就学 `NumberInput`：编辑缓冲 take/写回 `WidgetState` |
+//! | 浮层 / 弹出面板 | `ui.window("id::popup")` + z 哨兵 `WIN_TOPMOST`（`ui.state_mut().window_z.insert(..)`），范例见 `colorpicker/panel.rs` |
+//! | 绘制原语 | `push_panel_like`（圆角 + 刷 + 边框）/ `rounded_rect_at` / `gradient_rect_at` / `icon_at` / `image_at` / `push_text_rect` / `push_solid_rect` / `push_border_rect` / `debug_*` |
+//! | 裁剪 | 容器强制层（`Scroll` / Clip 沙箱）自动生效；`push_text_rect` 另加内容裁剪，自洽内容用 `push_text_rect_noclip` |
+//! | 光标 | `ui.set_cursor(UiCursor::EwResize)`（悬停 / 拖拽时；`finish` 统一落到系统光标） |
+//! | 数值 / 颜色等热路径数学 | 抽成**自由函数**放自己的子模块里单测（范例：`colorpicker/{format,hsv}.rs`） |
+//!
+//! ### 例子：旋钮（拖拽 + 键盘 + 跨帧状态，可直接编译）
+//!
+//! ```no_run
+//! use glam::Vec2;
+//! use rjw_transform::Rect;
+//! use rjw_ui::draw::TextVAlign;
+//! use rjw_ui::hit::{update_drag, update_interact};
+//! use rjw_ui::{FocusKind, Response, TextAlign, Ui, Widget};
+//! use winit::keyboard::KeyCode;
+//!
+//! /// 旋钮：**竖直拖动改值** + `↑`/`↓` 微调（演示交互状态机 / 焦点 / 跨帧状态）。
+//! pub struct Knob<'a> {
+//!     id: &'a str,
+//!     value: &'a mut f32,
+//!     range: (f32, f32),
+//! }
+//!
+//! impl<'a> Knob<'a> {
+//!     pub fn new(id: &'a str, value: &'a mut f32, range: (f32, f32)) -> Self {
+//!         Self { id, value, range }
+//!     }
+//! }
+//!
+//! impl Widget for Knob<'_> {
+//!     fn size(&self, _ui: &mut Ui) -> Vec2 {
+//!         Vec2::new(30.0, 30.0)
+//!     }
+//!
+//!     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+//!         // ① 状态键必须是**绝对 id**（`id_for` 返回 `IdAbsolute`；嵌套里同名相对 id 会互相踩）。
+//!         let abs = ui.id_for(self.id);
+//!         // ② 进焦点链：Tab 可到、焦点描边由引擎画。
+//!         ui.register_focus(&abs, rect, FocusKind::Slider);
+//!
+//!         let hit = ui.hit_abs(&rect);
+//!         let btn = ui.mouse_left();
+//!         // ③ 拖拽语义：按下就占用本次按压，外层窗口/面板不会把它当成窗口拖动。
+//!         if btn.down_edge() && hit {
+//!             ui.claim_press();
+//!         }
+//!         // ④ 先拷出鼠标（`&self`），再借 `state_mut()`——借用顺序不能颠倒。
+//!         let mouse = ui.mouse_screen();
+//!         let ev = {
+//!             let ws = ui.state_mut().widget(&abs);
+//!             let ev = update_interact(ws, hit, btn);
+//!             if btn.down_edge() && hit {
+//!                 // 拖拽基准：按下时的鼠标 + 按下时的值（与 `NumberInput` 手柄同一套）。
+//!                 ws.press_mouse = Some(mouse);
+//!                 ws.press_panel = Some(Vec2::new(0.0, *self.value));
+//!             }
+//!             ev
+//!         };
+//!         let dragging = {
+//!             let ws = ui.state_mut().widget(&abs);
+//!             update_drag(ws, hit, btn)
+//!         };
+//!         if dragging {
+//!             let (base, pm) = {
+//!                 let ws = ui.state_mut().widget(&abs);
+//!                 (ws.press_panel.unwrap_or_default().y, ws.press_mouse.unwrap_or(mouse))
+//!             };
+//!             // Shift = 细调（10×）：**按下时改倍率会跳**，实际控件会重设基准（见 NumberInput）。
+//!             let fine = if ui.key_down(KeyCode::ShiftLeft) { 0.1 } else { 1.0 };
+//!             let span = self.range.1 - self.range.0;
+//!             let d = (mouse.y - pm.y) * span * 0.005 * fine;
+//!             *self.value = (base - d).clamp(self.range.0, self.range.1);
+//!         }
+//!         // ⑤ 键盘：焦点在自己身上时用 `key_down_edge`（纯输入，状态自己维护）。
+//!         let focused = ui.state().focused.as_ref().is_some_and(|f| f.as_str() == abs.as_str());
+//!         if focused {
+//!             let step = (self.range.1 - self.range.0) * 0.02;
+//!             if ui.key_down_edge(KeyCode::ArrowDown) {
+//!                 *self.value = (*self.value - step).clamp(self.range.0, self.range.1);
+//!             }
+//!             if ui.key_down_edge(KeyCode::ArrowUp) {
+//!                 *self.value = (*self.value + step).clamp(self.range.0, self.range.1);
+//!             }
+//!         }
+//!         // ⑥ 绘制：公开原语组合（圆角 + 指针 + 数值文本），坐标 = `rect` 局部。
+//!         let t = ((*self.value - self.range.0) / (self.range.1 - self.range.0)).clamp(0.0, 1.0);
+//!         ui.rounded_rect_at(
+//!             Vec2::new(rect.x + 1.0, rect.y + 1.0),
+//!             Vec2::new(rect.w - 2.0, rect.h - 2.0),
+//!             7.0,
+//!             ui.theme().palette.surface_raised,
+//!         );
+//!         ui.rounded_rect_at(
+//!             Vec2::new(rect.x + (rect.w - 6.0) * t, rect.y + rect.h - 8.0),
+//!             Vec2::new(6.0, 5.0),
+//!             2.0,
+//!             ui.theme().palette.accent,
+//!         );
+//!         ui.push_text_rect(
+//!             rect,
+//!             &format!("{:.0}", *self.value * 100.0),
+//!             11.0,
+//!             ui.theme().label.color,
+//!             None,
+//!             TextAlign::Center,
+//!             TextVAlign::Top,
+//!             None,
+//!             None,
+//!         );
+//!         Response { hovered: hit, pressed: dragging, clicked: ev.clicked, ..Default::default() }
+//!     }
+//! }
+//!
+//! # fn demo(ui: &mut Ui, v: &mut f32) {
+//! ui.add(Knob::new("gain", v, (0.0, 1.0)));
+//! # }
+//! ```
+//!
+//! ## 2. 五条硬约定（都是踩过的坑）
+//!
+//! 1. **尺寸一律物理像素**：`Theme` 在 [`Ui`] 内已按 DPI 预乘；要收逻辑单位就用
+//!    [`Position`](crate::Position) / [`Size`](crate::Size)（或 [`Metric`](crate::Metric)）。
+//! 2. **状态键必须绝对 id**：`ui.id_for(id)` 得到 `IdAbsolute`；同一控件的子部件用
+//!    `"{id}::grip"` 这类派生名（`::` 是约定）——**不要**多个部件共用同一个 id，
+//!    否则 `press_mouse` / `caret` 互相覆盖（`NumberInput` 的手柄另起 `::grip` 就是这个原因）。
+//! 3. **输入 ≠ 状态**：`hit_abs` / `mouse_left` / `key_down_edge` 只是"这一帧的事实"；
+//!    悬停 / 按下 / 拖拽要经 `update_interact` / `update_drag` 落到 `WidgetState`。
+//! 4. **有拖拽语义就必须 `claim_press()`**：否则外层窗口 / 面板会把这次按下当作拖动基准
+//!    （窗口里的滑块会连窗口一起动）。反之，纯点击控件**不要**调用它。
+//! 5. **`size()` 每帧都会跑**：别在里面做重活；文本测量走 `ui.text_size`（内部有缓存），
+//!    id 拼接用 `&str` + 必要时一次 `format!`（热路径控件学 `NumberInput`：`fmt_step` 一次成型）。
+//!
+//! ## 3. 测试与调试
+//!
+//! - **把纯逻辑抽成自由函数**（数值映射 / 解析 / 几何换算）放进自己的子模块，配
+//!   `#[cfg(test)] mod tests`：本仓的单测**不需要 GPU**，`cargo test -p rjw_ui` 直接跑
+//!   （范例：`ColorPicker` 的 `format.rs` / `hsv.rs` / `state.rs`）。
+//! - `ui.debug_layout(true)`：给每个绘制命令的矩形画青色描边——布局矩形与你以为的
+//!   命中区不一致时一眼可见（控件 `size()` 与实际绘制内容不一致是经典的布局重叠来源）。
+//! - `ui.debug_dump()`（示例 `--ui-dump`）：窗口 id / z / 本帧提交原点 / 尺寸 / 拖拽状态。
+//! - 命中不生效？先查**窗口遮挡**（`UiState::occluded_hits`，重叠窗口只让最上层可交互）
+//!   与**强制裁剪层**（`Scroll` / Clip 沙箱外命中失效）。
+
 
 use glam::Vec2;
 use rjw_transform::Rect;
@@ -43,7 +282,10 @@ mod slider;
 
 pub use button::Button;
 pub use checkbox::Checkbox;
-pub use colorpicker::{ColorPicker, color_hex, ink_on, luma, parse_hex};
+pub use colorpicker::{
+    ColorFormat, ColorPicker, ColorPickerState, color_hex, format_color, format_f, format_u8,
+    ink_on, luma, parse_color, parse_hex,
+};
 pub use divider::Divider;
 pub use fontmodal::FontModal;
 pub use label::Label;

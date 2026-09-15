@@ -1506,9 +1506,18 @@ impl<'a> Ui<'a> {
     }
 
     /// 鼠标绝对坐标 → 当前容器局部坐标（逻辑像素，字段运算避免方法借用）。
+    ///
+    /// **控件作者公开面**：自定义拖拽区（如取色器的 SV 平面 / 色相条）拿它做
+    /// "点哪取哪"的绝对映射；[`Self::mouse_screen`] 是屏幕坐标，只有配合容器原点才有意义。
+    #[inline]
+    pub fn mouse_local(&self) -> Vec2 {
+        self.mouse_logical - self.abs_base
+    }
+
+    /// 鼠标局部坐标的 x（内部热路径用；语义同 [`Self::mouse_local`]）。
     #[inline]
     fn mouse_local_x(&self) -> f32 {
-        self.mouse_logical.x - self.abs_base.x
+        self.mouse_local().x
     }
 
     /// 局部矩形（逻辑）→ 命中测试（与逻辑鼠标坐标比较；含窗口外判定与窗口遮挡）。
@@ -1934,7 +1943,17 @@ impl<'a> Ui<'a> {
             elem,
             rect: track,
             clip: outer_clip,
-            kind: DrawKind::Solid(self.theme.slider.track),
+            // 滚动条轨道用主题滑块轨道刷（可能是渐变：纯色走最省的 `Solid`，
+            // 渐变走四角顶点色的 `Rect`——两者都是一条命令、无纹理）。
+            kind: match self.theme.slider.track.as_solid() {
+                Some(c) => DrawKind::Solid(c),
+                None => DrawKind::Rect(Gradient::corners(
+                    self.theme.slider.track.corners()[0],
+                    self.theme.slider.track.corners()[1],
+                    self.theme.slider.track.corners()[2],
+                    self.theme.slider.track.corners()[3],
+                )),
+            },
         });
         self.queue.push(UiDraw {
             depth,
@@ -4957,6 +4976,25 @@ impl Ui<'_> {
         value: f32,
         sens: f32,
     ) -> f32 {
+        let style = self.theme.slider.clone();
+        self.slider_at_styled(id, rect, range, value, sens, &style)
+    }
+
+    /// 滑块（显式 rect + **样式可覆盖** + 灵敏度）——widget 层 / 组合控件经此合并主题
+    /// 与逐控件属性（[`Self::slider_at_drag`] 委托本方法）。
+    ///
+    /// 非公开：样式必须来自 [`crate::style::Theme`] 或控件 builder，避免"同一种控件两条入口"。
+    /// 取色器的**通道颜色滑块**靠它给出"该通道 0→最大"的水平渐变轨道
+    /// （[`crate::Brush::Horizontal`]）——渐变轨道是刷，不是单色，故必须能逐次覆盖样式。
+    pub(crate) fn slider_at_styled(
+        &mut self,
+        id: &str,
+        rect: Rect,
+        range: RangeInclusive<f32>,
+        value: f32,
+        sens: f32,
+        style: &crate::style::SliderStyle,
+    ) -> f32 {
         let id_for = self.id_for(id);
 
         let hit = self.hit_abs(&rect);
@@ -5036,7 +5074,6 @@ impl Ui<'_> {
         } else {
             0.0
         };
-        let style = self.theme.slider.clone();
         let elem = self.seq + 1;
         let track_rect =
             Rect::new(rect.x, rect.y + (rect.h - style.track_h) * 0.5, rect.w, style.track_h);
@@ -5053,8 +5090,25 @@ impl Ui<'_> {
         );
         // 轨道 / 填充 / 手柄都是**圆角**矩形（`SliderStyle::radius`，默认胶囊）。
         // 填充画在手柄**左缘**且与手柄同高——两者都是胶囊时左右端自然接成一条。
-        self.push_panel_like(track_rect, style.track, style.track, 0.0, style.radius, elem);
-        self.push_panel_like(fill_rect, style.fill, style.fill, 0.0, style.radius, elem);
+        //
+        // 轨道是**刷**（可能是"该通道 0→最大"的水平渐变）：无边框（`border_w = 0`，
+        // 与旧行为一致，边框色不参与绘制）。填充刷**全透明时不画**——取色器的通道行
+        // 靠轨道本身表达色彩，纯色填充会盖掉斜坡，而且省一段几何。
+        self.push_panel_like(track_rect, style.track, Color::TRANSPARENT, 0.0, style.radius, elem);
+        let fill_alpha = style.fill.as_solid().map(|c| {
+            let a: [f32; 4] = c.into();
+            a[3]
+        });
+        if fill_alpha != Some(0.0) {
+            self.push_panel_like(
+                fill_rect,
+                style.fill,
+                Color::TRANSPARENT,
+                0.0,
+                style.radius,
+                elem,
+            );
+        }
         self.push_panel_like(
             handle_rect,
             style.handle,

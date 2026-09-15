@@ -84,6 +84,30 @@ ui.finish();
 | `checkbox` | 勾选值 | `CheckboxState`（`.checked()` / `.toggled()`） |
 | `radio` | 组内互斥（同组 ID 前缀） | `CheckboxState` |
 | `text_input` | 焦点 / 光标 / 内容 | `()`（写入 `&mut String`） |
+| `number_input` | 拖动调值 + 输入（`NumberInput`） | `()`（写入 `&mut f32`） |
+| `color_picker` | 内联色块 → 弹出取色面板（`ColorPicker`） | `()`（写入 `&mut Color`） |
+
+## 取色器（`ColorPicker`）
+
+内联只占一行（色块 + `#RRGGBB` + 展开箭头），点开是**独立置顶面板**：
+
+```rust
+ui.add(ColorPicker::new("tint", &mut color).alpha(true)); // 面板里多一行 A
+```
+
+- **呈现模式** `u8` / `HEX` / `F` + 文本输入框：按模式呈现，**输入自动识别格式**
+  （`255, 0, 0` / `#FF00AA` / `1.00, 0.00, 0.00` 都能直接粘贴）；
+- 文本无法识别时输入框右侧出现**警告按钮**（`Icon::Warning`），按下恢复成当前颜色的有效值；
+  打字中途**不会**改动颜色；
+- **HSV 区**：SV 平面（四角顶点色的圆角矩形 = 精确 HSV 公式）+ 6 段色相条；
+- **通道行**：颜色滑块（该通道 0→最大的渐变轨）+ `NumberInput`；
+- `A` 行可选（`.alpha(true)`）；圆角 / 颜色 / 字体全跟 `Theme`；
+- **跨帧数据全局唯一**：呈现模式、替补文本缓冲、展开的面板、HSV 缓存都在
+  `ColorPickerState`（`UiState::color_picker`，定义在控件自己的模块里）——
+  调用方**不需要**自己持有 `String`（需要外部读取时用 `.with_hex(&mut buf)`）；
+- 同一时刻**只开一个**面板（共享文本缓冲必须只有一个所有者）。
+
+纯函数 `format_color` / `parse_color`（+ `color_hex` / `parse_hex` / `ink_on` / `luma`）可单独用。
 
 ## 布局
 

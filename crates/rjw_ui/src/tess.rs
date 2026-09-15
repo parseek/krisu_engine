@@ -1492,6 +1492,7 @@ mod tests {
             crate::draw::Icon::ChevronRight,
             crate::draw::Icon::Check,
             crate::draw::Icon::Grip,
+            crate::draw::Icon::Warning,
         ] {
             for part in icon.parts() {
                 // 缩放到 20×20 的方框。

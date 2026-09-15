@@ -91,6 +91,18 @@ pub fn normalize_x(rect: &Rect, mx: f32) -> f32 {
     ((mx - rect.x) / rect.w).clamp(0.0, 1.0)
 }
 
+/// 值归一化：把 `my` 映射到 `rect` 纵向的 [0,1]（clamp）——[`normalize_x`] 的镜像。
+///
+/// 竖向自定义拖拽区（如取色器的**色相条** / **SV 平面**）用：光靠 `normalize_x`
+/// 只能表达一维取值，平面必须两个方向都能定位到参数。
+#[inline]
+pub fn normalize_y(rect: &Rect, my: f32) -> f32 {
+    if rect.h <= f32::EPSILON {
+        return 0.0;
+    }
+    ((my - rect.y) / rect.h).clamp(0.0, 1.0)
+}
+
 /// 帧末清除一次性边沿（clicked 等），由 `Ui::finish` 调用。
 #[inline]
 pub fn clear_frame_flags(ws: &mut WidgetState) {
@@ -205,6 +217,20 @@ mod tests {
         assert!((normalize_x(&r, 300.0) - 1.0).abs() < 1e-5);
         assert!((normalize_x(&r, 0.0) - 0.0).abs() < 1e-5, "越界 clamp 到 0");
         assert!((normalize_x(&r, 999.0) - 1.0).abs() < 1e-5, "越界 clamp 到 1");
+    }
+
+    #[test]
+    fn normalize_y_maps_and_clamps() {
+        // 竖向镜像：色相条 / SV 平面取参数值用（顶部 = 0，底部 = 1）。
+        let r = Rect::new(0.0, 50.0, 10.0, 200.0);
+        assert!((normalize_y(&r, 50.0) - 0.0).abs() < 1e-5, "顶边 = 0");
+        assert!((normalize_y(&r, 150.0) - 0.5).abs() < 1e-5, "中点 = 0.5");
+        assert!((normalize_y(&r, 250.0) - 1.0).abs() < 1e-5, "底边 = 1");
+        assert!((normalize_y(&r, -10.0) - 0.0).abs() < 1e-5, "越界 clamp 到 0");
+        assert!((normalize_y(&r, 999.0) - 1.0).abs() < 1e-5, "越界 clamp 到 1");
+        // 退化高度：返回 0 而不是 NaN / 除零。
+        let flat = Rect::new(0.0, 0.0, 10.0, 0.0);
+        assert_eq!(normalize_y(&flat, 5.0), 0.0);
     }
 
     #[test]

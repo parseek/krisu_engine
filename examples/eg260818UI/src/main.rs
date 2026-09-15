@@ -41,7 +41,7 @@ use std::time::Instant;
 
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
-use rjw_krusie::ui::{ColorPicker, CornerRadius, FontModal, IdAbsolute, Label, Palette};
+use rjw_krusie::ui::{ColorPicker, CornerRadius, FontModal, IdAbsolute, Label, Palette, Position};
 
 /// 顶部状态栏模块：FPS / 点击次数标签 + 字体按钮（打开 Modal）+ 玩家名输入框 + 字体 Modal。
 struct TopBar {
@@ -53,6 +53,8 @@ struct TopBar {
     font_input: String,
     /// 字体 Modal 开关。
     font_modal_open: bool,
+    /// **固定位置**的取色器颜色（物理定位：`--sim-picker` 的脚本化点击要能算到坐标）。
+    demo_color: Color,
 }
 
 impl TopBar {
@@ -62,6 +64,7 @@ impl TopBar {
             font_name: String::new(),
             font_input: String::new(),
             font_modal_open: false,
+            demo_color: Color::rgba_u8(255, 128, 40, 255),
         }
     }
 
@@ -92,6 +95,12 @@ impl TopBar {
             p.label("玩家名（可拖动）");
             p.text_input("name", &mut self.player_name);
         });
+        // **取色器演示**（固定物理位置：`--sim-picker` 的脚本化点击按这个坐标算）。
+        // 不传 `&mut String` —— 面板的文本框用全局跨帧缓冲（`ColorPickerState::text`）。
+        ui.add_at(
+            Position::Physical(Vec2::new(240.0, 250.0)),
+            ColorPicker::new("picker_demo", &mut self.demo_color).alpha(true),
+        );
     }
 
     /// 字体 Modal（**帧末调用**：modal 的 z 每帧重写为当前最大，最后录制才能保证
@@ -583,12 +592,6 @@ struct ThemeTuner {
     border: Color,
     /// 强调色；hover / active 由它派生。
     accent: Color,
-    /// 强调色的十六进制编辑缓冲（[`ColorPicker::with_hex`] 用；跨帧持有）。
-    ///
-    /// 本处**不直接读**它——`ColorPicker` 每帧重写并解析它（它的用途正是跨帧保留
-    /// "正在输入"的文本），故显式允许未读。
-    #[allow(dead_code)]
-    accent_hex: String,
     /// 是否显示本窗口。
     open: bool,
 }
@@ -620,7 +623,6 @@ impl ThemeTuner {
             bg: p.surface,
             border: p.border,
             accent: p.accent,
-            accent_hex: String::new(),
             // 默认打开：这是个"可调的窗口"，开着才能看见效果。
             open: true,
         }
@@ -709,17 +711,15 @@ impl ThemeTuner {
                     w.label("微渐变");
                     self.bevel = w.slider("th_bevel", 0.0..=0.35, self.bevel);
                 });
-                // 三组颜色改用 [`ColorPicker`]：预览色块（内含 `#RRGGBB`）+ 逐通道滑条，
-                // 强调色额外开 Alpha 与十六进制输入（演示 `.alpha(true)` / `.with_hex(..)`）。
+                // 三组颜色改用 [`ColorPicker`]：内联色块（内含 `#RRGGBB`）→ 点开取色面板
+                // （u8/HEX/F 呈现 + HSV 平面 + 通道行）。强调色额外开 Alpha 行
+                //（演示 `.alpha(true)`）。**不必自己持有 String**：面板的文本缓冲
+                // 来自全局跨帧状态（`ColorPickerState::text`）。
                 // 并排放一行，省纵向空间。
                 w.row(|w| {
                     w.add(ColorPicker::new("th_bg", &mut self.bg));
                     w.add(ColorPicker::new("th_border", &mut self.border));
-                    w.add(
-                        ColorPicker::new("th_accent", &mut self.accent)
-                            .alpha(true)
-//                          .with_hex(&mut self.accent_hex),
-                    );
+                    w.add(ColorPicker::new("th_accent", &mut self.accent).alpha(true));
                 });
                 w.row(|w| {
                     w.label("边框宽");
@@ -777,6 +777,8 @@ struct UiApp {
     /// --sim-drag：**脚本化鼠标**拖动 win_b（`Frame::debug_inject_mouse`）——
     /// 无鼠标环境复现「窗口拖动」（见 docs/DEBUGGING.md）。
     sim_drag: bool,
+    /// --sim-picker：**脚本化鼠标**打开取色面板并在其中拖动（面板路径只有点击才录制）。
+    sim_picker: bool,
     /// 帧统计聚合（每 `PERF_PRINT_EVERY` 帧打印一次）。
     perf: PerfAgg,
     // 各 UI 模块
@@ -799,6 +801,7 @@ impl UiApp {
             script_pos: false,
             ui_dump: false,
             sim_drag: false,
+            sim_picker: false,
             perf: PerfAgg::new(),
             top: TopBar::new(),
             menu: Menu::new(),
@@ -986,9 +989,89 @@ impl App for UiApp {
         }
 
         // 无帧不执行渲染代码（本帧也不录制 UI）。
+        // `--sim-picker` 需要 DPI（`Theme` 在 `Ui` 内才被 `scaled`——主题 builder 返回的是
+        // 未缩放值），而 `f` 借走 `ctx` 后不能再读，故先取。
+        let scale = ctx.scale();
         let Some(mut f) = ctx.frame() else {
             return;
         };
+        // ── 调试：脚本化鼠标（`--sim-picker`）──────────────────────
+        // 复现"打开取色面板 → 在面板里拖/点"：面板路径（SV 平面 / 色相条 / 通道滑块 /
+        // 文本框 / **警告按钮恢复** / 模式切换）只有交互才会录制，普通冒烟跑不到——
+        // 本开关守住"面板真能开、拖动真改色、不 panic、无 wgpu 校验错误"。
+        //
+        // 坐标**由主题解算**（`Theme` 在 `Ui` 内才按 DPI 预乘，故这里手动乘 `scale`；
+        // 布局常量与 `widgets/colorpicker/panel.rs` 对齐）——写死像素在非 1.0 DPI 下会点空。
+        if self.sim_picker {
+            let n = f.frames();
+            let theme = self.theme_tuner.theme(self.top.font_name());
+            // 取色面板内部的固定常量（与 `panel.rs` 一致）+ 主题尺寸 × DPI。
+            let (pad, gap, sv_h, hue_w, label_w, slider_min) =
+                (6.0f32, 6.0f32, 110.0f32, 14.0f32, 14.0f32, 90.0f32);
+            let (row, input_h, field_w) = (
+                theme.row_h * scale,
+                theme.input.height * scale,
+                theme.input.min_w * scale,
+            );
+            let anchor = Vec2::new(240.0, 250.0); // `TopBar` 里 picker_demo 的物理定位
+            let swatch = Vec2::new(anchor.x + field_w * 0.5, anchor.y + 11.0);
+            let pw = (field_w * 1.9).max(pad * 2.0 + label_w + gap + slider_min + gap + field_w);
+            let body_w = pw - pad * 2.0;
+            let origin = Vec2::new(anchor.x, anchor.y + 24.0); // 内联高 22 + 2px 间隙
+            let mode_w = (body_w - gap * 2.0) / 3.0;
+            let text_y = origin.y + pad + row + gap;
+            let sv_y = text_y + input_h + gap;
+            let sv_w = body_w - hue_w - gap;
+            let mode = |i: usize| {
+                Vec2::new(
+                    origin.x + pad + (mode_w + gap) * i as f32 + mode_w * 0.5,
+                    origin.y + pad + row * 0.5,
+                )
+            };
+            let sv = |s: f32, v: f32| Vec2::new(origin.x + pad + s * sv_w, sv_y + v * sv_h);
+            let hue = |t: f32| Vec2::new(origin.x + pad + sv_w + gap + hue_w * 0.5, sv_y + t * sv_h);
+            let text_box = Vec2::new(origin.x + pad + 24.0, text_y + input_h * 0.5);
+            let warn = Vec2::new(origin.x + pad + body_w - input_h * 0.5, text_y + input_h * 0.5);
+            let ch_row = |ch: usize| sv_y + sv_h + gap + row * (ch as f32 + 0.5);
+            let slider = |ch: usize, t: f32| {
+                let sw = body_w - label_w - gap - field_w - gap;
+                Vec2::new(origin.x + pad + label_w + gap + sw * t, ch_row(ch))
+            };
+            match n {
+                20 => f.debug_inject_mouse(swatch, true), // 内联色块
+                21 => f.debug_inject_mouse(swatch, false), // → 点开面板
+                24 => f.debug_inject_mouse(sv(0.5, 0.5), true), // SV 平面按下
+                25..=34 => {
+                    let k = (n - 24) as f32 / 10.0;
+                    f.debug_inject_mouse(sv(0.2 + k * 0.7, 0.2 + k * 0.6), true)
+                }
+                35 => f.debug_inject_mouse(sv(0.9, 0.8), false),
+                38 => f.debug_inject_mouse(hue(0.0), true), // 色相条按下
+                39..=46 => {
+                    let k = (n - 38) as f32 / 8.0;
+                    f.debug_inject_mouse(hue(k), true)
+                }
+                47 => f.debug_inject_mouse(hue(0.95), false),
+                50 => f.debug_inject_mouse(slider(0, 0.2), true), // R 通道滑块
+                51..=54 => {
+                    let k = (n - 50) as f32 / 4.0;
+                    f.debug_inject_mouse(slider(0, 0.2 + k * 0.8), true)
+                }
+                55 => f.debug_inject_mouse(slider(0, 1.0), false),
+                58 => f.debug_inject_mouse(slider(3, 0.8), true), // A 通道滑块
+                59..=62 => f.debug_inject_mouse(slider(3, 0.8 - (n - 58) as f32 * 0.2), true),
+                63 => f.debug_inject_mouse(slider(3, 0.0), false),
+                66 => f.debug_inject_mouse(text_box, true), // 文本框（聚焦）
+                67 => f.debug_inject_mouse(text_box, false),
+                74 => f.debug_inject_mouse(warn, true), // 警告按钮（恢复成有效值）
+                75 => f.debug_inject_mouse(warn, false),
+                82 => f.debug_inject_mouse(mode(2), true), // 切到 F 呈现
+                83 => f.debug_inject_mouse(mode(2), false),
+                96 => f.debug_inject_mouse(Vec2::new(900.0, 100.0), true), // 点面板外 → 收起
+                97 => f.debug_inject_mouse(Vec2::new(900.0, 100.0), false),
+                _ => {}
+            }
+        }
 
         // ── 调试：脚本化鼠标（`--sim-drag`）────────────────────────
         // 复现"窗口拖动"：第 20 帧在 win_b 标题栏按下，随后每帧右移 6px（物理像素），
@@ -1033,11 +1116,37 @@ impl App for UiApp {
         // `Esc` 退出请求：`Frame` 借用了 `ctx`，闭包内不能再借 `ctx`（`f.ui` 与
         // `ctx.exit()` 的借用冲突）——先记标记，闭包结束后再请求退出。
         let mut exit_requested = false;
+        // --sim-picker：文本框聚焦后**在固定几帧内**注入不可识别文本（非法文本只在聚焦时
+        // 得以保留——非聚焦会被每帧重写）⇒ 守护"警告按钮 + 按下恢复"这条路径。
+        // ⚠ 必须限定帧窗口：本闭包每帧新建，用 `bool` 会每帧都注入（覆盖恢复结果）。
+        let sim_bad_text_frames = 66..=72;
+        let sim_frame = f.frames();
+        let sim_picker = self.sim_picker;
 
         // ── UI 层：录制 + 提交由运行时接管（`Ui::begin` / 输入快照 / 主题 / DPI /
         //    `Ui::finish(&region, r2d_ui)`）；UI 渲染器排序已关闭。 ────────────
         let t_ui = Instant::now();
         f.ui(theme, |ui| {
+            if sim_picker
+                && sim_bad_text_frames.contains(&sim_frame)
+                && ui
+                    .state()
+                    .focused
+                    .as_ref()
+                    .is_some_and(|f| f.as_str().contains("picker_demo"))
+            {
+                ui.state_mut().color_picker.text = "zzz".into();
+            }
+            // 警告按钮按下（第 74 帧注入，位置/边沿下一帧生效）之后文本框应是**有效文本**
+            // （不是注入的 "zzz"）；第 84 帧再看一眼：模式已切到 F ⇒ 呈现应是 `0.00, ...`。
+            if sim_picker && (sim_frame == 80 || sim_frame == 86) {
+                let st = ui.state();
+                eprintln!(
+                    "sim-picker: frame={sim_frame} mode={:?} text={:?}",
+                    st.color_picker.mode,
+                    st.color_picker.text
+                );
+            }
             // ── 应用快捷键：**文本输入框聚焦时屏蔽**（`UiState::text_focus()`）——
             //    输入 `R` / `Esc` 不会被当作重置 / 退出。
             //    与旧 `capturing_text()`（任何控件持焦点都为真）不同：只有**文本控件**
@@ -1115,6 +1224,11 @@ impl App for UiApp {
         });
         let encode_us = t_ui.elapsed().as_secs_f64() * 1e6;
         self.clicks = clicks;
+        // --sim-picker：打印脚本化拖动后演示取色器的颜色（守护"面板确实改了值"：
+        // 只有点击命中色块 → 面板打开 → SV 平面/色相条/滑块被拖到，颜色才会变）。
+        if self.sim_picker && f.frames() == 90 {
+            eprintln!("sim-picker: demo_color = {:?}", self.top.demo_color);
+        }
 
         // ── 提交：世界层与 UI 层进同一个 pass（清色 + 一次 present）──────
         // `f.submit` 负责写入画面矩形 → 取 VP → 开 pass → 提交世界与 UI → 编码提交；
@@ -1172,6 +1286,7 @@ fn main() -> Result<(), RunError> {
     app.script_pos = args.iter().any(|a| a == "--script-pos");
     app.ui_dump = args.iter().any(|a| a == "--ui-dump");
     app.sim_drag = args.iter().any(|a| a == "--sim-drag");
+    app.sim_picker = args.iter().any(|a| a == "--sim-picker");
     run(app)
 }
 
