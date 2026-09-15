@@ -133,6 +133,8 @@ impl Widget for TagButton<'_> {
     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
         // 1) 交互：复用现成原语（推荐）或自写（hit_abs / mouse_left / register_focus /
         //    key_click / hit::update_interact 均为**公开**，可跨 crate）
+        //    自写命中时务必传自己的绝对 ID：`ui.hit_abs(&ui.id_for(self.id), &rect)` ——
+        //    引擎按它做**控件级遮挡**（同窗口内重叠控件只有最上层响应）。
         let st = ui.button_at_styled(self.id, rect, self.label, &ui.theme.button);
         // 2) 覆盖属性：你可以在 button_at_styled 前后追加自己的绘制命令
         //    （如 push_panel_like / push_text_rect / push_solid_rect 公开原语）
@@ -157,7 +159,7 @@ if ui.add(TagButton::new("t1", "标签").bg(Color::ORANGE)).clicked() { … }
 | 主题 | `ui.theme`（字段，可读可改） | 样式取值 / 逐控件覆盖合并 |
 | 测量 | `text_size` / `text_size_wrap` | `Widget::size` 里内容测量（逻辑像素） |
 | 布局 | `child_rect` | 自写"占光标"容器时分配子矩形 |
-| 命中 | `hit_abs(&Rect)` / `mouse_left()` / `mouse_logical()` | 点中判定 / 左键状态 / 拖拽基准 |
+| 命中 | `hit_abs(&绝对ID, &Rect)` / `hit_body_abs(&Rect)` / `mouse_left()` / `mouse_logical()` | 点中判定（含窗口遮挡 + **控件级遮挡** + 裁剪过滤）/ 窗口·面板本体 / 左键状态 / 拖拽基准 |
 | 按下归属 | `claim_press()` | **自身有拖拽语义的控件**在按下时调用——阻止外层窗口把本次按下当窗口拖拽基准 |
 | 焦点 | `register_focus(&id_for, rect, FocusKind)` / `key_click(&id_for, kind)`（`id_for = ui.id_for(id)` 为**绝对 ID**） | 键盘导航（Tab/Enter/方向键）接入 |
 | 状态 | `state_mut().widget(&id_for)` → `WidgetState` + `hit::update_drag` / `update_interact` | 跨帧交互状态机（hover/按下/拖拽基准）；**收绝对 ID** |

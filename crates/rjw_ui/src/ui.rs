@@ -48,7 +48,8 @@ use crate::edit::{
 };
 use crate::focus::{focus_step, FocusEntry, FocusKind};
 use crate::hit::{
-    clear_frame_flags, hit_test, normalize_x, update_drag, update_interact, window_occluded,
+    HitRegion, clear_frame_flags, hit_test, id_hash, normalize_x, update_drag, update_interact,
+    widget_occluded, window_occluded,
 };
 use crate::id::{IdAbsolute, IdRelative, IdStack};
 use crate::input::{KeyboardSnapshot, MouseSnapshot};
@@ -64,9 +65,21 @@ use crate::widgets::Widget as _;
 /// `ensure_text_buf` 的 `line_mult` 一致，cosmic 行盒按此递增）。
 pub(crate) const TEXT_AREA_LINE_SPACING: f32 = 1.2;
 
-/// 滚动条宽度（**逻辑像素**；`scroll_at` 与文本编辑框共用）。文本编辑框的滚动条
+/// 滚动条**条带**宽（物理像素；`scroll_at` 与文本编辑框共用）。文本编辑框的滚动条
 /// 条带排除（按下滚动条不建立文本选择）也用它。
-pub(crate) const SCROLLBAR_W: f32 = 8.0;
+///
+/// 条带 = 占位 + 命中 / 翻页热区，比可见滑块宽 ⇒ **两侧留白**（观感更轻，抓取
+/// 却更容易）。
+pub(crate) const SCROLLBAR_W: f32 = 14.0;
+
+/// 滚动条**可见滑块**宽（物理像素，居中于 [`SCROLLBAR_W`] 条带内）。
+pub(crate) const SCROLLBAR_BAR_W: f32 = 10.0;
+
+/// 滚动条轨道**上下留白**（物理像素）：胶囊两端不贴可视区边缘。
+pub(crate) const SCROLLBAR_MARGIN: f32 = 3.0;
+
+/// 滚动条滑块**最小长度**（物理像素）；轨道比它还矮时以轨道为准。
+pub(crate) const SCROLLBAR_MIN_THUMB: f32 = 18.0;
 
 /// **双击判定时间窗**：两次按下间隔 ≤ 该时长且位移 < [`DOUBLE_CLICK_DIST`] 视为双击。
 /// 用 `Instant`（时间）而非帧数——高帧率（O2 优化 / 144Hz）下"20 帧"时间窗口会缩水
@@ -587,7 +600,7 @@ impl<'a> Ui<'a> {
         cursor: crate::UiCursor,
     ) -> Option<Vec2> {
         let abs = self.id_for(id);
-        let hhit = self.hit_abs(&handle);
+        let hhit = self.hit_abs(&abs, &handle);
         let hbtn = self.mouse_left();
         if hbtn.down_edge() && hhit {
             // 缩放柄自身有拖拽语义：阻止外层窗口/面板把本次按下当作拖拽基准。
@@ -1541,15 +1554,48 @@ impl<'a> Ui<'a> {
         self.mouse_local().x
     }
 
-    /// 局部矩形（逻辑）→ 命中测试（与逻辑鼠标坐标比较；含窗口外判定与窗口遮挡）。
+    /// 局部矩形（逻辑）→ 命中测试（与逻辑鼠标坐标比较；含窗口外判定、窗口遮挡与
+    /// **控件级遮挡**）。
     ///
-    /// 遮挡时若控件矩形本身命中鼠标，累加 [`UiState::occluded_hits`]（诊断机制：
-    /// 告诉你"本帧有多少次点击被窗口遮挡拦截"——见示例 `eg260818UI` 的诊断面板）。
-    /// **强制裁剪层命中**：鼠标在 [`Self::clip`]（ScrollView 可视区 / Clip 沙箱）
-    /// 之外时**不命中**——修复"滚出可视区的控件边缘仍可交互"缺口。
-    /// 控件作者交互判断用（与 [`Self::mouse_left`] / `hit::update_interact` 组合）。
+    /// `owner` = 本控件的**绝对 ID**：用于控件级遮挡的身份判定（同一控件的多个区域
+    /// 互不遮挡）。控件作者交互判断用（与 [`Self::mouse_left`] /
+    /// [`hit::update_interact`](crate::hit::update_interact) 组合）。
+    ///
+    /// # 遮挡（"重叠控件被一起触发"修复）
+    ///
+    /// 同一窗口 / 面板内，**后录制 = 画在上面**的控件优先：鼠标下若有别的控件
+    /// 记录得比我晚且覆盖此处，本控件**不响应**（点击 / 悬停 / 拖拽都不响应），
+    /// 重叠区域只有最上层那一个控件被触发。判定用**上一帧**登记的区域
+    /// （[`crate::hit::widget_occluded`]）——本帧后面的控件还没录制，无法参与判定。
+    ///
+    /// ⚠ **自定义控件务必传自己的绝对 ID**（不是容器的 id）：传容器 id 会让同容器内
+    /// 的所有控件"互不遮挡"，传别人的 id 会让自己永远被那个控件挡住。
+    ///
+    /// # 其余拦截
+    ///
+    /// - **窗口遮挡**：鼠标下若有更高 z 的窗口盖住本控件所在窗口 → 不响应，
+    ///   累加 [`UiState::occluded_hits`](crate::UiState::occluded_hits)（诊断）；
+    /// - **强制裁剪层**：鼠标在 [`Self::clip`]（ScrollView 可视区 / Clip 沙箱）
+    ///   之外时不命中——修复"滚出可视区的控件边缘仍可交互"缺口。
     #[inline]
-    pub fn hit_abs(&mut self, local: &Rect) -> bool {
+    pub fn hit_abs(&mut self, owner: &IdAbsolute<'_>, local: &Rect) -> bool {
+        self.hit_impl(Some(owner), local)
+    }
+
+    /// **"本体"命中**（窗口 / 面板 / 浮层的**整块区域**，不是控件）：与 [`Self::hit_abs`]
+    /// 的区别是**不参与控件级遮挡**——本体**包含**它内部的子控件，若也走控件级遮挡，
+    /// 鼠标停在子控件上时本体就会被自己的子控件判成"被挡住"（浮层会误判"点在面板外"
+    /// 而收起）。窗口 / 面板本体的层级由**窗口遮挡**（z-order）负责，与控件级遮挡正交。
+    ///
+    /// 也不登记为遮挡区域：本体不需要挡住别的控件（那是窗口遮挡的事）。
+    #[inline]
+    pub fn hit_body_abs(&mut self, local: &Rect) -> bool {
+        self.hit_impl(None, local)
+    }
+
+    /// [`Self::hit_abs`] / [`Self::hit_body_abs`] 的公共实现
+    /// （`owner = None` ⇒ 本体：不做控件级遮挡、也不登记）。
+    fn hit_impl(&mut self, owner: Option<&IdAbsolute<'_>>, local: &Rect) -> bool {
         if !self.mouse_in_window {
             return false;
         }
@@ -1579,6 +1625,45 @@ impl<'a> Ui<'a> {
             // 命中但被遮挡 → 记录诊断计数（未响应）。
             self.state.occluded_hits += 1;
             return false;
+        }
+        let Some(owner) = owner else {
+            return true;
+        };
+        // **控件级遮挡**：登记自己（供下一帧判定"谁盖住谁"），并检查上一帧里是否有
+        // 更上层的别的控件覆盖此处。登记只在"几何命中"之后发生——遮挡判定只关心
+        // 鼠标下那一处，鼠标不在自己矩形内时无需登记。
+        let me = id_hash(owner);
+        let key = self.seq;
+        let blocked = widget_occluded(
+            me,
+            key,
+            self.mouse_logical,
+            self.state.prev_hit_regions.iter().copied(),
+        );
+        self.state.hit_regions.push(HitRegion {
+            owner: me,
+            key,
+            rect: abs,
+            clip: self.clip,
+        });
+        let traced = std::env::var_os("RJ_HIT_TRACE").is_some();
+        if blocked {
+            self.state.widget_occluded_hits += 1;
+            if traced {
+                eprintln!(
+                    "hit[frame {}] {} BLOCKED-by-widget rect=({},{},{},{}) mouse=({},{})",
+                    self.state.frame, owner.as_str(), abs.x, abs.y, abs.w, abs.h,
+                    self.mouse_logical.x, self.mouse_logical.y
+                );
+            }
+            return false;
+        }
+        if traced {
+            eprintln!(
+                "hit[frame {}] {} OK rect=({},{},{},{}) mouse=({},{})",
+                self.state.frame, owner.as_str(), abs.x, abs.y, abs.w, abs.h,
+                self.mouse_logical.x, self.mouse_logical.y
+            );
         }
         true
     }
@@ -1919,12 +2004,18 @@ impl<'a> Ui<'a> {
         clicked
     }
 
-    /// 滚动条：右侧竖条（轨道 + thumb）。返回更新后的滚动偏移（**物理像素**）。
+    /// 滚动条：右侧竖条（轨道 + 胶囊滑块）。返回更新后的滚动偏移（**物理像素**）。
+    ///
+    /// 观感（本轮起）：**常驻**、比旧版更粗的**胶囊**滑块，居中于 [`SCROLLBAR_W`]
+    /// 条带内 ⇒ **两侧留白**；配色取调色板的弱色（`text_dim`，悬停 / 拖拽转
+    /// `text_muted`）而不再用近白的 `slider.handle`——深 / 浅两色都不刺眼。
+    /// 条带（含留白）即命中 / 翻页热区，比可见滑块宽 ⇒ 抓取更容易。
     ///
     /// `view` 为**当前容器局部坐标**的可视区（与内容同空间，**不随内容滚动**；
     /// 由外层容器弹出统一平移成绝对坐标）；命中用局部坐标鼠标（`mouse_logical −
-    /// abs_base`），遮挡判定仍用绝对鼠标。thumb 几何在物理像素里取整，拖拽按
-    /// **整物理像素 1:1** 步进——内容与 thumb 刚性移动（非整数 DPI 不抖）。
+    /// abs_base`），遮挡判定仍用绝对鼠标。滑块几何在物理像素里取整（
+    /// [`scroll_thumb`]），拖拽按 **整物理像素 1:1** 步进——内容与滑块刚性移动
+    /// （非整数 DPI 不抖）。
     /// `elem`：所属元素序（`scroll_at` 传 `0` 装饰层；文本编辑框传 `seq+1` 使
     /// 滚动条覆盖在文本之上）。
     #[allow(clippy::too_many_arguments)]
@@ -1940,23 +2031,76 @@ impl<'a> Ui<'a> {
         elem: u32,
     ) -> f32 {
         let mut offset_px = offset_px;
-        let track = Rect::new(view.x + view.w - SCROLLBAR_W, view.y, SCROLLBAR_W, view_h);
-        let ratio = (view_h / content_h).clamp(0.0, 1.0);
-        // thumb 几何：**物理像素**计算（整像素步进 → 刚性）。
-        let view_h_px = view_h.round();
-        let thumb_h_px = (view_h_px * ratio).max(16.0).round();
-        let thumb_y_px = if max_off_px > 1e-6 {
-            (offset_px / max_off_px * (view_h_px - thumb_h_px)).round()
-        } else {
-            0.0
-        };
-        // thumb 顶 = 可视区顶（view.y，局部坐标）+ 视图内偏移（物理像素）
-        let thumb_y = view.y + thumb_y_px;
-        let thumb = Rect::new(track.x, thumb_y, track.w, thumb_h_px);
-        // 绘制：轨道 + thumb（白纹理图形，`elem` 所属元素）。
+        // 条带（占位 + 命中 / 翻页热区）与**可见**轨道（居中、上下留白 ⇒ 胶囊不贴边）。
+        let (strip, track) = scrollbar_rects(view, view_h);
+        let track_h = track.h;
+        // 滑块几何：**物理像素**计算（整像素步进 → 刚性；纯函数可单测）。
+        let (thumb_h_px, travel_px, thumb_y_px) =
+            scroll_thumb(track_h, view_h, content_h, offset_px, max_off_px);
+        // 滑块顶 = 轨道顶（局部坐标）+ 轨道内偏移（物理像素）
+        let thumb = Rect::new(track.x, track.y + thumb_y_px, track.w, thumb_h_px);
+        // 交互判定必须在**绘制前**求出（滑块颜色取决于悬停 / 拖拽状态）。
+        // 局部坐标鼠标 = 绝对鼠标 − 当前容器绝对原点（abs_base 已恢复为外层值）。
         let depth = self.depth;
         let win = self.cur_win;
+        let mouse_rel = self.mouse_logical - self.abs_base;
+        let bar_id = IdAbsolute::owned(format!("{}::bar", id.as_str()));
+        let on_top = self.mouse_in_window
+            && !window_occluded(win, self.mouse_logical, self.window_rects_iter());
+        // **控件级遮挡**（与 `hit_abs` 同一套）：滚动条画在内容**之上**，
+        // - 它自己参与遮挡链（鼠标在条带内时，条带下方的控件不得响应——否则
+        //   "点滚动条"会连带触发被压住的列表项 / 文本插入符）；
+        // - 同时也要能被**更晚录制**的控件挡住（对称处理，不搞特例）。
+        // 登记用**条带**（滑块 + 两侧留白 + 上下留白）：热区即占位区。
+        let me = id_hash(&bar_id);
+        let key = self.seq;
+        let strip_abs = Rect::new(
+            self.abs_base.x + strip.x,
+            self.abs_base.y + strip.y,
+            strip.w,
+            strip.h,
+        );
+        if on_top && hit_test(&strip_abs, self.mouse_logical) {
+            self.state.hit_regions.push(HitRegion {
+                owner: me,
+                key,
+                rect: strip_abs,
+                clip: self.clip,
+            });
+        }
+        let on_top = on_top
+            && !widget_occluded(
+                me,
+                key,
+                self.mouse_logical,
+                self.state.prev_hit_regions.iter().copied(),
+            );
+        let bar_hit = on_top && hit_test(&thumb, mouse_rel);
+        let strip_hit = on_top && hit_test(&strip, mouse_rel);
+        let btn = self.mouse_left();
+        // 滚动条自身有拖拽语义：按下（滑块 / 条带）置位 press_claimed，
+        // 阻止外层窗口把本次按下当作窗口拖拽基准（窗口内拖滚动条不连窗口一起动）。
+        if btn.down_edge() && strip_hit {
+            self.press_claimed = true;
+        }
+        let grab = {
+            let ws = self.state.widgets.entry(bar_id.clone()).or_default();
+            let dragging = update_drag(ws, bar_hit, btn);
+            if btn.down_edge() && bar_hit {
+                ws.press_mouse = Some(self.mouse_screen.round());
+                ws.press_panel = Some(Vec2::new(thumb_y_px, offset_px));
+            }
+            (dragging, ws.press_panel.unwrap_or(Vec2::ZERO))
+        };
+        // 绘制：轨道 + 滑块（白纹理图形，`elem` 所属元素）。胶囊 = 半径取半宽。
         let seq = self.next_seq();
+        let radius = CornerRadius::all(SCROLLBAR_BAR_W * 0.5);
+        let pal = self.theme.palette;
+        let thumb_col = if bar_hit || grab.0 {
+            pal.text_muted
+        } else {
+            pal.text_dim
+        };
         self.queue.push(UiDraw {
             depth,
             seq,
@@ -1964,10 +2108,13 @@ impl<'a> Ui<'a> {
             elem,
             rect: track,
             clip: outer_clip,
-            // 滚动条轨道用主题滑块轨道刷（可能是渐变：纯色走最省的 `Solid`，
-            // 渐变走四角顶点色的 `Rect`——两者都是一条命令、无纹理）。
+            // 滚动条轨道用主题滑块轨道刷（可能是渐变：纯色 → **胶囊**圆角矩形；
+            // 渐变无法圆角 → 退化成四角顶点色的 `Rect`。两者都是一条命令、无纹理）。
             kind: match self.theme.slider.track.as_solid() {
-                Some(c) => DrawKind::Solid(c),
+                Some(c) => DrawKind::RoundedRect {
+                    corners: [c; 4],
+                    radius,
+                },
                 None => DrawKind::Rect(Gradient::corners(
                     self.theme.slider.track.corners()[0],
                     self.theme.slider.track.corners()[1],
@@ -1983,34 +2130,11 @@ impl<'a> Ui<'a> {
             elem,
             rect: thumb,
             clip: outer_clip,
-            kind: DrawKind::Solid(self.theme.slider.handle),
+            kind: DrawKind::RoundedRect {
+                corners: [thumb_col; 4],
+                radius,
+            },
         });
-        // 交互：thumb 拖拽（复用 WidgetState.press_panel/press_mouse 基准）。
-        // 局部坐标鼠标 = 绝对鼠标 − 当前容器绝对原点（abs_base 已恢复为外层值）。
-        let mouse_rel = self.mouse_logical - self.abs_base;
-        let bar_id = IdAbsolute::owned(format!("{}::bar", id.as_str()));
-        let bar_hit = hit_test(&thumb, mouse_rel)
-            && self.mouse_in_window
-            && !window_occluded(win, self.mouse_logical, self.window_rects_iter());
-        let btn = self.mouse_left();
-        // 滚动条自身有拖拽语义：按下（thumb / 轨道区域）置位 press_claimed，
-        // 阻止外层窗口把本次按下当作窗口拖拽基准（窗口内拖滚动条不连窗口一起动）。
-        if btn.down_edge()
-            && hit_test(&track, mouse_rel)
-            && self.mouse_in_window
-            && !window_occluded(win, self.mouse_logical, self.window_rects_iter())
-        {
-            self.press_claimed = true;
-        }
-        let grab = {
-            let ws = self.state.widgets.entry(bar_id.clone()).or_default();
-            let dragging = update_drag(ws, bar_hit, btn);
-            if btn.down_edge() && bar_hit {
-                ws.press_mouse = Some(self.mouse_screen.round());
-                ws.press_panel = Some(Vec2::new(thumb_y_px, offset_px));
-            }
-            (dragging, ws.press_panel.unwrap_or(Vec2::ZERO))
-        };
         if grab.0 {
             let pm = self
                 .state
@@ -2018,28 +2142,19 @@ impl<'a> Ui<'a> {
                 .get(bar_id.as_str())
                 .and_then(|w| w.press_mouse)
                 .unwrap_or(self.mouse_screen);
-            // thumb **跟随鼠标 1:1**（保持按下时的抓取点偏移），滚动偏移由 thumb
-            // 位置反推——否则 thumb 按比例慢于鼠标（内容越高越明显，"不同步"）。
+            // 滑块**跟随鼠标 1:1**（保持按下时的抓取点偏移），滚动偏移由滑块
+            // 位置反推——否则滑块按比例慢于鼠标（内容越高越明显，"不同步"）。
             let dy_px = (self.mouse_screen.y - pm.y).round();
             let thumb_y_px_new = grab.1.x + dy_px; // grab.1.x = 按下时 thumb_y_px
-            offset_px = if view_h_px - thumb_h_px > 1.0 {
-                (thumb_y_px_new / (view_h_px - thumb_h_px) * max_off_px)
-                    .round()
-                    .clamp(0.0, max_off_px)
-            } else {
-                0.0
-            };
+            offset_px = scroll_offset_for_thumb(thumb_y_px_new, travel_px, max_off_px);
         }
-        // 光标：视口滑条（thumb/轨道）保持普通 Arrow（UI_NEEDS：滑条不用 <->）。
-        // 轨道点击（thumb 外）→ 翻页（整物理像素步长）。
-        let hit_track = hit_test(&track, mouse_rel)
-            && self.mouse_in_window
-            && !window_occluded(win, self.mouse_logical, self.window_rects_iter());
+        // 光标：视口滑条（滑块 / 条带）保持普通 Arrow（UI_NEEDS：滑条不用 <->）。
+        // 条带点击（滑块外）→ 翻页（整物理像素步长）。
         let page_px = view_h.round();
-        if btn.down_edge() && hit_track && !bar_hit {
-            if mouse_rel.y < thumb_y {
+        if btn.down_edge() && strip_hit && !bar_hit {
+            if mouse_rel.y < thumb.y {
                 offset_px = (offset_px - page_px).max(0.0);
-            } else if mouse_rel.y > thumb_y + thumb_h_px {
+            } else if mouse_rel.y > thumb.y + thumb.h {
                 offset_px = (offset_px + page_px).min(max_off_px);
             }
         }
@@ -3982,6 +4097,71 @@ fn clear_drag_base(ws: &mut WidgetState) {
     ws.press_size = None;
 }
 
+/// **滚动条几何**（纯函数，物理像素）：返回 `(条带, 可见轨道)`。
+///
+/// - 条带 = 右缘 [`SCROLLBAR_W`] 宽的全高矩形：**占位 + 命中 / 翻页热区**（比
+///   可见滑块宽 ⇒ 抓取更容易，也避免了"滑块太细点不中"）；
+/// - 可见轨道 = 条带**居中**的 [`SCROLLBAR_BAR_W`] 宽胶囊（两侧各留
+///   `(SCROLLBAR_W − SCROLLBAR_BAR_W) / 2` 的空白），上下各留 [`SCROLLBAR_MARGIN`]
+///   （胶囊两端不贴可视区边缘）。
+pub(crate) fn scrollbar_rects(view: &Rect, view_h: f32) -> (Rect, Rect) {
+    let strip = Rect::new(view.x + view.w - SCROLLBAR_W, view.y, SCROLLBAR_W, view_h);
+    let track = Rect::new(
+        strip.x + (SCROLLBAR_W - SCROLLBAR_BAR_W) * 0.5,
+        strip.y + SCROLLBAR_MARGIN,
+        SCROLLBAR_BAR_W,
+        (view_h - SCROLLBAR_MARGIN * 2.0).max(1.0),
+    );
+    (strip, track)
+}
+
+/// **滚动条滑块几何**（纯函数，物理像素，全部取整 ⇒ 整像素步进、不抖）。
+///
+/// 输入：`track_h` 轨道高、`view_h` / `content_h` 可视高 / 内容高、`offset_px` /
+/// `max_off_px` 当前 / 最大滚动偏移。返回 `(thumb_h, travel, thumb_y)`：
+/// 滑块长、滑块行程（= 轨道高 − 滑块长）、滑块顶端相对**轨道顶端**的偏移。
+///
+/// 不变量：内容装得下（`ratio ≥ 1`）⇒ 滑块铺满轨道、行程 0；`offset_px ==
+/// max_off_px` ⇒ `thumb_y == travel`（滑块底端与轨道底端对齐）——滑块与内容
+/// 刚性对应，这正是"滚到底"时视觉上真的贴底的原因。
+pub(crate) fn scroll_thumb(
+    track_h: f32,
+    view_h: f32,
+    content_h: f32,
+    offset_px: f32,
+    max_off_px: f32,
+) -> (f32, f32, f32) {
+    let track_h = track_h.round().max(1.0);
+    let ratio = if content_h > 0.0 {
+        (view_h / content_h).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let thumb_h = (track_h * ratio)
+        .max(SCROLLBAR_MIN_THUMB.min(track_h))
+        .min(track_h)
+        .round();
+    let travel = (track_h - thumb_h).max(0.0);
+    let thumb_y = if max_off_px > 1e-6 && travel > 1.0 {
+        (offset_px / max_off_px * travel).round().clamp(0.0, travel)
+    } else {
+        0.0
+    };
+    (thumb_h, travel, thumb_y)
+}
+
+/// **滚动条滑块位置 → 滚动偏移**（[`scroll_thumb`] 的逆，拖拽用；物理像素取整）。
+#[inline]
+pub(crate) fn scroll_offset_for_thumb(thumb_y: f32, travel: f32, max_off_px: f32) -> f32 {
+    if travel > 1.0 {
+        (thumb_y.clamp(0.0, travel) / travel * max_off_px)
+            .round()
+            .clamp(0.0, max_off_px)
+    } else {
+        0.0
+    }
+}
+
 // ─── 容器控件 API（UiAdd trait，替代旧的 widget_api! 宏） ─────────
 
 /// **容器控件 API**：全部容器包装（[`Panel`] / [`Pack`] / [`Grid`] / [`Window`] /
@@ -4637,7 +4817,7 @@ impl Ui<'_> {
         // 登记焦点链（键盘导航：Tab 可到；Enter/Space 展开收起；方向键切换选项）。
         self.register_focus(&abs, rect, FocusKind::Combo);
         // 按钮交互（点击 toggle）。
-        let hit = self.hit_abs(&rect);
+        let hit = self.hit_abs(&abs, &rect);
         let btn = self.mouse_left();
         let key_click = self.key_click(&abs, FocusKind::Combo);
         let mut ev = {
@@ -4767,15 +4947,15 @@ impl Ui<'_> {
                     for (i, opt) in options.iter().enumerate() {
                         let sel = selected == Some(i as u32);
                         let item_rect = Rect::new(0.0, pad_v + i as f32 * item_h, menu_w, item_h);
-                        let hit = ui.hit_abs(&item_rect);
+                        let item_id = IdAbsolute::owned(format!("{}::opt_{i}", abs.as_str()));
+                        let hit = ui.hit_abs(&item_id, &item_rect);
                         let btn = ui.mouse_left();
                         // 菜单项自身有拖拽语义：阻止 popup 窗口把按下当窗口拖拽基准。
                         if btn.down_edge() && hit {
                             ui.claim_press();
                         }
                         let ev = {
-                            let id = IdAbsolute::owned(format!("{}::opt_{i}", abs.as_str()));
-                            let ws = ui.state_mut().widget(&id);
+                            let ws = ui.state_mut().widget(&item_id);
                             update_interact(ws, hit, btn)
                         };
                         // hover / 选中 → 整行高亮（扁平菜单项，无边框）。
@@ -4907,7 +5087,7 @@ impl Ui<'_> {
     ) -> ButtonState {
         let id_for = self.id_for(id);
 
-        let hit = self.hit_abs(&rect);
+        let hit = self.hit_abs(&id_for, &rect);
         let btn = self.mouse_left();
         // 登记焦点链（键盘导航：Tab/方向键可到；Enter/Space 激活 —— 见 `key_click`）。
         self.register_focus(&id_for, rect, FocusKind::Button);
@@ -5018,7 +5198,7 @@ impl Ui<'_> {
     ) -> f32 {
         let id_for = self.id_for(id);
 
-        let hit = self.hit_abs(&rect);
+        let hit = self.hit_abs(&id_for, &rect);
         let btn = self.mouse_left();
         // 登记焦点链（键盘导航：Tab 可到；焦点下左右方向键调值 —— 见下方键盘分支）。
         self.register_focus(&id_for, rect, FocusKind::Slider);
@@ -5166,7 +5346,7 @@ impl Ui<'_> {
         style: &CheckboxStyle,
     ) -> CheckboxState {
         let abs = self.id_for(id);
-        let hit = self.hit_abs(&rect);
+        let hit = self.hit_abs(&abs, &rect);
         let btn = self.mouse_left();
         // 登记焦点链（键盘导航：Tab 可到；Enter/Space 切换）。
         self.register_focus(&abs, rect, FocusKind::Checkbox);
@@ -5212,7 +5392,7 @@ impl Ui<'_> {
     ) -> CheckboxState {
         // 单选 id 也参与命名空间（组名 `group` 不前缀——跨窗口复用组语义保留）。
         let abs = self.id_for(id);
-        let hit = self.hit_abs(&rect);
+        let hit = self.hit_abs(&abs, &rect);
         let btn = self.mouse_left();
         // 登记焦点链（键盘导航：Tab 可到；Enter/Space 选中）。
         self.register_focus(&abs, rect, FocusKind::Radio);
@@ -5479,7 +5659,7 @@ impl Ui<'_> {
 
     pub fn text_input_at(&mut self, id: &str, rect: Rect, value: &mut String) {
         let id_for = self.id_for(id);
-        let hit = self.hit_abs(&rect);
+        let hit = self.hit_abs(&id_for, &rect);
         if hit {
             // 鼠标悬停在输入框上 → 本帧系统光标设为 I 型（finish 统一设置）
             self.cursor_text = true;
@@ -5888,7 +6068,7 @@ impl Ui<'_> {
     fn text_area_impl(&mut self, id: &str, rect: Rect, value: &mut String, wrap: bool) {
         let id_for = self.id_for(id);
 
-        let hit = self.hit_abs(&rect);
+        let hit = self.hit_abs(&id_for, &rect);
         if hit {
             // 鼠标悬停在输入框上 → 本帧系统光标设为 I 型（finish 统一设置）
             self.cursor_text = true;

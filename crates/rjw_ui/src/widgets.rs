@@ -55,14 +55,15 @@
 //!
 //! /// 标签块：圆角底 + 居中文字（**最小可用自定义控件**）。
 //! pub struct Tag<'a> {
+//!     id: &'a str,
 //!     text: &'a str,
 //!     /// 逐控件覆盖；`None` = 跟主题。
 //!     fg: Option<Color>,
 //! }
 //!
 //! impl<'a> Tag<'a> {
-//!     pub fn new(text: &'a str) -> Self {
-//!         Self { text, fg: None }
+//!     pub fn new(id: &'a str, text: &'a str) -> Self {
+//!         Self { id, text, fg: None }
 //!     }
 //!     /// 属性化 builder：只存差异，未设的回落主题。
 //!     pub fn color(mut self, c: Color) -> Self {
@@ -79,7 +80,10 @@
 //!     }
 //!
 //!     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-//!         let hovered = ui.hit_abs(&rect); // 命中（含窗口遮挡 / 强制裁剪层）
+//!         // 身份 = **绝对 id**（控件级遮挡按它区分"谁盖住谁"，见第 7 条硬约定）。
+//!         let abs = ui.id_for(self.id);
+//!         // 命中（含窗口遮挡 / 控件级遮挡 / 强制裁剪层）。
+//!         let hovered = ui.hit_abs(&abs, &rect);
 //!         let st = ui.theme().button.clone();
 //!         ui.push_panel_like(rect, st.pick_bg(false, hovered), st.border, st.border_w, st.radius, 1);
 //!         ui.push_text_rect(
@@ -98,7 +102,7 @@
 //! }
 //!
 //! # fn demo(ui: &mut Ui) {
-//! ui.add(Tag::new("新").color(Color::WHITE));
+//! ui.add(Tag::new("tag_demo", "新").color(Color::WHITE));
 //! # }
 //! ```
 //!
@@ -114,7 +118,7 @@
 //!
 //! | 想要 | 用什么 |
 //! |---|---|
-//! | 悬停 / 按下 / 点击 | `ui.hit_abs(&rect)` + `ui.mouse_left()` + [`hit::update_interact`](crate::hit::update_interact) → [`InteractEvents`](crate::hit::InteractEvents) |
+//! | 悬停 / 按下 / 点击 | `ui.hit_abs(&abs, &rect)` + `ui.mouse_left()` + [`hit::update_interact`](crate::hit::update_interact) → [`InteractEvents`](crate::hit::InteractEvents) |
 //! | 拖拽（自带语义） | 按下时 `ui.claim_press()` + [`hit::update_drag`](crate::hit::update_drag) + 基准存 `WidgetState::{press_panel, press_mouse}` |
 //! | 2D / 竖向"点哪取哪" | `ui.mouse_local()` + [`hit::normalize_x`](crate::hit::normalize_x) / [`hit::normalize_y`](crate::hit::normalize_y) |
 //! | 键盘 / Tab 导航 | `ui.register_focus(&ui.id_for(id), rect, [`FocusKind`])` + `ui.key_click(&abs, kind)` |
@@ -162,7 +166,7 @@
 //!         // ② 进焦点链：Tab 可到、焦点描边由引擎画。
 //!         ui.register_focus(&abs, rect, FocusKind::Slider);
 //!
-//!         let hit = ui.hit_abs(&rect);
+//!         let hit = ui.hit_abs(&abs, &rect);
 //!         let btn = ui.mouse_left();
 //!         // ③ 拖拽语义：按下就占用本次按压，外层窗口/面板不会把它当成窗口拖动。
 //!         if btn.down_edge() && hit {
@@ -240,7 +244,7 @@
 //! # }
 //! ```
 //!
-//! ## 2. 五条硬约定（都是踩过的坑）
+//! ## 2. 七条硬约定（都是踩过的坑）
 //!
 //! 1. **尺寸一律物理像素**：`Theme` 在 [`Ui`] 内已按 DPI 预乘；要收逻辑单位就用
 //!    [`Position`](crate::Position) / [`Size`](crate::Size)（或 [`Metric`](crate::Metric)）。
@@ -259,6 +263,13 @@
 //!    手柄 / 箭头 / 分隔线若写死 `0` 或 `1`，会被本控件自己的背景或文本框**整块盖住**
 //!    （两个真实 bug：`NumberInput` 的拖拽手柄与分隔线、`ColorPicker` 的展开箭头
 //!    全都看不见）。
+//! 7. **`hit_abs` 必须传自己的绝对 id**：`ui.hit_abs(&ui.id_for(id), &rect)`。它不只是
+//!    命中测试——引擎按这个身份做**控件级遮挡**：同窗口内**后录制的控件画在上面**，
+//!    重叠处只有最上层那个控件被触发（"点滚动条却连带选中了下面的列表项 / 两个控件
+//!    被一起触发"就是这么修的，诊断计数 `UiState::widget_occluded_hits`）。
+//!    ⚠ 传**容器** id 会让同容器内所有控件"互不遮挡"（重叠时又一起触发）；传**别人**
+//!    的 id 会让自己永远被那个控件挡住。同一控件的多个可交互区（轨道 + 手柄）**共用**
+//!    同一个 id，才不会被自己挡住。
 //!
 //! ## 3. 测试与调试
 //!
@@ -268,7 +279,8 @@
 //! - `ui.debug_layout(true)`：给每个绘制命令的矩形画青色描边——布局矩形与你以为的
 //!   命中区不一致时一眼可见（控件 `size()` 与实际绘制内容不一致是经典的布局重叠来源）。
 //! - `ui.debug_dump()`（示例 `--ui-dump`）：窗口 id / z / 本帧提交原点 / 尺寸 / 拖拽状态。
-//! - 命中不生效？先查**窗口遮挡**（`UiState::occluded_hits`，重叠窗口只让最上层可交互）
+//! - 命中不生效？先查**窗口遮挡**（`UiState::occluded_hits`，重叠窗口只让最上层可交互）、
+//!   **控件级遮挡**（`UiState::widget_occluded_hits`，同窗口内重叠控件只让最上层可交互）
 //!   与**强制裁剪层**（`Scroll` / Clip 沙箱外命中失效）。
 
 

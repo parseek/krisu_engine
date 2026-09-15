@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 glam = "0.33.2"
 rjw_krusie = { path = "../../crates/rjw_krusie" }
+# `--image <路径>`：加载用户图片当 `ImageBg`（PNG / JPEG / BMP / GIF）。
+# `default-features = false` + 显式列解码器 ⇒ 不引入用不到的格式依赖。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }

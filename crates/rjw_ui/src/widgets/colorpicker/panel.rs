@@ -107,7 +107,9 @@ pub(super) fn show_popup(
         .style(panel_style)
         .show(|w| {
             let ui = w.ui_mut();
-            inside = ui.hit_abs(&Rect::new(0.0, 0.0, pw, ph));
+            // 面板**本体**（不是控件）：用 `hit_body_abs`——它包含面板内的子控件，
+            // 不能被自己的子控件判成"被挡住"（那会让点面板内也变成"点在面板外"）。
+            inside = ui.hit_body_abs(&Rect::new(0.0, 0.0, pw, ph));
             let btn = ui.mouse_left();
             // 按在面板任意处都算"面板内的按下"（点面板外才收起）。
             if btn.down_edge() && inside {
@@ -311,7 +313,11 @@ fn popup_body(
     if invalid {
         // 警告按钮：按下 → 文本恢复成当前颜色的有效值（颜色本身一直没被动过）。
         let wrect = Rect::new(PAD + text_rect.w + GAP, y, input_h, input_h);
-        let wh = ui.hit_abs(&wrect);
+        // 警告按钮自己的 id（`hit_abs` 的硬约定：传**自己的绝对 id**，引擎按它做
+        // 控件级遮挡——本按钮与文本框**相邻**不重叠，但一旦布局变化导致重叠，
+        // 归属立刻正确，不需要再改这里）。
+        let warn_abs = IdAbsolute::owned(format!("{id}::warn"));
+        let wh = ui.hit_abs(&warn_abs, &wrect);
         let pal = ui.theme.palette;
         let danger = pal.danger;
         let bg = if wh {
@@ -424,7 +430,7 @@ fn popup_body(
 ///
 /// 自带拖拽语义 ⇒ 按下时 `claim_press`（阻止外层窗口/面板把这次按下当作拖拽基准）。
 fn drag_region_active(ui: &mut Ui, id_abs: &IdAbsolute<'static>, rect: &Rect, btn: KeyState) -> bool {
-    let hit = ui.hit_abs(rect);
+    let hit = ui.hit_abs(id_abs, rect);
     if btn.down_edge() && hit {
         ui.claim_press();
     }

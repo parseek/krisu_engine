@@ -128,7 +128,9 @@ impl Widget for NumberInput<'_> {
             br: 0.0,
             bl: in_radius.bl,
         });
-        let grip_hit = ui.hit_abs(&grip);
+        let drag_id = IdAbsolute::owned(format!("{}::grip", id_for.as_str()));
+        // 手柄是**独立可交互区**（不与文本框重叠）→ 传自己的 id 参与控件级遮挡判定。
+        let grip_hit = ui.hit_abs(&drag_id, &grip);
         let btn = ui.mouse_left();
         ui.register_focus(&id_for, rect, FocusKind::TextInput);
 
@@ -159,7 +161,6 @@ impl Widget for NumberInput<'_> {
         if btn.down_edge() && grip_hit {
             ui.claim_press();
         }
-        let drag_id = IdAbsolute::owned(format!("{}::grip", id_for.as_str()));
         let mut dragging = false;
         // 先拷出鼠标/窗口尺寸（ws 借用期间不能再借 ui）
         let mx = ui.mouse_screen().x;

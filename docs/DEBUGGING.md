@@ -81,6 +81,47 @@ fn update(&mut self, ctx: &mut Ctx) {
   `cargo run -p eg260818UI -- --sim-picker --frames 110`。
   ⚠ 脚本坐标必须**由主题解算**（`Theme` 在 `Ui` 内才按 DPI 预乘）——写死像素在非 1.0
   DPI 下会点空。
+- **重叠控件的命中归属**（"点了 A 却连 B 也触发"）：示例的 `--sim-overlap` 把鼠标压在两个
+  **故意重叠**的控件交集中心（坐标由 `examples/eg260818UI/src/overlap.rs` 与绘制同源解算），
+  按下 + 释放后打印
+
+  ```
+  sim-overlap: below=0 above=1 widget_occluded_hits=2 -> [OK] 重叠处只有最上层控件被触发
+  ```
+
+  （`cargo run -p eg260818UI -- --sim-overlap --frames 62`）。判定口径：下层计数必须是 `0`、
+  上层必须是 `1`、`UiState::widget_occluded_hits()` 必须 `> 0`（否则 `[FAIL]`）。**这条断言
+  真的能抓 bug**：把 `Ui::hit_abs` 的控件级遮挡去掉，输出立刻变成 `below=1 above=1 -> [FAIL]`
+  ——正是"两个控件被一起触发"。
+  ⚠ 注入**必须每帧重注**（注入只对下一帧生效，真实鼠标一动就顶掉它），否则断言会随
+  真人手抖而随机失败。`RJ_OVERLAP_TRACE=1` 可打印两个探针逐帧的矩形 / 鼠标 / 命中 / 拦截数。
+- **"这一像素到底是谁的"**（重叠 / 相邻控件边界、跨窗口遮挡、滚动条条带）：
+
+  ```
+  cargo run -p eg260818UI -- --sim-click 500,216 --frames 50      # 背包第 1 列两格共享边
+  ```
+
+  `--sim-click X,Y` 在指定**屏幕物理点**按下 + 释放（第 20/21 帧，之后停在原地到第 40 帧），
+  并打印"这次点击切换了几个控件"（`背包已选中 N 个`）。配合 `RJ_HIT_TRACE=1`（引擎逐次
+  打印命中归属：`OK` / `BLOCKED-by-widget` / `--`）就能一眼看出谁赢：
+
+  ```
+  hit[frame 22] inv_panel/inv/slot_0 BLOCKED-by-widget rect=(450,177,96,39) mouse=(500,216)
+  hit[frame 22] inv_panel/inv/slot_3 OK                 rect=(450,216,96,39) mouse=(500,216)
+  sim-click: 背包已选中 1 个 / 控件遮挡拦截 1 / 窗口遮挡拦截 0 [OK] 一次点击最多切换一个控件
+  ```
+
+  同一命令在"控件级遮挡"关掉时输出 `背包已选中 2 个 … [FAIL]`——相邻格子的**共享边**
+  被两个格子同时命中（`hit_test` 含边界）正是"一次点击切换两个物品"的现场。
+  排查别的控件同理：换成它的中心 / 边缘坐标即可。
+- **加载外部文件**（看真实素材下的布局 / 图片铺排 / 字体）：`--image <路径>` 用你自己的
+  图片当 `ImageBg`（PNG / JPEG / BMP / GIF，四个窗口分别演示 Fill / Tile 等铺排），
+  `--font-file <路径>` 把 ttf / otf / ttc 加载进运行时文本子系统（随后在 `字体…` 弹窗里
+  输入该字体的**族名**即可全局换字）：
+
+  ```
+  cargo run -p eg260818UI -- --image .\shot.png --font-file C:\Windows\Fonts\consola.ttf
+  ```
 
 ---
 

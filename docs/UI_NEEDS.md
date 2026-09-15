@@ -31,7 +31,7 @@ UI模块的需求：
 Widget：
 * ✅ 设置可选的 min、max 大小，可以设置 DisableAutoExpansion, LimitedInParent, UnlimitedExpansion（`SizeConstraints{min_w,max_w,min_h,max_h}` 四字段全 `Option<f32>` + `Expansion` 三模式；`Ui::add` 统一 clamp/调整）
 * ✅ 可选的允许用户拖拽在可选的范围内缩放（`Ui::resize_handle` 通用原语 + `Resize` 枚举（`None`/`Horizontal`/`Both`，v0.3 起取代 `Widget::resizable()` 裸布尔）+ `UiState::sizes` 持久尺寸；`ui.window(id).width(w)` 宽度缩放、`resizable_text_input_at` / `resizable_text_area_at` 均基于它）
-* ✅ Widget 输入数据由父级换算、过滤（父级负责局部坐标换算 `abs_base`、窗口遮挡、`press_claimed` 拖拽占用；Clip 沙箱外命中失效并入 `hit_abs`）
+* ✅ Widget 输入数据由父级换算、过滤（父级负责局部坐标换算 `abs_base`、窗口遮挡、**控件级遮挡**（同窗口内重叠控件只让最上层响应，`hit_abs(绝对ID, rect)`）、`press_claimed` 拖拽占用；Clip 沙箱外命中失效并入 `hit_abs`）
 * ✅ 绘制方面提供服从内容裁剪的绘制方法和不服从裁剪的方法（`push_text_rect_noclip` 等：不附加软层、内容自洽；**仍服从 ScrollView 强制层**——父级强制裁切躲不掉，无 Scroll 的普通容器本无强制层）
 * ✅ min_width、max_width、min_height、max_height 皆是 `Option<f32>`（`SizeConstraints` 四字段）
 

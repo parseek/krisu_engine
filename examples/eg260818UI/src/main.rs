@@ -29,6 +29,8 @@
 //! - [`Inventory`]：可拖拽面板 + 3 列背包 grid；
 //! - [`Windows`]：可重叠 / 置顶 / 拖拽窗口 + 整窗 FX + 可调整大小文本输入框；
 //! - [`RightPanel`]：右侧窗口诊断 + 滚动列表 + flex 权重 + 底部说明。
+//! - [`overlap`]：两个**故意重叠**的控件探针 —— 演示 / 自证**控件级遮挡**
+//!   （重叠处只有画在上面的那个被触发；`--sim-overlap` 脚本化点击验证）。
 //!
 //! 运行时（`rjw_krusie::runtime`）接管驱动/生命周期：窗口、渲染上下文、世界层与 UI 层
 //! 渲染器、每帧 `Ui::begin` / 输入快照 / 主题 / DPI / `Ui::finish`。应用侧只剩
@@ -42,6 +44,10 @@ use std::time::Instant;
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
 use rjw_krusie::ui::{ColorPicker, CornerRadius, FontModal, IdAbsolute, Label, Palette, Position};
+
+/// 「重叠控件」演示模块（控件级遮挡：重叠处只有最上层被触发 + `--sim-overlap` 自证）。
+mod overlap;
+use overlap::OverlapDemo;
 
 /// 顶部状态栏模块：FPS / 点击次数标签 + 字体按钮（打开 Modal）+ 玩家名输入框 + 字体 Modal。
 struct TopBar {
@@ -494,10 +500,17 @@ impl RightPanel {
         Self { list_sel: None }
     }
 
-    /// 右侧区 UI。`prev_press` / `prev_blocked` 为上一帧窗口诊断数据（须在
-    /// **本帧 UI 录制之前**从 `ui.state()` 读取——值由上一帧 `Ui::finish` 写入，
-    /// 本帧 `finish` 才覆盖）。
-    fn ui(&mut self, ui: &mut Ui, clicks: &mut u32, prev_press: &str, prev_blocked: u32) {
+    /// 右侧区 UI。`prev_press` / `prev_blocked` / `prev_widget_blocked` 为上一帧诊断
+    /// 数据（须在**本帧 UI 录制之前**从 `ui.state()` 读取——值由上一帧 `Ui::finish`
+    /// 写入，本帧 `finish` 才覆盖）。
+    fn ui(
+        &mut self,
+        ui: &mut Ui,
+        clicks: &mut u32,
+        prev_press: &str,
+        prev_blocked: u32,
+        prev_widget_blocked: u32,
+    ) {
         // 窗口诊断面板：实时显示窗口叠放与点击解析。
         let order: String = ui
             .window_order()
@@ -512,11 +525,12 @@ impl RightPanel {
         ui.label_at(
             Vec2::new(880.0, 12.0),
             &format!(
-                "窗口 z 序: {}\n鼠标下最上层: {}\n上次按下接收: {}（上帧）\n被遮挡拦截: {}（上帧）",
+                "窗口 z 序: {}\n鼠标下最上层: {}\n上次按下接收: {}（上帧）\n窗口遮挡拦截: {}（上帧）\n控件遮挡拦截: {}（上帧）",
                 if order.is_empty() { "无" } else { &order },
                 under,
                 prev_press,
                 prev_blocked,
+                prev_widget_blocked,
             ),
         );
         // 滚动容器演示：可滚动选择列表（list_at：滚轮 / 滚动条 + 选中态）。
@@ -774,6 +788,20 @@ struct UiApp {
     sim_drag: bool,
     /// --sim-picker：**脚本化鼠标**打开取色面板并在其中拖动（面板路径只有点击才录制）。
     sim_picker: bool,
+    /// --sim-overlap：**脚本化鼠标**点击两个重叠控件的交集——验证"只有上层被触发"。
+    sim_overlap: bool,
+    /// --sim-click X,Y：**脚本化鼠标**在指定屏幕物理点按下 + 释放（配合 `RJ_HIT_TRACE=1`
+    /// 排查"这一像素到底命中了谁"：重叠 / 相邻控件边界、跨窗口遮挡、滚动条条带）。
+    sim_click: Option<Vec2>,
+    /// 「重叠控件」演示（两个探针的点击计数）。
+    overlap: OverlapDemo,
+    /// --image <路径>：**加载用户图片文件**当背景图（`ImageBg`；PNG / JPEG / BMP / GIF），
+    /// 替代内建棋盘纹理——四个窗口仍分别演示四种铺排（`ImageFit`）。
+    image_file: Option<String>,
+    /// --font-file <路径>：**加载用户字体文件**（ttf / otf / ttc）到运行时文本子系统
+    /// （`Ctx::text_mut().load_font_data`）——之后 `字体…` 弹窗里输入该字体的**族名**
+    /// 即可全局换字（下一帧按族名重建主题）。
+    font_file: Option<String>,
     /// 帧统计聚合（每 `PERF_PRINT_EVERY` 帧打印一次）。
     perf: PerfAgg,
     // 各 UI 模块
@@ -797,6 +825,11 @@ impl UiApp {
             ui_dump: false,
             sim_drag: false,
             sim_picker: false,
+            sim_overlap: false,
+            sim_click: None,
+            overlap: OverlapDemo::default(),
+            image_file: None,
+            font_file: None,
             perf: PerfAgg::new(),
             top: TopBar::new(),
             menu: Menu::new(),
@@ -967,9 +1000,27 @@ impl App for UiApp {
                 px[i..i + 4].copy_from_slice(&c);
             }
         }
-        let tex = gfx.texture("eg260818UI.pattern", Rgba8::new(&px, (TEX, TEX)));
-        self.windows.bg_image =
-            Some(ImageBg::new(tex.uid, Vec2::new(TEX as f32, TEX as f32)));
+        let mut tex = gfx.texture("eg260818UI.pattern", Rgba8::new(&px, (TEX, TEX)));
+        let mut size = Vec2::new(TEX as f32, TEX as f32);
+        // ── `--image <路径>`：用**用户自己的图片文件**替换棋盘纹理 ────────
+        // 解码由 `image` crate 完成（应用侧依赖，引擎不背），产出 RGBA8 →
+        // `Gfx::texture` → 同一套 `ImageBg` 通路（Fill / Tile / 九宫…全靠它）。
+        // 失败**不致命**（退回棋盘）并打印原因：示例要能离线裸跑。
+        if let Some(path) = &self.image_file {
+            match image::open(path) {
+                Ok(img) => {
+                    let img = img.to_rgba8();
+                    let (w, h) = img.dimensions();
+                    tex = gfx.texture("eg260818UI.user_image", Rgba8::new(img.as_raw(), (w, h)));
+                    size = Vec2::new(w as f32, h as f32);
+                    eprintln!("--image: 已加载 {w}×{h} 图片 ← {path}");
+                }
+                Err(e) => {
+                    eprintln!("--image: 加载失败（退回内建棋盘纹理）{path}: {e}");
+                }
+            }
+        }
+        self.windows.bg_image = Some(ImageBg::new(tex.uid, size));
         Ok(())
     }
 
@@ -987,6 +1038,21 @@ impl App for UiApp {
         // `--sim-picker` 需要 DPI（`Theme` 在 `Ui` 内才被 `scaled`——主题 builder 返回的是
         // 未缩放值），而 `f` 借走 `ctx` 后不能再读，故先取。
         let scale = ctx.scale();
+        // ── `--font-file <路径>`：**加载用户字体文件**（只需第一帧）──────────
+        // 必须加载进**运行时**的文本子系统（UI 排版/图集都用它，`Ctx::text_mut`），
+        // 而不是应用自建的 `Gfx::text()`（那是另一套图集，UI 不会用）。
+        // 加载成功后，在 `字体…`（FontModal）里输入该字体的**族名**即可全局换字。
+        if let Some(path) = self.font_file.take() {
+            match (std::fs::read(&path), ctx.text_mut()) {
+                (Ok(data), Some(text)) => {
+                    let n = data.len();
+                    text.load_font_data(data);
+                    eprintln!("--font-file: 已加载 {n} 字节 ← {path}（在「字体…」里输入其族名生效）");
+                }
+                (Ok(_), None) => eprintln!("--font-file: 文本子系统不可用（feature = text？）"),
+                (Err(e), _) => eprintln!("--font-file: 读取失败 {path}: {e}"),
+            }
+        }
         let Some(mut f) = ctx.frame() else {
             return;
         };
@@ -1086,6 +1152,34 @@ impl App for UiApp {
             }
         }
 
+        // ── 调试：脚本化鼠标（`--sim-overlap`）────────────────────
+        // 点在两个**故意重叠**控件的**交集中心**：期望只有画在上面的那个被触发
+        // （修复前两者一起触发 —— "重叠控件被一起触发"）。坐标由 `overlap` 模块解算，
+        // 与绘制同源（不写死像素）。
+        if self.sim_overlap {
+            let p = OverlapDemo::overlap_point();
+            // **每帧重注入**（注入只对"下一帧"生效；真实鼠标一动就会把它顶掉 ——
+            // 只注一次会让断言随真人手抖而随机失败，`--sim-drag` 同理每帧注入）。
+            match f.frames() {
+                20..=21 => f.debug_inject_mouse(p, true), // 按下并按住
+                22..=58 => f.debug_inject_mouse(p, false), // 释放后仍停在重叠区（到断言帧）
+                _ => {}
+            }
+        }
+
+        // ── 调试：脚本化鼠标（`--sim-click X,Y`）──────────────────
+        // 在**指定屏幕物理点**按下 + 释放（第 20/21 帧，之后停在原地到第 40 帧）——
+        // 配合 `RJ_HIT_TRACE=1`（引擎打印每次命中归属）就能回答"这一像素到底是谁的"：
+        // 重叠 / 相邻控件的边界、跨窗口遮挡、滚动条条带都能一眼定位。
+        // 第 22 帧起鼠标一直停在原地 ⇒ 断言不受后续真实鼠标移动影响。
+        if let Some(p) = self.sim_click {
+            match f.frames() {
+                20..=21 => f.debug_inject_mouse(p, true),
+                22..=40 => f.debug_inject_mouse(p, false),
+                _ => {}
+            }
+        }
+
         // ── 世界层：几个背景方块（在 UI 之下）─────────────────
         // 阶段计时（沿用旧 `[perf]` 的细分口径，因新驱动不再暴露 Frame 取用/pass 边界，
         // 以可达的边界重新划分）：`begin` = 世界层录制，`encode` = UI 帧
@@ -1119,6 +1213,12 @@ impl App for UiApp {
         let sim_bad_text_frames = 66..=72;
         let sim_frame = f.frames();
         let sim_picker = self.sim_picker;
+        let sim_overlap = self.sim_overlap;
+        let sim_click = self.sim_click;
+        // `--sim-overlap`：本帧被**控件级遮挡**拦下的命中次数（重叠区里下层探针的那次）。
+        let mut widget_blocked = 0u32;
+        // 本帧被**窗口遮挡**拦下的命中次数（`--sim-click` 诊断用）。
+        let mut window_blocked = 0u32;
 
         // ── UI 层：录制 + 提交由运行时接管（`Ui::begin` / 输入快照 / 主题 / DPI /
         //    `Ui::finish(&region, r2d_ui)`）；UI 渲染器排序已关闭。 ────────────
@@ -1169,6 +1269,7 @@ impl App for UiApp {
                 .map(|(id, z)| format!("{id} (z{z})"))
                 .unwrap_or_else(|| "无".to_owned());
             let prev_blocked = ui.state().occluded_hits();
+            let prev_widget_blocked = ui.state().widget_occluded_hits();
 
             // ── 位置责任链演示（--script-pos）：脚本让窗口 A 沿正弦摆动 ──
             // 处理器优先级 -10（< 0）：**用户拖拽优先**——拖住 A 时脚本让位、窗口跟手，
@@ -1192,12 +1293,22 @@ impl App for UiApp {
             self.menu.ui(ui, &mut clicks);
             self.inventory.ui(ui);
             self.windows.ui(ui, &mut clicks);
-            self.right.ui(ui, &mut clicks, &prev_press, prev_blocked);
+            // 重叠控件探针（顶层 win=0；位置在全屏所有窗口下方 ⇒ 不会被窗口遮挡）。
+            self.overlap.ui(ui);
+            self.right
+                .ui(ui, &mut clicks, &prev_press, prev_blocked, prev_widget_blocked);
             self.theme_tuner.ui(ui);
 
             // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
             // 不被本帧后录的窗口盖住——见 modal_at 文档）。
             self.top.show_font_modal(ui);
+
+            // `--sim-overlap` / `--sim-click`：读**本帧**两类遮挡拦截计数——必须在
+            // 全部模块录制之后（早读只会看到前半帧）。
+            if (sim_overlap || sim_click.is_some()) && sim_frame >= 26 {
+                widget_blocked = ui.state().widget_occluded_hits();
+                window_blocked = ui.state().occluded_hits();
+            }
 
             // 性能统计（**闭包末尾、本帧 `Ui::finish` 之前**读到的正是上一帧 finish 写入
             // 的 UI 各阶段耗时——与旧版「`ui.finish()` 之后读 `ui_state.stats`」等价：
@@ -1225,6 +1336,35 @@ impl App for UiApp {
         // 只有点击命中色块 → 面板打开 → SV 平面/色相条/滑块被拖到，颜色才会变）。
         if self.sim_picker && f.frames() == 90 {
             eprintln!("sim-picker: demo_color = {:?}", self.top.demo_color);
+        }
+        // --sim-click：打印"这一像素的归属"证据（点中了几个控件 + 谁被遮挡拦下）。
+        // 背包格子（`inventory`）相邻格的**共享边**是最典型的用例：修复前点在边上会
+        // **两个格子一起切换**，修复后只有画在后面的那个生效。
+        if sim_click.is_some() && f.frames() == 45 {
+            let owned = self.inventory.inventory.iter().filter(|x| **x).count();
+            eprintln!(
+                "sim-click: 背包已选中 {owned} 个 / 控件遮挡拦截 {widget_blocked} / \
+                 窗口遮挡拦截 {window_blocked} {}",
+                if owned <= 1 {
+                    "[OK] 一次点击最多切换一个控件"
+                } else {
+                    "[FAIL] 一次点击切换了多个控件（重叠处被一起触发）"
+                }
+            );
+        }
+        // --sim-overlap：重叠处点击的**判定**（自证控件级遮挡生效）。
+        // 期望：下层 = 0（灰：不会被触发）、上层 = 1（蓝：会被触发）、拦截计数 > 0。
+        if self.sim_overlap && f.frames() == 58 {
+            let (b, a) = (self.overlap.below_clicks, self.overlap.above_clicks);
+            let ok = b == 0 && a == 1 && widget_blocked > 0;
+            eprintln!(
+                "sim-overlap: below={b} above={a} widget_occluded_hits={widget_blocked} -> {}",
+                if ok {
+                    "[OK] 重叠处只有最上层控件被触发"
+                } else {
+                    "[FAIL] 重叠处触发了多个控件 / 遮挡未生效"
+                }
+            );
         }
 
         // ── 提交：世界层与 UI 层进同一个 pass（清色 + 一次 present）──────
@@ -1274,6 +1414,15 @@ fn parse_pos_arg(args: &[String], key: &str, default: Vec2) -> Vec2 {
     out
 }
 
+/// 解析 `--key 值` 形式的**字符串**参数（缺值 = `None`；`--image` / `--font-file` 用）。
+fn parse_str_arg(args: &[String], key: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+}
+
 fn main() -> Result<(), RunError> {
     let args: Vec<String> = std::env::args().collect();
     let mut app = UiApp::new();
@@ -1284,6 +1433,13 @@ fn main() -> Result<(), RunError> {
     app.ui_dump = args.iter().any(|a| a == "--ui-dump");
     app.sim_drag = args.iter().any(|a| a == "--sim-drag");
     app.sim_picker = args.iter().any(|a| a == "--sim-picker");
+    app.sim_overlap = args.iter().any(|a| a == "--sim-overlap");
+    app.sim_click = args
+        .iter()
+        .any(|a| a == "--sim-click")
+        .then(|| parse_pos_arg(&args, "--sim-click", Vec2::ZERO));
+    app.image_file = parse_str_arg(&args, "--image");
+    app.font_file = parse_str_arg(&args, "--font-file");
     run(app)
 }
 

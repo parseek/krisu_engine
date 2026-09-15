@@ -72,11 +72,14 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 
 ### 4. 命中与交互状态机（`hit.rs` + `WidgetState`）
 
-控件交互三件套：`hit_abs(&rect)`（矩形命中 + 窗口遮挡 + **强制层命中过滤**）、
-`mouse_left()`（左键含边沿）、`hit::update_interact` / `update_drag`（跨帧状态机）。
+控件交互三件套：`hit_abs(&id, &rect)`（矩形命中 + 窗口遮挡 + **控件级遮挡** + **强制层
+命中过滤**）、`mouse_left()`（左键含边沿）、`hit::update_interact` / `update_drag`（跨帧状态机）。
+窗口 / 面板 / 浮层的**整块本体**用 `hit_body_abs(&rect)`（同样的过滤，但不参与控件级遮挡）。
 
 关键约定：
 - **窗口遮挡**：重叠区域只让鼠标下最上层窗口响应（点击穿透修复）；
+- **控件级遮挡**：同一窗口 / 面板内的重叠控件，只有**后录制（画在上面）**的那个响应
+  （`hit_abs` 的第一个参数就是控件身份；诊断 `UiState::widget_occluded_hits`）；
 - **press_claimed**：自身有拖拽语义的控件（滑块 / 滚动条 / 文本框 / 缩放柄）按下时置位，
   阻止外层窗口/面板把本次按下当拖拽基准（窗口内拖滑块不连窗口动）；
 - **拖动需位移** ≥ 3 物理像素才激活（纯点击不拖拽 → 子控件正常响应）。
@@ -253,22 +256,24 @@ impl Widget for MyButton<'_> {
         Vec2::new(t.x + style.padding.x * 2.0, t.y + style.padding.y * 2.0)
     }
     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-        // 复用现有控件 / 原语；交互用 ui.hit_abs / ui.mouse_left / ui.state_mut().widget(&id_for)
-        // （状态键 / 焦点用**绝对 ID**：let id_for = ui.id_for(self.id);）
+        // 复用现有控件 / 原语；交互用 ui.hit_abs(&abs, &rect) / ui.mouse_left() /
+        // ui.state_mut().widget(&id_for)
+        // （状态键 / 焦点 / **控件级遮挡身份**都用**绝对 ID**：let abs = ui.id_for(self.id);）
         let st = ui.button_at(self.id, rect, self.label);
         st.into()   // ButtonState → Response
     }
 }
 ```
 
-公开原语：`text_size(_wrap)`（测量）、`hit_abs` / `mouse_left` / `mouse_logical`（命中）、
+公开原语：`text_size(_wrap)`（测量）、`hit_abs(&绝对ID, &rect)`（命中）/ `hit_body_abs(&rect)`
+（窗口 / 面板本体）/ `mouse_left` / `mouse_logical`、
 `claim_press` / `register_focus` / `key_click`（焦点；**收绝对 ID** `&ui.id_for(id_relative)`）、
 `state_mut().widget(&id_for)`（持久状态 +
 `hit::update_drag/update_interact`）、`push_solid_rect` / `push_border_rect` /
 `push_text_rect(_noclip)` / `push_panel_like` / `resize_handle`（绘制）。
 
-**注意**：`rect` 是相对当前容器 origin 的**局部坐标**；坐标换算、窗口遮挡、裁剪过滤都
-由父级（容器/沙箱）负责，控件只需"相对自己"绘制与命中。
+**注意**：`rect` 是相对当前容器 origin 的**局部坐标**；坐标换算、窗口遮挡、控件级遮挡、
+裁剪过滤都由父级（容器/沙箱）负责，控件只需"相对自己"绘制与命中。
 
 ---
 

@@ -958,3 +958,80 @@ fn geometry_cache_signature_tracks_atlas_revision() {
         (0..64).map(|r| geom_cache_sig(cmds, r)).collect();
     assert_eq!(revs.len(), 64, "64 个连续世代应给出 64 个不同签名");
 }
+
+// ─── 滚动条几何（`scroll_thumb` / `scroll_offset_for_thumb`） ─────
+
+#[test]
+fn scrollbar_is_centred_capsule_with_side_air() {
+    let view = Rect::new(100.0, 50.0, 200.0, 300.0);
+    let (strip, track) = scrollbar_rects(&view, 300.0);
+    // 条带 = 右缘全高（占位 / 命中 / 翻页热区）。
+    assert_eq!(
+        strip,
+        Rect::new(100.0 + 200.0 - SCROLLBAR_W, 50.0, SCROLLBAR_W, 300.0)
+    );
+    // 可见滑块**居中**于条带 ⇒ 两侧各留白（用户："两侧留白"）——不得贴边。
+    assert_eq!(track.w, SCROLLBAR_BAR_W);
+    assert_eq!(track.x, strip.x + (SCROLLBAR_W - SCROLLBAR_BAR_W) * 0.5);
+    assert!(track.x > strip.x && track.x + track.w < strip.x + strip.w);
+    assert_eq!(track.x - strip.x, SCROLLBAR_W - (track.x + track.w - strip.x));
+    // 上下留白（胶囊两端不贴可视区边缘）。
+    assert_eq!(track.y, strip.y + SCROLLBAR_MARGIN);
+    assert_eq!(track.y + track.h, strip.y + strip.h - SCROLLBAR_MARGIN);
+    // 比旧版（8）**更粗**。
+    assert!(track.w > 8.0);
+    // 极矮可视区不 panic、不溢出（轨道高至少 1px）。
+    let (_, tiny) = scrollbar_rects(&Rect::new(0.0, 0.0, 10.0, 4.0), 4.0);
+    assert_eq!(tiny.h, 1.0);
+}
+
+#[test]
+fn scroll_thumb_fills_track_when_content_fits() {
+    let (thumb_h, travel, y) = scroll_thumb(200.0, 200.0, 200.0, 0.0, 0.0);
+    assert_eq!((thumb_h, travel, y), (200.0, 0.0, 0.0), "正好装下 → 满轨");
+    // 内容比可视区矮（ratio clamp 到 1）⇒ 仍满轨、无行程。
+    let (thumb_h, travel, y) = scroll_thumb(200.0, 200.0, 40.0, 0.0, 0.0);
+    assert_eq!((thumb_h, travel, y), (200.0, 0.0, 0.0));
+    // 空内容（content_h = 0）不得除零、不得出现 NaN。
+    let (thumb_h, travel, y) = scroll_thumb(120.0, 100.0, 0.0, 0.0, 0.0);
+    assert_eq!((thumb_h, travel, y), (120.0, 0.0, 0.0));
+}
+
+#[test]
+fn scroll_thumb_is_proportional_and_bottom_aligned() {
+    // 可视 100 / 内容 400 ⇒ 滑块 = 轨道 1/4。
+    let (thumb_h, travel, top) = scroll_thumb(400.0, 100.0, 400.0, 0.0, 300.0);
+    assert_eq!((thumb_h, travel, top), (100.0, 300.0, 0.0));
+    // 中途：正比。
+    let (_, travel, top) = scroll_thumb(400.0, 100.0, 400.0, 150.0, 300.0);
+    assert_eq!((travel, top), (300.0, 150.0));
+    // **不变量**：滚到底 ⇒ 滑块底端与轨道底端对齐（视觉上真的贴底）。
+    let (thumb_h, travel, top) = scroll_thumb(400.0, 100.0, 400.0, 300.0, 300.0);
+    assert_eq!(top, travel);
+    assert_eq!(top + thumb_h, 400.0);
+    // 越界偏移被夹住（不得把滑块推出轨道）。
+    let (_, travel, top) = scroll_thumb(400.0, 100.0, 400.0, 9999.0, 300.0);
+    assert_eq!(top, travel);
+}
+
+#[test]
+fn scroll_thumb_respects_minimum_and_roundtrips() {
+    // 内容极高 ⇒ 滑块被最小值兜住（不会细成一条线）。
+    let (thumb_h, travel, _) = scroll_thumb(300.0, 100.0, 100_000.0, 0.0, 99_900.0);
+    assert_eq!(thumb_h, SCROLLBAR_MIN_THUMB);
+    assert_eq!(travel, 300.0 - SCROLLBAR_MIN_THUMB);
+    // 轨道比最小值还矮 ⇒ 滑块 = 轨道，不溢出。
+    let (thumb_h, travel, _) = scroll_thumb(10.0, 100.0, 100_000.0, 0.0, 1.0);
+    assert_eq!((thumb_h, travel), (10.0, 0.0));
+    // 拖拽逆映射与正映射互逆（整像素取整 ⇒ 往返误差 ≤ 1px）。
+    for off in [0.0, 1.0, 123.0, 499.0, 899.0, 900.0] {
+        let (_, travel, top) = scroll_thumb(400.0, 100.0, 400.0, off, 900.0);
+        let back = scroll_offset_for_thumb(top, travel, 900.0);
+        assert!(
+            (back - off).abs() <= 1.0,
+            "off={off} → top={top} → back={back}"
+        );
+    }
+    // 无行程（内容装得下）时拖拽不产生偏移。
+    assert_eq!(scroll_offset_for_thumb(50.0, 0.0, 900.0), 0.0);
+}

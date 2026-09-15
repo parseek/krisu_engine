@@ -176,7 +176,7 @@ L2 的构造器只收 `&Gpu`，不收 `device/queue/layout` 三件套。
 | 自定义绘制注入 | `Render2D::custom(impl CustomDraw)` |
 | 自定义排序 | `Render2D::sort_custom(Box<dyn SortPolicy>)` + `SortKey` |
 | 离屏 / 外部目标 | `RenderFrame::pass_to(RenderTarget, Clear)` |
-| 自定义控件 | `Ui::{child_rect, push_*, hit_abs, register_focus, key_click, claim_press, set_cursor, id_for}` |
+| 自定义控件 | `Ui::{child_rect, push_*, hit_abs(绝对ID, rect), hit_body_abs, register_focus, key_click, claim_press, set_cursor, id_for}` |
 | 调试图元 | `Render2D::debug(DebugStyle)` → `DebugPainter` |
 | 注册表 | `Gfx::{textures, meshes}`（`&TextureRegistry` / `&MeshRegistry`）与 `Gfx::{texture_registry, mesh_registry}`（`&Arc<..>`，供长生命周期持有者）；绘制期 `Render2D::{textures, meshes, gpu}` |
 | 资源 / 低级句柄 | `Render2D::{device, queue, texture_layout, white_texture}`（自建缓冲 / bind group）；`Gpu::{device, queue, texture_layout}` |

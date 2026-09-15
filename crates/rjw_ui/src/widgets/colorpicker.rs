@@ -163,7 +163,7 @@ impl Widget for ColorPicker<'_> {
         let id_for = ui.id_for(id);
         let abs = id_for.to_static();
         let btn = ui.mouse_left();
-        let hit = ui.hit_abs(&rect);
+        let hit = ui.hit_abs(&abs, &rect);
 
         // ── 内联色块（整行）：当前色 + 十六进制 + 右侧 ⌄ 提示 ──
         let label_fs = ui.theme.label.font_size;

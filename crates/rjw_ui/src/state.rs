@@ -183,6 +183,16 @@ pub struct UiState {
     /// **诊断**：本帧**命中但被更高窗口遮挡而未响应**的控件次数
     /// （点击穿透拦截计数；`Ui::hit_abs` 累加，`begin_frame` 清零）。
     pub(crate) occluded_hits: u32,
+    /// **诊断**：本帧**命中但被同窗口内更上层的控件遮挡而未响应**的次数
+    /// （控件级遮挡拦截计数；`Ui::hit_abs` 累加，`begin_frame` 清零）——
+    /// 与 [`Self::occluded_hits`]（窗口级）分开，便于区分"被窗口挡"与"被控件挡"。
+    pub(crate) widget_occluded_hits: u32,
+    /// **控件级遮挡登记**：本帧录制期写入的可交互控件命中区域（[`crate::hit::HitRegion`]）。
+    ///
+    /// 每帧重建；`begin_frame` 把**上一帧**整表翻页进 [`Self::prev_hit_regions`]。
+    pub(crate) hit_regions: Vec<crate::hit::HitRegion>,
+    /// **上一帧**的可交互控件命中区域（只读判定输入，见 [`crate::hit::widget_occluded`]）。
+    pub(crate) prev_hit_regions: Vec<crate::hit::HitRegion>,
     /// **诊断**：最近一次按下由哪个窗口接收（`finish::resolve_win_press` 写入；
     /// 即重叠点击时被置顶/可拖拽的**最上层**窗口）。跨帧保留直至下一次按下。
     pub(crate) last_press_window: Option<(IdAbsolute<'static>, u32)>,
@@ -242,6 +252,12 @@ impl UiState {
         self.frame = self.frame.wrapping_add(1);
         // 遮挡拦截计数按帧清零（诊断机制：读的是"上一帧"的累计值）。
         self.occluded_hits = 0;
+        self.widget_occluded_hits = 0;
+        // 控件级遮挡登记**整表翻页**：同窗口内"后录制的控件画在上面"，而本帧录制到
+        // 某控件时**后面的控件还没录制** → 只能用**上一帧**的区域判定谁盖住谁
+        // （与窗口级 `window_rects` 同一思路）。swap 复用两块缓冲，无每帧分配。
+        std::mem::swap(&mut self.hit_regions, &mut self.prev_hit_regions);
+        self.hit_regions.clear();
     }
 
     /// 取（或创建）某控件的持久状态。`id` 为**绝对 ID**（控件内 `ui.id_for(..)` 所得）。
@@ -279,6 +295,9 @@ impl UiState {
         self.ime_composing = false;
         self.window_quads.clear();
         self.occluded_hits = 0;
+        self.widget_occluded_hits = 0;
+        self.hit_regions.clear();
+        self.prev_hit_regions.clear();
         self.last_press_window = None;
         self.scrolls.clear();
         self.combo_open = None;
@@ -320,6 +339,14 @@ impl UiState {
     #[inline]
     pub fn occluded_hits(&self) -> u32 {
         self.occluded_hits
+    }
+
+    /// **诊断**：上一帧**命中但被同窗口内更上层控件遮挡而未响应**的次数
+    /// （控件级遮挡拦截计数——大于 0 说明鼠标下有**控件重叠**，下层控件被正确抑制：
+    /// "两个控件被一起触发"已修复）。与 [`Self::occluded_hits`]（窗口级）分开计数。
+    #[inline]
+    pub fn widget_occluded_hits(&self) -> u32 {
+        self.widget_occluded_hits
     }
 
     /// **诊断**：最近一次按下由哪个窗口接收（`(id, z)`；重叠点击时置顶/可拖拽的

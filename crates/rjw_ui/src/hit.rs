@@ -35,6 +35,63 @@ pub fn window_occluded(
     windows.any(|(wz, r)| wz > z && r.contains_point(mouse))
 }
 
+/// 一处**可交互控件的命中区域**（控件级遮挡的登记项；逻辑像素、已含容器平移）。
+///
+/// 每帧由 [`crate::Ui::hit_abs`] 在**控件自身矩形命中鼠标时**登记，下一帧成为
+/// [`widget_occluded`] 的判定输入——与窗口级遮挡（`UiState::window_rects`）同构：
+/// **用已完成的一帧判定本帧**，才能在"后录制的控件画在上面"这个前提成立时
+/// 一眼看出谁盖住谁（同一帧里后录制的控件还没录制，无法参与判定）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HitRegion {
+    /// **所属控件**（`IdAbsolute` 的 64 位哈希）：同一控件的多个区域（轨道 + 手柄、
+    /// 输入框 + 手柄…）**互不遮挡**——否则滑块轨道会被自己的手柄挡掉。
+    pub owner: u64,
+    /// **绘制层级键**：同帧内单调递增 = 录制顺序 = 绘制先后（越大越在上）。
+    pub key: u32,
+    /// 命中矩形（逻辑像素，屏幕空间）。
+    pub rect: Rect,
+    /// 该区域的裁剪层（ScrollView 可视区 / Clip 沙箱）；鼠标在其外时**不算覆盖**
+    /// （滚出可视区的控件不得挡住别人）。
+    pub clip: Option<Rect>,
+}
+
+/// **控件级遮挡判定**（"重叠控件被一起触发"修复）：鼠标下是否存在**别的控件**、
+/// **绘制层级更高**（`key` 更大 = 后录制 = 画在上面）且覆盖鼠标的命中区域。
+///
+/// `owner` / `key` 为被判定控件自身的身份与层级键；`regions` 是**上一帧**登记的全部
+/// 可交互控件区域。被遮挡 ⇒ 该控件不得响应点击 / 悬停 / 拖拽。
+///
+/// 与 [`window_occluded`] 的分工：窗口级管**跨窗口**（更高 z 的窗口挡住背后窗口的
+/// 控件），控件级管**同一窗口 / 面板内**（后录制的控件挡住先录制的）——两者都要过，
+/// 重叠区域才只有**最上层那一个**控件响应。
+#[inline]
+pub fn widget_occluded(
+    owner: u64,
+    key: u32,
+    mouse: Vec2,
+    regions: impl Iterator<Item = HitRegion>,
+) -> bool {
+    let mut regions = regions;
+    regions.any(|r| {
+        r.owner != owner
+            && r.key > key
+            && r.rect.contains_point(mouse)
+            && r.clip.is_none_or(|c| c.contains_point(mouse))
+    })
+}
+
+/// **绝对 ID → 控件级遮挡用的身份哈希**（`IdAbsolute` 的 `Hash`）。
+///
+/// 只需"同 id 相等、不同 id 大概率不等"，64 位足够（撞了也只是两个控件互不遮挡，
+/// 不会误判成遮挡——`!=` 分支才产生遮挡）。
+#[inline]
+pub fn id_hash(id: &crate::id::IdAbsolute<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.as_str().hash(&mut h);
+    h.finish()
+}
+
 /// 一次交互帧产生的事件（返回给控件，再映射为用户可见状态）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InteractEvents {
@@ -161,6 +218,63 @@ mod tests {
         // 单窗口：自身不遮挡，但遮挡 z=0 内容
         assert!(!window_occluded(5, Vec2::new(50.0, 40.0), [(5u32, RECT)].into_iter()));
         assert!(window_occluded(0, Vec2::new(50.0, 40.0), [(5u32, RECT)].into_iter()));
+    }
+
+    #[test]
+    fn widget_occluded_blocks_lower_widgets_only() {
+        // 两个重叠控件：下层（key = 10）与上层（key = 20），重叠区 x ∈ [50,100]。
+        let lower = HitRegion {
+            owner: 1,
+            key: 10,
+            rect: Rect::new(0.0, 0.0, 100.0, 100.0),
+            clip: None,
+        };
+        let upper = HitRegion {
+            owner: 2,
+            key: 20,
+            rect: Rect::new(50.0, 50.0, 100.0, 100.0),
+            clip: None,
+        };
+        let inside = Vec2::new(60.0, 60.0);
+        let outside = Vec2::new(10.0, 10.0);
+        let regions = [upper];
+        // 下层控件在重叠区：被上层遮挡 → 不响应
+        assert!(widget_occluded(1, 10, inside, regions.iter().copied()));
+        // 下层控件在非重叠区：可见可交互
+        assert!(!widget_occluded(1, 10, outside, regions.iter().copied()));
+        // 上层控件：不被任何更高层遮挡
+        assert!(!widget_occluded(2, 20, inside, [lower].into_iter()));
+        // **同一控件的多个区域互不遮挡**（否则滑块轨道被自己的手柄挡掉）
+        assert!(!widget_occluded(1, 5, inside, [lower].into_iter()));
+        // 无登记区域：恒不遮挡
+        assert!(!widget_occluded(1, 10, inside, std::iter::empty()));
+    }
+
+    #[test]
+    fn widget_occluded_respects_clip_and_equal_key() {
+        let clipped = HitRegion {
+            owner: 2,
+            key: 20,
+            rect: Rect::new(0.0, 0.0, 200.0, 200.0),
+            clip: Some(Rect::new(0.0, 0.0, 100.0, 100.0)),
+        };
+        // 区域命中但在**裁剪层外**（滚出可视区）→ 不算覆盖
+        assert!(!widget_occluded(1, 10, Vec2::new(150.0, 150.0), [clipped].into_iter()));
+        assert!(widget_occluded(1, 10, Vec2::new(50.0, 50.0), [clipped].into_iter()));
+        // 同 key（同层）：不算"更高"——不遮挡（只有严格更高才拦）
+        assert!(!widget_occluded(1, 20, Vec2::new(50.0, 50.0), [clipped].into_iter()));
+    }
+
+    #[test]
+    fn id_hash_is_stable_and_distinguishes() {
+        use crate::id::IdAbsolute;
+        let a = IdAbsolute::from("win/btn");
+        let b = IdAbsolute::from("win/btn");
+        let c = IdAbsolute::from("win/btn2");
+        assert_eq!(id_hash(&a), id_hash(&b), "同一 id 必须同哈希（判定才稳定）");
+        assert_ne!(id_hash(&a), id_hash(&c));
+        // borrowed / owned 两种构造同值即同哈希（`--` 拼接路径 vs 字面量）
+        assert_eq!(id_hash(&a), id_hash(&IdAbsolute::owned("win/btn".to_owned())));
     }
 
     #[test]
