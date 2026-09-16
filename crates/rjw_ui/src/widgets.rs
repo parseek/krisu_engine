@@ -319,7 +319,7 @@ pub use colorpicker::{
 pub use divider::Divider;
 pub use fontmodal::{FONT_WEIGHT_CHOICES, FontModal, weight_label};
 pub use label::Label;
-pub use numberinput::NumberInput;
+pub use numberinput::{GRIP_W, NumberInput};
 pub use slider::{Slider, SliderValue};
 
 // ─── 统一响应 ───────────────────────────────────────────────────

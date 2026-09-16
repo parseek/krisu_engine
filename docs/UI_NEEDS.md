@@ -73,5 +73,6 @@ ISSUE:
 * ✅ 字重选项（`Theme::font_weight` 全局令牌 + `FontModal` 字重下拉七档 300…900；字重进排版缓冲缓存键 + 窗口几何签名前缀，`--sim-weight` 实测宽度 112→116）
 * 文件导入（系统文件选择器 `rfd`：图片 → 背景纹理，字体 → 运行时文本子系统）
 * ✅ 阴影颜色（主题调节窗口「投影」滑杆后跟 `ColorPicker`（可拖 alpha），`ShadowStyle { color, .. }`；顶点 RGB 原样带出，`--sim-shadow` 实测主题值 0,0,0/0.47 → 0.9,0.15,0.1/0.55）
-* 主题调节窗口：每根滑杆后跟 `NumberInput`（Slider 后 NumberInput）
+* ✅ 主题调节窗口：每根滑杆后跟 `NumberInput`（Slider 后 NumberInput；`--sim-tuner` 实测拖数字条手柄 radius 8→18、拖滑杆 →0，主题圆角同步）
+* ✅ 数字条手柄宽度公开为 `rjw_ui::GRIP_W`（脚本算坐标不再写死 20；`RJ_NUM_TRACE=1` 打印矩形切分 + 拖拽状态机）
 * 菜单栏（横向 + 闭包式下拉；左侧竖排主菜单保留）

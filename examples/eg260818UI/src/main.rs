@@ -44,8 +44,8 @@ use std::time::Instant;
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
 use rjw_krusie::ui::{
-    ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, FontModal, GripShape, GripStyle,
-    IdAbsolute, Label, Palette, Position, ShadowStyle, Weight, weight_label,
+    ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, FontModal, GRIP_W, GripShape,
+    GripStyle, IdAbsolute, Label, Palette, Position, ShadowStyle, Weight, weight_label,
 };
 
 /// 「重叠控件」演示模块（控件级遮挡：重叠处只有最上层被触发 + `--sim-overlap` 自证）。
@@ -866,14 +866,20 @@ impl ThemeTuner {
                 w.row(|w| {
                     w.label("圆角");
                     self.radius = w.slider("th_radius", 0.0..=24.0, self.radius);
+                    // **滑杆后跟数字条**（`NumberInput`）：同一根滑杆的"精确输入"入口——
+                    // 拖滑杆粗调、在数字条上拖动 / 点击输入精确值（两者绑的是**同一个
+                    // `&mut f32`** ⇒ 天然同步；`step` 同时决定拖动吸附台阶与显示小数位）。
+                    w.add(NumberInput::new("th_radius_n", &mut self.radius).range(0.0, 24.0).step(0.5));
                 });
                 w.row(|w| {
                     w.label("羽化");
                     self.feather = w.slider("th_feather", 0.0..=5.0, self.feather);
+                    w.add(NumberInput::new("th_feather_n", &mut self.feather).range(0.0, 5.0).step(0.1));
                 });
                 w.row(|w| {
                     w.label("微渐变");
                     self.bevel = w.slider("th_bevel", 0.0..=0.35, self.bevel);
+                    w.add(NumberInput::new("th_bevel_n", &mut self.bevel).range(0.0, 0.35).step(0.01));
                 });
                 // 三组颜色改用 [`ColorPicker`]：内联色块（内含 `#RRGGBB`）→ 点开取色面板
                 // （u8/HEX/F 呈现 + HSV 平面 + 通道行）。强调色额外开 Alpha 行
@@ -888,6 +894,7 @@ impl ThemeTuner {
                 w.row(|w| {
                     w.label("边框宽");
                     self.border_w = w.slider("th_bdw", 0.0..=5.0, self.border_w);
+                    w.add(NumberInput::new("th_bdw_n", &mut self.border_w).range(0.0, 5.0).step(0.5));
                 });
                 // 右下角**缩放柄**：形状三档 + 颜色。只对固定宽窗口生效（`win_a` / `img_box`）；
                 // "不画"只是没有图案，**拖动缩放照旧**（命中区单独存在，见 `GripStyle`）。
@@ -922,13 +929,16 @@ impl ThemeTuner {
                 w.row(|w| {
                     w.label("字号");
                     self.font_scale = w.slider("th_fsc", 0.70..=1.50, self.font_scale);
+                    w.add(NumberInput::new("th_fsc_n", &mut self.font_scale).range(0.70, 1.50).step(0.01));
                 });
                 // 间距与行距并排（省一行纵向空间；两者都是"排布疏密"、常一起调）。
                 w.row(|w| {
                     w.label("间距");
                     self.spacing_scale = w.slider("th_ssc", 0.70..=1.50, self.spacing_scale);
+                    w.add(NumberInput::new("th_ssc_n", &mut self.spacing_scale).range(0.70, 1.50).step(0.01));
                     w.label("行距");
                     self.line_spacing = w.slider("th_lsp", 0.80..=2.00, self.line_spacing);
+                    w.add(NumberInput::new("th_lsp_n", &mut self.line_spacing).range(0.80, 2.00).step(0.05));
                 });
                 // 投影模糊宽：0 = 不画（平面风格）；拖大 = 窗口"浮"得更高。
                 // 后面紧跟**投影颜色**（色令牌 `Palette::shadow`；alpha 也归它管 ⇒
@@ -936,6 +946,7 @@ impl ThemeTuner {
                 w.row(|w| {
                     w.label("投影");
                     self.shadow_blur = w.slider("th_shd", 0.0..=32.0, self.shadow_blur);
+                    w.add(NumberInput::new("th_shd_n", &mut self.shadow_blur).range(0.0, 32.0).step(1.0));
                     w.add(ColorPicker::new("th_shadow_color", &mut self.shadow_color).alpha(true));
                 });
                 w.label(&format!(
@@ -1030,6 +1041,14 @@ struct UiApp {
     sim_shadow: bool,
     /// --sim-shadow：第 20 帧的主题投影色（第 40 帧对比用）。
     shadow_probe: Option<Color>,
+    /// --sim-tuner：脚本化鼠标的两个目标点（**录制时运行时解算**）：
+    /// `(圆角数字条中心, 圆角滑杆中心)`。注入只能经 `Frame`（录制中 `f` 被借着）
+    /// ⇒ 段末（`ui.finish()` 之后）再按帧注入——注入本来就下一帧才生效。
+    sim_tuner_pts: Option<(Vec2, Vec2)>,
+    /// --sim-tuner：拖数字条后的圆角值（第二阶段判定"数字条真的改了值"）。
+    tuner_probe: Option<f32>,
+    /// --sim-tuner：**实操主题调节窗口里的"滑杆 + 数字条"**（坐标运行时解算，不写死像素）。
+    sim_tuner: bool,
     /// 「被遮挡控件仍被触发」复现器。
     cover: CoverDemo,
     /// `--sim-cover` 段 A 结束时的认领次数（段 B 不许再涨）。
@@ -1072,6 +1091,9 @@ impl UiApp {
             sim_weight: false,
             sim_shadow: false,
             shadow_probe: None,
+            sim_tuner_pts: None,
+            tuner_probe: None,
+            sim_tuner: false,
             weight_probe: None,
             cover: CoverDemo::default(),
             cover_starts_after_a: 0,
@@ -1503,6 +1525,30 @@ impl App for UiApp {
                 }
             }
         }
+        // ── 调试：脚本化鼠标（`--sim-tuner`）──────────────────────
+        // ⚠ **必须在这里注入**（各段 `f.ui(..)` 之前）：`MouseInput::end_frame` 每帧末
+        // 清掉边沿位（`off_edge`）⇒ 在段末注入的 `down_edge` 会被同一帧的收尾吃掉，
+        // 下一帧只剩 `pressed`（症状：命中正常、`update_drag` 却永远不开始拖）。
+        // 坐标由**上一帧录制时**解算（`sim_tuner_pts`，见段 2 里的 `--sim-tuner` 块）。
+        //
+        // 行程：10..11 移到数字条手柄上（悬停）→ 12..13 按下 → 14..17 按住右移 20px
+        // （数字条：每像素 = step × 灵敏度 ⇒ step 0.5 × 20px = +10）→ 18..19 抬起；
+        // 30..31 按下滑杆 → 32..35 拖到轨道最左（圆角归 0）→ 36..43 抬起。
+        if self.sim_tuner {
+            let (num_grip, slider_c) = self.sim_tuner_pts.unwrap_or((Vec2::ZERO, Vec2::ZERO));
+            let right = Vec2::new(num_grip.x + 20.0, num_grip.y);
+            let left = Vec2::new(slider_c.x - 200.0, slider_c.y);
+            match f.frames() {
+                10..=11 => f.debug_inject_mouse(num_grip, false),
+                12..=13 => f.debug_inject_mouse(num_grip, true),
+                14..=17 => f.debug_inject_mouse(right, true),
+                18..=19 => f.debug_inject_mouse(right, false),
+                30..=31 => f.debug_inject_mouse(slider_c, true),
+                32..=35 => f.debug_inject_mouse(left, true),
+                36..=43 => f.debug_inject_mouse(left, false),
+                _ => {}
+            }
+        }
         // ── 调试：脚本化鼠标（`--sim-click X,Y`）──────────────────
         // 在**指定屏幕物理点**按下 + 释放（第 20/21 帧，之后停在原地到第 40 帧）——
         // 配合 `RJ_HIT_TRACE=1`（引擎打印每次命中归属）就能回答"这一像素到底是谁的"：
@@ -1521,6 +1567,9 @@ impl App for UiApp {
         let theme = self
             .theme_tuner
             .theme(self.top.font_name(), self.top.font_weight());
+        // 段 2 会**吃掉** `theme`（`f.ui(theme)`）；本帧主题里的圆角先拷出来，
+        // 供 `--sim-tuner` 的段末判定读（`CornerRadius` 是 `Copy`）。
+        let panel_radius = theme.panel.radius;
 
         // 性能统计（UI 段 2 里读取"上一帧收尾"写入的值；延迟初始化避免多余默认值）。
         let ui_stats: UiStats;
@@ -1751,6 +1800,44 @@ impl App for UiApp {
                 window_blocked = ui.state().occluded_hits();
             }
 
+            // ── `--sim-tuner`：**主题调节窗口**里"滑杆 + 数字条"两件套的坐标解算 ──
+            // 全部**运行时**算（不写死像素）：窗口原点取自 `ui.debug_dump()`（引擎本帧
+            // 真正提交的原点，已含 Screen 限位），行内 x 由主题尺寸 + 实测标签宽推出
+            // （`pad / gap / row_h / slider.min_w / input.min_w / 字号`）⇒ 换 DPI、
+            // 换字体、换密度档都不会点空。
+            if self.sim_tuner {
+                let dump = ui.debug_dump();
+                if let Some(tw) = dump.windows.iter().find(|w| w.id == "theme_tuner") {
+                    let (pad, row, gap, font, slider_w, num_w) = {
+                        let t = ui.theme();
+                        (
+                            t.panel.padding + t.panel.border_w,
+                            t.row_h,
+                            t.gap,
+                            t.label.font_size,
+                            t.slider.min_w.max(40.0),
+                            t.input.min_w,
+                        )
+                    };
+                    // 内容行自上而下：① 标题 label ② 预设 row ③ 圆角 row（本脚本的目标）。
+                    // ⚠ 数字条的**可拖动区 = 最右 `GRIP_W` 宽那一条**（点在文本框上是
+                    //   进入编辑、不调值）⇒ 目标点取手柄中心，不是控件中心。
+                    let label_w = ui.text_size("圆角", font, None).x;
+                    let row_y = tw.origin.y + pad + font + gap + row + gap + row * 0.5;
+                    let slider_x = tw.origin.x + pad + label_w + gap;
+                    let slider_c = Vec2::new(slider_x + slider_w * 0.5, row_y);
+                    let num_x = slider_x + slider_w + gap;
+                    let num_grip = Vec2::new(num_x + num_w - GRIP_W * 0.5, row_y);
+                    self.sim_tuner_pts = Some((num_grip, slider_c));
+                    if sim_frame == 10 {
+                        eprintln!(
+                            "sim-tuner: tuner origin={:?} size={:?} num_grip={num_grip:?} slider_c={slider_c:?} input.min_w={num_w} slider.min_w={slider_w} label_w={label_w}",
+                            tw.origin, tw.size
+                        );
+                    }
+                }
+            }
+
             // 性能统计（读到的正是**上一帧**收尾写入的 UI 各阶段耗时）。
             ui_stats = ui.state().stats.clone();
 
@@ -1774,6 +1861,37 @@ impl App for UiApp {
         }
         let encode_us = ui_seg1_us + t_ui2.elapsed().as_secs_f64() * 1e6;
         self.clicks = clicks;
+        // --sim-tuner：两阶段判定（打印的是**主题里**的圆角 ⇒ 滑杆 / 数字条 → 主题
+        // 这条线才是最终目的）。
+        if self.sim_tuner && f.frames() == 24 {
+            let r = self.theme_tuner.radius;
+            self.tuner_probe = Some(r);
+            let ok = (r - 18.0).abs() <= 1.0 && (panel_radius.tl - r).abs() < 1.0;
+            eprintln!(
+                "sim-tuner: 拖数字条后 radius={r:.1}（期望 ~18 = 8 + 20px × step 0.5）· 主题圆角 tl={:.1} {}",
+                panel_radius.tl,
+                if ok {
+                    "[OK] 数字条能改值，且进了主题"
+                } else {
+                    "[FAIL] 数字条没改值（点空 / 手柄不响应）或没进主题"
+                }
+            );
+        }
+        if self.sim_tuner && f.frames() == 44 {
+            let r0 = self.tuner_probe.unwrap_or(-1.0);
+            let r1 = self.theme_tuner.radius;
+            // 滑杆拖到轨道最左 ⇒ 值到下限 0；同时要求第一阶段的数字条确实改过值。
+            let ok = r0 > 0.0 && r1 <= 0.5 && panel_radius.tl <= 0.5;
+            eprintln!(
+                "sim-tuner: 数字条 {r0:.1} → 拖滑杆到最左 {r1:.1} · 主题圆角 tl={:.1} {}",
+                panel_radius.tl,
+                if ok {
+                    "[OK] 滑杆与数字条绑同一个值"
+                } else {
+                    "[FAIL] 滑杆没改值 / 没进主题"
+                }
+            );
+        }
         // --sim-picker：打印脚本化拖动后演示取色器的颜色（守护"面板确实改了值"：
         // 只有点击命中色块 → 面板打开 → SV 平面/色相条/滑块被拖到，颜色才会变）。
         if self.sim_picker && f.frames() == 90 {
@@ -1939,6 +2057,7 @@ fn main() -> Result<(), RunError> {
     app.sim_chrome = args.iter().any(|a| a == "--sim-chrome");
     app.sim_weight = args.iter().any(|a| a == "--sim-weight");
     app.sim_shadow = args.iter().any(|a| a == "--sim-shadow");
+    app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
         .iter()

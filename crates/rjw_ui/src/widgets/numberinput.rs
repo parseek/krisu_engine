@@ -20,6 +20,14 @@ use crate::hit::update_drag;
 use crate::id::IdAbsolute;
 use crate::{FocusKind, Response, Ui, UiCursor, Widget};
 
+/// **右侧拖拽调值手柄的宽度**（物理像素）。
+///
+/// 手柄就是数字条最右边这一条（`rect` 的右 `GRIP_W` 宽），**不是整个控件**：
+/// 点在文本框上是"进入编辑"，只有这一条能拖动调值。公开出来是给**脚本化测试**用的
+/// （`--sim-tuner` 要算出"手柄在哪一格"）——写死这个数字，改宽度后会静默点空，
+/// 而点空的症状是"控件没反应"，非常难查。
+pub const GRIP_W: f32 = 20.0;
+
 /// 数字输入框（文本框 + 右侧拖拽调值手柄）。
 pub struct NumberInput<'a> {
     id: &'a str,
@@ -116,8 +124,26 @@ impl Widget for NumberInput<'_> {
             .is_some_and(|f| f.as_str() == id_for.as_str());
 
         // 手柄宽度：16px 太窄（`≡` 几乎贴边、并与文本框的圆角打架），20px 更从容。
-        const GRIP_W: f32 = 20.0;
+        // ⚠ 公开常量：脚本化测试（`--sim-tuner`）要能算出"手柄在哪一格"——
+        // 写死 20 会在改宽度后点空，且点空**看起来像"控件不响应"**，很难查。
         let grip = Rect::new(rect.x + rect.w - GRIP_W, rect.y, GRIP_W, rect.h);
+        // `RJ_NUM_TRACE=1`：打印**矩形切分**与拖拽状态机（见 `docs/DEBUGGING.md`）。
+        // 为什么专门要这一条：数字条"点上去没反应"有两种完全不同的成因——
+        // ① 点在**文本框**上（那是"进入编辑"，本来就不调值）；② `down_edge` 没到
+        // （`update_drag` 不开始拖）。这两个数（`手柄 x 区间` / `down_edge`）一眼分开。
+        // 坐标是**当前容器局部**（通常 = 行内坐标）；绝对矩形看 `RJ_HIT_TRACE=1`。
+        if std::env::var_os("RJ_NUM_TRACE").is_some() {
+            eprintln!(
+                "num[{}] 局部 rect=({:.0},{:.0},{:.0},{:.0}) 手柄 x={:.0}..{:.0}（宽 {GRIP_W:.0}）",
+                id_for.as_str(),
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                grip.x,
+                grip.x + grip.w
+            );
+        }
         let text_rect = Rect::new(rect.x, rect.y, (rect.w - GRIP_W).max(0.0), rect.h);
         // 文本框**只圆左侧两角**：右侧要与手柄拼成一条直边，否则它自己的圆角会在
         // 手柄左缘处留下一个缺口（"两个方块错位"的观感就是这么来的）。
@@ -183,6 +209,15 @@ impl Widget for NumberInput<'_> {
             };
             let ws = ui.state_mut().widget(&drag_id);
             dragging = update_drag(ws, grip_hit, btn);
+            if std::env::var_os("RJ_NUM_TRACE").is_some() {
+                eprintln!(
+                    "num-grip[{}] 命中={grip_hit} down_edge={} 按住={} 拖拽中={dragging} 屏幕x={mx:.0} 值={:.2}",
+                    id_for.as_str(),
+                    btn.down_edge(),
+                    btn.pressed(),
+                    *self.value
+                );
+            }
             if btn.down_edge() && grip_hit {
                 // 拖拽基准：物理 x + 起始值
                 ws.press_mouse = Some(Vec2::new(mx, 0.0));
@@ -303,5 +338,29 @@ impl Widget for NumberInput<'_> {
             glyph,
         );
         Response::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_step;
+
+    #[test]
+    fn display_precision_follows_the_step() {
+        // **显示精度必须跟着 step**：旧实现写死 `{:.0}`，0.25 步进显示成整数
+        // （观感"step 没生效"）。这张表就是"主题调节"窗口里那几根滑杆 + 数字条的
+        // `range/step` 组合——它们现在都带一个数字条，显示错位会立刻被看见。
+        assert_eq!(fmt_step(8.0, 0.5), "8.0", "step 0.5 → 1 位小数");
+        assert_eq!(fmt_step(0.1, 0.01), "0.10", "step 0.01 → 2 位");
+        assert_eq!(fmt_step(0.35, 0.01), "0.35", "细粒度小范围不得被取整成 0");
+        assert_eq!(fmt_step(0.25, 0.25), "0.25", "step 不是 10 的整幂 → 多留一位");
+        assert_eq!(fmt_step(1.5, 0.05), "1.50", "step 0.05 → 2 位");
+        assert_eq!(fmt_step(0.8, 0.05), "0.80");
+        // step ≥ 1（或 ≤ 0 = 连续）→ 取整（投影模糊宽这类"整像素"量）。
+        assert_eq!(fmt_step(14.0, 1.0), "14");
+        assert_eq!(fmt_step(13.6, 0.0), "14");
+        // 四舍五入到精度（不是截断）。
+        assert_eq!(fmt_step(0.126, 0.01), "0.13");
+        assert_eq!(fmt_step(-0.4, 0.5), "-0.4", "负值/接近 0 也按同一精度显示");
     }
 }
