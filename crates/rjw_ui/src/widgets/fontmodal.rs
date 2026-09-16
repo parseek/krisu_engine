@@ -95,9 +95,12 @@ impl FontModal<'_> {
             }
             // PreviewInput：面板底 + 用当前输入的名字渲染示例文本，**按宽度换行、
             // 自动改大小**（超长字体名不裁剪，对话框随预览长高）。
+            //
+            // ⚠ 预览文本**不含字体名**：名字就在上面的输入框里，再拼进预览等于把同一串
+            // 文本画两遍（用户实测："文本输入重复"）。这里只放固定样本。
             let name = self.input.trim().to_owned();
             let psize = font_size * 2.0;
-            let example = format!("字体预览：Aa 中 123 {name}");
+            let example = "字体预览：Aa 中 123".to_owned();
             let inner_w = (content_w - 12.0).max(0.0);
             let th = {
                 let ui = m.ui_mut();

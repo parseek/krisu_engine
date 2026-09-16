@@ -57,7 +57,7 @@ use crate::draw::{Icon, Position, TextAlign, TextVAlign};
 use crate::hit::{hit_test, update_interact};
 use crate::layout::Child;
 use crate::style::PanelStyle;
-use crate::ui::{Level, Ui, UiAdd};
+use crate::ui::{Level, Ui, UiAdd, WindowClamp, WIN_TOPMOST};
 use crate::Window;
 
 /// 菜单栏（由 [`Ui::menu_bar`](crate::Ui::menu_bar) 构造，见模块文档）。
@@ -192,11 +192,20 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
         };
         let pos = Vec2::new(trigger.x, trigger.y + trigger.h + 2.0);
         let popup_id = format!("{}::{label}", self.id);
+        // **强制哨兵 z**（与 combo 浮层同一招）：菜单下拉恒在一切窗口之上，
+        // 这样"菜单栏录在哪里"就不再影响遮挡（不必强求录在各窗口之后）。
+        self.ui
+            .state_mut()
+            .window_z
+            .insert(crate::id::IdAbsolute::owned(popup_id.clone()), WIN_TOPMOST);
         let mut close = false;
         let size = self
             .ui
             .window(&popup_id)
             .pos(Position::Physical(pos))
+            // **锁定位置**：菜单面板不该能被拖动——拖走了就与触发器脱节，
+            // 点菜单项的命中按窗口走、视觉却跑别处（"控件严重错位"）。
+            .clamp(WindowClamp::Locked)
             .level(Level::Normal)
             .style(style)
             .show(|w| {
@@ -276,12 +285,41 @@ impl MenuCtx<'_, '_, '_> {
 
     /// 菜单里的一条**分割线**。
     pub fn separator(&mut self) {
+        self.indent();
         self.w.divider();
     }
 
     /// 菜单里的**纯文本行**（不可点：分组标题 / 说明）。
     pub fn caption(&mut self, text: &str) {
+        self.indent();
         self.w.label(text);
+    }
+
+    /// **横向排版**（= `Window::row`，但先按"勾选列"缩进）。
+    ///
+    /// 刻意遮蔽 `Deref` 出来的 [`Window::row`]：菜单里所有内容都该与**菜单项文字**
+    /// 同一列起排，否则标题 / 按钮行会贴到面板左缘、与菜单项错开一格图标位
+    /// （"控件严重错位"的观感就是这么来的）。
+    ///
+    /// ⚠ 内层 `Window::row` 用 `UiAdd::row`（trait 方法）显式调用，避免递归。
+    pub fn row(&mut self, f: impl FnOnce(&mut crate::ui::Pack<'_, '_>)) -> Vec2 {
+        self.indent();
+        UiAdd::row(self.w, f)
+    }
+
+    /// 把光标推到"菜单项文字列"（`item_pad_x + 勾选列宽`）。
+    ///
+    /// 用 `child_rect(w, 0)` 占位：`Window` 的内容栈会把它当成一个零高子项
+    /// （垂直只前进一个 `gap`，正好当作"缩进 + 行距"；宽度小于菜单项，不会撑宽面板）。
+    fn indent(&mut self) {
+        let (pad_x, check_w) = {
+            let t = self.w.ui_mut().theme.clone();
+            let fs = self.font_size.max(1.0);
+            (t.combo.item_pad_x, fs + 6.0)
+        };
+        self.w
+            .ui_mut()
+            .child_rect(pad_x + check_w, 0.0, Child::Expand);
     }
 
     /// 菜单项公共实现：`check = Some(是否勾选)` 时左侧画勾选标记。

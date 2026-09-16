@@ -863,7 +863,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.menu_bar(id, pos, \|bar\| ..)` | `bar.menu(label, \|m\| ..)` → `MenuCtx::{item, item_checked, caption, separator}` | 返回栏尺寸；`pos` = 栏左上角（顶层 = 屏幕坐标）。展开状态跨帧持久于 `UiState::menu_open`（触发器绝对 ID）；**同一时刻只有一个菜单开着**，点菜单项 / 点栏外 / Esc 都收起。`MenuCtx` **`Deref` 到 `Window`** ⇒ 菜单里同样能放 `label` / `button` / `divider` / `row`（横向排版）/ `text_input` / `add(..)`。下拉面板是 `Level::Normal` 浮层窗口——**想盖住别的窗口就把菜单栏录在各窗口之后**（窗口 z 按首次录制的 `max+1` 分配）。细节见 `docs/ENGINE_GUIDE.md` §18.13 |
+| `ui.menu_bar(id, pos, \|bar\| ..)` | `bar.menu(label, \|m\| ..)` → `MenuCtx::{item, item_checked, caption, separator}` | 返回栏尺寸；`pos` = 栏左上角（顶层 = 屏幕坐标）。展开状态跨帧持久于 `UiState::menu_open`（触发器绝对 ID）；**同一时刻只有一个菜单开着**，点菜单项 / 点栏外 / Esc 都收起。`MenuCtx` **`Deref` 到 `Window`** ⇒ 菜单里同样能放 `label` / `button` / `divider` / `row`（横向排版）/ `text_input` / `add(..)`；`caption` / `row` 会**先缩进到菜单项文字列**（与勾选列对齐）。下拉面板是 `Level::Normal` + **`WindowClamp::Locked`**（点它不置顶、**拖不动**）且 z 被强制成 `WIN_TOPMOST` 哨兵 —— 所以菜单栏录在哪里都盖得住别人。细节见 `docs/ENGINE_GUIDE.md` §18.13 |
 
 **窗口外框（标题栏 / 关闭 / 收起）**：三个选项各自独立、**都不调就完全没有外框**
 （逐像素等于旧行为）；任一开启都在窗口内容**第一行**录一条标题栏（底色
@@ -907,6 +907,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 | `text_input` | `p.text_input(id, &mut String)` | 单行输入框：点击聚焦/定位光标、打字/退格/删除/方向键、Enter/Esc 失焦、光标闪烁；**超长文本滚动跟随光标**（光标始终可见）、**拖选文本 + Ctrl+C/V/X 复制/粘贴/剪切**（选择优先于窗口拖拽）；**支持中文 IME**（组合候选浮动提示框 + 候选框定位到光标） |
 | `text_area` | `p.text_area(id, &mut String)` / `p.text_area_at(id, rect, &mut String)` | **多行文本输入框**：Enter 换行、↑/↓ 跨行（保持列）、Home/End 行首尾、按宽度自动换行、超出高度垂直滚动（滚轮 + 光标跟随）、跨行选择 + Ctrl+C/V/X、IME 支持；光标按逻辑行（`\n`）定位（超宽长行换行后近似） |
 | `NumberInput` | `p.add(NumberInput::new(id, &mut f32).range(min, max).step(s))` | **数字条**：右侧 `GRIP_W`（公开常量 **20px**）宽那条手柄**水平拖动**调值（向右 = 增；Shift ×10 / Ctrl ×0.1；拖到窗口边缘自动 warp），**文本框**点击 = 进入编辑（只收数字 / 负号 / 小数点）；显示精度跟 `step` 走（`0.25` → `2` 位小数、`≥1` → 整数）。常见组合：**滑杆后跟数字条**（拖滑杆粗调、数字条精确输入，两者绑同一个 `&mut f32`）——`eg260818UI` 的主题调节窗口整列都是这个形态，脚本化验证见 `--sim-tuner` |
+| `Segmented` | `p.add(Segmented::new(id, &["紧凑","标准","宽松"], &mut idx))` | **分段按钮组**（互斥选项**拼在一起**）：相邻段共享边、只有整组外侧角是圆角、选中段高亮；点击把新索引写进 `&mut usize`。**段间分隔线与 `ButtonStyle::border_w` 解耦**（边框关掉时退化成 `Palette::surface_dim`，否则三段连成一条）。`.font_size(..)` 可覆盖字号。见 `docs/ENGINE_GUIDE.md` §18.14 |
 
 ### 状态视图
 
@@ -958,9 +959,15 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 **缩放柄令牌**：`PanelStyle::grip: GripStyle { shape: GripShape, color, size, step, count }`
 —— 只对**固定宽窗口**（`WindowBuilder::width(..)`）生效，就是右下角那个"拖拽按钮"。
-`GripShape::{Squares（默认，历史观感）, Bars（内置 `Icon::Grip` 三条横线）, Hidden}`；
+`GripShape::{Squares（默认，历史观感）, Bars（**三条实心横杠**：宽 `size*count`、高 `size`、间距 `step`）, Hidden}`；
 逐窗口入口 `PanelStyle::{with_grip, with_grip_color, with_grip_shape, without_grip}`。
 `Hidden` 只是**不画图案**，**拖动缩放照旧**（命中区独立存在，跟随 `size*step*count`，下限 14px）。
+`Bars` 用实心矩形而不是 `Icon::Grip` 图标——小尺寸下图标会被 `Theme::feather` 糊成一坨。
+
+**边框归零（`border_w = 0`）的可见性**：未勾选的 `Checkbox` 本来只画一圈描边，边框关掉后
+会**整个消失**（标签看起来"没有控件"）⇒ 此时改画**实心底**（`surface_sunken` / 悬停
+`surface_hover`）。`Segmented` 的段间分隔线同样与 `border_w` 解耦（退化成 `surface_dim`）。
+凡"只靠描边存在"的新控件都要提供第二视觉来源，见 `docs/ENGINE_GUIDE.md` §18.14。
 
 **子样式责任链**：每个子样式都有 `with_*` builder setter（返回 `Self`，只改链上字段，
 其余回落默认）——`PanelStyle::default().with_radius(8.0)` / `ButtonStyle::default().

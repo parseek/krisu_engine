@@ -186,9 +186,9 @@ pub use view::{ViewCtx, ViewMode};
 pub use rjw_text::{Stretch, Style, Weight};
 pub use widgets::{
     Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, FONT_WEIGHT_CHOICES,
-    FontModal, GRIP_W, Label, MenuBar, MenuCtx, NumberInput, Response, Slider, SliderValue, Widget,
-    WidgetId, color_hex, format_color, format_f, format_u8, ink_on, luma, parse_color, parse_hex,
-    weight_label,
+    FontModal, GRIP_W, Label, MenuBar, MenuCtx, NumberInput, Response, Segmented, Slider,
+    SliderValue, Widget, WidgetId, color_hex, format_color, format_f, format_u8, ink_on, luma,
+    parse_color, parse_hex, weight_label,
 };
 
 /// **UI 文本模块**（公开）：`rjw_ui` 里与文字渲染相关的全部公开面。

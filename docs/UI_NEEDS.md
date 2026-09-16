@@ -75,4 +75,11 @@ ISSUE:
 * ✅ 阴影颜色（主题调节窗口「投影」滑杆后跟 `ColorPicker`（可拖 alpha），`ShadowStyle { color, .. }`；顶点 RGB 原样带出，`--sim-shadow` 实测主题值 0,0,0/0.47 → 0.9,0.15,0.1/0.55）
 * ✅ 主题调节窗口：每根滑杆后跟 `NumberInput`（Slider 后 NumberInput；`--sim-tuner` 实测拖数字条手柄 radius 8→18、拖滑杆 →0，主题圆角同步）
 * ✅ 数字条手柄宽度公开为 `rjw_ui::GRIP_W`（脚本算坐标不再写死 20；`RJ_NUM_TRACE=1` 打印矩形切分 + 拖拽状态机）
-* ✅ 菜单栏（`Ui::menu_bar` 横向触发器 + **闭包下拉面板**：`MenuCtx` 提供 `item` / `item_checked` / `caption` / `separator` 并 `Deref` 到 `Window` ⇒ 文本输入 / 分割线 / 按钮 / 横向排版都能放；展开状态 `UiState::menu_open`，点项 / 点栏外 / Esc 收起；示例三菜单「文件/视图/帮助」，**左侧竖排主菜单保留**；`--sim-menu` 实测）
+* ✅ 菜单栏（`Ui::menu_bar` 横向触发器 + **闭包下拉面板**：`MenuCtx` 提供 `item` / `item_checked` / `caption` / `separator` 并 `Deref` 到 `Window` ⇒ 文本输入 / 分割线 / 按钮 / 横向排版都能放；展开状态 `UiState::menu_open`，点项 / 点栏外 / Esc 收起；下拉面板 `WindowClamp::Locked` + `WIN_TOPMOST`（**拖不动、恒在最上**）、内容与菜单项文字列对齐；示例三菜单「文件/视图/帮助」，**左侧竖排主菜单保留**；`--sim-menu` 两阶段实测）
+* ✅ 分段按钮组 `Segmented`（互斥选项**拼在一起**：相邻段共享边、只有外侧角圆、选中段高亮；段间分隔线与 `border_w` 解耦，边框归零也分得开；`--sim-tuner` 阶段 3 点段实测 `preset=2` + 角点单测）
+* ✅ `border_w = 0` 的可见性兜底（未勾选 `Checkbox` 改画实心底——否则勾选框整个消失、看起来"控件严重错位"）
+* ✅ 修：`FontModal` 一帧被录两次（面板 + 文本画两遍 = "文本输入重复"；现在有 `modal_recorded` 帧内断言守着）
+* ✅ 修：`GripShape::Bars` 三条横杠改用实心矩形（图标羽化在小尺寸下糊成一坨 = "三横是斜的"）
+* ✅ 修：combo 下拉**勾选列恒留位**（未选中项文字不再比选中项凸出一个图标宽 —— "一列像素突兀"）
+* ✅ 字体弹窗预览不再重复显示输入框里的字体名（"文本输入重复"）
+* ✅ 主题调节窗口去掉尾部"当前值一览"两行标签（每行都有滑杆 + 数字条，就近可读）

@@ -157,9 +157,10 @@ fn update(&mut self, ctx: &mut Ctx) {
   由主题尺寸 + 实测标签宽推出 ⇒ 换 DPI / 字体 / 密度档都不会点空）：
 
   ```
-  cargo run -p eg260818UI -- --sim-tuner --frames 50
+  cargo run -p eg260818UI -- --sim-tuner --frames 70
   sim-tuner: 拖数字条后 radius=18.0（期望 ~18 = 8 + 20px × step 0.5）· 主题圆角 tl=18.0 [OK] 数字条能改值，且进了主题
   sim-tuner: 数字条 18.0 → 拖滑杆到最左 0.0 · 主题圆角 tl=0.0 [OK] 滑杆与数字条绑同一个值
+  sim-tuner: 点预设第 3 段后 preset=2 [OK] 分段按钮组可点（拼在一起的那组）
   ```
 
   判定读的是**主题里**的 `panel.radius`（不是控件自己的字段）⇒ 覆盖"滑杆 / 数字条 →
@@ -230,19 +231,22 @@ fn update(&mut self, ctx: &mut Ctx) {
   尺寸算、菜单项按**下拉窗口原点**算，见 `update` 里那段注释）：
 
   ```
-  cargo run -p eg260818UI -- --sim-menu --frames 40
+  cargo run -p eg260818UI -- --sim-menu --frames 62
   sim-menu: menu_open=None · 主题调节窗口=关 [OK] 点触发器开菜单 + 点菜单项执行并自动收起
+  sim-menu: 面板原点=Some(Vec2(1017.0, 59.0)) · 期望=Some(Vec2(1017.0, 59.0)) · 菜单仍开=true · 拖拽后没跑位=true [OK] 菜单面板不会被拖动
   ```
 
   判定同时看**引擎状态**（`UiState::menu_open` 必须已收起）与**应用状态**
-  （菜单项真的改了 `theme_tuner.open`）。两个典型失败：
+  （菜单项真的改了 `theme_tuner.open`）；阶段 2 在**面板空白处按住拖 600+px**，
+  面板原点必须不变（`WindowClamp::Locked`）。三个典型失败：
 
   | 症状 | 成因 |
   |---|---|
   | 触发器点不着 | 坐标错（栏位置 / 触发器宽 = 文字宽 + `button.padding.x`）；`RJ_HIT_TRACE=1` 看这个像素命中谁（`menubar::视图` / `menubar::视图/item::…`） |
   | 菜单开着但点菜单项后不收 | `MenuCtx` 的 `close` 标志没被 `MenuBar` 读回（`item_clicked`）⇒ `finish()` 不会写 `menu_open = None` |
-  | 下拉被别的窗口压住 | 菜单栏录得太早（窗口 z 按首次录制的 `max+1` 分配）⇒ 录在各窗口之后 |
-  | `m.row(..)` 编译报 "method `row` is private" | `MenuCtx` 上加过私有 `fn row` helper，遮蔽了 `Deref` 出来的 `Window::row` |
+  | 阶段 2 `[FAIL] 面板被拖走了` | 下拉面板漏了 `WindowClamp::Locked`（**A/B 实测**：去掉后原点被拖到 x=1682）⇒ 面板与触发器脱节，命中按窗口走、视觉跑别处（"控件严重错位"） |
+  | 菜单标题 / 按钮行与菜单项错开一格 | `caption` / `row` 没缩进"勾选列"（`MenuCtx::indent`）；`m.row(..)` 编译报 "method `row` is private" 则是 `MenuCtx` 上加了会撞名的**私有** helper |
+  | 下拉被别的窗口压住 | 面板 z 没走 `WIN_TOPMOST` 哨兵（走哨兵后与录制顺序无关） |
 
 - **「导入图片…」/「导入字体…」这条运行时通路**（系统文件选择器 → 字节 → 纹理 / 字体）：
   选择器是**阻塞**调用、无头环境里没法跑，所以脚本化的等价开关是 `--sim-import <路径>`

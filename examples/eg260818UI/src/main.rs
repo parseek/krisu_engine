@@ -45,7 +45,7 @@ use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
 use rjw_krusie::ui::{
     ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, FontModal, GRIP_W, GripShape,
-    GripStyle, IdAbsolute, Label, Palette, Position, ShadowStyle, Weight, weight_label,
+    GripStyle, IdAbsolute, Label, Palette, Position, Segmented, ShadowStyle, Weight, weight_label,
 };
 
 /// 「重叠控件」演示模块（控件级遮挡：重叠处只有最上层被触发 + `--sim-overlap` 自证）。
@@ -81,6 +81,9 @@ struct TopBar {
     import_request: Option<ImportKind>,
     /// 导入结果 / 失败原因（顶栏状态标签显示）。
     import_status: String,
+    /// 本帧是否已经录过字体 Modal（**一帧只允许录一次**：重复调用会把面板与文本画两遍，
+    /// 观感就是"文本输入重复"——历史 bug，见 `show_font_modal`）。
+    modal_recorded: bool,
 }
 
 impl TopBar {
@@ -94,6 +97,7 @@ impl TopBar {
             demo_color: Color::rgba_u8(255, 128, 40, 255),
             import_request: None,
             import_status: String::new(),
+            modal_recorded: false,
         }
     }
 
@@ -157,6 +161,14 @@ impl TopBar {
     /// 不被本帧后录的窗口盖住——见 `modal_at` 文档）。
     fn show_font_modal(&mut self, ui: &mut Ui) {
         if self.font_modal_open {
+            // **一帧只允许录一次**：调用点写重复（每帧两次 `show_font_modal`）会把整个
+            // 面板 —— 输入框、预览框、所有文本 —— 画两遍，观感就是"文本输入重复"。
+            // 这个断言把"多调用一次"这种无声 bug 变成冒烟测试里的 panic。
+            debug_assert!(
+                !self.modal_recorded,
+                "FontModal 一帧只能录一次（检查调用点是否重复）"
+            );
+            self.modal_recorded = true;
             FontModal {
                 input: &mut self.font_input,
                 weight: &mut self.font_weight,
@@ -881,14 +893,12 @@ impl ThemeTuner {
                 w.label("主题调节（实时）");
                 w.row(|w| {
                     w.label("预设:");
-                    if w.button("th_dark", "dark").clicked() {
-                        self.set_preset(0);
-                    }
-                    if w.button("th_light", "light").clicked() {
-                        self.set_preset(1);
-                    }
-                    if w.button("th_legacy", "legacy").clicked() {
-                        self.set_preset(2);
+                    // **分段按钮组**（`Segmented`）：互斥选项拼成一个整体——相邻段共享边、
+                    // 只有整组外侧角是圆的、选中段高亮（"按钮样式：拼在一起"）。
+                    let mut preset = self.preset.min(2) as usize;
+                    w.add(Segmented::new("th_preset", &["dark", "light", "legacy"], &mut preset));
+                    if preset != self.preset as usize {
+                        self.set_preset(preset as u8);
                     }
                 });
                 w.row(|w| {
@@ -928,30 +938,26 @@ impl ThemeTuner {
                 // "不画"只是没有图案，**拖动缩放照旧**（命中区单独存在，见 `GripStyle`）。
                 w.row(|w| {
                     w.label("拖拽柄");
-                    if w.button("th_grip_sq", "方块").clicked() {
-                        self.grip_shape = GripShape::Squares;
-                    }
-                    if w.button("th_grip_bar", "三横").clicked() {
-                        self.grip_shape = GripShape::Bars;
-                    }
-                    if w.button("th_grip_off", "不画").clicked() {
-                        self.grip_shape = GripShape::Hidden;
-                    }
+                    let mut gi = match self.grip_shape {
+                        GripShape::Squares => 0usize,
+                        GripShape::Bars => 1,
+                        GripShape::Hidden => 2,
+                    };
+                    w.add(Segmented::new("th_grip", &["方块", "三横", "不画"], &mut gi));
+                    self.grip_shape = [GripShape::Squares, GripShape::Bars, GripShape::Hidden]
+                        [gi.min(2)];
                     w.add(ColorPicker::new("th_grip_color", &mut self.grip_color));
                 });
                 // ── 布局密度（主题扩展：紧凑 / 标准 / 宽松）──────────────────
-                // 三个按钮一键铺开"间距 / 字号 / 行距"，三根滑杆随后可自由微调
-                // （点档位 = 把滑杆对齐到该档的规范值，与"预设"按钮同思路）。
+                // 一键铺开"间距 / 字号 / 行距"，三根滑杆随后可自由微调
+                // （点档位 = 把滑杆对齐到该档的规范值，与"预设"同思路）。
                 w.row(|w| {
                     w.label("密度:");
-                    if w.button("th_cmp", "紧凑").clicked() {
-                        self.set_density(Density::Compact);
-                    }
-                    if w.button("th_coz", "标准").clicked() {
-                        self.set_density(Density::Cozy);
-                    }
-                    if w.button("th_spa", "宽松").clicked() {
-                        self.set_density(Density::Spacious);
+                    let mut di = self.density as usize;
+                    w.add(Segmented::new("th_density", &["紧凑", "标准", "宽松"], &mut di));
+                    if di != self.density as usize {
+                        self.set_density([Density::Compact, Density::Cozy, Density::Spacious]
+                            [di.min(2)]);
                     }
                 });
                 w.row(|w| {
@@ -977,29 +983,8 @@ impl ThemeTuner {
                     w.add(NumberInput::new("th_shd_n", &mut self.shadow_blur).range(0.0, 32.0).step(1.0));
                     w.add(ColorPicker::new("th_shadow_color", &mut self.shadow_color).alpha(true));
                 });
-                w.label(&format!(
-                    "{} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 边框宽 {:.1} · 投影 {:.0}/a{:.0} · 柄 {}",
-                    ["dark", "light", "legacy"][self.preset.min(2) as usize],
-                    self.radius,
-                    self.feather,
-                    self.bevel,
-                    self.border_w,
-                    self.shadow_blur,
-                    // 投影色的 alpha（0..1 → 0..255 显示，与色块里的读数一致）。
-                    self.shadow_color.a * 255.0,
-                    match self.grip_shape {
-                        GripShape::Squares => "方块",
-                        GripShape::Bars => "三横",
-                        GripShape::Hidden => "无",
-                    },
-                ));
-                w.label(&format!(
-                    "密度 {} · 字号 ×{:.2} · 间距 ×{:.2} · 行距 ×{:.2}",
-                    ["紧凑", "标准", "宽松"][self.density as usize],
-                    self.font_scale,
-                    self.spacing_scale,
-                    self.line_spacing,
-                ));
+                // 尾部**不再放"当前值一览"标签**：每行都有滑杆 + 数字条，值就近看得见
+                // （用户："可以去掉了"）。
             });
     }
 }
@@ -1075,6 +1060,8 @@ struct UiApp {
     sim_tuner_pts: Option<(Vec2, Vec2)>,
     /// --sim-tuner：拖数字条后的圆角值（第二阶段判定"数字条真的改了值"）。
     tuner_probe: Option<f32>,
+    /// --sim-tuner：分段按钮组（预设行第 3 段）中心——第三阶段判定"分段能点"。
+    sim_seg_pt: Option<Vec2>,
     /// --sim-tuner：**实操主题调节窗口里的"滑杆 + 数字条"**（坐标运行时解算，不写死像素）。
     sim_tuner: bool,
     /// --sim-import <路径>：脚本化导入（**不弹对话框**，走同一条应用通路）——验证
@@ -1091,6 +1078,10 @@ struct UiApp {
     menu_trigger_pt: Option<Vec2>,
     /// --sim-menu：下拉里第一个菜单项中心（**菜单展开后**才知道下拉窗口在哪）。
     menu_item_pt: Option<Vec2>,
+    /// --sim-menu：下拉面板的 `(原点, 尺寸)`（脚本拖动用；每帧从 `debug_dump` 读）。
+    menu_panel: Option<(Vec2, Vec2)>,
+    /// --sim-menu：下拉面板**应该**在的原点（= 触发器左下 + 2px；由主题尺寸算出）。
+    menu_want_origin: Option<Vec2>,
     /// 「被遮挡控件仍被触发」复现器。
     cover: CoverDemo,
     /// `--sim-cover` 段 A 结束时的认领次数（段 B 不许再涨）。
@@ -1186,6 +1177,7 @@ impl UiApp {
             shadow_probe: None,
             sim_tuner_pts: None,
             tuner_probe: None,
+            sim_seg_pt: None,
             sim_tuner: false,
             sim_import: None,
             import_image_path: None,
@@ -1193,6 +1185,8 @@ impl UiApp {
             sim_menu: false,
             menu_trigger_pt: None,
             menu_item_pt: None,
+            menu_panel: None,
+            menu_want_origin: None,
             weight_probe: None,
             cover: CoverDemo::default(),
             cover_starts_after_a: 0,
@@ -1655,6 +1649,7 @@ impl App for UiApp {
         // 30..31 按下滑杆 → 32..35 拖到轨道最左（圆角归 0）→ 36..43 抬起。
         if self.sim_tuner {
             let (num_grip, slider_c) = self.sim_tuner_pts.unwrap_or((Vec2::ZERO, Vec2::ZERO));
+            let seg = self.sim_seg_pt.unwrap_or(Vec2::ZERO);
             let right = Vec2::new(num_grip.x + 20.0, num_grip.y);
             let left = Vec2::new(slider_c.x - 200.0, slider_c.y);
             match f.frames() {
@@ -1665,6 +1660,10 @@ impl App for UiApp {
                 30..=31 => f.debug_inject_mouse(slider_c, true),
                 32..=35 => f.debug_inject_mouse(left, true),
                 36..=43 => f.debug_inject_mouse(left, false),
+                // 阶段 3：点预设行的第 3 段（"legacy"）——分段按钮组可交互。
+                50..=51 => f.debug_inject_mouse(seg, false),
+                52..=53 => f.debug_inject_mouse(seg, true),
+                54..=59 => f.debug_inject_mouse(seg, false),
                 _ => {}
             }
         }
@@ -1675,12 +1674,31 @@ impl App for UiApp {
         if self.sim_menu {
             let trigger = self.menu_trigger_pt.unwrap_or(Vec2::ZERO);
             let item = self.menu_item_pt.unwrap_or(trigger);
+            // 阶段 2 用：**面板里"没有控件"的地方**（标题行左侧的空白——菜单项只占上半，
+            // 密度标题只从勾选列起排）⇒ 在那里按下会落到"窗口本体"，正是"拖菜单"的入口。
+            // 拖到面板**右侧外面**松手（不会点到任何菜单项）。
+            let grab = self
+                .menu_panel
+                .map(|(o, s)| Vec2::new(o.x + 20.0, o.y + s.y - 60.0))
+                .unwrap_or(trigger);
+            let aside = self
+                .menu_panel
+                .map(|(o, s)| Vec2::new(o.x + s.x + 30.0, grab.y))
+                .unwrap_or(trigger);
             match f.frames() {
                 10..=11 => f.debug_inject_mouse(trigger, false),
                 12..=13 => f.debug_inject_mouse(trigger, true),
                 14..=15 => f.debug_inject_mouse(trigger, false),
                 22..=23 => f.debug_inject_mouse(item, true),
                 24..=25 => f.debug_inject_mouse(item, false),
+                // 阶段 2：重开菜单 → 在**面板空白处**按住 → 拖到面板外 → 松手。
+                // 面板必须**原地不动**（`WindowClamp::Locked`：下拉浮层不可拖动）。
+                40..=41 => f.debug_inject_mouse(trigger, false),
+                42..=43 => f.debug_inject_mouse(trigger, true),
+                44..=45 => f.debug_inject_mouse(trigger, false),
+                46..=47 => f.debug_inject_mouse(grab, true),
+                48..=52 => f.debug_inject_mouse(aside, true),
+                53..=54 => f.debug_inject_mouse(aside, false),
                 _ => {}
             }
         }
@@ -1985,14 +2003,12 @@ impl App for UiApp {
                     m.separator();
                     m.caption("密度");
                     m.row(|r| {
-                        if r.button("mb_cmp", "紧凑").clicked() {
-                            self.theme_tuner.set_density(Density::Compact);
-                        }
-                        if r.button("mb_coz", "标准").clicked() {
-                            self.theme_tuner.set_density(Density::Cozy);
-                        }
-                        if r.button("mb_spa", "宽松").clicked() {
-                            self.theme_tuner.set_density(Density::Spacious);
+                        let mut di = self.theme_tuner.density as usize;
+                        r.add(Segmented::new("mb_density", &["紧凑", "标准", "宽松"], &mut di));
+                        if di != self.theme_tuner.density as usize {
+                            self.theme_tuner.set_density(
+                                [Density::Compact, Density::Cozy, Density::Spacious][di.min(2)],
+                            );
                         }
                     });
                 });
@@ -2017,15 +2033,20 @@ impl App for UiApp {
                 // 触发器：「视图」是第 2 个（三个都是两个字 ⇒ 等宽），栏在 (620,12) 逻辑。
                 let tw = ui.text_size("视图", fs, None).x;
                 let w = tw + pad_x * 2.0;
+                let trigger_rect = Rect::new(930.0 + (w + gap), 18.0, w, row_h);
                 self.menu_trigger_pt =
-                    Some(Vec2::new(930.0 + (w + gap) + w * 0.5, 18.0 + row_h * 0.5));
+                    Some(Vec2::new(trigger_rect.x + w * 0.5, trigger_rect.y + row_h * 0.5));
+                // 下拉原点（引擎里的 `pos = (t.x, t.y + h + 2)`，见 `MenuBar::popup`）。
+                self.menu_want_origin =
+                    Some(Vec2::new(trigger_rect.x, trigger_rect.y + row_h + 2.0));
                 // 下拉里**第一个菜单项**（窗口原点 + 半项高；面板 padding = 0）。
                 let item_h = (fs * 1.3).round() + 6.0;
-                self.menu_item_pt = dump
-                    .windows
-                    .iter()
-                    .find(|p| p.id == "menubar::视图")
-                    .map(|p| Vec2::new(p.origin.x + w * 0.5, p.origin.y + item_h * 0.5));
+                if let Some(p) = dump.windows.iter().find(|p| p.id == "menubar::视图") {
+                    self.menu_item_pt = Some(Vec2::new(p.origin.x + w * 0.5, p.origin.y + item_h * 0.5));
+                    self.menu_panel = Some((p.origin, p.size));
+                } else {
+                    self.menu_panel = None;
+                }
             }
             // `--sim-menu` 判定（在菜单栏录制**之后**读状态：本帧的展开 / 收起已定）。
             // ① 点「视图」触发器 → 菜单打开（`UiState::menu_open` = 该触发器绝对 ID）；
@@ -2044,13 +2065,34 @@ impl App for UiApp {
                     }
                 );
             }
+            // 阶段 2 判定：**菜单面板不可拖动**（拖面板 = 拖窗口会把它从触发器上拖走，
+            // 命中判定按窗口走、视觉却跑别处 ⇒"控件严重错位"）。
+            // 期望原点由**主题尺寸**算出（触发器左下 + 2px），与 `MenuBar::popup` 同源。
+            if self.sim_menu && sim_frame == 58 {
+                let open = ui.state().menu_open().is_some();
+                let dump = ui.debug_dump();
+                let got = dump
+                    .windows
+                    .iter()
+                    .find(|p| p.id == "menubar::视图")
+                    .map(|p| p.origin);
+                let stayed = match (got, self.menu_want_origin) {
+                    (Some(g), Some(w)) => (g.x - w.x).abs() < 2.0 && (g.y - w.y).abs() < 2.0,
+                    _ => false,
+                };
+                eprintln!(
+                    "sim-menu: 面板原点={got:?} · 期望={:?} · 菜单仍开={open} · 拖拽后没跑位={stayed} {}",
+                    self.menu_want_origin,
+                    if open && stayed {
+                        "[OK] 菜单面板不会被拖动"
+                    } else {
+                        "[FAIL] 面板被拖走了 / 菜单意外关闭"
+                    }
+                );
+            }
 
             // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
             // 不被本帧后录的窗口盖住——见 `modal_at` 文档）。
-            self.top.show_font_modal(&mut ui);
-
-            // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
-            // 不被本帧后录的窗口盖住——见 modal_at 文档）。
             self.top.show_font_modal(&mut ui);
 
             // `--sim-overlap` / `--sim-click`：读**本帧**两类遮挡拦截计数——必须在
@@ -2089,10 +2131,28 @@ impl App for UiApp {
                     let num_x = slider_x + slider_w + gap;
                     let num_grip = Vec2::new(num_x + num_w - GRIP_W * 0.5, row_y);
                     self.sim_tuner_pts = Some((num_grip, slider_c));
+                    // **分段按钮组**（`Segmented`）的目标：预设行的第 3 段（"legacy"）。
+                    // 段宽 = 文字实测 + `button.padding.x × 2`（与 `Segmented::size` 同口径）。
+                    let (btn_fs, pad_x) = {
+                        let t = ui.theme();
+                        (t.button.font_size, t.button.padding.x)
+                    };
+                    let (w_dark, w_light, w_legacy, label_preset) = (
+                        ui.text_size("dark", btn_fs, None).x + pad_x * 2.0,
+                        ui.text_size("light", btn_fs, None).x + pad_x * 2.0,
+                        ui.text_size("legacy", btn_fs, None).x + pad_x * 2.0,
+                        ui.text_size("预设:", font, None).x,
+                    );
+                    let preset_y = tw.origin.y + pad + font + gap + row * 0.5;
+                    let preset_x = tw.origin.x + pad + label_preset + gap;
+                    self.sim_seg_pt = Some(Vec2::new(
+                        preset_x + w_dark + w_light + w_legacy * 0.5,
+                        preset_y,
+                    ));
                     if sim_frame == 10 {
                         eprintln!(
-                            "sim-tuner: tuner origin={:?} size={:?} num_grip={num_grip:?} slider_c={slider_c:?} input.min_w={num_w} slider.min_w={slider_w} label_w={label_w}",
-                            tw.origin, tw.size
+                            "sim-tuner: tuner origin={:?} size={:?} num_grip={num_grip:?} slider_c={slider_c:?} seg={:?}",
+                            tw.origin, tw.size, self.sim_seg_pt
                         );
                     }
                 }
@@ -2121,6 +2181,8 @@ impl App for UiApp {
         }
         let encode_us = ui_seg1_us + t_ui2.elapsed().as_secs_f64() * 1e6;
         self.clicks = clicks;
+        // 帧内"只录一次"的守卫复位（本帧的 UI 段已全部录完）。
+        self.top.modal_recorded = false;
         // --sim-tuner：两阶段判定（打印的是**主题里**的圆角 ⇒ 滑杆 / 数字条 → 主题
         // 这条线才是最终目的）。
         if self.sim_tuner && f.frames() == 24 {
@@ -2149,6 +2211,19 @@ impl App for UiApp {
                     "[OK] 滑杆与数字条绑同一个值"
                 } else {
                     "[FAIL] 滑杆没改值 / 没进主题"
+                }
+            );
+        }
+        // --sim-tuner 阶段 3：**分段按钮组**（`Segmented`）——点第 3 段（"legacy"）应把
+        // 预设切到 2（`ThemeTuner::preset`）。
+        if self.sim_tuner && f.frames() == 66 {
+            let p = self.theme_tuner.preset;
+            eprintln!(
+                "sim-tuner: 点预设第 3 段后 preset={p} {}",
+                if p == 2 {
+                    "[OK] 分段按钮组可点（拼在一起的那组）"
+                } else {
+                    "[FAIL] 分段没被点到 / 没写回选中"
                 }
             );
         }

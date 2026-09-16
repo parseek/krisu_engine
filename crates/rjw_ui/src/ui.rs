@@ -1276,16 +1276,21 @@ impl<'a> Ui<'a> {
                 }
             }
             GripShape::Bars => {
-                // 图标画成 `size*count` 的方框（`icon_at` 内部取居中方块 ⇒ 不变形），
-                // 距右下角留一个 `step` 的边距。
-                let d = grip.size * grip.count as f32;
-                let m = grip.step;
-                self.icon_at(
-                    Position::Physical(Vec2::new(size.x - d - m, size.y - d - m)),
-                    Size::Physical(Vec2::splat(d)),
-                    Icon::Grip,
-                    grip.color,
-                );
+                // 三条**实心横杠**（宽 = `size*count`，高 = `size`，间距 = `step`）。
+                //
+                // ⚠ 不用 `Icon::Grip` 图标：图标走 `push_icon`，每条杠只有 `size` 高
+                // （默认 4 逻辑像素），再叠上 `Theme::feather` 的羽化带（默认 1 逻辑像素
+                // ⇒ 每侧 0.5）就把三条糊成一坨（用户实测："三横看起来是斜的一坨"）。
+                // 实心矩形没有羽化，任意尺寸都读得出三条。
+                let w = grip.size * grip.count as f32;
+                let right = size.x - grip.step;
+                for k in 0..grip.count {
+                    let o = grip.step * (k as f32 + 1.0);
+                    self.push_solid_rect(
+                        Rect::new(right - w, size.y - o, w, grip.size),
+                        grip.color,
+                    );
+                }
             }
         }
     }
@@ -5428,6 +5433,9 @@ impl Ui<'_> {
             let popup_size = self
                 .window(&popup_id)
                 .pos(Position::Physical(popup_pos))
+                // **锁定位置**：下拉浮层不该能被拖动——它是"某个控件的展开部分"，
+                // 拖走了就与触发控件脱节（点选项的命中判定按控件走，视觉却跑别处了）。
+                .clamp(WindowClamp::Locked)
                 .style(panel_style)
                 .show(|w| {
                     let cs = w.ui_mut().theme.combo.clone();
@@ -5466,6 +5474,10 @@ impl Ui<'_> {
                             (item_rect.w - pad_x * 2.0).max(0.0),
                             item_rect.h,
                         );
+                        // **勾选列恒留位**（不论选中与否）：选中项先画 ✓ 图标、文字再右移
+                        // `font_size`；若未选中项不右移，同一列文字就会左右跳（"一列像素
+                        // 突兀"——未选中的首字比选中项的文字凸出去一个图标宽）。
+                        let check_w = cs.font_size;
                         if sel {
                             // 选中标记用**矢量图标**（不再用 "✓" 字形）。
                             ui.icon_at(
@@ -5477,35 +5489,23 @@ impl Ui<'_> {
                                 Icon::Check,
                                 cs.fg_mark,
                             );
-                            ui.push_text_rect(
-                                Rect::new(
-                                    text_rect.x + cs.font_size,
-                                    text_rect.y,
-                                    (text_rect.w - cs.font_size).max(0.0),
-                                    text_rect.h,
-                                ),
-                                opt,
-                                cs.font_size,
-                                cs.fg,
-                                cs.font_family.clone(),
-                                TextAlign::Left,
-                                TextVAlign::Center,
-                                None,
-                                None,
-                            );
-                        } else {
-                            ui.push_text_rect(
-                                text_rect,
-                                opt,
-                                cs.font_size,
-                                cs.fg,
-                                cs.font_family.clone(),
-                                TextAlign::Left,
-                                TextVAlign::Center,
-                                None,
-                                None,
-                            );
                         }
+                        ui.push_text_rect(
+                            Rect::new(
+                                text_rect.x + check_w,
+                                text_rect.y,
+                                (text_rect.w - check_w).max(0.0),
+                                text_rect.h,
+                            ),
+                            opt,
+                            cs.font_size,
+                            cs.fg,
+                            cs.font_family.clone(),
+                            TextAlign::Left,
+                            TextVAlign::Center,
+                            None,
+                            None,
+                        );
                         if ev.clicked {
                             picked = Some(i as u32);
                         }
@@ -5958,21 +5958,44 @@ impl Ui<'_> {
             style.box_size,
         );
         let seq = self.next_seq();
-        self.queue.push(UiDraw {
-            depth,
-            seq,
-            win,
-            elem,
-            rect: box_rect,
-            clip: self.clip,
-            kind: DrawKind::Border {
-                // 悬停时方框描边转向强调色——与按钮 / 下拉框的悬停反馈一致
-                // （此前勾选框 hover 毫无变化，鼠标移上去看不出"可以点"）。
-                color: if hovered { self.theme.focus.color } else { style.box_border },
-                width: style.border_w,
-                radius: style.radius,
-            },
-        });
+        // **边框宽 = 0 时的兜底底色**：未勾选的方框本来只画一圈描边——主题把
+        // `border_w` 拖到 0（"平面风格"）后它**整个消失**，标签看起来像"没有控件"
+        // （用户实测："控件严重错位"：两个勾选框一个有一个没有）。
+        // 这里退化成**实心底**（下沉色 / 悬停色），保证任何主题下都看得见方框。
+        let flat = style.border_w <= 0.0;
+        if !checked && flat {
+            let bg = if hovered {
+                self.theme.palette.surface_hover
+            } else {
+                self.theme.palette.surface_sunken
+            };
+            let seq = self.next_seq();
+            self.queue.push(UiDraw {
+                depth,
+                seq,
+                win,
+                elem,
+                rect: box_rect,
+                clip: self.clip,
+                kind: DrawKind::RoundedRect { corners: [bg; 4], radius: style.radius },
+            });
+        } else {
+            self.queue.push(UiDraw {
+                depth,
+                seq,
+                win,
+                elem,
+                rect: box_rect,
+                clip: self.clip,
+                kind: DrawKind::Border {
+                    // 悬停时方框描边转向强调色——与按钮 / 下拉框的悬停反馈一致
+                    // （此前勾选框 hover 毫无变化，鼠标移上去看不出"可以点"）。
+                    color: if hovered { self.theme.focus.color } else { style.box_border },
+                    width: style.border_w,
+                    radius: style.radius,
+                },
+            });
+        }
         if checked {
             // 中心填充 = 外框 **内缩**（减法，非写死偏移）：
             // inset（物理像素）= floor(border_w) + floor(CHECKBOX_INNER)，
