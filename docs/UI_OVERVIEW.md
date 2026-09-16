@@ -17,6 +17,11 @@
 这带来两个好处：**不需要保留 UI 树**（像 egui 一样，代码即界面），又**不会因为重新绘制
 丢掉状态**（像传统 immediate GUI 那样每帧重置）。
 
+**"ui anywhere"**：一帧 = **开场 + N 段 + 收尾**——运行时入口 `f.ui(theme)` 开**一段**，
+一帧可开任意多段、位置随意（世界绘制之前 / 之间 / 之后均可），`&mut Ui` 可直接透传给
+任意函数 / 模块；帧级账（帧号 / 命中区翻页 / 输入快照 / 焦点导航 + 描边 / 光标 / 统计）
+**每帧只做一次**（开场在第一段懒执行，收尾由运行时在提交前补齐）。
+
 布局是 **DOM 风格自动尺寸**（叶子控件由内容撑开、容器闭包结束时按子控件结算），几何
 管理是 **Tkinter 风格**（`pack` 堆叠 / `grid` 网格 / `*_at` 绝对定位）。
 
@@ -24,20 +29,27 @@
 
 ## 二、原理
 
-### 1. 一帧的生命周期（录制 → 提交）
+### 1. 一帧的生命周期（开场 → 录制（N 段）→ 提交 → 收尾）
 
 ```
-Ui::begin(window, &mut text, &mut state)
-   .capture(&mouse, &keyboard)   // 拷贝输入快照（与设备解耦）
-   .theme(theme).scale_factor(dpi).build()
-   → 录制：ui.label_at / pack_at / ui.window(id).show(..) / add(...)  …
-   → Ui::finish(&mut render2d)
+【开场】本帧第一段 Ui::begin(..).build() 懒执行（运行时路径由 Frame::ui 触发）：
+        帧号 +1 / 命中区表翻页 / 冻结输入快照 / 帧级暂存清零 + 责任链种入
+【段】  f.ui(theme) → ui.label_at / pack_at / ui.window(id).show(..) / add(...)
+        → Ui::finish(&mut backend)：分桶 → 顶点（含窗口顶点缓存）→ 提交到 UI 层 Render2D
+        （一帧可开多段，段序 = 绘制序：后一段整体压在前一段之上）
+【收尾】Ui::end_frame(&mut backend)（每帧一次，运行时在提交前调）：
+        输入结算（空白清焦点 / 清一次性边沿 / 窗口按下裁决）/ 焦点导航 + 描边 /
+        光标定夺 / 统计写回 / 帧级暂存关场
 ```
 
-- **录制阶段**：每次控件调用把一条/多条 `UiDraw` 命令压入队列（坐标是**相对当前容器的
-  局部逻辑像素**，容器弹出时统一平移成绝对）。这一阶段不碰 GPU，也不碰输入设备（快照）。
-- **提交阶段**（`finish`）：排序 → 按窗口分组 → 收集成四边形 → 提交到独立的 `Render2D`
-  （UI 必须 `set_sort_mode(SortMode::None)`，绘制顺序由 UI 自己管理）。
+- **录制阶段**：每次控件调用把一条/多条 `UiDraw` 命令压入**本段**队列（坐标是**相对当前
+  容器的局部逻辑像素**，容器弹出时统一平移成绝对）。这一阶段不碰 GPU，也不碰输入设备
+  （快照）。**帧级事实**（按下归属 / 窗口原点 / 焦点链 / 光标意图 / 责任链 / 位置尺寸责任链）
+  由各段共享，段收尾时回存、下段开头装载——所以第二段录的窗口也参与遮挡、Tab 顺序与拖动。
+- **提交阶段**（`finish`）：排序 → 按窗口分组 → 收集成四边形 → 提交到 UI 层自己的
+  `Render2D`（`set_sort_mode(SortMode::None)`，绘制顺序由 UI 自己管理）。
+- **段间可交错**：世界层绘制、世界文本、逻辑代码都可以放在两段之间（段存活期间 `f` 被借用，
+  编译期拦住 `draw`/`submit`）。
 
 ### 2. 坐标与 DPI
 
@@ -192,41 +204,48 @@ Tab / Shift+Tab / 方向键遍历焦点链；Enter / Space 激活；滑块方向
 ```rust
 use rjw_ui::{Button, Label, NumberInput, PackSide, Theme, Ui, UiAdd, Viewport};
 
-// 每帧：
+// 运行时路径（推荐）：一帧可开任意多段 / 任意位置；段收尾自动提交。
+fn update(&mut self, ctx: &mut Ctx) {
+    let Some(mut f) = ctx.frame() else { return };
+    let mut ui = f.ui(Theme::dark().with_radius(8.0));
+    ui.label_at(Vec2::new(16.0, 12.0), "FPS: 60");
+
+    // pack 垂直堆叠
+    ui.pack_at(Vec2::new(16.0, 56.0), PackSide::Top, |p| {
+        if p.button("start", "开始游戏").clicked() { /* ... */ }
+        p.checkbox_mut(None, "全屏", &mut self.fullscreen);
+        p.divider();                                // 分割线
+        p.row(|r| {                                 // 水平等高行
+            r.label("HP:");
+            r.add(NumberInput::new("hp", &mut self.hp).range(0.0, 100.0));
+            if r.button("hp_btn", "应用").clicked() { /* ... */ }
+        });
+    });
+
+    // 窗口 + Label 溢出处理（容器责任链 builder：`ui.window(id).pos(..).width(..)`
+    // 固定宽 + 右下角缩放；`.placement(Placement::Clip)` = 强制裁剪；`.style(..)` = 逐窗口样式覆盖）
+    ui.window("win")
+        .pos(Vec2::new(560.0, 240.0))
+        .width(220.0)
+        .show(|w| {
+            w.label("标题（缩窄窗口自动换行）");
+            w.add(Label::new("省略标签……").ellipsis());
+        });
+    ui.finish();                                    // 段收尾（可省略：作用域结束即收尾）
+    f.submit(&mut self.cam, Clear::color(Color::rgb(0.05, 0.05, 0.08)));
+}
+```
+
+**低层路径**（自己持有 `UiState`；此时帧级账也归调用方）：
+
+```rust
 let mut ui = Ui::begin(&window, &mut text, &mut state)
     .capture(&mouse, &keyboard)
     .theme(Theme::dark().with_radius(8.0))      // with_font_family / with_font_size / with_radius / with_border_w / with_feather / ...
     .scale_factor(ctx.scale_factor().unwrap_or(1.0))
     .build();
-
-ui.label_at(Vec2::new(16.0, 12.0), "FPS: 60");
-
-// pack 垂直堆叠
-ui.pack_at(Vec2::new(16.0, 56.0), PackSide::Top, |p| {
-    if p.button("start", "开始游戏").clicked() { /* ... */ }
-    p.checkbox_mut(None, "全屏", &mut self.fullscreen);
-    p.divider();                                // 分割线
-    p.row(|r| {                                 // 水平等高行
-        r.label("HP:");
-        r.add(NumberInput::new("hp", &mut self.hp).range(0.0, 100.0));
-        if r.button("hp_btn", "应用").clicked() { /* ... */ }
-    });
-});
-
-// 窗口 + Label 溢出处理（容器责任链 builder：`ui.window(id).pos(..).width(..)`
-// 固定宽 + 右下角缩放；`.placement(Placement::Clip)` = 强制裁剪；`.style(..)` = 逐窗口样式覆盖）
-ui.window("win")
-    .pos(Vec2::new(560.0, 240.0))
-    .width(220.0)
-    .show(|w| {
-        w.label("标题（缩窄窗口自动换行）");
-        w.add(Label::new("省略标签……").ellipsis());
-    });
-
-// 提交
-let viewport = Viewport::new(render2d.size(), Vec2::ZERO);
-r2d_ui.set_mvp(viewport.vp_matrix());           // UI 的 Render2D 须 set_sort_mode(SortMode::None)
-ui.finish(r2d_ui);                              // UI 无需相机/视口参数（屏幕固定变换由本次 MVP 决定）
+// ... 录制（同上）...
+ui.end_frame(r2d_ui);   // 帧收尾 + 提交（UI 无需相机/视口参数：屏幕固定变换由运行时 UI 层相机决定）
 ```
 
 ### 常用控件 / 方法速查

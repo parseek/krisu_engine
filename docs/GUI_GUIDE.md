@@ -2,10 +2,31 @@
 
 > 立即模式 UI：外观每帧录制（`Ui::begin` → 控件 → `finish`），交互状态按 ID 持久于
 > `UiState`。坐标一律为**屏幕逻辑像素**（左上角原点、Y+ 向下），内部自动换算物理像素。
+> **一帧 = 开场 + N 段 + 收尾**（运行时 `f.ui(theme)` 一段一段来，位置随意、段间可交错
+> 世界绘制）。
 
 ---
 
 ## 1. 快速上手
+
+**运行时路径（推荐）**：
+
+```rust
+fn update(&mut self, ctx: &mut Ctx) {
+    let Some(mut f) = ctx.frame() else { return };
+    let mut ui = f.ui(Theme::dark());            // 开一段（一帧可开多段）
+    ui.label_at(Vec2::new(16.0, 12.0), "Hello UI");
+    ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {
+        p.label("主菜单");
+        if p.button("btn_start", "开始游戏").clicked() { /* … */ }
+        self.volume = p.slider("vol", 0.0..=1.0, self.volume);
+    });
+    ui.finish();                                 // 段收尾（可省略：作用域结束即收尾）
+    f.submit(&mut self.cam, Clear::color(Color::rgb(0.05, 0.05, 0.08)));
+}
+```
+
+**低层路径**（自己持有 `UiState`；帧级账也归调用方：每帧一次 `begin_frame` / `end_frame`）：
 
 ```rust
 use rjw_ui::{PackSide, Theme, Ui, UiState};
@@ -13,7 +34,8 @@ use rjw_ui::{PackSide, Theme, Ui, UiState};
 // 应用持有跨帧状态
 let mut ui_state = UiState::new();
 
-// 每帧：begin → 录制控件 → finish（输入经 capture 快照；相机/渲染器延迟到 finish 传入）
+// 每帧：开场 → 录制控件 → 帧收尾（输入经 capture 快照；渲染器延迟到收尾传入）
+ui_state.begin_frame();
 let mut ui = Ui::begin(window, &mut text, &mut ui_state)
     .capture(&mouse, &keyboard)
     .theme(Theme::dark())
@@ -33,7 +55,7 @@ ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {
     let vol = p.slider("vol", 0.0..=1.0, 0.6);
 });
 
-ui.finish(r2d); // 只传渲染器（UI 无需相机/视口参数；屏幕固定变换由本 Render2D 的 MVP 决定）
+ui.end_frame(r2d); // 帧收尾 + 提交（UI 无需相机/视口参数：屏幕固定变换由本 Render2D 的 MVP 决定）
 // r2d 提交（UI 的 Render2D 必须 set_sort_mode(SortMode::None)；set_mvp 用 viewport.vp_matrix()）
 ```
 

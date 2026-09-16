@@ -68,7 +68,7 @@ L2 的构造器只收 `&Gpu`，不收 `device/queue/layout` 三件套。
 | `Render2D` | 录制 → 排序 → 剔除 → 合批 → 写 pass | 不取帧、不 present、不拥有 GPU、**不含相机** |
 | `Camera2D` | **矩形区域 + 2D 变换** + VP 矩阵 + 坐标互转 | 不渲染、不被运行时持有 |
 | `Text` | 字体系统 + 字形图集 + 文本链 | 不渲染（`Label::draw` 才提交） |
-| `Ui` | 每帧 UI 录制（外观立即 + 状态经 ID 持久） | 不拥有 `UiState`/`Render2D` |
+| `Ui` | **一段** UI 录制（外观立即 + 状态经 ID 持久）；一帧可多段，帧级账由 `UiState` 的帧暂存跨段共享 | 不拥有 `UiState`/`Render2D` |
 | `DynamicAtlas` | 运行时图集：打包 / 寿命 / 复活 / 句柄 | 不绘制 |
 | `TileMap` | 瓦片集合 + chunk 预生成 + 自身的剔除 | 不拥有图集 |
 
@@ -460,6 +460,8 @@ R1 的唯一例外清单（除数据构造器外）：
 | 诊断：画面矩形 | `RUST_LOG=rjw_krusie=debug` 打印每个画面的 `region` 与清屏意图（多画面"画到哪去了"第一手证据）；冒烟/边框 overlay 的调用也可由此观察 |
 | **多画面的 UI 层语义（明确规则，非隐含行为）** | ① 每个画面的 UI 层坐标 = **该画面矩形左上角为原点的物理像素**（`ui_cam.transform.pos = region.center()`）⇒ 分屏各画各的 HUD 无需偏移换算；② `Render2D::submit` 是**提交即清帧**（世界层 + UI 层队列一起清）⇒ 多画面必须**交错写入**（录左屏 → `submit` 左屏 → 录右屏 → `submit` 右屏）；录完再连续 `submit` 两次时，第二次队列已空。两条都写进 `ENGINE_GUIDE.md` §4.4.1（此前的"UI 层在多画面下只出现在最后一个 pass"现象即由这两条共同解释：不是 VP 串味，而是队列清空 + 各画面 scissor 裁剪） |
 | 冒烟 + 画面证据 | `--frames N` / `KRUSIE_SMOKE_FRAMES=N` 自动退出，收尾打印 `[OK] N iterations / N frames presented`，**0 呈现 = 退出码 2**；10 个示例实跑 30 帧全绿（各 30/30 呈现）；`egHello` / `eg260731RPG` / `eg260818UI` 另经 RenderDoc 抓帧导出 PNG 目视确认（地形 / 精灵 / 文本 / HUD / UI 窗口全部到位） |
+
+| **运行时 UI 层「ui anywhere」（L1：帧作用域多段）** | `Frame::ui(theme) -> UiSession`（`Deref` 到 `Ui`；**一帧可多次、位置随意**，段间可交错世界绘制 / 世界文本）；帧级账每帧一次——**懒开场**（`UiInit::build()` 在 `frame_open()` 为假时开场：帧号 +1 / 命中区翻页 / 冻结输入快照 / 责任链种入，留到第一段以保住应用先注入的鼠标边沿）+ **帧收尾** `Ui::end_frame`（输入结算 / 焦点导航 + 描边（走 `debug_queue`，恒覆盖最上）/ 光标定夺 / 统计写回 / 帧级暂存关场），由 `Ctx::ui_end_frame()` 在 UI 队列提交前**幂等**调用；`UiLayer` 收拢为**自洽一层**（`UiState` + `Theme` + 专用 `Render2D`——`Ctx.ui_2d` 删除）；各段统计聚合进 `UiStats`（`frame` 每帧 +1、计数与耗时求和、`ui_frame_us` = 开场→收尾）；`UiState::clone` 不带帧内暂存；附带修 `Frame::present/drop` 的"未 submit ⇒ 自动清屏提交"路径（`egHello --no-submit` + `RUST_LOG=rjw_krusie=trace` 验证）。验证：两段 `--ui-dump` 打印同一 `frame=` 且后一段能看到前一段录的窗口；`--sim-picker/-drag/-overlap/-click` 与 10 示例冒烟结果不变 |
 
 ### 尚未落地（后续阶段要做的）
 

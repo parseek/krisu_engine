@@ -20,6 +20,9 @@ struct Hello {
     cam: Camera2D,
     /// 累计时间（驱动旋转）。
     t: f32,
+    /// `--no-submit`：**故意不**调 `Frame::submit`，验证帧尾"自动清屏 + 提交"路径
+    /// （`RUST_LOG=krusie=trace` 应出现"应用未提交本帧"；冒烟仍须有画面）。
+    no_submit: bool,
 }
 
 const CIRCLE_VERTS: LazyLock<[Vec2; 96]> = LazyLock::new(|| {
@@ -37,6 +40,7 @@ impl App for Hello {
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
+        let no_submit = self.no_submit;
         // ── 逻辑半程：无帧也执行（后台模拟 / 计时 / 输入状态持续）──
         if ctx.key(KeyCode::Escape).down_edge() {
             ctx.exit();
@@ -96,7 +100,10 @@ impl App for Hello {
         }
 
         // ── 提交：一个画面 = 一次 submit(相机, clear) ──
-        f.submit(&mut self.cam, Clear::color(Color::rgb(0.10, 0.11, 0.16)));
+        // （`--no-submit` 只作验证用：跳过显式提交，帧尾应走"自动清屏 + 提交"路径。）
+        if !no_submit {
+            f.submit(&mut self.cam, Clear::color(Color::rgb(0.10, 0.11, 0.16)));
+        }
         // 不调用 present 也行：`Frame` 析构会自动 present。
     }
 }
@@ -108,5 +115,6 @@ fn key_axis(f: &Frame<'_>, plus: KeyCode, minus: KeyCode) -> f32 {
 
 fn main() -> Result<(), RunError> {
     env_logger::init();
-    run(Hello::default())
+    let no_submit = std::env::args().any(|a| a == "--no-submit");
+    run(Hello { no_submit, ..Hello::default() })
 }

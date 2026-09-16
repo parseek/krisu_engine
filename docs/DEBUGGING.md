@@ -12,11 +12,15 @@
 
 ```rust
 // 应用侧（eg260818UI 的 `--ui-dump` 即此法）
-f.ui(theme, |ui| {
-    // ... 录制 UI ...
-    eprintln!("{}", ui.debug_dump());   // 或 log::info!(..)
-});
+let mut ui = f.ui(theme);
+// ... 录制 UI ...
+eprintln!("{}", ui.debug_dump());   // 或 log::info!(..)；**任一段**都能调
+ui.finish();
 ```
+
+> 一帧多段时：帧级暂存（窗口原点 / z / 拖拽状态）**跨段共享**，所以后一段的 dump 能看到
+> 前一段录的窗口，且两段打印的 `frame=` **相同**（帧号每帧只 +1）。示例里的 `[段 1]` /
+> `[段 2]` 两行就是这个对照。
 
 输出是单行可 grep 格式：
 
@@ -163,6 +167,10 @@ cargo run -p egHello -- --frames 60
 - **冒烟开关**：`--frames N` 跑满 N 次迭代后退出，并打印
   `krusie smoke: [OK] N iterations / N frames presented`；**0 呈现 = 退出码 2**
   （挡住"能跑但没画面"的回归）。
+- **"未 submit ⇒ 帧尾自动清屏提交"路径**（`Frame::present` / `Frame::drop`）：用
+  `egHello --no-submit` 复现——它故意跳过 `f.submit`，配合 `RUST_LOG=rjw_krusie=trace`
+  应看到 `krusie: 应用未提交本帧，使用 AppConfig::clear 自动清屏并呈现` + `画面 #1 region=…`，
+  且冒烟仍 `[OK] N iterations / N frames presented`；正常（有 `submit`）的帧**不应**出现该行。
 - 帧内诊断钩子：`Ui::debug_dump()`、`UiState::{stats, occluded_hits, last_press_window}`
   、`Render2D::{will_use_depth_stencil, sort_mode, cull_mode}`。
 

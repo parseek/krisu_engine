@@ -15,6 +15,13 @@ use rjw_transform::{Camera2D, Rect};
 
 use crate::runtime::ctx::Ctx;
 
+/// UI 基层层级（= UI 层内 `layer` 的基准；世界层之上、常驻最上）。
+///
+/// 与 `UiInit::base_layer` 默认值一致；需要其它值请走低层 `Ui::begin`（runtime 入口只
+/// 保留一个——R4「一个概念一条入口」）。
+#[cfg(feature = "ui")]
+const UI_BASE_LAYER: f64 = 1.0e7;
+
 /// 本帧渲染面。
 pub struct Frame<'a> {
     ctx: &'a mut Ctx,
@@ -88,9 +95,20 @@ impl<'a> Frame<'a> {
 
     /// 呈现本帧（提交 encoder + present）。可省略：`Frame` 析构时自动呈现。
     ///
-    /// 呈现**之前**会先画「画面边框」overlay（若 `AppConfig::viewport_borders` 开启）——
-    /// 它必须是本帧的**最后一个 pass**（视口 = 整屏），所以挂在帧末收尾而不是画面里。
+    /// 帧末收尾顺序（与本函数/Drop 共用一条路径）：
+    /// 1. **UI 帧收尾**（`Ctx::ui_end_frame`，幂等）：焦点导航 + 描边 / 光标 / 统计；
+    /// 2. 应用**没** `submit` 时补一次自动提交（`AppConfig::clear` 清屏 + 世界 / UI 层）——
+    ///    否则"未显式 submit 的帧"既没开 pass 也没清屏（旧实现只 present，画面不会更新）；
+    /// 3. 「画面边框」overlay（若 `AppConfig::viewport_borders` 开启）——它必须是本帧的
+    ///    **最后一个 pass**（视口 = 整屏），所以挂在帧末收尾而不是画面里；
+    /// 4. `present`。
     pub fn present(&mut self) {
+        #[cfg(feature = "ui")]
+        self.ctx.ui_end_frame();
+        if !self.ctx.app_submitted() {
+            log::trace!("krusie: 应用未提交本帧，使用 AppConfig::clear 自动清屏并呈现");
+            self.ctx.submit_default_clear();
+        }
         self.ctx.submit_viewport_borders();
         self.ctx.present();
         self.presented = true;
@@ -122,16 +140,33 @@ impl<'a> Frame<'a> {
         self.ctx.surface.as_mut().map(|f| (f.device(), f.queue()))
     }
 
-    /// UI（feature = `ui`）：自动完成 `Ui::begin` / 输入快照 / 主题 / DPI / `finish`。
+    /// **开一段 UI 录制**（feature = `ui`）：一帧可调用**任意多次**、位置随意——
+    /// 世界绘制之前 / 之间 / 之后都行（这就是「ui anywhere」）。
     ///
     /// ```ignore
-    /// f.ui(Theme::dark(), |ui| {
-    ///     ui.window("inv").pos(Vec2::new(300.0, 90.0)).show(|w| { w.label("背包"); });
-    /// });
+    /// let mut ui = f.ui(Theme::dark());      // 段 1
+    /// self.hud.ui(&mut ui);                  // &mut Ui 可透传给任意函数 / 模块
+    /// drop(ui);                              // 段收尾（等价于作用域结束）
+    /// render_world(f.draw());                // 世界里绘制（段之间随便交错）
+    /// f.text(|t| { /* 世界文本 */ });
+    /// let mut ui = f.ui(Theme::dark());      // 段 2（同一帧；不再重复开帧）
+    /// self.panel.ui(&mut ui);
+    /// drop(ui);
+    /// f.submit(&mut cam, clear);             // 提交前运行时自动做一次帧收尾
     /// ```
+    ///
+    /// - **段存活期间** `f` 被借用 ⇒ 不能 `draw` / `text` / `submit`（编译期拦住）；
+    /// - **帧级账**（帧号 / 命中区翻页 / 输入快照 / 焦点导航 + 描边 / 光标 / 窗口遮挡清理 /
+    ///   统计）每帧只做一次：开场在第一段**懒执行**（应用常在 `update` 里先
+    ///   `debug_inject_mouse`，快照早了会丢点击边沿），收尾由运行时在提交前补齐；
+    /// - **段序 = 绘制序**：后一段整体压在前一段之上（同一窗口内也是）。⚠ 因此**一个窗口
+    ///   （或一处顶层放置）尽量在同一段内录完**——跨段会让该窗口的顶点缓存每帧重算两次。
+    ///
+    /// 返回值 [`UiSession`] `Deref` 到 [`rjw_ui::Ui`]；详见
+    /// [`Frame::ui`](crate::runtime::Frame::ui) 所在模块与 `docs/UI_OVERVIEW.md`。
     #[cfg(feature = "ui")]
-    pub fn ui(&mut self, theme: rjw_ui::Theme, f: impl FnOnce(&mut rjw_ui::Ui<'_>)) {
-        self.ctx.run_ui(theme, f);
+    pub fn ui(&mut self, theme: rjw_ui::Theme) -> crate::runtime::layers::ui::UiSession<'_> {
+        self.ctx.ui_view(theme, UI_BASE_LAYER, false)
     }
 
     /// 文本（feature = `text`）：闭包拿到运行时文本上下文 [`TextCtx`]
@@ -170,8 +205,9 @@ impl<'a> Frame<'a> {
     #[cfg(feature = "text")]
     pub fn text_ui<R>(&mut self, f: impl FnOnce(&mut rjw_text::TextCtx<'_>) -> R) -> Option<R> {
         let ctx = &mut *self.ctx;
+        // 分字段借用（`text` 与 `ui_layer.r2d` 不相交）：`ctx.ui_mut()` 会整体借用 `ctx`。
         let text = ctx.text.as_mut()?;
-        let r2d = ctx.ui_2d.as_mut()?;
+        let r2d = ctx.ui_layer.as_mut()?.r2d.as_mut()?;
         let mut tc = rjw_text::TextCtx::new(text, r2d);
         Some(f(&mut tc))
     }
@@ -188,9 +224,9 @@ impl Deref for Frame<'_> {
 impl Drop for Frame<'_> {
     fn drop(&mut self) {
         if !self.presented {
-            // 未显式 present：帧尾收尾（画面边框 overlay → 自动 clear → present）。
-            self.ctx.submit_viewport_borders();
-            self.ctx.present();
+            // 未显式 present：帧尾收尾（UI 帧收尾 → 未提交则自动清屏提交 → 画面边框
+            // overlay → present）。与 [`Frame::present`] 同一条路径，避免两处语义漂移。
+            self.present();
         }
     }
 }

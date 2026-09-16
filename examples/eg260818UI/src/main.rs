@@ -1180,22 +1180,12 @@ impl App for UiApp {
             }
         }
 
-        // ── 世界层：几个背景方块（在 UI 之下）─────────────────
-        // 阶段计时（沿用旧 `[perf]` 的细分口径，因新驱动不再暴露 Frame 取用/pass 边界，
-        // 以可达的边界重新划分）：`begin` = 世界层录制，`encode` = UI 帧
-        // （`Ui::begin` → `Ui::finish` 的录制/布局/提交队列），`submit` = `f.submit`，
-        // `present` = `f.present`；四段不重叠，合计 = `render` 总耗时。
-        let t_world = Instant::now();
-        render_world(f.draw());
-        let begin_us = t_world.elapsed().as_secs_f64() * 1e6;
-
         // 主题由 [`ThemeTuner`] 每帧组装（预设调色板 + 圆角 / 羽化 / 微渐变 / 强调色，
-        // 以及 FontModal 选定的字体族）。⚠ 须在 `f.ui(..)` **之前**构建：
-        // 闭包借用 `self`，闭包内不能构造它。
+        // 以及 FontModal 选定的字体族）。两段 UI 各传一份（`Theme` 可克隆）。
         let theme = self.theme_tuner.theme(self.top.font_name());
 
-        // 性能统计（`f.ui` 前复制的上一帧值；闭包内每帧覆盖）。
-        let mut ui_stats = UiStats::default();
+        // 性能统计（UI 段 2 里读取"上一帧收尾"写入的值；延迟初始化避免多余默认值）。
+        let ui_stats: UiStats;
         // 本帧点击计数（顶部状态栏显示）；UI 模块内累加，帧末写回 `self.clicks`。
         let mut clicks = self.clicks;
         // --script-pos：`Instant` 为 `Copy`——先复制出时间基准，闭包只捕获它（不借 `self`）。
@@ -1220,10 +1210,13 @@ impl App for UiApp {
         // 本帧被**窗口遮挡**拦下的命中次数（`--sim-click` 诊断用）。
         let mut window_blocked = 0u32;
 
-        // ── UI 层：录制 + 提交由运行时接管（`Ui::begin` / 输入快照 / 主题 / DPI /
-        //    `Ui::finish(&region, r2d_ui)`）；UI 渲染器排序已关闭。 ────────────
+        // ── UI 层（段 1）：状态栏 / 菜单 / 背包 / 窗口 / 重叠探针 ───────────────────
+        // 「ui anywhere」：`f.ui(theme)` 开**一段**录制；一帧可开任意多段、位置随意，
+        // 段之间可以穿插世界层绘制 / 世界文本（段存续期间 `f` 被借用 ⇒ 不能 draw/submit）。
+        // 帧级账（帧号 / 命中区翻页 / 输入快照）在第一段**懒开场**，后续段复用。
         let t_ui = Instant::now();
-        f.ui(theme, |ui| {
+        {
+            let mut ui = f.ui(theme.clone());
             if sim_picker
                 && sim_bad_text_frames.contains(&sim_frame)
                 && ui
@@ -1248,9 +1241,6 @@ impl App for UiApp {
             //    输入 `R` / `Esc` 不会被当作重置 / 退出。
             //    与旧 `capturing_text()`（任何控件持焦点都为真）不同：只有**文本控件**
             //    持焦点才屏蔽快捷键（按钮/滑块 Tab 焦点不吞应用按键）。
-            //    新驱动下没有「`Ui::begin` 之前」的 `UiState` 取用口，故快捷键判定放在
-            //    闭包内、经 `Ui::state()` 读取（输入快照在 `Ui::begin` 时已捕获，
-            //    `down_edge` 语义与旧版一致）。
             if ui.state().text_focus().is_none() {
                 if ui.key_down_edge(KeyCode::Escape) {
                     exit_requested = true;
@@ -1259,21 +1249,11 @@ impl App for UiApp {
                     reset_ui_state(ui.state_mut());
                 }
             }
-            // 窗口诊断（调试机制）：值由**上一帧** `Ui::finish` 写入、本帧 `finish` 覆盖
-            // （`last_press_window` / `occluded_hits` 跨帧保留）——须在「本帧 UI 模块录制
-            // 之前」从 `ui.state()` 读取。`f.ui(..)` 的闭包是唯一能拿到 `UiState` 的地方，
-            // 故由旧版「`Ui::begin` 之前读」改为「闭包开头读」；显示内容与旧版一致。
-            let prev_press = ui
-                .state()
-                .last_press_window()
-                .map(|(id, z)| format!("{id} (z{z})"))
-                .unwrap_or_else(|| "无".to_owned());
-            let prev_blocked = ui.state().occluded_hits();
-            let prev_widget_blocked = ui.state().widget_occluded_hits();
-
             // ── 位置责任链演示（--script-pos）：脚本让窗口 A 沿正弦摆动 ──
             // 处理器优先级 -10（< 0）：**用户拖拽优先**——拖住 A 时脚本让位、窗口跟手，
             // 松开后停在放置处；不拖时脚本每帧驱动位置（脚本"动画"，拖动"覆盖"）。
+            // ⚠ 责任链是**帧级暂存**（跨段共享）：段 1 注册的处理器对段 2 录制的窗口
+            //    同样生效。
             if script_pos {
                 ui.pos_handler(-10, move |id| {
                     if id == "win_a" {
@@ -1289,19 +1269,53 @@ impl App for UiApp {
             }
 
             // ── 各 UI 模块依次录制（互不重叠字段借用，顺序与屏幕布局无关） ──
-            self.top.ui(ui, fps, clicks, &mut self.theme_tuner);
-            self.menu.ui(ui, &mut clicks);
-            self.inventory.ui(ui);
-            self.windows.ui(ui, &mut clicks);
+            self.top.ui(&mut ui, fps, clicks, &mut self.theme_tuner);
+            self.menu.ui(&mut ui, &mut clicks);
+            self.inventory.ui(&mut ui);
+            self.windows.ui(&mut ui, &mut clicks);
             // 重叠控件探针（顶层 win=0；位置在全屏所有窗口下方 ⇒ 不会被窗口遮挡）。
-            self.overlap.ui(ui);
+            self.overlap.ui(&mut ui);
+            // `--ui-dump`：段 1 也打印一份——两段应打印**同一个 `frame=`**（帧号每帧只 +1），
+            // 且段 2 那份还应包含段 1 录的窗口（帧级暂存跨段共享）。
+            if ui_dump {
+                eprintln!("[段 1] {}", ui.debug_dump());
+            }
+            // 段收尾：提交本段到 UI 层自己的 `Render2D`；`f` 的借用到此结束。
+            ui.finish();
+        }
+        let ui_seg1_us = t_ui.elapsed().as_secs_f64() * 1e6;
+
+        // ── 段之间：世界层绘制（在 UI 之下；证明 UI 段与世界绘制可任意交错）─────
+        // 阶段计时（`begin` = 世界层录制，`encode` = UI 两段之和，`submit` = `f.submit`，
+        // `present` = `f.present`）。
+        let t_world = Instant::now();
+        render_world(f.draw());
+        let begin_us = t_world.elapsed().as_secs_f64() * 1e6;
+
+        // ── UI 层（段 2）：右侧诊断 / 主题调音台 / 字体 Modal ─────────────────────
+        let t_ui2 = Instant::now();
+        {
+            let mut ui = f.ui(theme);
+            // 窗口诊断（调试机制）：值由**上一帧** UI 收尾写入、本帧收尾覆盖
+            // （`last_press_window` / `occluded_hits` 跨帧保留）——须在「本段 UI 模块录制
+            // 之前」从 `ui.state()` 读取。段内 `Ui` 视图与 `UiState` 一一对应，
+            // 故任一段都能读到同一份跨帧状态。
+            // 故由旧版「`Ui::begin` 之前读」改为「段开头读」；显示内容与旧版一致。
+            let prev_press = ui
+                .state()
+                .last_press_window()
+                .map(|(id, z)| format!("{id} (z{z})"))
+                .unwrap_or_else(|| "无".to_owned());
+            let prev_blocked = ui.state().occluded_hits();
+            let prev_widget_blocked = ui.state().widget_occluded_hits();
+
             self.right
-                .ui(ui, &mut clicks, &prev_press, prev_blocked, prev_widget_blocked);
-            self.theme_tuner.ui(ui);
+                .ui(&mut ui, &mut clicks, &prev_press, prev_blocked, prev_widget_blocked);
+            self.theme_tuner.ui(&mut ui);
 
             // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
             // 不被本帧后录的窗口盖住——见 modal_at 文档）。
-            self.top.show_font_modal(ui);
+            self.top.show_font_modal(&mut ui);
 
             // `--sim-overlap` / `--sim-click`：读**本帧**两类遮挡拦截计数——必须在
             // 全部模块录制之后（早读只会看到前半帧）。
@@ -1310,27 +1324,28 @@ impl App for UiApp {
                 window_blocked = ui.state().occluded_hits();
             }
 
-            // 性能统计（**闭包末尾、本帧 `Ui::finish` 之前**读到的正是上一帧 finish 写入
-            // 的 UI 各阶段耗时——与旧版「`ui.finish()` 之后读 `ui_state.stats`」等价：
-            // 那时读到的同样是上一帧的统计，本次 `finish` 才会覆盖它）。
+            // 性能统计（读到的正是**上一帧**收尾写入的 UI 各阶段耗时）。
             ui_stats = ui.state().stats.clone();
 
             // ── 引擎状态诊断（`--ui-dump`）：Rust 侧调试用 —— 打印每个窗口的
             //    id / z / **本帧提交原点** / 尺寸 / 拖拽状态 / 持久位置 + 鼠标 / 焦点。
             //    排查"位置 / 层级 / 拖拽"问题时**先看这份状态**（见 docs/DEBUGGING.md）。
+            //    ⚠ 帧级暂存跨段共享 ⇒ 段 2 的 dump 能看到**段 1 录的窗口**（且两段打印的
+            //    `frame=` 相同：帧号每帧只 +1）。
             if ui_dump {
-                eprintln!("{}", ui.debug_dump());
+                eprintln!("[段 2] {}", ui.debug_dump());
             }
 
             // 重置请求（按钮点击 / `R` 键）：须在**全部录制之后**执行——
             // `UiState::reset` 清空控件状态与窗口缓存，此时本帧命令已录好、下次
-            // `begin_frame` 前无读取者（与旧版「`ui.finish()` 后重置」等价）。
+            // 开场前无读取者。
             if self.menu.reset_requested {
                 self.menu.reset_requested = false;
                 reset_ui_state(ui.state_mut());
             }
-        });
-        let encode_us = t_ui.elapsed().as_secs_f64() * 1e6;
+            ui.finish();
+        }
+        let encode_us = ui_seg1_us + t_ui2.elapsed().as_secs_f64() * 1e6;
         self.clicks = clicks;
         // --sim-picker：打印脚本化拖动后演示取色器的颜色（守护"面板确实改了值"：
         // 只有点击命中色块 → 面板打开 → SV 平面/色相条/滑块被拖到，颜色才会变）。

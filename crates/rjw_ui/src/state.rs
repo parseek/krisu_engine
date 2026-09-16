@@ -7,7 +7,7 @@ use glam::Vec2;
 use rjw_text::Buffer;
 use rjw_transform::Rect;
 
-use crate::focus::FocusKind;
+use crate::focus::{FocusEntry, FocusKind};
 use crate::id::IdAbsolute;
 
 /// 控件文本 `Arc<Buffer>` 缓存容量上限：超出时按"本帧未使用"驱逐（帧级近似 LRU），
@@ -81,8 +81,11 @@ pub struct ScrollState {
     pub content_h: f32,
 }
 
-/// UI 帧性能统计（`Ui::finish` 各阶段耗时，µs；debug/release 对比与优化决策用）。
-/// 每次 `finish` 覆盖写入——示例里读到的是**上一帧**的统计值。
+/// UI 帧性能统计（`Ui::finish` / `Ui::end_frame` 各阶段耗时，µs）。
+///
+/// **每帧聚合**（一帧可有多段 UI：[`crate::Ui::finish`] 逐段累加、[`crate::Ui::end_frame`]
+/// 写回）：`frame` 每帧 +1，`cmd_count` / `win_count` / 缓存命中与各阶段耗时为**各段之和**，
+/// `ui_frame_us` 为**开场 → 收尾**的整帧跨度。示例里读到的是**上一帧**的统计值。
 #[derive(Clone, Debug, Default)]
 pub struct UiStats {
     /// 统计帧号（每次 `finish` 自增）。
@@ -110,9 +113,146 @@ pub struct UiStats {
     pub ui_frame_us: f64,
 }
 
+/// **UI 帧级暂存**（每帧开场清零；**同一帧内的多段 UI 共享**）。
+///
+/// 为什么独立于 `Ui`：`Ui` 是**段**（一次 `Ui::begin(..).build()` → `Ui::finish`）的
+/// 瞬态视图，而下列事实是**一帧一份**的——多段录制时必须跨段存活，否则
+/// "第二段把第一段的按下归属 / 窗口原点 / 焦点链 / 责任链 / 统计全部清掉"。
+/// 住在 [`UiState`] 里（而不是运行时），使 `Ui::begin(window, text, state)` 仍是
+/// **3 参**（`docs/API_DESIGN.md` §9 白名单）且无自引用借用。
+///
+/// 生命周期：`UiState::begin_frame()`（帧首，运行时调用）→ [`Self::begin`]；
+/// 各段读写；`Ui::end_frame()`（帧尾）→ [`Self::close`]。
+pub(crate) struct UiFrameState {
+    /// 本帧是否已开场（`UiInit::build()` 懒开场判据 + 帧收尾幂等判据）。
+    pub open: bool,
+    /// 本帧冻结的鼠标 / 键盘快照（**第一段开场时捕获一次**：段间注入只影响下一帧）。
+    pub mouse: crate::input::MouseSnapshot,
+    pub keyboard: crate::input::KeyboardSnapshot,
+    /// 鼠标屏幕坐标（物理像素）与是否在窗口内。
+    pub mouse_logical: Vec2,
+    pub mouse_screen: Vec2,
+    pub mouse_in_window: bool,
+    /// 本帧是否有控件被按下（空白点击清焦点用）。
+    pub any_pressed: bool,
+    /// 本帧按下是否被文本输入控件占用（拖拽语义归属）。
+    pub press_claimed: bool,
+    /// 当前拖拽中的面板 / 窗口绝对 ID。
+    pub drag_panel: Option<IdAbsolute<'static>>,
+    /// 本帧按下命中的最上层窗口（重叠点击裁决）。
+    pub win_press_top: Option<(IdAbsolute<'static>, u32)>,
+    /// 窗口 z → 窗口左上角（逻辑坐标；顶点局部化基准）。
+    pub win_origins: HashMap<u32, Vec2>,
+    /// 窗口 z → 窗口绝对 ID（几何缓存 key）。
+    pub win_ids: HashMap<u32, IdAbsolute<'static>>,
+    /// 本帧焦点链（键盘导航；各段按录制序追加）。
+    pub focusables: Vec<FocusEntry>,
+    /// 本帧光标意图（帧尾由 `finalize_cursor_and_reset` 统一落到系统光标）。
+    pub cursor_text: bool,
+    pub cursor_grab: bool,
+    pub cursor_grabbing: bool,
+    pub cursor_window_drag: bool,
+    pub cursor_custom: Option<winit::window::CursorIcon>,
+    /// 位置 / 尺寸责任链（应用脚本处理器 + 内置拖拽环；跨段共享）。
+    pub pos_chain: Vec<(i32, crate::ui::PosLink)>,
+    pub size_chain: Vec<(i32, crate::ui::SizeLink)>,
+    /// UI 帧起点（开场时刻；`ui_frame_us` = 收尾 − 起点）。
+    pub frame_t0: std::time::Instant,
+    /// win=0 放置子槽组号（跨段**连续**递增：组号即缓存槽 key，各段从 1 重开会互相踩）。
+    pub cur_z0_group: u32,
+    /// 各段累加的统计（帧尾写回 `UiState::stats`）。
+    pub stats: UiStats,
+}
+
+impl Default for UiFrameState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            mouse: Default::default(),
+            keyboard: Default::default(),
+            mouse_logical: Vec2::ZERO,
+            mouse_screen: Vec2::ZERO,
+            mouse_in_window: false,
+            any_pressed: false,
+            press_claimed: false,
+            drag_panel: None,
+            win_press_top: None,
+            win_origins: HashMap::new(),
+            win_ids: HashMap::new(),
+            focusables: Vec::new(),
+            cursor_text: false,
+            cursor_grab: false,
+            cursor_grabbing: false,
+            cursor_window_drag: false,
+            cursor_custom: None,
+            pos_chain: vec![(0, crate::ui::PosLink::Drag)],
+            size_chain: vec![(0, crate::ui::SizeLink::Drag)],
+            frame_t0: std::time::Instant::now(),
+            cur_z0_group: 0,
+            stats: UiStats::default(),
+        }
+    }
+}
+
+/// 帧级暂存**不参与克隆**（`UiState::clone` 复制的是跨帧持久状态；帧内在新帧里本就该是空的）。
+impl Clone for UiFrameState {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// 手写 `Debug`：责任链里装的是 `Box<dyn Fn>`，只打印"有没有 / 几环"。
+impl std::fmt::Debug for UiFrameState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiFrameState")
+            .field("open", &self.open)
+            .field("mouse_in_window", &self.mouse_in_window)
+            .field("any_pressed", &self.any_pressed)
+            .field("press_claimed", &self.press_claimed)
+            .field("drag_panel", &self.drag_panel)
+            .field("win_press_top", &self.win_press_top)
+            .field("wins", &self.win_origins.len())
+            .field("focusables", &self.focusables.len())
+            .field("pos_chain", &self.pos_chain.len())
+            .field("size_chain", &self.size_chain.len())
+            .field("cur_z0_group", &self.cur_z0_group)
+            .finish()
+    }
+}
+
+impl UiFrameState {
+    /// 帧开场：清空帧级事实 + 冻结输入快照 + 种入内置责任链环。
+    fn begin(&mut self) {
+        *self = Self::default();
+        self.open = true;
+        self.frame_t0 = std::time::Instant::now();
+    }
+
+    /// 帧收尾：关场（暂存内容留到下次 `begin` 再清，便于诊断读取）。
+    fn close(&mut self) {
+        self.open = false;
+    }
+
+    /// 冻结本帧输入快照（**本帧第一段开场时调用一次**；后续段复用，段间注入只影响下一帧）。
+    pub(crate) fn freeze_input(
+        &mut self,
+        mouse: crate::input::MouseSnapshot,
+        keyboard: crate::input::KeyboardSnapshot,
+    ) {
+        self.mouse = mouse;
+        self.keyboard = keyboard;
+        let (mx, my) = self.mouse.pos_px();
+        self.mouse_screen = Vec2::new(mx as f32, my as f32);
+        self.mouse_logical = self.mouse_screen;
+        self.mouse_in_window = self.mouse.in_window();
+    }
+}
+
 /// UI 全局持久状态（由应用持有，跨帧复用；一个 `UiState` 可对应多个 `Ui`）。
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
+    /// **帧级暂存**（每帧开场清零；**同一帧内多段共享**，见 [`UiFrameState`]）。
+    pub(crate) frame_state: UiFrameState,
     /// 控件 **绝对 ID** → 持久状态。
     pub widgets: HashMap<IdAbsolute<'static>, WidgetState>,
     /// 当前持有焦点的控件 **绝对 ID**（文本输入框等）。
@@ -247,7 +387,8 @@ impl UiState {
         Self::default()
     }
 
-    /// 进入新的一帧（内部自动调用，应用无需手动）。
+    /// 进入新的一帧（**每帧一次**；段起始由 `UiInit::build()` 懒开场——`frame_open()`
+    /// 为假才开，故同帧多段只开一次）。
     pub fn begin_frame(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         // 遮挡拦截计数按帧清零（诊断机制：读的是"上一帧"的累计值）。
@@ -258,6 +399,21 @@ impl UiState {
         // （与窗口级 `window_rects` 同一思路）。swap 复用两块缓冲，无每帧分配。
         std::mem::swap(&mut self.hit_regions, &mut self.prev_hit_regions);
         self.hit_regions.clear();
+        // 帧级暂存开场：清空 + 种入内置责任链环（输入快照由 `UiInit::build()` 冻结）。
+        self.frame_state.begin();
+    }
+
+    /// 帧收尾（**每帧一次**，由 [`crate::Ui::end_frame`] 调用）：帧级暂存关场复位。
+    pub(crate) fn end_frame(&mut self) {
+        self.frame_state.close();
+    }
+
+    /// **本帧是否已开场**（帧级暂存是否有效）。
+    ///
+    /// 运行时的 UI 帧收尾据此判定"本帧是否录过 UI"（没录过则空操作，零开销）。
+    #[inline]
+    pub fn frame_open(&self) -> bool {
+        self.frame_state.open
     }
 
     /// 取（或创建）某控件的持久状态。`id` 为**绝对 ID**（控件内 `ui.id_for(..)` 所得）。
@@ -305,6 +461,9 @@ impl UiState {
         self.sizes.clear();
         self.window_fx.clear();
         self.stats = UiStats::default();
+        // **帧级暂存也清**（含 `open = false`）：`reset` 常在**段内**调用（示例"R 重开"），
+        // 若把 `open` 留成 true，下一帧第一段就不再开场（帧号不推进 / 命中区不翻页）。
+        self.frame_state = UiFrameState::default();
     }
 
     /// **文本焦点**（`None` = 当前焦点不是文本控件 / 无焦点）。
@@ -431,5 +590,42 @@ impl CheckboxState {
     #[inline]
     pub fn clicked(&self) -> bool {
         self.clicked
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **帧级暂存**：一帧开场一次、收尾关场；`UiState::clone` 不带帧内暂存。
+    ///
+    /// 这些是"一帧可多段 UI"正确性的地基：若 `begin_frame` 被第二次调用（旧实现里
+    /// 每段 `Ui::begin(..).build()` 都会调一次），帧号会 +2、命中区表二次翻页；
+    /// 若 `clone` 把帧内暂存带过去，两份 `UiState` 会共享上一帧的按下归属。
+    #[test]
+    fn frame_state_opens_once_per_frame_and_is_not_cloned() {
+        let mut state = UiState::new();
+        assert!(!state.frame_open(), "初始（未开场）应为关");
+        let f0 = state.frame;
+        state.begin_frame();
+        assert!(state.frame_open(), "begin_frame 后应处于开场状态");
+        assert_eq!(state.frame, f0 + 1, "每帧帧号 +1");
+        // 帧内暂存：责任链预置内置拖拽环（段间共享、跨段存活）。
+        assert_eq!(state.frame_state.pos_chain.len(), 1);
+        assert_eq!(state.frame_state.size_chain.len(), 1);
+        // 段与段之间**不**再开场：开场状态由 `frame_open()` 决定，第二段复用暂存。
+        state.frame_state.any_pressed = true;
+        assert!(state.frame_open(), "第一段之后本帧仍是开场状态（第二段复用，不重置）");
+        // 帧收尾：关场。
+        state.end_frame();
+        assert!(!state.frame_open(), "end_frame 后应关场");
+        // 下一帧再开场 → 暂存被清零（上一帧的按下归属不残留）。
+        state.begin_frame();
+        assert!(!state.frame_state.any_pressed, "新帧暂存清零");
+        assert_eq!(state.frame, f0 + 2);
+        // clone 只复制跨帧持久状态：帧内暂存回到默认（未开场）。
+        let cloned = state.clone();
+        assert!(!cloned.frame_open(), "克隆的 UiState 帧内暂存为空（未开场）");
+        assert!(state.frame_open(), "原 state 不受克隆影响");
     }
 }

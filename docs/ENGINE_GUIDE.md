@@ -74,8 +74,7 @@ App (impl rjw_krusie::App)                    ← 游戏侧唯一 trait
       let Some(mut f) = ctx.frame() else { return };   ← 无帧则不执行渲染代码（逻辑照常）
      读输入(键盘/鼠标) → 更新逻辑 → 摆相机(Camera2D)
      → f.draw().sprite(..)/mesh(..)/polygon(..)/region(..)/static_mesh(..)/custom(..) + 链式 RStates
-     → f.submit(&mut cam, Clear::color(..))    ← 一个画面 = 一次 submit = 一个 pass
-     → f.ui(theme, |ui| ..) / f.text(|t| ..)   ← 可选：overlay 层
+     → f.ui(theme) 开一段录 UI（可多段 / 任意位置） / f.text(|t| ..)（世界文本）  ← 可选：overlay 层
      （f 析构自动 present；未 submit 则按 AppConfig::clear 收尾）
 ```
 
@@ -289,7 +288,7 @@ f.set_region(mini);  f.submit(&mut cam_m, Clear::depth(1.0));  // 只清深度�
 - **一个画面 = 一次 `submit(相机, clear)` = 一个 pass**；`submit` 会把 `region` 写回 `cam.region`
   （屏幕↔世界换算据此），并占用一个**帧级 VP 槽**（多画面互不串味）；
 - **`submit` 是"提交即清帧"**：世界层与 UI 层的命令队列都会被清空 ⇒ 每个画面**先录制
-  （`f.draw()` / `f.draw_ui()` / `f.text_ui()` / `f.ui(..)`）再 `submit`**；交错写入
+（`f.draw()` / `f.draw_ui()` / `f.text_ui()` / `f.ui(..)`）再 `submit`**；交错写入
   （录左屏 → 提交左屏 → 录右屏 → 提交右屏）才是每个画面各自见自己的内容。
   把全部内容录完再连续 `submit` 两次，后一次的队列已空（只在第一个画面里出现）。
 - 每个画面的 UI 层有自己的坐标系：UI 层坐标 = **该画面矩形左上角为原点的物理像素**
@@ -984,7 +983,7 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 | 调试：给每个画面描边 | `AppConfig::new(..).viewport_borders(ViewportBorders::On)` |
 | 绕中心旋转的精灵 | `r2d.solid(SpriteRect::centered(center, (w, h)))` |
 | 让画面跟随玩家 | `cam.transform.pos += (player.pos - cam.transform.pos) * (1-exp(-k*dt))` |
-| UI 固定最顶层 | 走 `f.ui(theme, \|ui\| ..)`（运行时已把 UI 层设为 `SortMode::None` + 默认 base layer 1e7） |
+| UI 固定最顶层 | 走 `f.ui(theme)` 开一段（运行时已把 UI 层设为 `SortMode::None` + 默认 base layer 1e7） |
 | 退出 | `Esc` → `ctx.exit()`（持帧时 `f.exit()`） |
 | 加性混合 Sprite | `.blend(BlendMode::Additive)` |
 | 全局启用深度测试 | `render2d.states_mut(RStates::new().depth_test(true).depth_write(true))` |
@@ -1030,39 +1029,52 @@ cam.zoom *= Vec2::splat(1.1_f64.powf(wheel.1) as f32);
 
 ### 18.2 最小用法
 
-**推荐：走运行时（`f.ui` 已替你管 `UiState` / `Theme` / DPI / UI 层 Render2D）**
+**推荐：走运行时（`f.ui(theme)` 开一段，运行时替你管 `UiState` / `Theme` / DPI / UI 层 Render2D）**
 
 ```rust
 fn update(&mut self, ctx: &mut Ctx) {
     let Some(mut f) = ctx.frame() else { return };
     f.draw().sprite(...);                       // 世界层
-    f.ui(Theme::dark(), |ui| {
-        ui.label_at(vec2(16.0, 12.0), "FPS: 60");       // place：绝对定位 + 自然尺寸
-        ui.pack_at(vec2(16.0, 90.0), PackSide::Top, |p| {  // pack：垂直堆叠
-            if p.button("btn_start", "开始游戏").clicked() { /* ... */ }
-            self.volume = p.slider("vol", 0.0..=1.0, self.volume);
-            if p.checkbox("fs", "全屏", self.fs).toggled() { self.fs = !self.fs; }
-            if p.radio("diff_hard", "diff", "困难").checked() { /* 单选组互斥 */ }
-            p.text_input("name", &mut self.player_name);   // 点击聚焦、打字（IME）、Enter/Esc 失焦
+    // ── UI 段 1（「ui anywhere」：一帧可开任意多段、位置随意）──
+    let mut ui = f.ui(Theme::dark());
+    ui.label_at(vec2(16.0, 12.0), "FPS: 60");       // place：绝对定位 + 自然尺寸
+    ui.pack_at(vec2(16.0, 90.0), PackSide::Top, |p| {  // pack：垂直堆叠
+        if p.button("btn_start", "开始游戏").clicked() { /* ... */ }
+        self.volume = p.slider("vol", 0.0..=1.0, self.volume);
+        if p.checkbox("fs", "全屏", self.fs).toggled() { self.fs = !self.fs; }
+        if p.radio("diff_hard", "diff", "困难").checked() { /* 单选组互斥 */ }
+        p.text_input("name", &mut self.player_name);   // 点击聚焦、打字（IME）、Enter/Esc 失焦
+    });
+    ui.window("win_a").pos(vec2(560.0, 240.0)).show(|w| {   // 可重叠窗口：点击置顶 + 可拖拽
+        w.label("窗口 A");
+        w.button("win_a_btn", "A 按钮");
+    });
+    ui.drag_panel_at("inv_panel", vec2(300.0, 90.0), |pp| {  // 可拖拽面板（位置持久）
+        pp.label("背包");
+        pp.grid_at(vec2(0.0, 28.0), 3, "inv", |g| {          // 3 列网格（cell 跨帧缓存）
+            g.button("slot_0", "物品 0");
         });
-        ui.window("win_a").pos(vec2(560.0, 240.0)).show(|w| {   // 可重叠窗口：点击置顶 + 可拖拽
-            w.label("窗口 A");
-            w.button("win_a_btn", "A 按钮");
-        });
-        ui.drag_panel_at("inv_panel", vec2(300.0, 90.0), |pp| {  // 可拖拽面板（位置持久）
-            pp.label("背包");
-            pp.grid_at(vec2(0.0, 28.0), 3, "inv", |g| {          // 3 列网格（cell 跨帧缓存）
-                g.button("slot_0", "物品 0");
-            });
-        });
-    });   // 关闭即提交（UI 层恒在世界层之后）
+    });
+    ui.finish();                                 // 段收尾（也可省略：作用域结束即收尾）
+
+    // ── 段与段之间可以做任何事（世界层 / 世界文本 / 逻辑）──
+    f.text(|t| { t.label("世界里的文字").size(16.0).at((0.0, 0.0)).draw(10.0); });
+
+    let mut hud = f.ui(Theme::dark());           // ── UI 段 2 ──
+    hud.label_at(vec2(16.0, 690.0), "FPS HUD");
+    hud.finish();
+
     f.submit(&mut self.cam, Clear::color(Color::rgb(0.05, 0.05, 0.08)));
+```
 }
 ```
 
 **低层/逃逸舱口**：自己持有 `UiState` 并手动开帧（需要自定义 `base_layer` / `scale_factor` / 复用别的 `Text` 时）：
 
 ```rust
+// ⚠ 帧级账由调用方负责：每帧**一次** `ui_state.begin_frame()`（段起始的 `build()`
+// 会在未开场时兜底开场），录制收尾调 `ui.end_frame(r2d)` 做帧收尾（焦点/光标/统计）。
+ui_state.begin_frame();
 let mut ui = Ui::begin(window, &mut text, &mut ui_state)
     .capture(ctx.mouse(), ctx.keys())          // 输入快照（&MouseInput, &KeyboardInput）
     .theme(Theme::dark())
@@ -1070,16 +1082,22 @@ let mut ui = Ui::begin(window, &mut text, &mut ui_state)
     .scale_factor(ctx.scale_factor().unwrap_or(1.0))  // 控件坐标/字号按逻辑像素
     .build();
 // ... 录制 ...
-ui.finish(r2d);      // 免全量排序提交（视口/渲染器此时才需要；UI 无需相机）
+ui.end_frame(r2d);   // 帧收尾 + 免全量排序提交（视口/渲染器此时才需要；UI 无需相机）
 ```
+
+> **段 vs 帧**：`Ui::finish(r2d)` = **段收尾**（分桶 → 顶点 → 提交，一帧可多次）；
+> `Ui::end_frame(r2d)` = **帧收尾**（输入结算 / 焦点导航 + 描边 / 光标定夺 / 统计写回 /
+> 帧级暂存复位，**每帧一次**）。运行时路径（`f.ui(theme)`）自动处理这两件事。
 
 ### 18.3 ⚠️ 易混淆点
 
 - **坐标一律屏幕逻辑像素**（左上角原点、Y+ 向下）：调用 `.scale_factor(ctx.scale_factor().unwrap_or(1.0))` 后，所有控件坐标 / 字号按逻辑像素使用，内部自动换算物理像素绘制与命中；不设置则 scale = 1.0（与物理像素一致）。与引擎世界坐标（中心原点）不同；内部经相机屏幕固定变换绘制，旋转/缩放相机下依然 1:1。
+- **UI 段存续期间 `f` 被借用**：`f.ui(theme)` 返回的 `UiSession` 活着时不能 `f.draw()` / `f.text()` / `f.submit()`（编译期拦住）；段之间可以随便交错（世界层、世界文本、逻辑都行）。需要重置 `UiState` 等操作时用局部标记，`ui.finish()` 之后统一处理（见示例）。
+- **一帧多段：段序 = 绘制序**：每段各自 `finish` 提交到同一个 UI 层 `Render2D`，所以**后一段整体压在前一段之上**（同一窗口内也如此）。因此**一个窗口（或一处顶层放置）尽量在同一段内录完**——跨段会让该窗口的顶点缓存每帧重算两次。
 - **顶层 pack 直接可用**：`build()` 内建**根容器**（PackSide::Top，可用宽 = 视口物理宽）——`finish` 前任何位置调 `label` / `button` / `slider` 等 pack 控件，顶层即自顶向下流式堆叠；绝对定位仍用 `*_at(pos, ...)`（含 `label_at` / `panel_at` / `pack_at` / `grid_at`）。容器内用无位置形式（`p.button(...)` 占光标）。容器内嵌套容器用 `*_at(offset)`（相对当前容器内容原点），**不占光标**——v1 不支持容器内"光标嵌套"。
 - **交互控件必须有稳定 ID 字符串**（按钮 / 滑块 / 勾选 / 单选 / 输入框）；ID 变化 = 状态丢失。`UiState::reset()` 清空全部状态。
 - **ID 命名空间**（[`IdRelative`] / [`IdAbsolute`] / [`Ui::id_for`]）：窗口 / 滚动容器 / grid / 可拖拽面板 / 下拉框是**命名空间边界**——进入自动压栈、退出自动弹栈（`with_id` 闭包作用域保证配对），其内控件的**绝对 ID** 自动带容器前缀（如 `"chishi/btn"`）。控件公开 API 仍传**相对名字**（`&str`），内部自动解析；状态键 / 焦点 / 单选组值 / 窗口 id 一律用**绝对 ID**。`ui.id_for(id_relative)` 从名字生成绝对 ID（顶层零拷贝）。类型层面杜绝双重前缀与相对/绝对混用（详见 `crate::id`）。
-- **闭包内不可借用已被 `ui` 借用的字段**（如 `self.ui_state`）；需要重置等操作时用局部标记，`ui.finish()` 后统一处理（见示例）。
+- **闭包内不可借用已被 `ui` 借用的字段**（如 `self.ui_state`）；需要重置等操作时用局部标记，段收尾（`ui.finish()`）后统一处理——见上文"UI 段存续期间 `f` 被借用"。
 - **单选**的选中状态完全存于 `UiState.radio_groups`（`group → 控件绝对 ID`），应用只读 `checked()`；初始选中用 `state.radio_groups.insert("组名", IdAbsolute::from("id"))`（顶层无前缀 = 原样；窗口内单选值自动带窗口前缀，与应用无关）。
 - **文本输入**：普通字符走 `ctx.keys().chars()`（含 Shift 组合，控制字符已过滤）；**中文输入法（IME）已支持**——`rjw_main` 建窗时自动 `set_ime_allowed(true)`，`rjw_keyboard` 收集上屏文本（`ime_commits()`）与组合候选（`ime_preedit()`，输入框以灰色绘制在光标后），Enter 确认上屏。
 - **可拖拽面板 / 窗口**：`drag_panel_at(id, pos, |p| ...)` 按住面板拖动；`ui.window(id).pos(..).show(|w| ...)` 是**可重叠窗口**——点击即**置顶**（焦点 z-order，`UiState.window_z`），位置持久于 `UiState.panel_pos`；拖动期间**抑制内部子控件交互**。拖拽位置按**物理像素粒度**跟随（1px 跟手，不受 DPI 逻辑量化影响）。

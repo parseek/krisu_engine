@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use rjw_2d_render::{Layer, Render2D, SortMode, SpriteRect};
+use rjw_2d_render::{Layer, Render2D, SpriteRect};
 use rjw_main::{DeltaTimer, KeyboardInput, MouseInput};
 use rjw_render::wgpu;
 use rjw_render::{Clear, RenderContext, RenderFrame};
@@ -49,7 +49,6 @@ pub struct Ctx {
     // ── 帧 ──
     pub(crate) surface: Option<RenderFrame>,
     pub(crate) world: Option<Render2D>,
-    pub(crate) ui_2d: Option<Render2D>,
     pub(crate) region: Option<Rect>,
     /// **画面边框**（调试：区分多画面 / 分屏；来自 AppConfig）。
     pub(crate) viewport_borders: ViewportBorders,
@@ -100,7 +99,6 @@ impl Ctx {
             mouse: MouseInput::default(),
             surface: None,
             world: None,
-            ui_2d: None,
             region: None,
             viewport_borders: config.viewport_borders,
             frame_viewports: 0,
@@ -135,11 +133,7 @@ impl Ctx {
 
         let mut world = Render2D::new(render);
         world.reset();
-        let mut ui = Render2D::new(render);
-        // UI 必须关闭排序（UI 自行管理提交顺序；重排会把圆角/渐变盖到文字上）。
-        ui.sort(SortMode::None);
         self.world = Some(world);
-        self.ui_2d = Some(ui);
 
         #[cfg(feature = "text")]
         {
@@ -147,7 +141,8 @@ impl Ctx {
         }
         #[cfg(feature = "ui")]
         {
-            self.ui_layer = Some(crate::runtime::layers::ui::UiLayer::default());
+            // UI 层自带专用渲染器（SortMode::None）：状态 + 主题 + 渲染器都在层里。
+            self.ui_layer = Some(crate::runtime::layers::ui::UiLayer::new(render));
         }
         self.attached = true;
     }
@@ -354,10 +349,13 @@ impl Ctx {
         self.world.as_mut().expect("Ctx 未接入渲染上下文（headless）：无法绘制")
     }
 
-    /// UI 层渲染器（`Frame::draw_ui` 用）。
+    /// UI 层渲染器（`Frame::draw_ui` / `Frame::text_ui` 用）。
     #[inline]
     pub(crate) fn ui_mut(&mut self) -> &mut Render2D {
-        self.ui_2d.as_mut().expect("Ctx 未接入渲染上下文（headless）：无法绘制")
+        self.ui_layer
+            .as_mut()
+            .and_then(|l| l.r2d.as_mut())
+            .expect("Ctx 未接入渲染上下文（headless）：无法绘制")
     }
 
     /// 每帧开始：刷新时间，复位画面状态，统计无帧连续次数。
@@ -378,6 +376,9 @@ impl Ctx {
     pub(crate) fn end_update(&mut self) {
         // 本迭代是否取到了表面（渲染帧）。
         let rendered = self.surface.is_some();
+        // UI 帧收尾（幂等）：焦点导航 + 描边 / 光标 / 统计写回 / 帧级暂存关场。
+        // 必须在**提交之前**（描边命令要进本次提交的 UI 队列）。
+        self.ui_end_frame();
         if rendered && !self.presented {
             // 应用没有显式 submit：用配置的清屏 + identity 相机自动提交世界 / UI
             // （日志便于排查「画面被清掉」类问题：本行**不应**在应用已 submit 的帧出现）。
@@ -391,7 +392,8 @@ impl Ctx {
         if let Some(w) = self.world.as_mut() {
             w.discard();
         }
-        if let Some(u) = self.ui_2d.as_mut() {
+        #[cfg(feature = "ui")]
+        if let Some(u) = self.ui_layer.as_mut().and_then(|l| l.r2d.as_mut()) {
             u.discard();
         }
         // 字形图集寿命推进（**只在渲染帧**推进：无帧时不应让缓存老化）。
@@ -405,6 +407,22 @@ impl Ctx {
         self.submitted = false;
         self.presented = false;
         self.frames += 1;
+    }
+
+    /// **本帧是否已被应用接管**（调用过 `Frame::submit` / `submit_keep`）。
+    ///
+    /// 与 [`Self::presented`]（真正 present 过）分开：帧末只对"应用没接管"的帧补一次
+    /// 自动提交（`AppConfig::clear` 清屏 + 世界 / UI 层）。
+    #[inline]
+    pub(crate) fn app_submitted(&self) -> bool {
+        self.submitted
+    }
+
+    /// 帧末自动提交：用 `AppConfig::clear` + identity 相机把世界层 + UI 层落成一个 pass。
+    #[inline]
+    pub(crate) fn submit_default_clear(&mut self) {
+        let clear = self.clear;
+        self.submit_with(clear, None);
     }
 
     /// 提交当前队列为一个 pass（世界层 + UI 层）。
@@ -434,7 +452,11 @@ impl Ctx {
             clear
         };
 
-        let Self { surface, world, ui_2d, .. } = self;
+        // **UI 帧收尾**（幂等）：应用可能录了多段 UI 且本帧只 submit 一次；焦点描边 /
+        // 光标 / 统计属于"每帧一次"，必须在这里补齐——且必须在取 UI 队列（下面）之前。
+        self.ui_end_frame();
+        let Self { surface, world, ui_layer, .. } = self;
+        let ui_2d = ui_layer.as_mut().and_then(|l| l.r2d.as_mut());
         let Some(surface) = surface.as_mut() else {
             return;
         };
@@ -468,7 +490,7 @@ impl Ctx {
         if let Some(world) = world.as_mut() {
             world.submit(&mut pass, cam);
         }
-        if let Some(ui) = ui_2d.as_mut() {
+        if let Some(ui) = ui_2d {
             // UI 层坐标 = **物理像素、左上原点**（与 `rjw_ui` 的公开 API 一致）：
             // 把 UI 相机整体平移 `region.center()` ⇒ `screen_to_world(px) == px`。
             // 这样 `f.draw_ui()` / `f.text_ui()` 里的 (0,0) 就是窗口左上角，
@@ -502,11 +524,11 @@ impl Ctx {
         self.region = Some(full);
         log::debug!("krusie: 画面边框 overlay：{} 个画面", regions.len());
 
-        let Self { surface, ui_2d, text, .. } = self;
+        let Self { surface, ui_layer, text, .. } = self;
         let Some(surface) = surface.as_mut() else {
             return false;
         };
-        let Some(ui) = ui_2d.as_mut() else {
+        let Some(ui) = ui_layer.as_mut().and_then(|l| l.r2d.as_mut()) else {
             return false;
         };
         for (region, idx) in &regions {
@@ -543,30 +565,80 @@ impl Ctx {
         self.presented = true;
     }
 
-    /// UI（feature = `ui`）：自动 begin / 输入快照 / 主题 / DPI / finish。
+    /// **开一段 UI 录制**（feature = `ui`；`Frame::ui(theme)` 的实现）。
     ///
-    /// UI 层的屏幕矩形由提交期的 UI 相机决定（[`Self::submit_with`]），`finish` 不再需要
-    /// 传入视口——UI 坐标空间恒为**物理像素、左上原点**。
+    /// 一帧可调用**任意多次**、位置随意（世界绘制之前 / 之间 / 之后）：本帧第一段
+    /// **懒开场**（帧号 +1 / 命中区翻页 / 输入快照冻结 / 责任链种入），后续段复用帧级
+    /// 暂存；每段析构时 `Ui::finish` 提交到 UI 层自己的 `Render2D`。
+    ///
+    /// 返回 [`UiSession`](crate::runtime::layers::ui::UiSession)：`Deref` 到 [`rjw_ui::Ui`]，
+    /// 可直接透传给任意函数；段存活期间 `Ctx` / `Frame` 被借用（不能 `draw` / `text` /
+    /// `submit`，编译期保证）。
+    ///
+    /// `panic`：feature `ui` 已编译且取到帧 ⇒ `window` / `text` / `ui_layer`（含渲染器）
+    /// **必定**已接入（`attach` 无条件设置）——与 `Ctx::world_mut()` 同一不变式。
     #[cfg(feature = "ui")]
-    pub(crate) fn run_ui(&mut self, theme: rjw_ui::Theme, f: impl FnOnce(&mut rjw_ui::Ui<'_>)) {
+    pub(crate) fn ui_view(
+        &mut self,
+        theme: rjw_ui::Theme,
+        base_layer: f64,
+        debug_layout: bool,
+    ) -> crate::runtime::layers::ui::UiSession<'_> {
         use rjw_ui::Ui;
-        let scale = self.scale as f64;
-        let Self { window, keyboard, mouse, text, ui_layer, ui_2d, .. } = self;
-        let (Some(window), Some(text), Some(layer), Some(r2d)) =
-            (window.as_ref(), text.as_mut(), ui_layer.as_mut(), ui_2d.as_mut())
+        let scale_f = self.scale as f64;
+        let scale = self.scale;
+        let Self { window, keyboard, mouse, text, ui_layer, .. } = self;
+        let window = window.as_ref().expect("Ctx 未接入窗口：无法录制 UI");
+        let text = text.as_mut().expect("Ctx 未接入文本子系统：无法录制 UI");
+        let layer = ui_layer.as_mut().expect("Ctx 未接入 UI 层：无法录制 UI");
+        // 记录本段配置（帧收尾视图复用最近一次）——必须在取 `r2d`（会借用 `layer.r2d`）之前。
+        layer.remember_view_config(theme.clone(), base_layer, scale, debug_layout);
+        let r2d = layer.r2d.as_mut().expect("Ctx 未接入渲染上下文（headless）：无法录制 UI");
+        let mut init = Ui::begin(window, text, &mut layer.state)
+            .capture(mouse, keyboard)
+            .theme(theme)
+            .scale_factor(scale_f)
+            .base_layer(base_layer);
+        if debug_layout {
+            init = init.debug_layout();
+        }
+        crate::runtime::layers::ui::UiSession::new(init.build(), r2d)
+    }
+
+    /// **UI 帧收尾**（feature = `ui`）：每帧一次、**幂等**——运行时在 UI 队列被提交之前
+    /// （`Frame::submit` / `present` / `drop` / `Ctx::end_update`）调用。
+    ///
+    /// 做的事（把"一帧一份"的账补齐）：开一个**空段**（本帧已开场 ⇒ 不再开场）→
+    /// `Ui::end_frame`（输入结算 / 焦点导航 + 描边 / 光标定夺 / 统计写回 / 帧级复位）→
+    /// 提交描边命令到 UI 层渲染器。本帧没有任何 UI 段时是**空操作**（零开销）。
+    #[cfg(feature = "ui")]
+    pub(crate) fn ui_end_frame(&mut self) {
+        use rjw_ui::Ui;
+        let scale_f = self.scale as f64;
+        let Self { window, keyboard, mouse, text, ui_layer, .. } = self;
+        let (Some(window), Some(text), Some(layer)) = (window.as_ref(), text.as_mut(), ui_layer.as_mut())
         else {
             return;
         };
-        let mut ui = Ui::begin(window, text, &mut layer.state)
+        if !layer.state.frame_open() {
+            return;
+        }
+        let Some(r2d) = layer.r2d.as_mut() else {
+            return;
+        };
+        let (theme, base_layer, debug_layout) =
+            (layer.theme.clone(), layer.base_layer, layer.debug_layout);
+        let mut init = Ui::begin(window, text, &mut layer.state)
             .capture(mouse, keyboard)
             .theme(theme)
-            .scale_factor(scale)
-            .build();
-        f(&mut ui);
-        // UI 只输出批次；适配到本上下文的 2D 渲染器由桥接层负责。
-        let mut backend =
-            crate::runtime::layers::ui_backend::Render2dUiBackend::new(r2d);
-        ui.finish(&mut backend);
+            .scale_factor(scale_f)
+            .base_layer(base_layer);
+        if debug_layout {
+            init = init.debug_layout();
+        }
+        let mut ui = init.build();
+        let mut backend = crate::runtime::layers::ui_backend::Render2dUiBackend::new(r2d);
+        ui.end_frame(&mut backend);
     }
 
     /// 文本子系统（feature = `text`；`Frame` 上的便捷入口在 P2 提供 `label` 链）。

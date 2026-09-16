@@ -188,62 +188,65 @@ impl App for DebugApp {
         }
 
         // ── Debug UI 层（rjw_ui 调试窗口；F1 开关） ─────────────
-        // `Frame::ui` 接管 begin / capture / theme / scale_factor / finish，
-        // UI 渲染器为引擎第二个 `Render2D`（排序已关闭）。
-        f.ui(Theme::dark(), |ui| {
-            // 调试 rjw_ui 自身：布局矩形 / 命中区域描边（本帧生效；`_layout()` / `without_` 收枚举语义）。
-            if self.ui_debug_layout {
-                ui.debug_layout();
-            } else {
-                ui.without_debug_layout();
-            }
+        // `Frame::ui` 开一段 UI 录制（一帧可多段、位置随意）：开场 / 输入快照 / 主题 /
+        // DPI 懒开场，段结束（`ui` 作用域结束）自动 `Ui::finish` 提交到 UI 层的
+        // `Render2D`（排序已关闭）；帧收尾由运行时在 `submit` 前补齐。
+        // 演示"ui anywhere"：这一段可以放在世界绘制之前 / 之间 / 之后——这里放在世界之后。
+        let mut ui = f.ui(Theme::dark());
+        // 调试 rjw_ui 自身：布局矩形 / 命中区域描边（本帧生效；`_layout()` / `without_` 收枚举语义）。
+        if self.ui_debug_layout {
+            ui.debug_layout();
+        } else {
+            ui.without_debug_layout();
+        }
 
-            if self.debug_visible {
-                ui.window("debug_panel").pos(Vec2::new(24.0, 24.0)).show(|w| {
-                    w.label("Debug 面板（F1 关闭）");
-                    w.label(&format!("FPS: {fps:.0}"));
-                    w.label(&format!(
-                        "球: ({:.0}, {:.0})  vel=({:.0}, {:.0})",
-                        self.ball_pos.x, self.ball_pos.y, self.ball_vel.x, self.ball_vel.y
-                    ));
-                    if w.checkbox("dbg_hitbox", "显示碰撞盒", self.show_hitboxes).toggled() {
-                        self.show_hitboxes = !self.show_hitboxes;
-                    }
-                    if w.checkbox("dbg_grid", "显示网格", self.show_grid).toggled() {
-                        self.show_grid = !self.show_grid;
-                    }
-                    if w.checkbox("dbg_ui_layout", "调试 UI 布局", self.ui_debug_layout).toggled() {
-                        self.ui_debug_layout = !self.ui_debug_layout;
-                    }
-                    if w.checkbox("dbg_ui_shapes", "屏幕调试图元", self.ui_debug_shapes).toggled() {
-                        self.ui_debug_shapes = !self.ui_debug_shapes;
-                    }
-                    self.line_width = w.slider("dbg_width", 1.0..=6.0, self.line_width);
-                    w.label(&format!("线宽: {:.1}px", self.line_width));
-                });
-            }
-            ui.label_at(
-                Vec2::new(16.0, 690.0),
-                &format!(
-                    "F1 开关调试面板 · 拖动调试窗口 · {} · Esc 退出",
-                    if self.debug_visible { "勾选切换调试图元" } else { "调试面板已隐藏" }
-                ),
-            );
-
-            // ── rjw_ui 的 DebugDraw（屏幕空间；物理像素，覆盖在 UI 之上） ──
-            if self.ui_debug_shapes {
-                // 鼠标十字 + 跟随圆圈
-                ui.debug_cross(mouse, 10.0, 1.5, Color::CSS_ORANGE);
-                ui.debug_circle_outline(mouse, 24.0, 40, 1.5, Color::CSS_ORANGE);
-                // 屏幕中心 → 鼠标 连线
-                let center = Vec2::new(region.w * 0.5, region.h * 0.5);
-                ui.debug_line(center, mouse, 1.0, Color::rgba_u8(255, 200, 100, 200));
-                // 调试面板矩形框（若面板可见）
-                if self.debug_visible {
-                    ui.debug_rect_outline(Rect::new(24.0, 24.0, 190.0, 240.0), 1.5, Color::CSS_MAGENTA);
+        if self.debug_visible {
+            ui.window("debug_panel").pos(Vec2::new(24.0, 24.0)).show(|w| {
+                w.label("Debug 面板（F1 关闭）");
+                w.label(&format!("FPS: {fps:.0}"));
+                w.label(&format!(
+                    "球: ({:.0}, {:.0})  vel=({:.0}, {:.0})",
+                    self.ball_pos.x, self.ball_pos.y, self.ball_vel.x, self.ball_vel.y
+                ));
+                if w.checkbox("dbg_hitbox", "显示碰撞盒", self.show_hitboxes).toggled() {
+                    self.show_hitboxes = !self.show_hitboxes;
                 }
+                if w.checkbox("dbg_grid", "显示网格", self.show_grid).toggled() {
+                    self.show_grid = !self.show_grid;
+                }
+                if w.checkbox("dbg_ui_layout", "调试 UI 布局", self.ui_debug_layout).toggled() {
+                    self.ui_debug_layout = !self.ui_debug_layout;
+                }
+                if w.checkbox("dbg_ui_shapes", "屏幕调试图元", self.ui_debug_shapes).toggled() {
+                    self.ui_debug_shapes = !self.ui_debug_shapes;
+                }
+                self.line_width = w.slider("dbg_width", 1.0..=6.0, self.line_width);
+                w.label(&format!("线宽: {:.1}px", self.line_width));
+            });
+        }
+        ui.label_at(
+            Vec2::new(16.0, 690.0),
+            &format!(
+                "F1 开关调试面板 · 拖动调试窗口 · {} · Esc 退出",
+                if self.debug_visible { "勾选切换调试图元" } else { "调试面板已隐藏" }
+            ),
+        );
+
+        // ── rjw_ui 的 DebugDraw（屏幕空间；物理像素，覆盖在 UI 之上） ──
+        if self.ui_debug_shapes {
+            // 鼠标十字 + 跟随圆圈
+            ui.debug_cross(mouse, 10.0, 1.5, Color::CSS_ORANGE);
+            ui.debug_circle_outline(mouse, 24.0, 40, 1.5, Color::CSS_ORANGE);
+            // 屏幕中心 → 鼠标 连线
+            let center = Vec2::new(region.w * 0.5, region.h * 0.5);
+            ui.debug_line(center, mouse, 1.0, Color::rgba_u8(255, 200, 100, 200));
+            // 调试面板矩形框（若面板可见）
+            if self.debug_visible {
+                ui.debug_rect_outline(Rect::new(24.0, 24.0, 190.0, 240.0), 1.5, Color::CSS_MAGENTA);
             }
-        });
+        }
+        // 段收尾（显式早让出 `f`；省略也行——`ui` 作用域结束即收尾）。
+        ui.finish();
 
         // ── 提交：世界层（含 DebugDraw）与 UI 层进同一个 pass，一次 present ──
         f.submit(&mut self.cam, Clear::color(Color::rgb(0.08, 0.09, 0.12)));

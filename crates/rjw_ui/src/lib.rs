@@ -86,11 +86,16 @@
 //!
 //! # 快速上手
 //!
+//! 一个 [`Ui`] = 一帧里的**一段**录制；帧级账（帧号 / 命中区翻页 / 输入快照 / 焦点导航 /
+//! 光标 / 统计）由 [`UiState::begin_frame`] + [`Ui::end_frame`] 每帧各做一次
+//! （运行时路径 `rjw_krusie::Frame::ui` 自动处理，且支持**一帧多段**）：
+//!
 //! ```no_run
 //! # let viewport = todo!(); let mouse = todo!(); let keyboard = todo!();
-//! # let text = todo!(); let state = todo!(); let window = todo!();
+//! # let text = todo!(); let mut state: rjw_ui::UiState = todo!(); let window = todo!();
 //! use rjw_ui::{PackSide, RecordingBackend, Theme, Ui, UiAdd};
 //! # let mut backend = RecordingBackend::default();   // 真实项目用 `rjw_krusie` 的桥接后端
+//! state.begin_frame();                               // 帧开场（每帧一次）
 //! let mut ui = Ui::begin(&window, &mut text, &mut state)
 //!     .capture(&mouse, &keyboard)
 //!     .theme(Theme::dark())
@@ -112,7 +117,7 @@
 //!     g.button("slot_1", "B");
 //!     g.button("slot_2", "C");
 //! });
-//! ui.finish(&mut backend);
+//! ui.end_frame(&mut backend);                         // 帧收尾（含段提交）
 //! ```
 //!
 //! # 模块

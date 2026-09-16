@@ -753,21 +753,30 @@ f.text(|t| {
 
 ### 入口与生命周期
 
+> **一帧 = 开场 + N 段 + 收尾**（"ui anywhere"）：运行时入口 `Frame::ui(theme)` 返回一段
+> （`UiSession`，`Deref` 到 `Ui`），**一帧可调用任意多次、位置随意**（世界绘制之前 /
+> 之间 / 之后均可），`&mut Ui` 可透传给任意函数。帧级账（帧号 / 命中区翻页 / 输入快照 /
+> 焦点导航 + 描边 / 光标 / 统计）**每帧只做一次**：开场在第一段懒执行（应用常先
+> `debug_inject_mouse`，快照早了会丢点击边沿），收尾由运行时在 UI 队列被提交前补齐。
+
 | 函数 | 签名 / 用法 | 说明 |
 |---|---|---|
-| `Ui::begin` | `Ui::begin(window, &mut text, &mut state) -> UiInit` | 一帧一次；`window` 用于 IME 候选框定位与光标图标。**输入与绘制解耦**：输入经 `UiInit::capture` 快照、相机/渲染器延迟到 `Ui::finish` 传入 |
-| `UiInit::capture(&MouseInput, &KeyboardInput)` | `.capture(ctx.mouse(), ctx.keys())` | 把键盘/鼠标设备状态**拷贝**为 Ui 自持快照（省略 = 空输入，headless 安全） |
+| `Frame::ui(Theme)` | `let mut ui = f.ui(Theme::dark());` … `ui.finish();` | **运行时入口**（推荐）：开一段 UI；段结束（`finish()`/作用域结束）自动提交到 UI 层渲染器。段存活期间 `f` 被借用（不能 `draw`/`text`/`submit`），段之间可任意交错。**帧收尾**（焦点描边 / 光标 / 统计）由运行时在 `submit` / `present` / 帧尾自动补齐（幂等），应用无需手动调 |
+| `Ui::begin` | `Ui::begin(window, &mut text, &mut state) -> UiInit` | 低层段入口；`window` 用于 IME 候选框定位与光标图标。**输入与绘制解耦**：输入经 `UiInit::capture` 快照、相机/渲染器延迟到 `Ui::finish` 传入。⚠ 帧级账由调用方负责：每帧一次 `UiState::begin_frame()`（`build()` 会兜底） |
+| `UiInit::capture(&MouseInput, &KeyboardInput)` | `.capture(ctx.mouse(), ctx.keys())` | 把键盘/鼠标设备状态**拷贝**为 Ui 自持快照（省略 = 空输入，headless 安全）。**本帧第一段冻结一次**，后续段复用（段间注入只影响下一帧） |
 | `UiInit::theme(Theme)` / `Ui::theme()` / `Ui::theme_mut()` | `.theme(Theme::dark())` | 主题（默认浅色；`Theme::dark()` 深色；构建后经 `ui.theme()` / `theme_mut()` 读写） |
 | `UiInit::base_layer(f64)` | `.base_layer(1e7)` | 基层层级（默认 `1e7`） |
 | `UiInit::scale_factor(f64)` | `.scale_factor(ctx.scale() as f64)` | DPI：控件坐标/字号按逻辑像素，内部换算物理像素（默认 1.0） |
 | `UiInit::debug_layout()` / `without_debug_layout()` | `.debug_layout()` | 调试 UI 布局：给每个控件/容器矩形画描边（颜色/宽度见 [样式小节](#样式theme可-clone-覆盖) 的 `DebugStyle`；默认关闭）。**无裸布尔**：开 = 调 `debug_layout()`，关 = `without_debug_layout()` |
-| `Ui::debug_layout()` / `Ui::without_debug_layout()` | `ui.debug_layout()` | 同 `UiInit` 版本，帧内运行时开关 |
-| `UiInit::build()` | → `Ui` | 完成构建（内部 `state.begin_frame()`） |
-| `Ui::finish(&mut dyn UiBackend)` | `ui.finish(&mut backend)` | 按 `(win, depth, 图形/文字, 录制序)` 序**免全量排序**提交（win + depth 分桶、桶内保持录制序，语义与排序完全等价）；**产出 `UiBatch` 批次交给后端**（`rjw_ui` 不再直接调用渲染器）；UI 无需相机/视口（屏幕固定变换由运行时 UI 层相机提供）；清空帧状态 |
+| `Ui::debug_layout()` / `Ui::without_debug_layout()` | `ui.debug_layout()` | 同 `UiInit` 版本，段内运行时开关 |
+| `UiInit::build()` | → `Ui` | 完成构建（本帧未开场则顺带开场：帧号 +1 / 命中区翻页 / 输入快照冻结 / 责任链种入） |
+| `Ui::finish(&mut dyn UiBackend)` | `ui.finish(&mut backend)` | **段收尾**：按 `(win, depth, 图形/文字, 录制序)` 序**免全量排序**提交（win + depth 分桶、桶内保持录制序）；**产出 `UiBatch` 批次交给后端**；段统计累加进帧级暂存。一帧可多次 |
+| `Ui::end_frame(&mut dyn UiBackend)` | `ui.end_frame(&mut backend)` | **帧收尾**（每帧一次）：输入结算（空白清焦点 / 清一次性边沿 / 窗口按下裁决）/ 焦点导航 + 描边 / 光标定夺 / 统计写回（`UiStats.frame` 每帧 +1、`ui_frame_us` = 开场→收尾）/ 帧级暂存关场 |
 | `UiState::new()` | 应用持有 | 跨帧持久状态容器 |
+| `UiState::begin_frame()` / `frame_open()` | 运行时内部 / 诊断 | 每帧开场一次（帧号 / 命中区翻页 / 帧级暂存清零）；`frame_open()` 判断本帧是否录过 UI |
 | `UiState::reset()` / `remove(id)` | 示例"R 重开" | 清空全部 / 移除单个控件状态 |
 | `UiState::text_focus() -> Option<TextFocus>` | `if ui.state().text_focus().is_none() { /* 快捷键 */ }` | **文本焦点**（只有输入框/多行框持焦点才为 `Some`）；取代旧 `capturing_text()` —— 按钮/滑块的 Tab 焦点不再吞应用快捷键 |
-| `Ui::debug_dump() -> UiDebugDump` | `eprintln!("{}", ui.debug_dump())` | 引擎侧状态快照（每窗口 `id/z/origin/submit/size/drag/press/stored`），单行可 grep；见 [DEBUGGING.md](DEBUGGING.md) §1 |
+| `Ui::debug_dump() -> UiDebugDump` | `eprintln!("{}", ui.debug_dump())` | 引擎侧状态快照（每窗口 `id/z/origin/submit/size/drag/press/stored`），单行可 grep；任一段都能调用，帧级暂存跨段共享 ⇒ 后一段能看到前一段录的窗口。见 [DEBUGGING.md](DEBUGGING.md) §1 |
 
 ### UI 绘制后端（`rjw_ui::backend`，v0.3 新增）
 
@@ -1171,6 +1180,30 @@ let theme = rjw_ui::Theme::themed(&p);
 
 ### 快速上手
 
+**运行时路径（推荐）**：一帧可开任意多段（`f.ui(theme)`），位置随意。
+
+```rust
+fn update(&mut self, ctx: &mut Ctx) {
+    let Some(mut f) = ctx.frame() else { return };
+    f.draw().sprite(...);                       // 世界层
+    let mut ui = f.ui(Theme::dark());           // 段 1
+    ui.pack_at(Vec2::new(16.0, 16.0), PackSide::Top, |p| {
+        if p.button("start", "开始游戏").clicked() { /* ... */ }
+        self.volume = p.slider("vol", 0.0..=1.0, self.volume);
+        if p.checkbox("fs", "全屏", self.fs).toggled() { self.fs = !self.fs; }
+        p.text_input("name", &mut self.name);
+    });
+    ui.finish();                                // 段收尾（可省略：作用域结束即收尾）
+    f.text(|t| { /* 世界文本（段之间随便交错） */ });
+    let mut hud = f.ui(Theme::dark());          // 段 2（同一帧）
+    hud.label_at(Vec2::new(16.0, 690.0), "HUD");
+    hud.finish();
+    f.submit(&mut self.cam, Clear::color(Color::rgb(0.05, 0.05, 0.08)));
+}
+```
+
+**低层路径**（自己持有 `UiState`，自定义 `base_layer` / 复用别的 `Text`）：
+
 ```rust
 use rjw_ui::{IdAbsolute, PackSide, Theme, Ui, UiState};
 
@@ -1179,7 +1212,8 @@ state
     .radio_groups
     .insert("diff".into(), IdAbsolute::from("diff_normal")); // 默认选中
 
-// 每帧（window/font 来自主循环；输入设备经 capture 快照；相机/渲染器延迟到 finish）：
+// 每帧（window/font 来自主循环；输入设备经 capture 快照；相机/渲染器延迟到收尾）：
+state.begin_frame();                            // 帧级账由调用方负责（每帧一次）
 let mut ui = Ui::begin(window, &mut font, &mut state)
     .capture(&ctx.mouse, &ctx.keyboard)
     .theme(Theme::dark()).build();
@@ -1190,7 +1224,7 @@ ui.pack_at(Vec2::new(16.0, 16.0), PackSide::Top, |p| {
     if p.checkbox("fs", "全屏", fs).toggled() { fs = !fs; }
     p.text_input("name", &mut name);
 });
-ui.finish(r2d);
+ui.end_frame(r2d);                              // 帧收尾（焦点导航/描边 + 光标 + 统计 + 提交）
 ```
 
 > 约定：交互控件 ID 必须稳定；顶层 pack 控件（`label`/`button`/…）经**根容器**（`build()`
@@ -1199,9 +1233,9 @@ ui.finish(r2d);
 > （`ctx.keys().ime_commits()` / `ime_preedit()`，候选框跟随光标）；输入框聚焦时用
 > `ui.state().text_focus()` 屏蔽应用快捷键；
 > 控件文本排版缓冲自持于 `UiState.text_buffers`（`CachePolicy::User`，不推入 `rjw_text` LRU）；
-> **独立 UI 渲染**：UI 录到单独 Render2D（`set_sort_mode(SortMode::None)` 关闭排序），与世界
-> `encode` 合并提交（一次 present）；`finish` 按 `(win, depth, 图形/文字, 录制序)`
-> 免排序（win + depth 分桶）提交。
+> **独立 UI 渲染**：UI 录到 UI 层自己的 Render2D（`set_sort_mode(SortMode::None)` 关闭排序），与世界
+> `encode` 合并提交（一次 present）；`Ui::finish` 按 `(win, depth, 图形/文字, 录制序)`
+> 免排序（win + depth 分桶）**逐段**提交，`Ui::end_frame` 做帧收尾。
 
 ---
 

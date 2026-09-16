@@ -1,18 +1,26 @@
 //! `Ui` 主体：控件录制 + 深度排序 + 提交绘制。
 //!
-//! 用法（见 crate 文档与示例）：
+//! 一个 `Ui` = 一帧里的**一段**录制（一帧可多段；段间帧级事实由
+//! [`UiState::frame_state`] 共享）。用法（见 crate 文档与示例）：
 //! ```no_run
 //! # let viewport = todo!(); let mouse = todo!(); let keyboard = todo!();
-//! # let text = todo!(); let mut backend = rjw_ui::RecordingBackend::default(); let state = todo!(); let window = todo!();
+//! # let text = todo!(); let mut state: rjw_ui::UiState = todo!(); let mut backend = rjw_ui::RecordingBackend::default(); let window = todo!();
 //! use rjw_ui::{Theme, Ui};
+//! state.begin_frame();                       // 每帧一次（运行时路径由 Frame::ui 懒开场）
 //! let mut ui = Ui::begin(&window, &mut text, &mut state)
 //!     .capture(&mouse, &keyboard)
 //!     .theme(Theme::dark())
 //!     .base_layer(1e7)
 //!     .build();
 //! ui.label_at(glam::Vec2::new(20.0, 20.0), "Hello UI");
-//! ui.finish(&mut backend);
+//! ui.finish(&mut backend);                   // 段收尾（可多段）
+//! ui.end_frame(&mut backend);                // 帧收尾：焦点导航/描边 + 光标 + 统计 + 复位
 //! ```
+//!
+//! - [`Ui::finish`] = **段收尾**（分桶 → 顶点 → 提交，一帧可多次）；
+//! - [`Ui::end_frame`] = **帧收尾**（每帧一次；输入结算 / 焦点导航 + 描边 / 光标定夺 /
+//!   统计写回 / 帧级暂存关场）；
+//! - 运行时路径（`rjw_krusie::Frame::ui(theme)`）自动处理这两件事。
 //!
 //! 坐标语义：所有位置为**屏幕逻辑像素**（左上角原点，Y+ 向下）；容器内 `*_at` 的 `pos`
 //! 相对**当前容器内容原点**（顶层即屏幕原点）；交互命中在逻辑坐标进行（内部经 DPI 换算）。
@@ -54,7 +62,7 @@ use crate::hit::{
 use crate::id::{IdAbsolute, IdRelative, IdStack};
 use crate::input::{KeyboardSnapshot, MouseSnapshot};
 use crate::layout::{Child, Frame, PackSide};
-use crate::state::{ButtonState, CheckboxState, TEXT_BUFFER_CACHE_CAP, UiState, UiStats, WidgetState};
+use crate::state::{ButtonState, CheckboxState, TEXT_BUFFER_CACHE_CAP, UiState, WidgetState};
 use crate::style::{ButtonStyle, CheckboxStyle, PanelStyle, Theme};
 use crate::view::{clip_for_view, ViewCtx, ViewMode};
 use crate::widgets::Widget as _;
@@ -203,20 +211,34 @@ impl<'a> UiInit<'a> {
             scale,
             debug_layout,
         } = self;
-        state.begin_frame();
+        // ── 帧级账（**懒开场**）──────────────────────────────────────────
+        // 本帧第一段才开帧：帧号 +1 / 命中区表翻页 / 帧级暂存清零 + **冻结输入快照**。
+        // 后续段（同帧第二次起录制）**不再开场**——否则帧号 +2、命中表二次翻页、
+        // 上一段录下的窗口原点 / 焦点链 / 责任链 / 按下归属全被清掉。
+        // ⚠ 开场必须留到"第一段"而不是帧首（`Ctx::begin_update`）：应用在 `update`
+        // 里先 `debug_inject_mouse(..)`（脚本化鼠标）再录 UI，快照早了就丢了点击边沿。
+        if !state.frame_open() {
+            state.begin_frame();
+            state
+                .frame_state
+                .freeze_input(mouse.clone(), keyboard.clone());
+        }
+        // 本帧统一使用**开场时冻结**的快照（段间注入只影响下一帧）。
+        let frame_mouse = state.frame_state.mouse.clone();
+        let frame_keyboard = state.frame_state.keyboard.clone();
         // **Theme 预乘 scale**：样式尺寸 / 字号 × scale 取整——Ui 内部此后以物理像素
         // 为单位（布局 / 绘制 / 命中零 scale 换算）；`scale` 仅保留给 API 边界
         // `Size` / `Position` 的 Logical→Physical 换算。
         let theme = theme.scaled(scale);
-        let (mx, my) = mouse.pos_px();
+        let (mx, my) = frame_mouse.pos_px();
         let mouse_screen = Vec2::new(mx as f32, my as f32);
-        let mouse_in_window = mouse.in_window();
+        let mouse_in_window = frame_mouse.in_window();
         let mut ui = Ui {
             window,
             text,
             state,
-            mouse,
-            keyboard,
+            mouse: frame_mouse,
+            keyboard: frame_keyboard,
             theme,
             base_layer,
             scale,
@@ -245,7 +267,7 @@ impl<'a> UiInit<'a> {
             win_origins: std::collections::HashMap::new(),
             win_ids: std::collections::HashMap::new(),
             focusables: Vec::new(),
-            // UI 帧起点（finish 计算 ui_frame_us = begin → finish 结束的整帧耗时）
+            // UI 帧起点（帧收尾计算 ui_frame_us = 开场 → 收尾的整帧耗时）
             frame_t0: Instant::now(),
             // 位置责任链：预置内置"用户拖拽状态"环（优先级 0）
             pos_chain: vec![(0, PosLink::Drag)],
@@ -258,6 +280,8 @@ impl<'a> UiInit<'a> {
             cursor_custom: None,
             ids: IdStack::new(),
         };
+        // 帧级事实从暂存**装载**回本段视图（第一段 = 刚开场的默认值，等价于不装载）。
+        ui.load_frame_state();
         // 根容器（顶层流式布局）：pack 控件（`label` / `button` / `slider` …）在
         // `finish` 前**任何位置**可调用——顶层直接自顶向下堆叠（原 `child_rect` 在
         // 无容器时 panic）；固定宽 = 视口物理宽 → 顶层 `avail_w()` = 视口宽
@@ -277,7 +301,10 @@ impl<'a> UiInit<'a> {
 ///   `Arc<Mutex<_>>`；约束闭包不借用 `self`，避免拖长 `Ui` 的借用导致
 ///   `ui.finish()` 后无法再访问应用状态）；
 /// - [`PosLink::Drag`]：内置"用户拖拽状态"（[`UiState::panel_pos`]，固定优先级 `0`）。
-enum PosLink {
+///
+/// 存在 [`UiState`] 的帧级暂存里（`pub(crate)`）：一帧可有多段 UI，责任链必须跨段存活
+/// （第一段注册的脚本处理器对第二段录制的窗口同样生效）。
+pub(crate) enum PosLink {
     Script(Box<dyn Fn(&str) -> Option<Vec2> + 'static>),
     Drag,
 }
@@ -312,7 +339,9 @@ fn resolve_pos_link(
 /// - [`SizeLink::Script`]：应用注册的脚本/动画/布局尺寸处理器（[`Ui::size_handler`]；
 ///   语义与 [`PosLink::Script`] 相同：`'static` 闭包，不借用 `self`）；
 /// - [`SizeLink::Drag`]：内置"用户拖拽缩放"（[`UiState::sizes`]，固定优先级 `0`）。
-enum SizeLink {
+///
+/// 存于 [`UiState`] 的帧级暂存（跨段存活，理由同 [`PosLink`]）。
+pub(crate) enum SizeLink {
     Script(Box<dyn Fn(&str) -> Option<Vec2> + 'static>),
     Drag,
 }
@@ -480,6 +509,60 @@ impl<'a> Ui<'a> {
     }
 
     // ── 内部工具 ─────────────────────────────────────────────
+
+    /// **装载帧级事实**（段起始，`UiInit::build()` 末尾）：把 [`UiState::frame_state`]
+    /// 里的一帧一份的事实搬进本段视图。
+    ///
+    /// 一帧一 `Ui` 的旧模型下这些字段本来就是"本段构造 = 本帧事实"；分成多段后必须
+    /// 显式搬运，否则第二段会以**空**的按下归属 / 窗口原点 / 焦点链 / 责任链开始录制。
+    fn load_frame_state(&mut self) {
+        let fs = &mut self.state.frame_state;
+        self.mouse_in_window = fs.mouse_in_window;
+        self.mouse_screen = fs.mouse_screen;
+        self.mouse_logical = fs.mouse_logical;
+        self.any_pressed = fs.any_pressed;
+        self.press_claimed = fs.press_claimed;
+        self.cursor_text = fs.cursor_text;
+        self.cursor_grab = fs.cursor_grab;
+        self.cursor_grabbing = fs.cursor_grabbing;
+        self.cursor_window_drag = fs.cursor_window_drag;
+        self.cursor_custom = fs.cursor_custom;
+        self.frame_t0 = fs.frame_t0;
+        self.cur_z0_group = fs.cur_z0_group;
+        // 集合 / `Option` 用 take（`save_frame_state` 会原样换回去）：段与帧之间**搬移**
+        // 而不是克隆——窗口原点表 / 焦点链在大 UI 下可不小。
+        self.drag_panel = fs.drag_panel.take();
+        self.win_press_top = fs.win_press_top.take();
+        self.win_origins = std::mem::take(&mut fs.win_origins);
+        self.win_ids = std::mem::take(&mut fs.win_ids);
+        self.focusables = std::mem::take(&mut fs.focusables);
+        self.pos_chain = std::mem::take(&mut fs.pos_chain);
+        self.size_chain = std::mem::take(&mut fs.size_chain);
+    }
+
+    /// **回存帧级事实**（段收尾，`Ui::finish()` 末尾）：本段的修改成为本帧的真值，
+    /// 供后续段（以及帧收尾的输入结算 / 光标定夺 / 统计）继续使用。
+    fn save_frame_state(&mut self) {
+        let fs = &mut self.state.frame_state;
+        fs.mouse_in_window = self.mouse_in_window;
+        fs.mouse_screen = self.mouse_screen;
+        fs.mouse_logical = self.mouse_logical;
+        fs.any_pressed = self.any_pressed;
+        fs.press_claimed = self.press_claimed;
+        fs.cursor_text = self.cursor_text;
+        fs.cursor_grab = self.cursor_grab;
+        fs.cursor_grabbing = self.cursor_grabbing;
+        fs.cursor_window_drag = self.cursor_window_drag;
+        fs.cursor_custom = self.cursor_custom;
+        fs.cur_z0_group = fs.cur_z0_group.max(self.cur_z0_group);
+        fs.drag_panel = self.drag_panel.take();
+        fs.win_press_top = self.win_press_top.take();
+        std::mem::swap(&mut fs.win_origins, &mut self.win_origins);
+        std::mem::swap(&mut fs.win_ids, &mut self.win_ids);
+        std::mem::swap(&mut fs.focusables, &mut self.focusables);
+        std::mem::swap(&mut fs.pos_chain, &mut self.pos_chain);
+        std::mem::swap(&mut fs.size_chain, &mut self.size_chain);
+    }
 
     #[inline]
     fn next_seq(&mut self) -> u32 {
@@ -3051,19 +3134,19 @@ impl<'a> Ui<'a> {
     /// 录制阶段可完全独立于绘制资源；`viewport`（屏幕矩形，见 [`rjw_transform::Rect`]）
     /// 提供屏幕固定变换，`r2d` 接收四边形。UI 不需要相机（恒为 identity：不旋转/缩放），
     /// 仅需视口矩形。
+    /// **段收尾**：把本段录制的命令分桶 → 生成 / 复用顶点 → 提交到 `backend`
+    /// （`rjw_ui` 只产出 `UiBatch`；渲染器由调用方适配）。**一帧可调用多次**（多段 UI），
+    /// 帧级收尾在 [`Self::end_frame`]。
+    ///
+    /// 流水线（职责见各自文档注释）：
+    /// 1. 命令分桶 + WHITE 纹理解析（本函数内联）；
+    /// 2. 按窗口生成可提交顶点 / 顶点缓存（`cache_all_windows` → 子槽 `cache_z0_window`
+    ///    / 窗口 `cache_window`；签名 `hash_cmds`）；
+    /// 3. 排序 + 连续运行合批提交（`submit_quads` / `flush_seg`）；
+    /// 4. Debug 叠加（`submit_debug`：debug_queue / 布局描边 / 焦点描边，恒覆盖在最上）；
+    /// 5. 段统计累加进帧级暂存 + 帧级事实回存（`save_frame_state`）。
     pub fn finish(&mut self, backend: &mut dyn UiBackend) {
         let t_finish = Instant::now();
-        // ── `finish` 流水线（已拆分为内聚子函数，职责见各自文档注释） ──────
-        // 1. 帧末输入结算：空白清焦点 / 清一次性边沿 / 窗口按下裁决 / 键盘导航
-        //    （`finish_pre_input`）；
-        // 2. 命令分桶 + WHITE 纹理解析（本函数内联）；
-        // 3. 按窗口生成可提交顶点 / 顶点缓存（`cache_all_windows` → 子槽 `cache_z0_window`
-        //    / 窗口 `cache_window`；签名 `hash_cmds`）；
-        // 4. 排序 + 连续运行合批提交（`submit_quads` / `flush_seg`）；
-        // 5. Debug 叠加（`submit_debug`）；
-        // 6. 写本帧统计（本函数内联）→ 光标定夺 + 帧复位（`finalize_cursor_and_reset`）。
-        // 帧末输入结算（空白清焦点 / 清一次性边沿 / 窗口按下裁决 / 键盘导航与焦点描边）。
-        self.finish_pre_input();
         // 提交序 = (窗口 z → 深度 → 元素序 → 元素内图形/文字 → 命令序)。**免全量排序**：
         // 命令按录制序（seq）生成，同深度内 `(elem, group, seq)` 天然有序（元素随录制
         // 递增、同元素"背景/图形"先于文字录制）；唯一乱序维度是 `depth`（容器嵌套
@@ -3134,36 +3217,48 @@ impl<'a> Ui<'a> {
         let layer_base = self.base_layer;
         let submit_us = self.submit_quads(backend, cached, &mut quads, layer_base);
 
-        // ── Debug 叠加（DebugDraw / debug_layout 描边）────────────
+        // ── Debug 叠加（DebugDraw / debug_layout 描边 / 焦点描边）────────────
         // 在**全部 UI 内容之后**提交（`submit_debug`：合并 debug_queue 与布局描边、
         // 按 win 分组、白纹理、屏幕固定变换提交——不进窗口缓存、恒覆盖在最上）。
         self.submit_debug(backend, &mut quads, white_uid, layer_base);
+        // ── 段统计**累加**进帧级暂存 ─────────────────────────────────────
+        // （`UiStats` 是每帧聚合值：帧号 / `ui_frame_us` 由 `Ui::end_frame` 写回。）
+        let acc = &mut self.state.frame_state.stats;
+        acc.cmd_count = acc.cmd_count.saturating_add(cmd_count);
+        acc.win_count = acc.win_count.saturating_add(stats.win_count);
+        acc.cache_hits = acc.cache_hits.saturating_add(stats.cache_hits);
+        acc.cache_misses = acc.cache_misses.saturating_add(stats.cache_misses);
+        acc.sort_us += sort_us;
+        acc.sig_us += stats.sig_us;
+        acc.collect_us += stats.collect_us;
+        acc.clone_us += stats.clone_us;
+        acc.submit_us += submit_us;
+        acc.finish_us += t_finish.elapsed().as_secs_f64() * 1e6;
         // 记录 IME 组合状态（供下一帧退格判定，见 text_input_at）
         self.state.ime_composing =
             self.keyboard.ime_preedit().is_some_and(|p| !p.is_empty());
-        // 窗口矩形遮挡缓存只保留**本帧录制过**的窗口（z 变化 / 窗口销毁的旧条目随帧清理）。
-        // 性能统计（本帧各阶段 µs；写入 UiState.stats，示例/诊断读取）
-        self.state.stats = UiStats {
-            frame: self.state.stats.frame.wrapping_add(1),
-            cmd_count,
-            win_count: stats.win_count,
-            cache_hits: stats.cache_hits,
-            cache_misses: stats.cache_misses,
-            sort_us,
-            sig_us: stats.sig_us,
-            collect_us: stats.collect_us,
-            clone_us: stats.clone_us,
-            submit_us,
-            finish_us: t_finish.elapsed().as_secs_f64() * 1e6,
-            ui_frame_us: self.frame_t0.elapsed().as_secs_f64() * 1e6,
-        };
-        // 系统光标图案（优先级：窗口拖拽(Arrow) > 内置拖拽抓握 > 控件作者自定义 >
-        // 文本输入 > 可拖拽悬停 > 默认）。窗体悬停/拖动保持普通 Arrow（UI_NEEDS）；
-        // 移动窗口时即使悬停数字手柄/输入框也强制 Arrow（修复拖动中 <-> 的 BUG）。
-        // **抑制**：本帧没有任何 UI 光标意图（未悬停任何 UI 内容）时不主动设置——
-        // 保留应用自定义光标（如游戏准星）；仅当上一帧设过时清一次回 Default。
-        // 同时复位本帧的帧级状态（下一帧从干净起点开始录制）。
+        // **段收尾**：本段的帧级事实（按下归属 / 窗口原点 / 焦点链 / 责任链 / 光标意图 /
+        // z0 组号）回存暂存，供同帧后续段与帧收尾使用。
+        // ⚠ 帧级收尾（输入结算 / 焦点导航与描边 / 光标定夺 / 统计写回 / 复位）**不在这里**：
+        // 那是每帧一次的事，搬到 [`Self::end_frame`]。
+        self.save_frame_state();
+    }
+
+    /// **帧收尾**（**每帧一次**，由运行时在 UI 队列被提交之前调用；低层手动路径自己调）。
+    ///
+    /// 与 [`Self::finish`]（段收尾：分桶 → 顶点 → 提交）分工明确：
+    /// 1. [`Self::finish_pre_input`]：空白点击清焦点 / 清一次性边沿 / 窗口按下裁决
+    ///    （`resolve_win_press`）/ 键盘导航（Tab·方向键 / Esc）；
+    /// 2. 焦点描边（`handle_focus_keys` 内，走 `debug_queue`：不进窗口缓存、恒覆盖在最上）；
+    /// 3. `finish(backend)`：把上面追加的描边命令 flush 出去（本视图自身命令通常为空）；
+    /// 4. [`Self::finalize_cursor_and_reset`]：系统光标定夺 / `window_rects` 清理 /
+    ///    统计写回（帧号 +1、`ui_frame_us` = 开场 → 收尾）/ 帧级字段复位；
+    /// 5. [`UiState::end_frame`]：帧级暂存关场（下次开场重新清零）。
+    pub fn end_frame(&mut self, backend: &mut dyn UiBackend) {
+        self.finish_pre_input();
+        self.finish(backend);
         self.finalize_cursor_and_reset();
+        self.state.end_frame();
     }
 
     /// **帧末输入结算**（`finish` 起始）：空白点击清焦点（本帧按下且无控件响应）、
@@ -3529,6 +3624,11 @@ impl<'a> Ui<'a> {
     /// （保留应用自定义光标，如游戏准星；上一帧设过则清一次回 Default）；随后清空本帧
     /// 帧级状态（光标位 / depth / seq / cur_win / 窗口映射 / 焦点链等），下一帧从干净起点录制。
     fn finalize_cursor_and_reset(&mut self) {
+        // **统计写回**（每帧一次）：各段累加值 + 帧号 + 整帧跨度（开场 → 收尾）。
+        let mut stats = std::mem::take(&mut self.state.frame_state.stats);
+        stats.frame = self.state.stats.frame.wrapping_add(1);
+        stats.ui_frame_us = self.state.frame_state.frame_t0.elapsed().as_secs_f64() * 1e6;
+        self.state.stats = stats;
         let intent = self.cursor_text
             || self.cursor_grab
             || self.cursor_grabbing
@@ -3913,7 +4013,10 @@ impl<'a> Ui<'a> {
                 self.state.focused_kind = None;
             }
         }
-        // 焦点描边：对当前焦点控件画一圈 Border（elem 全局最大 → 画在窗口内容之上）。
+        // 焦点描边：对当前焦点控件画一圈 Border。
+        // ⚠ 走 **`debug_queue`**（`submit_debug` 路径：不进窗口顶点缓存、恒覆盖在最上）：
+        // 一帧多段后帧收尾视图的 `seq` 从 0 重开，若沿用"`elem = seq + 1` 最大 ⇒ 画在
+        // 窗口内容之上"的老写法，描边会被压到窗口内容下面（`elem` 比各段的都小）。
         if let Some(fid) = &self.state.focused {
             let Some(entry) = chain.iter().find(|e| e.id == *fid) else {
                 return;
@@ -3923,7 +4026,7 @@ impl<'a> Ui<'a> {
             let focus = self.theme.focus.clone();
             let elem = self.seq + 1;
             let seq = self.next_seq();
-            self.queue.push(UiDraw {
+            self.debug_queue.push(UiDraw {
                 depth,
                 seq,
                 win,
