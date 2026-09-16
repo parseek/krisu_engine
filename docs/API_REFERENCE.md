@@ -898,7 +898,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 ### 样式（`Theme`，可 clone 覆盖）
 
 `Theme { label, panel, button, slider, input, checkbox, divider, debug, focus, modal, combo, gap, row_h, feather, line_spacing }`，子样式见 `crates/rjw_ui/src/style.rs`：
-`LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**/**shadow**）、`ButtonStyle`（三态 bg + padding + **radius**）、
+`LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**/**shadow**/**grip**）、`ButtonStyle`（三态 bg + padding + **radius**）、
 `SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius**）、
 `CheckboxStyle`（box_size/checked_fill/gap）、`DividerStyle`、`DebugStyle`（layout_outline / layout_outline_width）、
 `FocusStyle`（color / width，键盘导航焦点描边）、`ModalStyle`（dim / size）、
@@ -917,6 +917,12 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 主题级入口 `Theme::with_shadow(ShadowStyle)` / `Theme::without_shadow()`，逐容器入口
 `PanelStyle::{with_shadow, with_shadow_color, without_shadow}`。`blur = 0` = 不画（不是
 `Option`）。见 §11「渲染增强」下方的说明。
+
+**缩放柄令牌**：`PanelStyle::grip: GripStyle { shape: GripShape, color, size, step, count }`
+—— 只对**固定宽窗口**（`WindowBuilder::width(..)`）生效，就是右下角那个"拖拽按钮"。
+`GripShape::{Squares（默认，历史观感）, Bars（内置 `Icon::Grip` 三条横线）, Hidden}`；
+逐窗口入口 `PanelStyle::{with_grip, with_grip_color, with_grip_shape, without_grip}`。
+`Hidden` 只是**不画图案**，**拖动缩放照旧**（命中区独立存在，跟随 `size*step*count`，下限 14px）。
 
 **子样式责任链**：每个子样式都有 `with_*` builder setter（返回 `Self`，只改链上字段，
 其余回落默认）——`PanelStyle::default().with_radius(8.0)` / `ButtonStyle::default().

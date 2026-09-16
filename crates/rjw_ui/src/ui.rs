@@ -63,7 +63,7 @@ use crate::id::{IdAbsolute, IdRelative, IdStack};
 use crate::input::{KeyboardSnapshot, MouseSnapshot};
 use crate::layout::{Child, Frame, PackSide};
 use crate::state::{ButtonState, CheckboxState, TEXT_BUFFER_CACHE_CAP, UiState, WidgetState};
-use crate::style::{ButtonStyle, CheckboxStyle, PanelStyle, Theme};
+use crate::style::{ButtonStyle, CheckboxStyle, GripShape, GripStyle, PanelStyle, Theme};
 use crate::view::{clip_for_view, ViewCtx, ViewMode};
 use crate::widgets::Widget as _;
 
@@ -1250,6 +1250,44 @@ impl<'a> Ui<'a> {
             rect,
             0,
         );
+    }
+
+    /// **右下角缩放柄图案**（窗口/面板局部坐标；`size` = 本体尺寸）。
+    ///
+    /// 只画图案 —— **命中区不在这里**（在 `window_impl` 里由 [`Self::resize_handle`] 建立，
+    /// 其大小跟随 `grip.extent()`）。所以 [`GripShape::Hidden`] 时"看不见但仍能拖"。
+    ///
+    /// 形状 / 颜色 / 尺寸 / 个数全部来自 [`GripStyle`]：`Squares` = 沿右下对角线的
+    /// 递减小方块（历史观感）、`Bars` = 内置矢量图标 [`Icon::Grip`]（三条横线，
+    /// 与字体无关）、`Hidden` = 不画。
+    pub fn push_resize_grip(&mut self, size: Vec2, grip: &GripStyle) {
+        if !grip.is_visible() {
+            return;
+        }
+        match grip.shape {
+            GripShape::Hidden => {}
+            GripShape::Squares => {
+                for k in 0..grip.count {
+                    let o = grip.step * (k as f32 + 1.0);
+                    self.push_solid_rect(
+                        Rect::new(size.x - o, size.y - o, grip.size, grip.size),
+                        grip.color,
+                    );
+                }
+            }
+            GripShape::Bars => {
+                // 图标画成 `size*count` 的方框（`icon_at` 内部取居中方块 ⇒ 不变形），
+                // 距右下角留一个 `step` 的边距。
+                let d = grip.size * grip.count as f32;
+                let m = grip.step;
+                self.icon_at(
+                    Position::Physical(Vec2::new(size.x - d - m, size.y - d - m)),
+                    Size::Physical(Vec2::splat(d)),
+                    Icon::Grip,
+                    grip.color,
+                );
+            }
+        }
     }
 
     /// 同 [`Self::push_panel_like`]，另带可选**背景图**（[`ImageBg`]）。
@@ -2680,7 +2718,9 @@ impl<'a> Ui<'a> {
         // handle 为**外层容器局部坐标**（此处 abs_base 仍为外层原点）；用 clamp 后
         // 位置 `base_pos`（而非 origin）——与显示一致，贴边窗口缩放柄可命中。
         if let (Some(w), Some(ps)) = (width, prev_size) {
-            let hw = 14.0_f32;
+            // **命中区跟随柄的图案尺寸**（`GripStyle::extent`），下限 14px（太小的柄点不中）；
+            // `GripShape::Hidden` 时退回下限 —— 图案可以不画，但**缩放能力保留**。
+            let hw = style.grip.extent().max(14.0);
             let handle = Rect::new(base_pos.x + ps.x - hw, base_pos.y + ps.y - hw, hw, hw);
             let h_id = format!("{id}::resize");
             if let Some(new_size) = self.resize_handle(
@@ -2850,16 +2890,10 @@ impl<'a> Ui<'a> {
         let bg_rect = Rect::new(0.0, 0.0, size.x, size.y);
         self.push_panel_shadow(bg_rect, &style.shadow, style.radius);
         self.push_panel_like_img(bg_rect, style.bg, style.bg_image, style.border, style.border_w, style.radius, 0);
-        // 固定宽窗口：右下角缩放柄图案（3 条递减小斜杠；窗口局部坐标，随窗口平移）
+        // 固定宽窗口：右下角**缩放柄图案**（样式见 [`GripStyle`]；窗口局部坐标，随窗口平移）。
+        // 只对固定宽窗口生效 —— 那是唯一带缩放柄的容器；命中区在上面的 `resize_handle`。
         if width.is_some() {
-            let grip = style.border;
-            for k in 0..3 {
-                let o = 5.0 * (k as f32 + 1.0);
-                self.push_solid_rect(
-                    Rect::new(size.x - o, size.y - o, 4.0, 4.0),
-                    grip,
-                );
-            }
+            self.push_resize_grip(size, &style.grip);
         }
         for d in &mut self.queue[start..] {
             d.translate(display_pos);

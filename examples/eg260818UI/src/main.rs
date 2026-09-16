@@ -44,8 +44,8 @@ use std::time::Instant;
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
 use rjw_krusie::ui::{
-    ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, FontModal, IdAbsolute, Label, Palette,
-    Position, ShadowStyle,
+    ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, FontModal, GripShape, GripStyle,
+    IdAbsolute, Label, Palette, Position, ShadowStyle,
 };
 
 /// 「重叠控件」演示模块（控件级遮挡：重叠处只有最上层被触发 + `--sim-overlap` 自证）。
@@ -622,6 +622,10 @@ struct ThemeTuner {
     line_spacing: f32,
     /// **投影模糊宽**（逻辑像素；0 = 不画投影——立面 / 扁平风格）。
     shadow_blur: f32,
+    /// **右下角缩放柄形状**（[`GripShape`]；只对固定宽窗口生效）。
+    grip_shape: GripShape,
+    /// 缩放柄颜色（默认跟预设的描边色）。
+    grip_color: Color,
     /// 表面基色（整条 `surface*` 阶梯按**逐通道比**一起缩）。
     bg: Color,
     /// 描边色；`border_strong` 由它派生。
@@ -661,6 +665,8 @@ impl ThemeTuner {
             spacing_scale: 1.0,
             line_spacing: DEFAULT_LINE_SPACING,
             shadow_blur: ShadowStyle::default().blur,
+            grip_shape: GripShape::default(),
+            grip_color: p.border,
             bg: p.surface,
             border: p.border,
             accent: p.accent,
@@ -677,6 +683,8 @@ impl ThemeTuner {
         self.bg = p.surface;
         self.border = p.border;
         self.accent = p.accent;
+        // 柄色默认跟描边色（形状是造型选择，切预设不动它）。
+        self.grip_color = p.border;
     }
 
     /// **切密度档并把三个倍率滑杆对齐到该档的规范值**（与 [`Self::set_preset`] 同思路：
@@ -740,6 +748,13 @@ impl ThemeTuner {
         if !font.is_empty() {
             t = t.with_font_family(font);
         }
+        // **右下角缩放柄**：形状 + 颜色（尺寸/个数沿用令牌默认）。只对固定宽窗口生效
+        // （`win_a` / `img_box`）；`GripShape::Hidden` 时图案不画但**仍可拖动缩放**。
+        t.panel.grip = GripStyle {
+            shape: self.grip_shape,
+            color: self.grip_color,
+            ..t.panel.grip
+        };
         t
     }
 
@@ -793,6 +808,21 @@ impl ThemeTuner {
                     w.label("边框宽");
                     self.border_w = w.slider("th_bdw", 0.0..=5.0, self.border_w);
                 });
+                // 右下角**缩放柄**：形状三档 + 颜色。只对固定宽窗口生效（`win_a` / `img_box`）；
+                // "不画"只是没有图案，**拖动缩放照旧**（命中区单独存在，见 `GripStyle`）。
+                w.row(|w| {
+                    w.label("拖拽柄");
+                    if w.button("th_grip_sq", "方块").clicked() {
+                        self.grip_shape = GripShape::Squares;
+                    }
+                    if w.button("th_grip_bar", "三横").clicked() {
+                        self.grip_shape = GripShape::Bars;
+                    }
+                    if w.button("th_grip_off", "不画").clicked() {
+                        self.grip_shape = GripShape::Hidden;
+                    }
+                    w.add(ColorPicker::new("th_grip_color", &mut self.grip_color));
+                });
                 // ── 布局密度（主题扩展：紧凑 / 标准 / 宽松）──────────────────
                 // 三个按钮一键铺开"间距 / 字号 / 行距"，三根滑杆随后可自由微调
                 // （点档位 = 把滑杆对齐到该档的规范值，与"预设"按钮同思路）。
@@ -825,13 +855,18 @@ impl ThemeTuner {
                     self.shadow_blur = w.slider("th_shd", 0.0..=32.0, self.shadow_blur);
                 });
                 w.label(&format!(
-                    "{} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 边框宽 {:.1} · 投影 {:.0}",
+                    "{} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 边框宽 {:.1} · 投影 {:.0} · 柄 {}",
                     ["dark", "light", "legacy"][self.preset.min(2) as usize],
                     self.radius,
                     self.feather,
                     self.bevel,
                     self.border_w,
                     self.shadow_blur,
+                    match self.grip_shape {
+                        GripShape::Squares => "方块",
+                        GripShape::Bars => "三横",
+                        GripShape::Hidden => "无",
+                    },
                 ));
                 w.label(&format!(
                     "密度 {} · 字号 ×{:.2} · 间距 ×{:.2} · 行距 ×{:.2}",

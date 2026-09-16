@@ -215,7 +215,7 @@ impl LabelStyle {
 }
 
 impl PanelStyle {
-    /// 预乘 DPI scale：边框宽 / 内边距 / 圆角 × s 取整。
+    /// 预乘 DPI scale：边框宽 / 内边距 / 圆角 / 投影 / **缩放柄** × s 取整。
     pub fn scaled(mut self, s: f32) -> Self {
         if s <= 0.0 {
             return self;
@@ -225,6 +225,7 @@ impl PanelStyle {
         self.padding = m(self.padding);
         self.radius = self.radius.scaled_rounded(s);
         self.shadow = self.shadow.scaled(s);
+        self.grip = self.grip.scaled(s);
         self
     }
 }
@@ -586,7 +587,8 @@ impl LabelStyle {
 }
 
 impl PanelStyle {
-    /// 从调色板派生：`surface` 面板 + 常规描边（背景带调色板强度的微渐变）+ `shadow` 投影色。
+    /// 从调色板派生：`surface` 面板 + 常规描边（背景带调色板强度的微渐变）+ `shadow` 投影色
+    /// + `border` 色的缩放柄。
     pub fn themed(p: &Palette) -> Self {
         Self {
             bg: bevel_raised(p.surface, p.bevel),
@@ -594,6 +596,10 @@ impl PanelStyle {
             shadow: ShadowStyle {
                 color: p.shadow,
                 ..ShadowStyle::default()
+            },
+            grip: GripStyle {
+                color: p.border,
+                ..GripStyle::default()
             },
             ..Self::default()
         }
@@ -821,6 +827,83 @@ impl Density {
     }
 }
 
+/// **缩放柄的形状**（[`GripStyle::shape`]）。
+///
+/// 用枚举而不是多个裸 bool（R2）：形状是**互斥**的几档，且以后加档位不改签名。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GripShape {
+    /// **三条递减小方块**（默认；历史观感：沿右下对角线逐级内缩）。
+    #[default]
+    Squares,
+    /// **三条横线**（内置矢量图标 [`Icon::Grip`]，画在 `size × count` 的方框里，
+    /// 与字体无关、缺字形也不会变形）。
+    Bars,
+    /// **不画图案**（命中区照旧 —— 仍可拖动缩放，适合"干净"的界面）。
+    Hidden,
+}
+
+/// **窗口右下角缩放柄样式**（[`PanelStyle::grip`]）。
+///
+/// 只对**固定宽窗口**（`WindowBuilder::width(..)`）生效 —— 那是唯一带缩放柄的容器；
+/// 会话里的"拖拽按钮"指的就是它。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GripStyle {
+    /// 形状（默认 [`GripShape::Squares`]）。
+    pub shape: GripShape,
+    /// 颜色（默认 = 面板边框色，由 [`PanelStyle::themed`] 从 `Palette::border` 灌入）。
+    pub color: Color,
+    /// 单个图元边长（**逻辑像素**，默认 4.0）。
+    pub size: f32,
+    /// 图元间距 / 对角递进步长（**逻辑像素**，默认 5.0）。
+    pub step: f32,
+    /// 图元个数（默认 3；[`GripShape::Bars`] 下表示三条横线所在方框的边长倍数）。
+    pub count: u32,
+}
+
+impl Default for GripStyle {
+    fn default() -> Self {
+        Self {
+            shape: GripShape::default(),
+            // 默认色与 `PanelStyle::default().border` 一致；走主题时由 `themed` 覆盖。
+            color: Color::rgba_u8(180, 180, 180, 255),
+            size: 4.0,
+            step: 5.0,
+            count: 3,
+        }
+    }
+}
+
+impl GripStyle {
+    /// 预乘 DPI scale（`size` / `step` × s 取整；形状 / 颜色 / 个数不变）。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.size = m(self.size).max(1.0);
+        self.step = m(self.step).max(1.0);
+        self
+    }
+
+    /// 是否真的画图案（[`GripShape::Hidden`] ⇒ 不画，但**命中区照旧**）。
+    #[inline]
+    pub fn is_visible(&self) -> bool {
+        self.shape != GripShape::Hidden && <[f32; 4]>::from(self.color)[3] > 0.0
+    }
+
+    /// **图案占用的方形边长**（逻辑像素）：从窗口右下角往左上量，图案全部落在这个方框内。
+    ///
+    /// 也是命中区的下限来源 —— 柄画得大，抓取范围就该跟着大。
+    #[inline]
+    pub fn extent(&self) -> f32 {
+        match self.shape {
+            GripShape::Hidden => 0.0,
+            GripShape::Squares => self.step * self.count as f32 + self.size,
+            GripShape::Bars => self.size * self.count as f32 + self.step,
+        }
+    }
+}
+
 /// 面板（背景 + 边框）样式。
 #[derive(Clone, Debug)]
 pub struct PanelStyle {
@@ -842,6 +925,8 @@ pub struct PanelStyle {
     ///
     /// 画在本体**之下**、**更低 z 的窗口之上**（"投影落在下面的窗口上"）。
     pub shadow: ShadowStyle,
+    /// **右下角缩放柄样式**（只对固定宽窗口生效；见 [`GripStyle`]）。
+    pub grip: GripStyle,
 }
 
 impl Default for PanelStyle {
@@ -854,6 +939,7 @@ impl Default for PanelStyle {
             radius: CornerRadius::default(),
             bg_image: None,
             shadow: ShadowStyle::default(),
+            grip: GripStyle::default(),
         }
     }
 }
@@ -1153,6 +1239,26 @@ impl PanelStyle {
     /// **关闭投影**（等价 `blur = 0`；语义与 `debug_layout()` / `without_debug_layout()` 同风格）。
     pub fn without_shadow(mut self) -> Self {
         self.shadow.blur = 0.0;
+        self
+    }
+    /// **右下角缩放柄样式**（整对象替换；只对固定宽窗口生效）。
+    pub fn with_grip(mut self, grip: GripStyle) -> Self {
+        self.grip = grip;
+        self
+    }
+    /// **缩放柄颜色**（只改色，形状 / 尺寸沿用现值）。
+    pub fn with_grip_color(mut self, c: Color) -> Self {
+        self.grip.color = c;
+        self
+    }
+    /// **缩放柄形状**（只改形状，颜色 / 尺寸沿用现值）。
+    pub fn with_grip_shape(mut self, shape: GripShape) -> Self {
+        self.grip.shape = shape;
+        self
+    }
+    /// **不画缩放柄**（等价 `shape = Hidden`；**仍可拖动缩放**，只是没有图案）。
+    pub fn without_grip(mut self) -> Self {
+        self.grip.shape = GripShape::Hidden;
         self
     }
 }
@@ -2222,6 +2328,36 @@ mod tests {
         // 这里断言"没顺手改坏 padding / 圆角"。
         assert_eq!(flat.panel.padding, light.panel.padding);
         assert_eq!(flat.panel.radius, light.panel.radius);
+    }
+
+    #[test]
+    fn grip_style_extends_scales_and_hides() {
+        // 缩放柄：颜色走调色板、尺寸随 DPI 预乘、`Hidden` 不画但**仍可拖**
+        // （命中区在 `window_impl` 里另有 14px 下限 ⇒ 数据层只负责"画不画"与"多大"）。
+        let p = Palette::dark();
+        let panel = PanelStyle::themed(&p);
+        assert_eq!(panel.grip.color, p.border, "柄色取自调色板边框色");
+        assert_eq!(panel.grip.shape, GripShape::Squares, "默认形状 = 历史观感");
+        assert!(panel.grip.is_visible());
+        // 图案占位：从右下角往左上的方框边长（命中区下限的来源）。
+        let sq = panel.grip;
+        assert_eq!(sq.extent(), sq.step * sq.count as f32 + sq.size);
+        let bars = panel.clone().with_grip_shape(GripShape::Bars);
+        assert_eq!(bars.grip.extent(), bars.grip.size * bars.grip.count as f32 + bars.grip.step);
+        // 预乘 DPI：尺寸类字段 ×s，形状 / 颜色 / 个数不变。
+        let scaled = panel.grip.scaled(2.0);
+        assert_eq!(scaled.size, (panel.grip.size * 2.0).round());
+        assert_eq!(scaled.step, (panel.grip.step * 2.0).round());
+        assert_eq!(scaled.count, panel.grip.count);
+        assert_eq!(scaled.color, panel.grip.color);
+        // Hidden：不画（`is_visible` 为假）、`extent` 归零；全透明色同理。
+        let hidden = panel.clone().without_grip();
+        assert_eq!(hidden.grip.shape, GripShape::Hidden);
+        assert!(!hidden.grip.is_visible());
+        assert_eq!(hidden.grip.extent(), 0.0);
+        assert!(!panel.clone().with_grip_color(Color::rgba_u8(0, 0, 0, 0)).grip.is_visible());
+        // `scaled` 也走 Theme → PanelStyle 这条链（避免只测了子样式、漏了主题预乘）。
+        assert_eq!(Theme::dark().scaled(1.5).panel.grip.size, (4.0_f32 * 1.5).round());
     }
 
     #[test]
