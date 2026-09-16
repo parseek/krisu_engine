@@ -334,10 +334,11 @@ pub struct UiState {
     /// 重新整形的抖动。
     ///
     /// 版本号用于强制刷新缓存（如行高计算方式变更），避免新旧缓存混用导致布局错乱；
-    /// 末两元组是**换行行距倍率位 + 版本号**——行距现为主题令牌（[`crate::Theme::line_spacing`]），
-    /// 运行时可变，必须进键（不同行距各自缓存、改行距不会复用旧排版）。
+    /// 末元组是**换行行距倍率位 + 全局字重 + 版本号**——行距（[`crate::Theme::line_spacing`]）
+    /// 与字重（[`crate::Theme::font_weight`]）都是运行时可变主题令牌，必须进键
+    /// （不同行距 / 字重各自缓存，不会复用旧排版：字重会改字形**与步进宽度**）。
     pub(crate) text_buffers:
-        HashMap<(String, u32, Option<String>, u32, (u32, u8)), (Arc<Buffer>, u64)>,
+        HashMap<(String, u32, Option<String>, u32, (u32, u16, u8)), (Arc<Buffer>, u64)>,
     /// 帧计数（光标闪烁相位用）。
     pub frame: u64,
     /// 上一帧是否处于 IME 组合中（text_input 退格判定用）：

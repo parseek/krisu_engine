@@ -910,7 +910,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 ### 样式（`Theme`，可 clone 覆盖）
 
-`Theme { label, panel, button, slider, input, checkbox, divider, debug, focus, modal, combo, gap, row_h, feather, line_spacing }`，子样式见 `crates/rjw_ui/src/style.rs`：
+`Theme { label, panel, button, slider, input, checkbox, divider, debug, focus, modal, combo, gap, row_h, feather, line_spacing, font_weight, palette }`，子样式见 `crates/rjw_ui/src/style.rs`：
 `LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**/**shadow**/**grip**）、`ButtonStyle`（三态 bg + padding + **radius**）、
 `SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius**）、
 `CheckboxStyle`（box_size/checked_fill/gap）、`DividerStyle`、`DebugStyle`（layout_outline / layout_outline_width）、
@@ -925,6 +925,21 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 默认 `DEFAULT_LINE_SPACING` = 1.2）只作用于**可能换行的文本**（多行 TextArea / `wrap(..)`
 标签），`wrap <= 0` 的单行文本行高恒等于字号；`Theme::scaled(DPI)` 不缩放它（倍率不是尺寸）。
 `eg260818UI` 的「主题调节」窗口可实时切档 + 拖三根倍率滑杆。
+
+**字重令牌**：`Theme::font_weight: Weight`（`rjw_ui::Weight` = `fontdb` 的 `Weight(u16)`，
+常量 `THIN` 100 … `NORMAL` 400 … `BLACK` 900；默认 `NORMAL` = 与扩展前逐像素一致），
+入口 `Theme::with_font_weight(w)`。它是**全局**文本令牌：作用于 `Ui` 里所有排版
+（标签 / 按钮 / 输入框 / 下拉 / 换行文本……——它们都经同一对出口建缓冲）。
+字体没有该字面时由 cosmic-text 按最接近的字面回落。**不是尺寸量**：
+`Theme::scaled(DPI)` / `Density` 都不碰它。⚠ 字重会改**字形与步进宽度**（布局随之变）
+⇒ 排版缓冲缓存键与窗口 / win=0 子槽的几何签名都含字重，改字重时会自动重建
+（见 `docs/ENGINE_GUIDE.md` §18.7）。
+
+`builtin::FontModal`（字体弹窗）现在同时管**字体族 + 字重**：
+`FontModal { input, weight: &mut Weight, apply: &mut dyn FnMut(&str, Weight) }`，
+字重下拉项来自 `rjw_ui::FONT_WEIGHT_CHOICES`（七档 300…900），显示名 `weight_label(w)`。
+`eg260818UI` 里字重由弹窗直接写回应用侧 `TopBar::font_weight`，下一帧主题按它重建；
+`--sim-weight` 脚本化守护这条路径（第 30 帧 400 → 700，前后量同一串文本的实测宽必须变）。
 
 **投影令牌**：`PanelStyle::shadow: ShadowStyle { blur, offset, color }`（色令牌 `Palette::shadow`），
 主题级入口 `Theme::with_shadow(ShadowStyle)` / `Theme::without_shadow()`，逐容器入口

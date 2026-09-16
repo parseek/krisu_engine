@@ -181,10 +181,13 @@ pub use style::{
 pub use input::{KeyboardSnapshot, MouseSnapshot};
 pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Placement, Resize, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
 pub use view::{ViewCtx, ViewMode};
+/// 文本**形状层**的重导出（`rjw_text`）：`Ui` 只在此处依赖 cosmic-text 名字，
+/// 应用侧用 [`Theme::with_font_weight`] / [`Weight`] 时不必自己引 `rjw_text`。
+pub use rjw_text::{Stretch, Style, Weight};
 pub use widgets::{
-    Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, FontModal, Label,
-    NumberInput, Response, Slider, SliderValue, Widget, WidgetId, color_hex, format_color,
-    format_f, format_u8, ink_on, luma, parse_color, parse_hex,
+    Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, FONT_WEIGHT_CHOICES,
+    FontModal, Label, NumberInput, Response, Slider, SliderValue, Widget, WidgetId, color_hex,
+    format_color, format_f, format_u8, ink_on, luma, parse_color, parse_hex, weight_label,
 };
 
 /// **UI 文本模块**（公开）：`rjw_ui` 里与文字渲染相关的全部公开面。

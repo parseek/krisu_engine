@@ -317,7 +317,7 @@ pub use colorpicker::{
     ink_on, luma, parse_color, parse_hex,
 };
 pub use divider::Divider;
-pub use fontmodal::FontModal;
+pub use fontmodal::{FONT_WEIGHT_CHOICES, FontModal, weight_label};
 pub use label::Label;
 pub use numberinput::NumberInput;
 pub use slider::{Slider, SliderValue};

@@ -21,7 +21,9 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-pub use cosmic_text::{Align, Attrs, AttrsOwned, Buffer, Family, FontSystem, Metrics, Shaping};
+pub use cosmic_text::{
+    Align, Attrs, AttrsOwned, Buffer, Family, FontSystem, Metrics, Shaping, Stretch, Style, Weight,
+};
 use glam::Vec2;
 use rjw_atlas::{AtlasConfig, AtlasRegion, DynamicAtlas};
 #[cfg(feature = "rjw_2d_render")]

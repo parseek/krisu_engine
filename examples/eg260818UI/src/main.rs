@@ -45,7 +45,7 @@ use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
 use rjw_krusie::ui::{
     ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, FontModal, GripShape, GripStyle,
-    IdAbsolute, Label, Palette, Position, ShadowStyle,
+    IdAbsolute, Label, Palette, Position, ShadowStyle, Weight, weight_label,
 };
 
 /// 「重叠控件」演示模块（控件级遮挡：重叠处只有最上层被触发 + `--sim-overlap` 自证）。
@@ -62,6 +62,10 @@ struct TopBar {
     player_name: String,
     /// 当前应用的字体族（空 = 系统默认；FontModal 确定后写入，下一帧主题按它重建）。
     font_name: String,
+    /// 当前**全局字重**（FontModal 的字重下拉；默认 400）。引擎侧是主题令牌
+    /// `Theme::font_weight`——改它 = 全 UI 一起换字形（不只是"看着粗一点"，
+    /// 步进宽度也会变 ⇒ 布局随之变）。
+    font_weight: Weight,
     /// 字体 Modal 输入框内容（跨帧持久）。
     font_input: String,
     /// 字体 Modal 开关。
@@ -75,6 +79,7 @@ impl TopBar {
         Self {
             player_name: "Krisu".to_owned(),
             font_name: String::new(),
+            font_weight: Weight::NORMAL,
             font_input: String::new(),
             font_modal_open: false,
             demo_color: Color::rgba_u8(255, 128, 40, 255),
@@ -86,6 +91,11 @@ impl TopBar {
         &self.font_name
     }
 
+    /// 当前全局字重（供主题构建读取）。
+    fn font_weight(&self) -> Weight {
+        self.font_weight
+    }
+
     /// 顶部 place 区：状态标签 + 字体按钮 + 玩家名可拖动面板。
     fn ui(&mut self, ui: &mut Ui, fps: f64, clicks: u32, tuner: &mut ThemeTuner) {
         ui.label_at(Vec2::new(16.0, 12.0), &format!("FPS: {fps:.0}"));
@@ -95,7 +105,10 @@ impl TopBar {
         // 留出 8px 间隙；叠成两行会压到菜单上。
         ui.pack_at(Vec2::new(16.0, 56.0), PackSide::Top, |p| {
             p.row(|r| {
-                if r.button("font_btn", &format!("字体… {}", self.font_name)).clicked() {
+                // 按钮文字带出当前**字体族 + 字重**（改完不用重新打开弹窗就知道现在是哪档）。
+                let fam = if self.font_name.is_empty() { "默认" } else { &self.font_name };
+                let label = format!("字体… {fam} / {}", weight_label(self.font_weight));
+                if r.button("font_btn", &label).clicked() {
                     self.font_modal_open = true;
                 }
                 if r.button("theme_btn", "主题调节…").clicked() {
@@ -122,7 +135,10 @@ impl TopBar {
         if self.font_modal_open {
             FontModal {
                 input: &mut self.font_input,
-                apply: &mut |name: &str| self.font_name = name.to_owned(),
+                weight: &mut self.font_weight,
+                // 字重由**弹窗直接写回**（确定时按下拉选中项赋值）⇒ 回调里不再碰
+                // `self.font_weight`（否则与上面那行 `&mut` 借用冲突）。
+                apply: &mut |name: &str, _w: Weight| self.font_name = name.to_owned(),
             }
             .show(ui, &mut self.font_modal_open);
         }
@@ -311,6 +327,8 @@ struct Windows {
     /// --sim-chrome：上一次窗口 A 的结算尺寸（只在**变化**时打印，作为标题栏 / 收起 /
     /// 关闭三条路径的机器可读证据）。
     last_win_a_size: Vec2,
+    /// --sim-chrome：窗口 A 出现过的 `(open, collapsed)` 组合（去重，帧末判定用）。
+    chrome_states: Vec<(bool, bool)>,
     /// --sim-chrome：是否打印上面的证据。
     sim_chrome: bool,
 }
@@ -332,6 +350,7 @@ impl Windows {
             win_a_open: true,
             win_a_collapsed: false,
             last_win_a_size: Vec2::ZERO,
+            chrome_states: Vec::new(),
             sim_chrome: false,
         }
     }
@@ -408,6 +427,12 @@ impl Windows {
                 a_size.y
             );
             self.last_win_a_size = a_size;
+        }
+        if self.sim_chrome {
+            let st = (self.win_a_open, self.win_a_collapsed);
+            if self.chrome_states.last() != Some(&st) {
+                self.chrome_states.push(st);
+            }
         }
         // 窗口 B（覆盖在 A 之上）：输入框 + 多行 TextArea。
         ui.window("win_b").pos(self.win_b_pos).show(|w| {
@@ -742,7 +767,7 @@ impl ThemeTuner {
     }
 
     /// 按当前旋钮组装主题（`frame.ui(..)` 之前调用——闭包借用 `self`，闭包内不能构造）。
-    fn theme(&self, font: &str) -> Theme {
+    fn theme(&self, font: &str, weight: Weight) -> Theme {
         let mut p = preset_palette(self.preset);
         // 表面基色：按**逐通道比**缩放整条 `surface*` 阶梯 —— 既改亮度也改色相，
         // 同时保持"凹陷 / 面板 / 抬升 / 浮层 / 悬停 / 激活"之间的相对关系不塌。
@@ -777,7 +802,9 @@ impl ThemeTuner {
             .density(self.density)
             .with_font_scale(self.font_scale)
             .with_spacing_scale(self.spacing_scale)
-            .with_line_spacing(self.line_spacing);
+            .with_line_spacing(self.line_spacing)
+            // **全局字重**（`字体…` 弹窗里选；默认 400 = 与扩展前逐像素一致）。
+            .with_font_weight(weight);
         // **投影**：> 0 = 按滑杆改模糊宽（偏移 / 颜色沿用预设令牌）；拖到 0 = 平面风格。
         // `with_shadow` 吃 `self`，故先拷出现值再整体替换（`ShadowStyle` 是 `Copy`）。
         let shadow = t.panel.shadow;
@@ -978,6 +1005,11 @@ struct UiApp {
     /// `win_a_open` / `win_a_collapsed`，并由 `Windows` 打印每次结算尺寸变化
     /// （收起 ⇒ 高度塌到一行标题栏；关闭 ⇒ `(0,0)` 整窗短路）。见 docs/DEBUGGING.md。
     sim_chrome: bool,
+    /// --sim-weight：第 20 帧（字重 400）量到的文本宽；第 40 帧（字重 700）对比用
+    /// （**硬断言**：字重必须真的进排版输入 ⇒ 宽度必须变）。
+    weight_probe: Option<f32>,
+    /// --sim-weight：**脚本化切字重**（第 30 帧 NORMAL → BOLD），前后量同一串文本。
+    sim_weight: bool,
     /// 「被遮挡控件仍被触发」复现器。
     cover: CoverDemo,
     /// `--sim-cover` 段 A 结束时的认领次数（段 B 不许再涨）。
@@ -1017,6 +1049,8 @@ impl UiApp {
             overlap: OverlapDemo::default(),
             sim_cover: false,
             sim_chrome: false,
+            sim_weight: false,
+            weight_probe: None,
             cover: CoverDemo::default(),
             cover_starts_after_a: 0,
             image_file: None,
@@ -1265,7 +1299,9 @@ impl App for UiApp {
         // 布局常量与 `widgets/colorpicker/panel.rs` 对齐）——写死像素在非 1.0 DPI 下会点空。
         if self.sim_picker {
             let n = f.frames();
-            let theme = self.theme_tuner.theme(self.top.font_name());
+            let theme = self
+                .theme_tuner
+                .theme(self.top.font_name(), self.top.font_weight());
             // 取色面板内部的固定常量（与 `panel.rs` 一致）+ 主题尺寸 × DPI。
             let (pad, gap, hue_w, label_w, slider_min) =
                 (6.0f32, 6.0f32, 14.0f32, 14.0f32, 90.0f32);
@@ -1407,7 +1443,9 @@ impl App for UiApp {
         if self.sim_chrome {
             // 尺寸取自**本帧主题**（与下面 `let theme` 同一套输入 ⇒ 值一致）；
             // `Theme` 在 `Ui` 内才按 DPI 预乘 ⇒ 这里手动乘 `scale`（同 `--sim-picker`）。
-            let th = self.theme_tuner.theme(self.top.font_name());
+            let th = self
+                .theme_tuner
+                .theme(self.top.font_name(), self.top.font_weight());
             let (pad, row, gap) =
                 ((th.panel.padding + th.panel.border_w) * scale, th.row_h * scale, th.gap * scale);
             // 按钮边长 = `row_h - 2`，**减号作用在已缩放的 row_h 上**（同 `TitleIconButton::size`）。
@@ -1458,7 +1496,9 @@ impl App for UiApp {
 
         // 主题由 [`ThemeTuner`] 每帧组装（预设调色板 + 圆角 / 羽化 / 微渐变 / 强调色，
         // 以及 FontModal 选定的字体族）。两段 UI 各传一份（`Theme` 可克隆）。
-        let theme = self.theme_tuner.theme(self.top.font_name());
+        let theme = self
+            .theme_tuner
+            .theme(self.top.font_name(), self.top.font_weight());
 
         // 性能统计（UI 段 2 里读取"上一帧收尾"写入的值；延迟初始化避免多余默认值）。
         let ui_stats: UiStats;
@@ -1514,6 +1554,44 @@ impl App for UiApp {
                     st.color_picker.mode,
                     st.color_picker.text
                 );
+            }
+            // ── `--sim-weight`：字重是**排版输入**（改字形 + 步进宽度）──
+            // 第 30 帧 NORMAL → BOLD，并在 20 / 40 帧量同一串文本：宽度应变化
+            // （字体没有该字面时 cosmic-text 回落最接近的字面，宽度可能不变 ⇒ 打印是
+            // **观察证据**；硬断言在单测：字重进缓冲缓存键 + 进窗口几何签名前缀）。
+            if self.sim_weight {
+                if sim_frame == 30 {
+                    self.top.font_weight = Weight::BOLD;
+                }
+                if sim_frame == 20 || sim_frame == 40 {
+                    // 主题是 `&`（`ui.theme()`），先拷出需要的值再 `text_size(&mut self)`。
+                    let (size, fam, weight) = {
+                        let t = ui.theme();
+                        (t.label.font_size, t.label.font_family.clone(), t.font_weight)
+                    };
+                    let w = ui.text_size("字重 Aa 123", size, fam.as_deref()).x;
+                    eprintln!(
+                        "sim-weight: frame={sim_frame} weight={} '字重 Aa 123' width={w:.1} (label size {size})",
+                        weight.0
+                    );
+                    match self.weight_probe {
+                        None => self.weight_probe = Some(w),
+                        Some(w0) => {
+                            // **硬断言**：400 → 700 后同一串文本的实测宽必须变化
+                            // ——字重真的进了排版输入，而不是只记在主题里没被用上。
+                            let ok = (w - w0).abs() > 0.5;
+                            eprintln!(
+                                "sim-weight: weight 400 → {} : width {w0:.1} → {w:.1} {}",
+                                weight.0,
+                                if ok {
+                                    "[OK] 字重真的改变了字形 / 步进宽度"
+                                } else {
+                                    "[FAIL] 字重没进排版输入"
+                                }
+                            );
+                        }
+                    }
+                }
             }
             // ── 应用快捷键：**文本输入框聚焦时屏蔽**（`UiState::text_focus()`）——
             //    输入 `R` / `Esc` 不会被当作重置 / 退出。
@@ -1676,6 +1754,27 @@ impl App for UiApp {
             );
         }
 
+        // --sim-chrome：**外框四态**的判定（收起 / 关闭 / 重开 / 展开各走通 + 按钮按下
+        // 没有变成窗口拖拽）。`Windows` 每帧把当前 `(open, collapsed)` 压进
+        // `chrome_states`（去重），这里只看**最终态**与"过程中是否出现过关闭态"：
+        // - 出现过 `open = false` ⇒ × 真的把窗口关掉了（整窗短路）；
+        // - 出现过 `collapsed = true` 且尺寸仍是标题栏高 ⇒ ⌃ 真的收起了内容；
+        // - 结束态是 `open = true && collapsed = false` ⇒ 应用侧重开 / 展开都生效；
+        // - 全程窗口位置不变 ⇒ 按钮上的按下没被当成窗口拖拽（`claim_press`）。
+        if self.sim_chrome && f.frames() == 99 {
+            let st = &self.windows.chrome_states;
+            let closed = st.iter().any(|(o, _)| !*o);
+            let folded = st.iter().any(|(o, c)| *o && *c);
+            let back = self.windows.win_a_open && !self.windows.win_a_collapsed;
+            let moved = (self.windows.win_a_pos - Vec2::new(40.0, 470.0)).length() > 0.5;
+            let ok = closed && folded && back && !moved;
+            eprintln!(
+                "sim-chrome[四态]: 关闭={closed} / 收起={folded} / 重开+展开={back} / 窗口没被拖动={} {}",
+                !moved,
+                if ok { "[OK] 标题栏按钮三态都走通" } else { "[FAIL] 外框按钮路径不完整" }
+            );
+        }
+
         // --sim-cover：**被上层窗口盖住的控件不该收到按下**。
         // 判定口径（两段各管一处修复，见 `cover` 模块文档）：
         // - `covered_drags`：被盖住却还带着拖拽状态进来（错误认领的按下会一直拖到释放）
@@ -1783,6 +1882,7 @@ fn main() -> Result<(), RunError> {
     app.sim_overlap = args.iter().any(|a| a == "--sim-overlap");
     app.sim_cover = args.iter().any(|a| a == "--sim-cover");
     app.sim_chrome = args.iter().any(|a| a == "--sim-chrome");
+    app.sim_weight = args.iter().any(|a| a == "--sim-weight");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
         .iter()

@@ -122,6 +122,22 @@ fn update(&mut self, ctx: &mut Ctx) {
   ⚠ 这段脚本依赖"注入只对下一帧生效"：几何变化与按下**必须同一帧**，故注入帧号与几何
   变化帧号要对齐（见 `main.rs` 里的注释）；每段之间要**复位两窗 z**，否则上一段的按下
   会把被点窗口置顶、下一段的前置条件就不成立了。
+- **"改了字重 / 行距但画面不动"**（主题级文本令牌没进缓存键 / 几何签名）：示例的
+  `--sim-weight` 在第 30 帧把全局字重从 400 切到 700，并在切换前后量同一串文本：
+
+  ```
+  cargo run -p eg260818UI -- --sim-weight --frames 50
+  sim-weight: frame=20 weight=400 '字重 Aa 123' width=112.0 (label size 21)
+  sim-weight: frame=40 weight=700 '字重 Aa 123' width=116.0 (label size 21)
+  sim-weight: weight 400 → 700 : width 112.0 → 116.0 [OK] 字重真的改变了字形 / 步进宽度
+  ```
+
+  宽度不变（`[FAIL] 字重没进排版输入`）说明 `.weight(..)` 没落到建缓冲那条路——
+  **A/B 已实测**：把 `cache_buffer_wrap` 里的 `.weight(weight)` 去掉，输出立刻变成
+  `width 112.0 → 112.0 [FAIL]`。宽度变了但画面（按钮 / 输入框里的居中文本）仍是旧字形，
+  则是**几何签名前缀**漏了字重——`Ui::hash_cmds` 与 `UiState::text_buffers` /
+  `WidgetState::text_buf` 三处键都在 `docs/ENGINE_GUIDE.md` §18.7 列着。
+
 - **"这一像素到底是谁的"**（重叠 / 相邻控件边界、跨窗口遮挡、滚动条条带）：
 
   ```
@@ -149,6 +165,7 @@ fn update(&mut self, ctx: &mut Ctx) {
   sim-chrome: win_a open=false collapsed=true  pos=(40,470) size=(0,0)       # 点 ×：整窗短路
   sim-chrome: win_a open=true  collapsed=true  pos=(40,470) size=(358,67)    # 应用重开
   sim-chrome: win_a open=true  collapsed=false pos=(40,470) size=(358,320)   # 应用展开
+  sim-chrome[四态]: 关闭=true / 收起=true / 重开+展开=true / 窗口没被拖动=true [OK] 标题栏按钮三态都走通
   ```
 
   脚本先把窗口 A 挪到**没有别的窗口压着**的空位（默认布局里 `win_b` / `chishi` 正盖着它的

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use glam::Vec2;
 use rjw_color::Color;
-use rjw_text::Align;
+use rjw_text::{Align, Weight};
 
 use crate::draw::CornerRadius;
 
@@ -145,6 +145,14 @@ pub struct Theme {
     /// 高度仍是字号 ⇒ 不受影响。**不是** DPI 量（[`Theme::scaled`] 不缩放它），因为它
     /// 本来就是"相对字号"的倍率。见 [`Theme::with_line_spacing`]。
     pub line_spacing: f32,
+    /// **全局字重**（[`Weight`]；默认 `Weight::NORMAL` = 400）。
+    ///
+    /// 与 `line_spacing` 同类：**主题级文本令牌**，作用于 `Ui` 里**所有**排版
+    /// （标签 / 按钮 / 输入框 / 下拉 / 换行文本……）——因为它们都经
+    /// `Ui::cache_buffer_wrap` / `Ui::ensure_text_buf` 这两个出口建缓冲。
+    /// 不是 DPI 量（[`Theme::scaled`] 不缩放它）。字体没有该字重时由 cosmic-text
+    /// 按最接近的字面回落（`fontdb` 匹配），不会变成豆腐块。见 [`Theme::with_font_weight`]。
+    pub font_weight: Weight,
     /// **本主题的调色板**（换肤 / 回退 / 诊断用；由 [`Theme::themed`] 记录）。
     ///
     /// 手工改过子样式字段后它可能与实际颜色不一致——它记录的是"组装来源"，
@@ -1586,6 +1594,7 @@ impl Theme {
             gap: 6.0,
             feather: crate::tess::DEFAULT_FEATHER,
             line_spacing: DEFAULT_LINE_SPACING,
+            font_weight: Weight::NORMAL,
             palette: *p,
         }
     }
@@ -1808,6 +1817,24 @@ impl Theme {
     /// 仍是字号，不受影响）。调小 = 更紧凑的多行排版，调大 = 更疏朗。
     pub fn with_line_spacing(mut self, mult: f32) -> Self {
         self.line_spacing = mult.max(0.5);
+        self
+    }
+
+    /// **全局字重**（[`Weight`]；见 [`Theme::font_weight`]）。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{Theme, Weight};
+    /// let bold = Theme::dark().with_font_weight(Weight::BOLD);      // 700
+    /// let semi = Theme::dark().with_font_weight(Weight(600));       // 任意数值
+    /// ```
+    ///
+    /// ⚠ 字重会改变**字形与步进宽度**（不只是"看着粗一点"）⇒ 布局随之变化。引擎在
+    /// 三处保证不串味：排版缓冲缓存键（`UiState.text_buffers` / `WidgetState::text_buf`）
+    /// 含字重、窗口 / win=0 子槽的几何签名以字重为前缀（[`crate::ui::Ui`] 的
+    /// `hash_cmds`，与 `line_spacing` 同一机制）——漏掉后者会"改了字重但窗口几何仍命中
+    /// 旧顶点缓存"（固定矩形里的居中文本尤其明显）。
+    pub fn with_font_weight(mut self, w: Weight) -> Self {
+        self.font_weight = w;
         self
     }
 
@@ -2390,6 +2417,31 @@ mod tests {
         assert_eq!(b.clone().with_font_scale(0.0).label.font_size, b.label.font_size);
         assert_eq!(b.clone().with_spacing_scale(-1.0).gap, b.gap);
         assert_eq!(b.clone().with_font_scale(-2.0).input.height, b.input.height);
+    }
+
+    #[test]
+    fn font_weight_is_a_font_choice_not_a_size_token() {
+        // 默认 400：**不设字重 = 与扩展前逐像素一致**（既有 sim 坐标 / 截图基线不受影响）。
+        assert_eq!(Theme::default().font_weight, Weight::NORMAL);
+        assert_eq!(Theme::themed(&Palette::dark()).font_weight, Weight::NORMAL);
+        // 显式设置原样保留（任意数值，不吸附到某个档位）。
+        assert_eq!(Theme::default().with_font_weight(Weight(550)).font_weight, Weight(550));
+        // **不是尺寸量**：DPI 预乘（`scaled`）与密度档（`density`）都不得改它——
+        // 它们是"逻辑像素尺寸 / 间距"，字重是"选哪个字面"。写错会让换 DPI 悄悄变字重。
+        let t = Theme::default()
+            .with_font_weight(Weight::BOLD)
+            .density(Density::Spacious)
+            .scaled(2.0);
+        assert_eq!(t.font_weight, Weight::BOLD);
+        // 对照：同一趟链上字号被 ×2 预乘（**尺寸类**），行距只被密度档改、不被 DPI 改
+        // （**倍率类**）——字重跟行距一类。
+        let base = Theme::default().density(Density::Spacious);
+        assert_eq!(t.line_spacing, base.line_spacing, "行距是倍率：DPI 不缩放它");
+        assert_eq!(
+            t.label.font_size,
+            (base.label.font_size * 2.0).round(),
+            "字号是尺寸：DPI ×2（取整）"
+        );
     }
 }
 

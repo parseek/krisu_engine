@@ -1,22 +1,52 @@
 //! **字体切换模态对话框**（组合控件，只依赖公开 API）。
 //!
-//! 布局：`modal_at_w` 固定宽对话框 → `Input`（输入字体名）+ `PreviewInput`（用当前
-//! 输入的名字**实时预览**渲染示例文本，字体不存在回落默认）+ **确定 / 取消**
-//! （`PackSide::Left` 水平排列、`min_size` 撑开 spacer **右对齐**）。
+//! 布局：`modal_at_w` 固定宽对话框 → `Input`（输入字体名）+ **字重下拉** +
+//! `PreviewInput`（用当前输入的名字 + 字重**实时预览**渲染示例文本，字体不存在回落
+//! 默认）+ **确定 / 取消**（`PackSide::Left` 水平排列、`min_size` 撑开 spacer **右对齐**）。
 //!
-//! 确定 → `apply(字体名)`（demo 里 `theme.with_font_family(name)`）；取消 / Esc → 关闭。
+//! 确定 → `apply(字体名, 字重)`（demo 里 `theme.with_font_family(name)` +
+//! `theme.with_font_weight(w)`）；取消 / Esc → 关闭。
 
 use glam::Vec2;
 
 use crate::ui::Ui;
-use crate::{Child, PackSide, UiAdd};
+use crate::{Child, PackSide, UiAdd, Weight};
+
+/// 字重下拉的档位（CSS 常用九档里的七档；`fontdb`/`cosmic-text` 按最接近的字面回落）。
+pub const FONT_WEIGHT_CHOICES: [Weight; 7] = [
+    Weight::LIGHT,
+    Weight::NORMAL,
+    Weight::MEDIUM,
+    Weight::SEMIBOLD,
+    Weight::BOLD,
+    Weight::EXTRA_BOLD,
+    Weight::BLACK,
+];
+
+/// 字重的显示名（下拉项 + 触发按钮文本）。
+pub fn weight_label(w: Weight) -> String {
+    let name = match w {
+        Weight::LIGHT => "细",
+        Weight::NORMAL => "常规",
+        Weight::MEDIUM => "中等",
+        Weight::SEMIBOLD => "半粗",
+        Weight::BOLD => "粗",
+        Weight::EXTRA_BOLD => "特粗",
+        Weight::BLACK => "黑",
+        _ => "字重",
+    };
+    format!("{name} {}", w.0)
+}
 
 /// 字体切换模态对话框。
 pub struct FontModal<'a> {
     /// 输入框内容（应用侧持有，跨帧持久；`trim()` 后为待应用字体名，空 = 系统默认）。
     pub input: &'a mut String,
-    /// 确定回调（收到输入框内的字体名）。
-    pub apply: &'a mut dyn FnMut(&str),
+    /// 字重下拉的**选中值**（应用侧持有，跨帧持久）——下拉项来自
+    /// [`FONT_WEIGHT_CHOICES`]，选中索引持久于 `UiState.combo`。
+    pub weight: &'a mut Weight,
+    /// 确定回调（收到输入框内的字体名 + 下拉选中的字重）。
+    pub apply: &'a mut dyn FnMut(&str, Weight),
 }
 
 impl FontModal<'_> {
@@ -44,6 +74,11 @@ impl FontModal<'_> {
         // 预览示例（字体不存在时 rjw_text 回落默认）
         let mut ok = false;
         let mut cancel = false;
+        // 字重下拉：选中索引（`ui.combo` 的第 4 参 = 跨帧持久索引）。
+        let weight_now = *self.weight;
+        let weight_idx = FONT_WEIGHT_CHOICES.iter().position(|w| *w == weight_now).map(|i| i as u32);
+        let choices: Vec<String> = FONT_WEIGHT_CHOICES.iter().map(|w| weight_label(*w)).collect();
+        let mut picked_weight = None;
         ui.modal("font_modal").pos(Vec2::new(460.0, 220.0)).width(width).show(|m| {
             // 内容区宽 = 窗口**内容可用宽**——`avail_w()` 已扣除窗口内边距
             // （`Frame::fixed_avail_w = w − pad_total×2`，`pad_total = padding + border_w`），
@@ -54,6 +89,10 @@ impl FontModal<'_> {
             m.label("字体切换：输入字体名预览，确定生效（空 = 默认）");
             // Input：输入字体名
             m.text_input("font_modal_input", self.input);
+            // 字重：下拉（触发按钮文字 = 当前档位）。
+            if let Some(i) = m.combo("font_modal_weight", &weight_label(weight_now), &choices, weight_idx) {
+                picked_weight = FONT_WEIGHT_CHOICES.get(i as usize).copied();
+            }
             // PreviewInput：面板底 + 用当前输入的名字渲染示例文本，**按宽度换行、
             // 自动改大小**（超长字体名不裁剪，对话框随预览长高）。
             let name = self.input.trim().to_owned();
@@ -113,10 +152,40 @@ impl FontModal<'_> {
         });
         if ok {
             let name = self.input.trim().to_owned();
-            (self.apply)(&name);
+            // 下拉本帧选中的档位写回应用持久的字重（跨帧值），再一起交给回调——
+            // 于是"只改字重、不改字体名"也是一次确定的提交。
+            if let Some(w) = picked_weight {
+                *self.weight = w;
+            }
+            (self.apply)(&name, *self.weight);
             *open = false;
         } else if cancel {
             *open = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weight_choices_are_the_seven_ordered_steps_and_labeled_uniquely() {
+        // 七档：细 / 常规 / 中等 / 半粗 / 粗 / 特粗 / 黑（CSS 常用九档去掉 100/200）。
+        assert_eq!(FONT_WEIGHT_CHOICES.len(), 7);
+        assert!(FONT_WEIGHT_CHOICES.contains(&Weight::NORMAL), "必须含常规 400");
+        assert!(FONT_WEIGHT_CHOICES.contains(&Weight::BOLD), "必须含粗 700");
+        assert!(
+            FONT_WEIGHT_CHOICES.windows(2).all(|w| w[0] < w[1]),
+            "下拉项必须**由细到粗**递增（选择行顺序 = 视觉顺序）"
+        );
+        // 显示名唯一（同名两项在下拉里分不清）。
+        let names: Vec<String> = FONT_WEIGHT_CHOICES.iter().map(|w| weight_label(*w)).collect();
+        let mut uniq = names.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), names.len(), "字重显示名不得重复：{names:?}");
+        // 显示名带数值（应用/主题里排查时一眼对得上）。
+        assert!(weight_label(Weight::NORMAL).contains("400"));
     }
 }

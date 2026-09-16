@@ -1334,6 +1334,34 @@ let t = Theme::dark()
 >   （`Ui::hash_cmds`）。漏掉 ②，改了行距后窗口会继续命中旧顶点缓存（内容含换行文本时，
 >  窗口 / 标签高度就停在旧值不更新）。
 
+**字重**（`Theme::font_weight`，默认 `Weight::NORMAL` = 400）：
+
+```rust
+use rjw_ui::{Theme, Weight};
+
+let t = Theme::dark().with_font_weight(Weight::BOLD);   // 700
+let t = Theme::dark().with_font_weight(Weight(550));    // 任意数值（可变字体 / 精细档）
+```
+
+- **一个令牌管全 UI**：所有排版都经 `Ui::cache_buffer_wrap` / `Ui::ensure_text_buf`
+  这两个出口建缓冲 ⇒ 在那里统一 `.weight(self.theme.font_weight)`，**不新增参数**、
+  不改任何控件签名（标签 / 按钮 / 输入框 / 下拉 / 换行文本自动一起变）。
+- **它是排版输入，不是"画粗一点"**：字重改**字形**也改**步进宽度** ⇒ 文本自然宽 /
+  换行位置 / 控件尺寸都会变。字体没有该字面时 cosmic-text 按最接近的字面回落。
+- **不是尺寸量**：`Theme::scaled(DPI)` 与 `Density` 都不碰它（同 `line_spacing` 一类）。
+- **缓存三处**（漏一处就"改了字重画面不动"）：① `UiState::text_buffers` 键
+  （`(…, (mult_bits, weight.0, TEXT_LINE_HEIGHT_VERSION))`）；② 输入框自持缓冲
+  `WidgetState::text_buf` 的键字符串；③ 窗口 / `win=0` 子槽几何签名前缀
+  （`Ui::hash_cmds` 里 `write_u16(font_weight.0)`）——③ 与行距同理：固定矩形里的居中
+  文本（按钮 / 输入框）矩形不变，而字形变了，只靠命令哈希永远不失效。
+- 验证：`--sim-weight`（第 30 帧 400 → 700，前后量同一串文本的实测宽：`112 → 116`
+  ⇒ 字重真的进了排版输入；`[FAIL] 字重没进排版输入` 就是漏了上面某一处——A/B 实测：
+  去掉 `.weight(..)` 后输出立刻变成 `112.0 → 112.0 [FAIL]`）；
+  单测 `style::tests::font_weight_is_a_font_choice_not_a_size_token` +
+  `widgets::fontmodal::tests::weight_choices_are_the_seven_ordered_steps_and_labeled_uniquely`。
+- 应用侧入口：`builtin::FontModal`（字体弹窗）现在同时管字体族 + 字重，见
+  `docs/API_REFERENCE.md`「字重令牌」。
+
 **阴影**（`PanelStyle::shadow` / `ShadowStyle { blur, offset, color }`，色令牌
 `Palette::shadow`）：
 

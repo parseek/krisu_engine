@@ -1384,16 +1384,18 @@ impl<'a> Ui<'a> {
         let size_px = size.round();
         let wrap_px = wrap_logical.round().max(0.0);
         let mult_bits = line_mult.to_bits();
+        let weight = self.theme.font_weight;
         let key = format!(
-            "{s}\u{1}{size_px}\u{1}{}\u{1}{wrap_px}\u{1}{mult_bits}\u{1}{TEXT_LINE_HEIGHT_VERSION}",
-            family.unwrap_or("")
+            "{s}\u{1}{size_px}\u{1}{}\u{1}{wrap_px}\u{1}{mult_bits}\u{1}{}\u{1}{TEXT_LINE_HEIGHT_VERSION}",
+            family.unwrap_or(""),
+            weight.0
         );
         if let Some((k, b)) = self.state.widgets.get(id).and_then(|w| w.text_buf.as_ref())
             && *k == key {
                 return b.clone();
             }
         let lh = (size_px * line_mult.max(1.0)).round();
-        // 样式：字号 / 行高（行高 = 字号 × 行距倍率）/ 左对齐 / 可选字体族。
+        // 样式：字号 / 行高（行高 = 字号 × 行距倍率）/ 左对齐 / 可选字体族 / 全局字重。
         // （`TextStyle` 是唯一文本样式类型；此处只做机械适配，排版输入与旧
         //  `Text::create_buffer_wrap` 完全一致。）
         let style = match family {
@@ -1402,6 +1404,7 @@ impl<'a> Ui<'a> {
         }
         .size(size_px)
         .line_height(lh)
+        .weight(weight)
         .align(Align::Left);
         let buf = self.text.buffer(s, &style, wrap_px, CachePolicy::User);
         if let Some(ws) = self.state.widgets.get_mut(id) {
@@ -1478,12 +1481,14 @@ impl<'a> Ui<'a> {
         let wrap_px = wrap.round().max(0.0);
         // 换行文本按主题行距排版（单行不受影响）；倍率进缓存键（不同行距各自缓存）。
         let mult = if wrap_px > 0.0 { self.theme.line_spacing } else { 1.0 };
+        // 全局字重：改字形 + 步进宽度 ⇒ **必须进缓存键**（否则换字重后旧排版缓冲被判命中）。
+        let weight = self.theme.font_weight;
         let key = (
             s.to_owned(),
             size_px.to_bits(),
             family.map(|f| f.to_owned()),
             wrap_px.to_bits(),
-            (mult.to_bits(), TEXT_LINE_HEIGHT_VERSION),
+            (mult.to_bits(), weight.0, TEXT_LINE_HEIGHT_VERSION),
         );
         if let Some(b) = self.state.text_buffers.get_mut(&key) {
             // 命中：刷新"最后使用帧号"（帧级近似 LRU 驱逐依据）
@@ -1498,6 +1503,7 @@ impl<'a> Ui<'a> {
         }
         .size(size_px)
         .line_height(lh)
+        .weight(weight)
         .align(Align::Left);
         let buf = self.text.buffer(s, &style, wrap_px, CachePolicy::User);
         // 满容量：先驱逐**本帧未使用**的条目（保留静态标签），仍满（本帧全在用）
@@ -3611,14 +3617,16 @@ impl<'a> Ui<'a> {
     /// 而命令内容没变 ⇒ 只靠命令哈希永远不失效。世代号只由图集整理（分配失败触发）
     /// 推进，不是每帧变化。
     ///
-    /// 签名还**以主题行距为前缀**（[`Theme::line_spacing`]）：`DrawKind::Text` 的
-    /// `buf` 是排版结果、按设计**不参与哈希**（命令内容相同），而换行文本的实际
-    /// 行高 / 整体高度取决于行距 ⇒ 不并入就会被"改了行距但窗口几何仍命中旧
-    /// 缓存"卡住。行距是主题令牌、只在主题变更时改，代价可忽略。
+    /// 签名还**以主题行距 + 字重为前缀**（[`Theme::line_spacing`] / [`Theme::font_weight`]）：
+    /// `DrawKind::Text` 的 `buf` 是排版结果、按设计**不参与哈希**（命令内容相同），而换行
+    /// 文本的实际行高 / 整体高度取决于行距、字形与步进宽度取决于字重 ⇒ 不并入就会被
+    /// "改了行距 / 字重但窗口几何仍命中旧缓存"卡住（固定矩形里的居中文本尤其明显）。
+    /// 两者都是主题令牌、只在主题变更时改，代价可忽略。
     fn hash_cmds<'c>(&self, cmds: impl IntoIterator<Item = &'c UiDraw>) -> u64 {
         use std::hash::Hasher;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         h.write_u32(self.theme.line_spacing.to_bits());
+        h.write_u16(self.theme.font_weight.0);
         for d in cmds {
             self.cmd_sig(&mut h, d);
         }
