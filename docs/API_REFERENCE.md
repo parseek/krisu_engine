@@ -863,7 +863,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.menu_bar(id, pos, \|bar\| ..)` | `bar.menu(label, \|m\| ..)` → `MenuCtx::{item, item_checked, caption, separator}` | 返回栏尺寸；`pos` = 栏左上角（顶层 = 屏幕坐标）。展开状态跨帧持久于 `UiState::menu_open`（触发器绝对 ID）；**同一时刻只有一个菜单开着**，点菜单项 / 点栏外 / Esc 都收起。`MenuCtx` **`Deref` 到 `Window`** ⇒ 菜单里同样能放 `label` / `button` / `divider` / `row`（横向排版）/ `text_input` / `add(..)`；`caption` / `row` 会**先缩进到菜单项文字列**（与勾选列对齐）。下拉面板是 `Level::Normal` + **`WindowClamp::Locked`**（点它不置顶、**拖不动**）且 z 被强制成 `WIN_TOPMOST` 哨兵 —— 所以菜单栏录在哪里都盖得住别人。细节见 `docs/ENGINE_GUIDE.md` §18.13 |
+| `ui.menu_bar(id, pos, \|bar\| ..)` | `bar.menu(label, \|m\| ..)` → `MenuCtx::{item, item_checked, caption, separator}` | 返回栏尺寸；`pos` = 栏左上角（顶层 = 屏幕坐标）。展开状态跨帧持久于 `UiState::menu_open`（触发器绝对 ID）；**同一时刻只有一个菜单开着**，点菜单项 / 点栏外 / Esc 都收起。`MenuCtx` **`Deref` 到 `Window`** ⇒ 菜单里同样能放 `label` / `button` / `divider` / `row`（横向排版）/ `text_input` / `add(..)`。下拉面板是 `Level::Normal` + **`WindowClamp::Locked`**（点它不置顶、**拖不动**）且 z 被强制成 `WIN_TOPMOST` 哨兵 —— 所以菜单栏录在哪里都盖得住别人。面板排版由引擎保证：左内边距 = `item_pad_x + 勾选列`（菜单项 / `caption` / `separator` 天然同列）、面板宽取上一帧结算宽（子项高亮 / 分割线**铺满面板**）、`caption` 用 `text_muted` + 小字号做分组标题。细节见 `docs/ENGINE_GUIDE.md` §18.13；几何可 `RJ_MENU_TRACE=1` 打印 |
 
 **窗口外框（标题栏 / 关闭 / 收起）**：三个选项各自独立、**都不调就完全没有外框**
 （逐像素等于旧行为）；任一开启都在窗口内容**第一行**录一条标题栏（底色

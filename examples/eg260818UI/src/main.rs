@@ -2039,10 +2039,19 @@ impl App for UiApp {
                 // 下拉原点（引擎里的 `pos = (t.x, t.y + h + 2)`，见 `MenuBar::popup`）。
                 self.menu_want_origin =
                     Some(Vec2::new(trigger_rect.x, trigger_rect.y + row_h + 2.0));
-                // 下拉里**第一个菜单项**（窗口原点 + 半项高；面板 padding = 0）。
+                // 下拉里**第一个菜单项**：注意面板有左内边距（= `item_pad_x + 勾选列`）
+                // + 边框 ⇒ 第一项从内容原点起，不是面板顶边。
                 let item_h = (fs * 1.3).round() + 6.0;
+                let (ci_pad, ci_chk, border_w) = {
+                    let t = ui.theme();
+                    (t.combo.item_pad_x, fs + 6.0, t.panel.border_w)
+                };
+                let top_pad = ci_pad + ci_chk + border_w;
                 if let Some(p) = dump.windows.iter().find(|p| p.id == "menubar::视图") {
-                    self.menu_item_pt = Some(Vec2::new(p.origin.x + w * 0.5, p.origin.y + item_h * 0.5));
+                    self.menu_item_pt = Some(Vec2::new(
+                        p.origin.x + top_pad + 20.0,
+                        p.origin.y + top_pad + item_h * 0.5,
+                    ));
                     self.menu_panel = Some((p.origin, p.size));
                 } else {
                     self.menu_panel = None;

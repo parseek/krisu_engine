@@ -245,8 +245,20 @@ fn update(&mut self, ctx: &mut Ctx) {
   | 触发器点不着 | 坐标错（栏位置 / 触发器宽 = 文字宽 + `button.padding.x`）；`RJ_HIT_TRACE=1` 看这个像素命中谁（`menubar::视图` / `menubar::视图/item::…`） |
   | 菜单开着但点菜单项后不收 | `MenuCtx` 的 `close` 标志没被 `MenuBar` 读回（`item_clicked`）⇒ `finish()` 不会写 `menu_open = None` |
   | 阶段 2 `[FAIL] 面板被拖走了` | 下拉面板漏了 `WindowClamp::Locked`（**A/B 实测**：去掉后原点被拖到 x=1682）⇒ 面板与触发器脱节，命中按窗口走、视觉跑别处（"控件严重错位"） |
-  | 菜单标题 / 按钮行与菜单项错开一格 | `caption` / `row` 没缩进"勾选列"（`MenuCtx::indent`）；`m.row(..)` 编译报 "method `row` is private" 则是 `MenuCtx` 上加了会撞名的**私有** helper |
+  | **分割线又短又偏 / 标题与菜单项错列** | 面板左内边距没算勾选列（应 = `item_pad_x + 勾选列宽`）；或分割线用了 `Divider`（它的宽 = `avail_w()`，**自动宽**窗口里是 `None` ⇒ 退回固定 120）。`RJ_MENU_TRACE=1` 一跑就知道：正确时 `item` / `separator` / `caption` 三者**同 `x` 同 `w`**（实测 `x=47 w=234`） |
   | 下拉被别的窗口压住 | 面板 z 没走 `WIN_TOPMOST` 哨兵（走哨兵后与录制顺序无关） |
+
+  `RJ_MENU_TRACE=1`（引擎侧）打印下拉面板每一行的矩形与"宽度是否已固定"：
+
+  ```
+  menu[popup menubar::视图] prev=None pad_total=47 fill=false     # 首帧：自然宽
+  menu[item]      x=47 y=47  w=210 h=33
+  menu[separator] x=47 y=173 w=120 h=14                           # 首帧分割线按自然宽
+  menu[popup menubar::视图] prev=Some(328.0) pad_total=47 fill=true
+  menu[item]      x=47 y=47  w=234 h=33                           # 次帧起：全部铺满内容宽
+  menu[separator] x=47 y=173 w=234 h=14
+  menu[caption]   x=47 y=196 w=234 h=22
+  ```
 
 - **「导入图片…」/「导入字体…」这条运行时通路**（系统文件选择器 → 字节 → 纹理 / 字体）：
   选择器是**阻塞**调用、无头环境里没法跑，所以脚本化的等价开关是 `--sim-import <路径>`

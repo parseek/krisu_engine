@@ -53,11 +53,11 @@
 use glam::Vec2;
 use rjw_transform::Rect;
 
-use crate::draw::{Icon, Position, TextAlign, TextVAlign};
+use crate::draw::{Icon, Position, Size, TextAlign, TextVAlign};
 use crate::hit::{hit_test, update_interact};
 use crate::layout::Child;
 use crate::style::PanelStyle;
-use crate::ui::{Level, Ui, UiAdd, WindowClamp, WIN_TOPMOST};
+use crate::ui::{Level, Ui, UiAdd as _, WindowClamp, WIN_TOPMOST};
 use crate::Window;
 
 /// 菜单栏（由 [`Ui::menu_bar`](crate::Ui::menu_bar) 构造，见模块文档）。
@@ -182,10 +182,16 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
         // 浮层面板样式：`ComboStyle` 的菜单外观（现代扁平菜单）+ 面板 bg / radius；
         // **内边距 0**（菜单项自己带 padding），边框取 `menu_border`。
         let cs = self.ui.theme.combo.clone();
+        // **左内边距 = 勾选列 + 文字左留白**：这样"菜单项文字"与 `caption` / `row` /
+        // 自己画的分割线**天然同列**（都从内容原点起排），不需要任何"给下一子项缩进"
+        // 的花招（垂直栈里子项 x 恒等于内容原点，缩进宽度是无效的）。
+        let pad = cs.item_pad_x + Self::check_w(font_size);
+        let border_w = self.ui.theme.panel.border_w;
+        let pad_total = pad + border_w;
         let style = PanelStyle {
             bg: cs.menu_bg.into(),
             border: cs.menu_border,
-            padding: 0.0,
+            padding: pad,
             radius: cs.menu_radius,
             bg_image: None,
             ..self.ui.theme.panel.clone()
@@ -198,8 +204,22 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
             .state_mut()
             .window_z
             .insert(crate::id::IdAbsolute::owned(popup_id.clone()), WIN_TOPMOST);
+        // **固定宽 = 上一帧的结算宽**（首帧自然宽，次帧起精确——菜单内容通常跨帧不变）：
+        // 固定宽让 `avail_w()` 有值（`LimitedInParent` 控件与 `Divider` 才有正确可用宽），
+        // 且子项请求"极宽"时会被 clamp 到内容宽 ⇒ **菜单项高亮满宽**（不再取决于
+        // "谁是当前最宽子项"——长标题会把面板撑宽，高亮却只有标题宽）。
+        // ⚠ `WindowBuilder::width` 收的是**内容宽**，而 `settle = fixed_w + 2*pad_total`
+        // ⇒ 传 `prev - 2*pad_total` 才能保持上一帧的宽度（次帧起收敛）。
+        let prev = self.ui.state().window_sizes.get(popup_id.as_str()).map(|s| s.x);
+        // `fill = 固定宽已知`（第 2 帧起）：此时子项请求"极宽"会被 clamp 到内容宽 ⇒
+        // 高亮 / 分割线**铺满面板**；第 1 帧（自动宽）必须请求**自然宽**——否则 1e6 的
+        // 请求会把"自然尺寸"撑成一百万，面板宽度就再也收敛不回来了。
+        let fill = prev.is_some();
+        if std::env::var_os("RJ_MENU_TRACE").is_some() {
+            eprintln!("menu[popup {popup_id}] prev={prev:?} pad_total={pad_total} fill={fill}");
+        }
         let mut close = false;
-        let size = self
+        let mut b = self
             .ui
             .window(&popup_id)
             .pos(Position::Physical(pos))
@@ -207,16 +227,28 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
             // 点菜单项的命中按窗口走、视觉却跑别处（"控件严重错位"）。
             .clamp(WindowClamp::Locked)
             .level(Level::Normal)
-            .style(style)
-            .show(|w| {
-                let mut m = MenuCtx { w, font_size, close: &mut close };
-                content(&mut m);
-            });
+            .style(style);
+        if let Some(w) = prev {
+            b = b.width(Size::Physical((w - pad_total * 2.0).max(40.0)));
+        }
+        let size = b.show(|w| {
+            let mut m = MenuCtx { w, font_size, pad, fill, close: &mut close };
+            content(&mut m);
+        });
         // 面板里点了菜单项 ⇒ 收起（`finish` 统一写 `UiState::menu_open`）。
         if close {
             self.item_clicked = true;
         }
         self.popup = Some(Rect::new(pos.x, pos.y, size.x, size.y));
+    }
+
+    /// **勾选列宽度**（图标 + 与文字的间隙；菜单项文字相对面板内缘右移的量）。
+    ///
+    /// 面板的左内边距取 `item_pad_x + 勾选列宽`，于是"勾选列"落在内边距里，
+    /// 菜单项 / 标题 / 分割线全部从**同一个内容原点**起排 ⇒ 天然对齐。
+    #[inline]
+    fn check_w(font_size: f32) -> f32 {
+        font_size + 6.0
     }
 
     /// 收尾（由 [`Ui::menu_bar`](crate::Ui::menu_bar) 调用）：定展开状态 + 返回栏尺寸。
@@ -245,6 +277,11 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
 pub struct MenuCtx<'w, 'a, 'b> {
     w: &'w mut Window<'a, 'b>,
     font_size: f32,
+    /// 面板的左内边距（= `item_pad_x + 勾选列宽`）——菜单项高亮要往左扩这么多才铺满内缘。
+    pad: f32,
+    /// **面板宽度已固定**（第 2 帧起）：子项请求"极宽"由窗口 clamp 到内容宽 ⇒ 铺满。
+    /// 第 1 帧（自动宽）为 `false`：必须请求自然宽，否则会把自然尺寸撑爆。
+    fill: bool,
     /// 点了菜单项 ⇒ 收起（由 [`MenuBar::finish`] 统一判定）。
     close: &'w mut bool,
 }
@@ -283,60 +320,88 @@ impl MenuCtx<'_, '_, '_> {
         clicked
     }
 
-    /// 菜单里的一条**分割线**。
+    /// 菜单里的一条**分割线**（满内容宽、与菜单项文字同列）。
+    ///
+    /// 自己画而不是用 [`Divider`](crate::Divider)：`Divider` 的宽 = `avail_w()`，
+    /// 而**自动宽**窗口里那是 `None`（退回固定 120）⇒ 线又短又不在该在的位置
+    /// （用户实测："Menu 分割线错位"）。这里请求"极宽"，由窗口把子项 clamp 到
+    /// 内容宽 ⇒ 线恒等于面板内容宽、起点也在内容原点。
     pub fn separator(&mut self) {
-        self.indent();
-        self.w.divider();
-    }
-
-    /// 菜单里的**纯文本行**（不可点：分组标题 / 说明）。
-    pub fn caption(&mut self, text: &str) {
-        self.indent();
-        self.w.label(text);
-    }
-
-    /// **横向排版**（= `Window::row`，但先按"勾选列"缩进）。
-    ///
-    /// 刻意遮蔽 `Deref` 出来的 [`Window::row`]：菜单里所有内容都该与**菜单项文字**
-    /// 同一列起排，否则标题 / 按钮行会贴到面板左缘、与菜单项错开一格图标位
-    /// （"控件严重错位"的观感就是这么来的）。
-    ///
-    /// ⚠ 内层 `Window::row` 用 `UiAdd::row`（trait 方法）显式调用，避免递归。
-    pub fn row(&mut self, f: impl FnOnce(&mut crate::ui::Pack<'_, '_>)) -> Vec2 {
-        self.indent();
-        UiAdd::row(self.w, f)
-    }
-
-    /// 把光标推到"菜单项文字列"（`item_pad_x + 勾选列宽`）。
-    ///
-    /// 用 `child_rect(w, 0)` 占位：`Window` 的内容栈会把它当成一个零高子项
-    /// （垂直只前进一个 `gap`，正好当作"缩进 + 行距"；宽度小于菜单项，不会撑宽面板）。
-    fn indent(&mut self) {
-        let (pad_x, check_w) = {
-            let t = self.w.ui_mut().theme.clone();
-            let fs = self.font_size.max(1.0);
-            (t.combo.item_pad_x, fs + 6.0)
+        let (t, m) = {
+            let d = self.w.ui_mut().theme.divider.clone();
+            (d.thickness, d.margin)
         };
-        self.w
-            .ui_mut()
-            .child_rect(pad_x + check_w, 0.0, Child::Expand);
+        let h = t + m * 2.0;
+        let r = self.row_rect(120.0, h);
+        let y = r.y + (r.h - t) * 0.5;
+        let color = self.w.ui_mut().theme.divider.color;
+        self.w.ui_mut().push_solid_rect(Rect::new(r.x, y, r.w, t), color);
+        self.trace("separator", r);
+    }
+
+    /// 菜单里的**纯文本行**（不可点：分组标题 / 说明）——比菜单项字号略小、颜色更淡，
+    /// 一眼看出"这是分组标题而不是可点的项"。
+    pub fn caption(&mut self, text: &str) {
+        let (fs, fam, color, h, tw) = {
+            let t = self.w.ui_mut().theme.clone();
+            let fs = (self.font_size * 0.85).round().max(1.0);
+            let fam = t.combo.font_family.clone();
+            let tw = self.w.ui_mut().text_size(text, fs, fam.as_deref()).x;
+            (fs, fam, t.palette.text_muted, fs.max(14.0) + 4.0, tw)
+        };
+        let r = self.row_rect(tw, h);
+        self.w.ui_mut().push_text_rect(
+            r,
+            text,
+            fs,
+            color,
+            fam,
+            TextAlign::Left,
+            TextVAlign::Center,
+            None,
+            None,
+        );
+        self.trace("caption", r);
+    }
+
+    /// 占一行光标并取回该行矩形：**宽度已固定时请求"极宽"**（由窗口 clamp 到内容宽 ⇒
+    /// 高亮 / 分割线铺满面板），否则用调用方给的**自然宽**（第 1 帧决定面板自然尺寸）。
+    fn row_rect(&mut self, natural_w: f32, h: f32) -> Rect {
+        let w = if self.fill { 1.0e6 } else { natural_w };
+        self.w.ui_mut().child_rect(w, h, Child::Expand)
+    }
+
+    /// `RJ_MENU_TRACE=1`：打印每个下拉内容的**行矩形**（`x/y/w/h`）。
+    ///
+    /// 为什么留这条通道：菜单的"对齐"是纯几何约定（标题 / 菜单项 / 分割线必须同 x、
+    /// 同宽），而它**看不出来**——肉眼看"差不多"，出问题时只是"有点怪"。有了这三个数，
+    /// "分割线错位"这类问题一眼可判（`w` 应等于菜单项的 `w`，`x` 也应相同）。
+    fn trace(&self, kind: &str, r: Rect) {
+        if std::env::var_os("RJ_MENU_TRACE").is_some() {
+            eprintln!(
+                "menu[{kind}] x={:.0} y={:.0} w={:.0} h={:.0}",
+                r.x, r.y, r.w, r.h
+            );
+        }
     }
 
     /// 菜单项公共实现：`check = Some(是否勾选)` 时左侧画勾选标记。
     ///
-    /// ⚠ 名字刻意不叫 `row`：`MenuCtx` 经 `Deref` 到 [`Window`]，而 `Window::row`（横向排版）
-    /// 是给应用用的——同名私有方法会**遮蔽**它（trait / deref 方法优先级更低），
-    /// 于是 `m.row(|r| ..)` 会去调这个私有 helper（编译报错 "method `row` is private"）。
+    /// ⚠ 名字刻意不叫 `row`：`MenuCtx` 经 `Deref` 到 [`Window`]，同名私有方法会**遮蔽**
+    /// `Window::row`（deref 方法优先级更低）⇒ 应用的 `m.row(..)` 会去调私有那个。
     fn item_row(&mut self, label: &str, check: Option<bool>) -> bool {
-        let (cs, font_size, pad_x, item_h, check_w) = {
+        let (cs, font_size, item_h, natural_w) = {
             let t = self.w.ui_mut().theme.clone();
-            let cs = t.combo.clone();
             let fs = self.font_size.max(1.0);
-            (cs, fs, t.combo.item_pad_x, (fs * 1.3).round() + 6.0, fs + 6.0)
+            let check_w = MenuBar::check_w(fs);
+            let tw = self.w.ui_mut().text_size(label, fs, t.combo.font_family.as_deref()).x;
+            let item_h = (fs * 1.3).round() + 6.0;
+            let natural = (check_w + tw + t.combo.item_pad_x * 3.0).max(t.combo.item_min_w);
+            (t.combo.clone(), fs, item_h, natural)
         };
-        let tw = self.w.ui_mut().text_size(label, font_size, cs.font_family.as_deref()).x;
-        let w = (check_w + tw + pad_x * 2.0).max(cs.item_min_w);
-        let rect = self.w.ui_mut().child_rect(w, item_h, Child::Expand);
+        // **宽度已固定 ⇒ 请求极宽**：窗口把子项 clamp 到内容宽 ⇒ 高亮满宽（与面板等宽），
+        // 不再受"当前最宽子项"影响（长标题撑宽面板时高亮仍满宽）。
+        let rect = self.row_rect(natural_w, item_h);
         let item_id = format!("item::{label}");
         let abs = self.w.ui_mut().id_for(item_id.as_str());
         let ui = self.w.ui_mut();
@@ -351,19 +416,31 @@ impl MenuCtx<'_, '_, '_> {
             update_interact(ws, hit, btn)
         };
         let bg = if ev.pressed || hit { cs.item_hover } else { cs.menu_bg };
+        // 高亮**满内宽**：`rect` 是内容区，把它的左右两侧各扩一个 `pad` 就铺满面板内缘
+        // （`pad` = 面板左内边距，右内边距同值）。
         // `elem_hint()`：装饰画在本元素背景之上（写死小 elem 会被自己的背景盖住）。
-        ui.push_panel_like(rect, bg, cs.menu_bg, 0.0, 0.0, ui.elem_hint());
-        if let Some(on) = check {
+        let hl = Rect::new(rect.x - self.pad, rect.y, rect.w + self.pad * 2.0, rect.h);
+        ui.push_panel_like(hl, bg, cs.menu_bg, 0.0, 0.0, ui.elem_hint());
+        if let Some(on) = check
+            && on
+        {
+            // 勾选标记**只在勾选时画**：勾选列由面板左内边距**恒留位**，未勾选时什么都不画
+            // （曾经给它画一个"背景色图标"占位——悬停高亮时那块背景色会在高亮上显形）。
             let d = font_size;
             ui.icon_at(
-                Position::Physical(Vec2::new(rect.x + pad_x, rect.y + (rect.h - d) * 0.5)),
+                // 勾选列在**左内边距里**（内容原点左侧一个勾选列宽）：
+                // 于是所有文字都在同一条竖线上，勾选图标不占文字位置。
+                Position::Physical(Vec2::new(
+                    rect.x - MenuBar::check_w(font_size),
+                    rect.y + (rect.h - d) * 0.5,
+                )),
                 crate::draw::Size::Physical(Vec2::splat(d)),
                 Icon::Check,
-                if on { cs.fg } else { cs.menu_bg },
+                cs.fg_mark,
             );
         }
         ui.push_text_rect(
-            Rect::new(rect.x + pad_x + check_w, rect.y, (rect.w - pad_x * 2.0 - check_w).max(0.0), rect.h),
+            Rect::new(rect.x, rect.y, rect.w, rect.h),
             label,
             font_size,
             cs.fg,
@@ -376,6 +453,7 @@ impl MenuCtx<'_, '_, '_> {
         if ev.clicked {
             *self.close = true;
         }
+        self.trace("item", rect);
         ev.clicked
     }
 
