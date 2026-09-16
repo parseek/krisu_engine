@@ -53,8 +53,27 @@ krusie 引擎的 UI 模块：**hybrid 模式**（立即外观 + ID 持久状态�
   行距 `Theme::line_spacing`（行高 = 字号 × 该值，默认 `DEFAULT_LINE_SPACING` = 1.2）只作用于
   **可能换行**的文本；它同时进排版缓冲缓存键与窗口几何签名（`Ui::hash_cmds`），
   所以调它不会留下陈旧几何。默认档与扩展前逐像素一致。
-- **状态持久**：交互控件（按钮/滑块/勾选/输入框）通过 **ID**（`&str`）把 hover / 按下 / 焦点 / 输入内容 / 拖拽标记持久化在 `UiState` 中（应用持有，跨帧复用）。
-- **自动尺寸**（DOM 风格）：叶子控件由内容测量（`rjw_text::Text::measure` + padding）自然撑开，容器（panel / pack / grid）在闭包结束时按子控件结算自身尺寸——**默认无需手写宽高**；任何控件可显式 `.size(w, h)` 或传 `Rect` 覆盖。
+- **窗口外框可配**：`WindowBuilder::{title, close_button, shrink}` 三个**独立可选**部件
+  （都不调 = 逐像素等于旧行为）。标题栏是内容**第一行**（通条底色 + 底边那条就是分隔线）；
+  `×` 点击 ⇒ `*open = false` 后**整窗短路**（不录制、不写原点 / 尺寸、不占遮挡矩形），
+  **重开由应用负责**；`shrink(show, collapsed)` 的 `show = false` **仍尊重** `*collapsed`
+  （菜单 / 代码收起窗口）。按钮是**几何**（`Icon::Close` / `Chevron*`）而非字形，按下即
+  `claim_press` ⇒ 点按钮不会顺带拖动窗口。`eg260818UI --sim-chrome` 脚本化守护。
+- **菜单栏**：`Ui::menu_bar(id, pos, |bar| ..)` —— 横向触发器 + 点开的**闭包下拉面板**；
+  `MenuCtx` 有 `item`（点完自动收起）/ `item_checked`（翻转 `&mut bool`）/ `caption` /
+  `separator`，并 **`Deref` 到 `Window`**（所以菜单里也能放文本输入 / 分割线 / 按钮 /
+  横向排版）。展开状态 `UiState::menu_open`（同一时刻只有一个菜单开着；点项 / 点栏外 /
+  Esc 收起）。下拉是 `Level::Normal` 浮层窗口 ⇒ **菜单栏录在各窗口之后**才盖得住它们。
+- **全局字重**：`Theme::font_weight`（`Weight`，默认 `NORMAL` = 400，任意数值可用）；
+  它是**排版输入**（改字形与步进宽度）⇒ 与 `line_spacing` 同样进「排版缓冲缓存键 +
+  窗口 / 子槽几何签名前缀」两处，改它不会留下陈旧几何。`Density` / `scaled(DPI)` 都不碰它。
+- **缩放柄 / 投影颜色令牌**：`PanelStyle::grip: GripStyle`（`GripShape::{Squares, Bars,
+  Hidden}` + 颜色 / 尺寸 / 步距 / 个数；**只对固定宽窗口**生效，`Hidden` 只是不画图案、
+  拖动缩放照旧）；`ShadowStyle::color` 是**任意色**（顶点 RGB 原样带出、只有 alpha 按圈衰减）。
+- **运行时导入字体 / 图片**：`Text::load_font_data(data) -> Vec<String>` **返回新增族名**
+  （`label.font_family(name)` 只认族名）；图片走后端**共享的**纹理表
+  （`Render2D::gpu().texture(..)` → `ImageBg`）。文件选择器属应用侧（示例用 `rfd`）。
+- **状态持久**：交互控件（按钮/滑块/勾选/输入框）通过 **ID**（`&str`）把 hover / 按下 / 焦点 / 输入内容 / 拖拽标记持久化在 `UiState` 中（应用持有，跨帧复用）。- **自动尺寸**（DOM 风格）：叶子控件由内容测量（`rjw_text::Text::measure` + padding）自然撑开，容器（panel / pack / grid）在闭包结束时按子控件结算自身尺寸——**默认无需手写宽高**；任何控件可显式 `.size(w, h)` 或传 `Rect` 覆盖。
 - **屏幕空间**：控件坐标一律为屏幕像素（左上角原点、Y+ 向下），内部经相机屏幕固定变换绘制，命中测试直接在屏幕像素进行（旋转/缩放相机依然准确）。
 
 > ⚠ **下方"快速上手"是 v0.2 的旧签名**（`Ui::begin` 收 6 参、`finish()` 不收后端），
