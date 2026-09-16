@@ -1274,7 +1274,9 @@ impl App for UiApp {
         }
 
         // ── 调试：脚本化鼠标（`--sim-cover`）───────────────────────
-        // 两段脚本，各自暴露一条"遮挡表与本帧几何不同步"的路径（详见 `cover` 模块文档）：
+        // 三段脚本（详见 `cover` 模块文档）：
+        //   段 0（帧 5..）**正对照**：移动窗让开 ⇒ 探针没被盖住，按下并按住**必须拖得动**
+        //     （曾经被"帧末复核拿旧 z 比"误撤，窗口内控件全拖不动）；
         //   段 A（帧 30）**同帧移动**：移动窗本帧才移到探针上，按下也在本帧；
         //   段 B（帧 60）**应用改 z**：录制前把移动窗 z 抬到最前（不占鼠标键），本帧再按下。
         // 命中点由 `cover` 模块按本帧结算尺寸解算（`overlap` 模块同一套"不写死像素"做法）。
@@ -1289,7 +1291,9 @@ impl App for UiApp {
             // 段 A 几何在 `n = 30` 变（按下注入在 n=30 ⇒ 落在同一帧）；
             // 段 B z 在 `n = 59` 变（注入同样在 n=59）。
             match n {
-                1..=29 => f.debug_inject_mouse(Vec2::new(1800.0, 1050.0), false),
+                1..=4 => f.debug_inject_mouse(Vec2::new(1800.0, 1050.0), false),
+                5..=18 => f.debug_inject_mouse(p, true), // 段 0：正对照——应当拖得动
+                19..=29 => f.debug_inject_mouse(Vec2::new(1800.0, 1050.0), false),
                 30..=33 => f.debug_inject_mouse(p, true), // 段 A：同帧移动 + 按下
                 34..=58 => f.debug_inject_mouse(Vec2::new(1800.0, 1050.0), false),
                 59..=62 => f.debug_inject_mouse(p, true), // 段 B：同帧改 z + 按下
@@ -1411,7 +1415,11 @@ impl App for UiApp {
             // 「被遮挡控件仍被触发」复现（`--sim-cover`）：z 改动在**录制前**做——那正是
             // "应用把某窗口置顶"的时机（本帧它按新 z 绘制，而遮挡表里还是上一帧的旧 z）。
             if sim_cover {
-                if sim_frame == 50 {
+                if sim_frame == 25 {
+                    // 段 0 的按下把探针窗置顶了 ⇒ 复位两窗 z，恢复段 A 的前置条件
+                    // （"移动窗画在探针窗之上"）。
+                    CoverDemo::reseed_z(&mut ui);
+                } else if sim_frame == 50 {
                     // 段 B 前置：把移动窗压到探针窗**之下**（此时它盖住探针也不算"该挡住"）。
                     CoverDemo::lower_mover_z(&mut ui);
                 } else if sim_frame == 59 {
@@ -1535,21 +1543,29 @@ impl App for UiApp {
         //   就不该再让被盖住的控件认领按下。
         // 段 A（同帧移动）的 `starts` 允许为 1：命中发生在几何变化那一帧，那一刻**本帧
         // 几何还没录完**，任何帧内判定都拿不到新位置——这条只能靠帧末复核兜住后果。
-        if sim_cover && (f.frames() == 42 || f.frames() == 72) {
-            let (s, d) = (self.cover.starts, self.cover.covered_drags);
-            if f.frames() == 42 {
-                self.cover_starts_after_a = s;
-                let ok = d == 0 && self.cover.covers;
+        if sim_cover && (f.frames() == 24 || f.frames() == 42 || f.frames() == 72) {
+            let (s, d, c) = (self.cover.starts, self.cover.drag_frames, self.cover.covered_drags);
+            if f.frames() == 24 {
+                // 段 0（正对照）：没被盖住 ⇒ 拖拽必须**持续活着**（脚本按住约 14 帧）。
+                // 若按下被误撤，拖拽状态在第 1 帧就被清掉 ⇒ 这里只有 1 帧 ⇒ FAIL。
+                let ok = d >= 5;
                 eprintln!(
-                    "sim-cover[A 同帧移动]: 认领按下={s} / 被盖住却还在拖={d} 帧 / 移动窗确实盖住探针={} {}",
+                    "sim-cover[0 正对照]: 拖拽活着={d} 帧（探针未被盖住，按住约 14 帧） {}",
+                    if ok { "[OK] 窗口内控件拖得动" } else { "[FAIL] 窗口内控件拖不动（按下被误撤）" }
+                );
+            } else if f.frames() == 42 {
+                self.cover_starts_after_a = s;
+                let ok = c == 0 && self.cover.covers;
+                eprintln!(
+                    "sim-cover[A 同帧移动]: 认领按下={s} / 被盖住却还在拖={c} 帧 / 移动窗确实盖住探针={} {}",
                     self.cover.covers,
                     if ok { "[OK] 被盖住的控件没留下按下状态" } else { "[FAIL] 被盖住的控件带着按下状态继续拖" }
                 );
             } else {
                 let no_new = s == self.cover_starts_after_a;
-                let ok = d == 0 && no_new && self.cover.covers;
+                let ok = c == 0 && no_new && self.cover.covers;
                 eprintln!(
-                    "sim-cover[B 应用改 z]: 段 B 新增认领={} / 累计被盖住却还在拖={d} 帧 / 移动窗确实盖住探针={} {}",
+                    "sim-cover[B 应用改 z]: 段 B 新增认领={} / 累计被盖住却还在拖={c} 帧 / 移动窗确实盖住探针={} {}",
                     s - self.cover_starts_after_a,
                     self.cover.covers,
                     if ok { "[OK] 抬高 z 后背后的控件不再被触发" } else { "[FAIL] 抬高 z 后背后的控件仍被触发" }

@@ -56,11 +56,14 @@ const GREY: Color = Color::rgba_u8(122, 122, 122, 255);
 /// 见 [`GREY`]。
 const BLUE: Color = Color::rgba_u8(0, 162, 232, 255);
 
-/// 「被遮挡控件仍被触发」复现器（状态 = 探针的两次计数）。
+/// 「被遮挡控件仍被触发」复现器（状态 = 探针的几次计数）。
 #[derive(Default)]
 pub struct CoverDemo {
-    /// 探针**认领按下**的次数（`down_edge` 且命中）——被盖住时必须是 **0**。
+    /// 探针**认领按下**的次数（`down_edge` 且命中）——被盖住时不该发生（信息性计数）。
     pub starts: u32,
+    /// **拖拽活着的帧数**（`dragging == true`）——正对照：没有任何窗口盖住探针时，
+    /// 窗口内控件**必须能被拖动**（曾经被帧末复核误撤而拖不动）。
+    pub drag_frames: u32,
     /// **被盖住却还在拖**的帧数（`dragging && !hit`）——错误认领的按下会一直拖到释放，
     /// 这正是"被遮挡的控件仍被触发"的用户可见后果。必须是 **0**。
     pub covered_drags: u32,
@@ -82,6 +85,15 @@ impl CoverDemo {
     /// 帧首：把移动窗压到探针窗**之下**（段 B 的前置条件）。
     pub fn lower_mover_z(ui: &mut Ui) {
         Self::set_mover_z(ui, MOVER_Z_LOW);
+    }
+
+    /// 帧首：把两个窗口的 z 复位成预置值（脚本在两段之间调用——上一段的按下会把被点窗口
+    /// 置顶，不复位的话下一段的前置条件"移动窗画在探针窗之上"就不成立了）。
+    pub fn reseed_z(ui: &mut Ui) {
+        Self::set_mover_z(ui, MOVER_Z);
+        ui.state_mut()
+            .window_z
+            .insert(IdAbsolute::owned(PROBE_WIN_ID.to_owned()), PROBE_Z);
     }
 
     fn set_mover_z(ui: &mut Ui, z: u32) {
@@ -116,6 +128,7 @@ impl CoverDemo {
                 w.add(DragProbe {
                     id: "cover_probe",
                     starts: &mut self.starts,
+                    drag_frames: &mut self.drag_frames,
                     covered: &mut self.covered_drags,
                 });
             });
@@ -151,6 +164,7 @@ impl CoverDemo {
 struct DragProbe<'a> {
     id: &'a str,
     starts: &'a mut u32,
+    drag_frames: &'a mut u32,
     covered: &'a mut u32,
 }
 
@@ -163,10 +177,12 @@ impl Widget for DragProbe<'_> {
         let abs = ui.id_for(self.id);
         let hit = ui.hit_abs(&abs, &rect);
         let btn = ui.mouse_left();
-        // ① **被盖住却还带着拖拽状态进来**：上一帧错误认领的按下会一直拖到释放——这正是
-        //    用户看到的"被遮挡的控件仍被触发"。帧末复核（`Ui::resolve_widget_press`）修好后
-        //    这里必须恒为 0。
-        if ui.state_mut().widget(&abs).dragging && !hit {
+        // ① **鼠标就在本控件上、却拿不到命中** = 被更高 z 的窗口盖住；此时**还在拖** ⇒
+        //    上一帧错误认领的按下一直拖到释放（用户看到的"被遮挡的控件仍被触发"）。
+        //    ⚠ 必须带上"鼠标仍在 rect 内"：拖拽中鼠标移出矩形（或已松开）时 `hit` 也是 false，
+        //    那是**正常拖拽行为**，不算被遮挡。
+        let mouse_on_me = rect.contains_point(ui.mouse_local());
+        if ui.state_mut().widget(&abs).dragging && !hit && mouse_on_me {
             *self.covered += 1;
         }
         // ② 认领按下（`down_edge` + 命中）——被盖住时不该发生（信息性计数）。
@@ -178,13 +194,18 @@ impl Widget for DragProbe<'_> {
             let ws = ui.state_mut().widget(&abs);
             update_drag(ws, hit, btn)
         };
+        // ④ **正对照**：拖拽活着的帧数（没被盖住时按下并按住 ⇒ 应当一直活着）。
+        if dragging {
+            *self.drag_frames += 1;
+        }
         if std::env::var_os("RJ_COVER_TRACE").is_some() {
             eprintln!(
-                "probe f={} hit={hit} down_edge={} dragging={dragging} under_mouse={:?} starts={} covered={}",
+                "probe f={} hit={hit} down_edge={} dragging={dragging} under_mouse={:?} starts={} drag={} covered={}",
                 ui.state().frame,
                 btn.down_edge(),
                 ui.window_under_mouse(),
                 *self.starts,
+                *self.drag_frames,
                 *self.covered
             );
         }

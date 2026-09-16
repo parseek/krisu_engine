@@ -257,6 +257,7 @@ impl<'a> UiInit<'a> {
             depth: 0,
             seq: 0,
             cur_win: 0,
+            cur_win_id: None,
             win_hit_bounds: None,
             z0_ranges: Vec::new(),
             cur_z0_group: 0,
@@ -423,6 +424,11 @@ pub struct Ui<'a> {
     seq: u32,
     /// 当前窗口 z 序（[`Self::window`]；非窗口内容 = 0）。
     cur_win: u32,
+    /// **当前窗口的绝对 ID**（非窗口内容 = `None`；嵌套窗口进出时保存/恢复）。
+    ///
+    /// 用途：`hit_impl` 记下"这次按下认领属于哪扇窗"时**必须存 ID 而不是 z**——z 会在帧末
+    /// 被"点击置顶"改，帧末复核要解它的**当前** z（见 `resolve_widget_press`）。
+    cur_win_id: Option<IdAbsolute<'static>>,
     /// **当前窗口内"可交互控件的命中区"并集**（绝对坐标）：窗口退出时与窗口盒子
     /// 并起来写进 `UiState::window_rects[z]` ⇒ **遮挡判定按"看得见的范围"走**。
     ///
@@ -1832,12 +1838,12 @@ impl<'a> Ui<'a> {
             );
         }
         // **记下"本帧由谁认领了按下"**（帧末复核用，见 `resolve_widget_press`）：
+        // 连同**所在窗口的绝对 ID**一起记（复核时要解它的**当前** z——不能在复核时拿认领
+        // 时的旧 z 比，那样窗口会把自己判成"被别人盖住"，把窗口内所有拖拽都撤掉）。
         // 只记第一个认领者——正常情况下（控件级遮挡生效）也只有一个。
-        if self.mouse_left().down_edge() {
-            if self.state.frame_state.press_widget.is_none() {
-                self.state.frame_state.press_widget = Some((owner.to_static(), self.cur_win));
-            }
-            self.state.frame_state.press_claimants += 1;
+        if self.mouse_left().down_edge() && self.state.frame_state.press_widget.is_none() {
+            self.state.frame_state.press_widget =
+                Some((owner.to_static(), self.cur_win_id.clone()));
         }
         true
     }
@@ -2705,6 +2711,9 @@ impl<'a> Ui<'a> {
             *self.state.window_z.entry(id_for.to_static()).or_insert(max_z + 1)
         };
         let saved_win = std::mem::replace(&mut self.cur_win, z);
+        // 当前窗口 ID（嵌套窗口 = 下拉浮层进出时保存/恢复）：`hit_impl` 记按下归属要用它，
+        // 因为 z 会在帧末被"点击置顶"改，而复核要用**当前** z（见 `resolve_widget_press`）。
+        let saved_win_id = self.cur_win_id.replace(id_for.to_static());
         // 当前窗口的"可交互内容范围"并集：进入时从零开始，退出时并进遮挡矩形
         // （浮层是嵌套窗口 ⇒ 保存/恢复，浮层的内容不该算进外层窗口）。
         let saved_hit_bounds = self.win_hit_bounds.take();
@@ -2947,6 +2956,7 @@ impl<'a> Ui<'a> {
             d.translate(display_pos);
         }
         self.cur_win = saved_win;
+        self.cur_win_id = saved_win_id;
         // 恢复外层窗口的"可交互内容范围"（本窗口已并进自己的遮挡矩形）。
         self.win_hit_bounds = saved_hit_bounds;
         size
@@ -3370,19 +3380,32 @@ impl<'a> Ui<'a> {
     /// # 为什么需要"帧末复核"
     ///
     /// 窗口遮挡判定用的是 `UiState::window_rects`——一张**录制期逐步写入**的表：本帧还没
-    /// 录到的窗口，表里是**上一帧**的矩形（甚至是旧 z 下的矩形）。于是"盖住我的那个窗口
-    /// 本帧才移过来 / 本帧才被抬高 z"这两种情况下，控件命中时会被判成"没被遮挡"而收下按下。
-    /// 命中的那一刻几何还没录全，**唯一能拿到完备几何的时机就是帧末**（所有窗口都录完了），
-    /// 所以复核放在这里。
+    /// 录到的窗口，表里是**上一帧**的矩形。于是"盖住我的那个窗口本帧才移过来 / 本帧才被抬高
+    /// z"这两种情况下，控件命中时会被判成"没被遮挡"而收下按下。命中的那一刻几何还没录全，
+    /// **唯一能拿到完备几何的时机就是帧末**（所有窗口都录完了），所以复核放在这里。
+    ///
+    /// # ⚠ 比较基准必须是**窗口的当前 z**，不是认领时的旧 z
+    ///
+    /// `resolve_win_press` 在帧末会把**被点的窗口**抬到 `max+1`；若这里拿"认领时的旧 z"去比，
+    /// 那个窗口的**新 z 比自己的旧 z 大**、且它的矩形当然覆盖鼠标（鼠标就在它里面）⇒
+    /// **窗口把自己判成"被别人盖住"**，于是**每一次**窗口内控件的按下都被撤销：滑块 /
+    /// 滚动条 / 文本选择全都拖不动（真实回归，已由 `--sim-cover` 的正对照守住）。
+    /// 用当前 z 后，"自己"与"自己"相等，而 `window_occluded` 是**严格大于**判定 ⇒ 自己永远
+    /// 不遮挡自己，同时"确实被别人盖住"依旧成立。
     ///
     /// 代价与边界：一次按下已在命中那一帧被应用侧读到（动作已发生）——本条只保证
     /// **状态不再延续**（`pressed` / `clicked` / `dragging` 全清、`press_claimed` 保持），
     /// 因此不会出现"被盖住的控件一直拖到释放"。同帧内按下 + 抬起（极快点击）不受保护。
     fn resolve_widget_press(&mut self) {
-        let Some((id, z)) = self.state.frame_state.press_widget.take() else {
+        let Some((id, win_id)) = self.state.frame_state.press_widget.take() else {
             return;
         };
-        if !window_occluded(z, self.mouse_logical, self.window_rects_iter()) {
+        // 本控件所在窗口的**当前** z（`None` = win=0 非窗口内容 ⇒ z=0）。
+        let my_z = win_id
+            .as_ref()
+            .and_then(|w| self.state.window_z.get(w.as_str()).copied())
+            .unwrap_or(0);
+        if !window_occluded(my_z, self.mouse_logical, self.window_rects_iter()) {
             return;
         }
         let ws = self.state.widgets.entry(id).or_default();

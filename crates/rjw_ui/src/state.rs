@@ -179,15 +179,6 @@ pub(crate) struct UiFrameState {
     /// 必须**按帧**汇总：`cache_z0_window` 每段各跑一次，段只见到自己那部分槽——按段清
     /// 会把同帧其它段刚写好的缓存删掉，那些槽于是每帧都 miss、每帧重镶嵌整个 win=0 几何。
     pub z0_seen: Vec<(u32, u32)>,
-    /// **本帧认领了按下的控件**（`(控件绝对 ID, 认领时所在窗口的 z)`；`None` = 没有）。
-    ///
-    /// 由 `Ui::hit_impl` 在"命中且本帧按下沿"时记下**第一个**认领者；帧末由
-    /// `Ui::resolve_widget_press` 用**完备的遮挡表**复核：若它所在窗口并非鼠标下最上层
-    /// （被更高 z 的窗口盖住）则撤销这次认领。命中的那一刻几何还没录全，帧末才是唯一能
-    /// 拿到完备几何的时机——这是"被盖住的控件仍被触发"的兜底修复。
-    pub press_widget: Option<(IdAbsolute<'static>, u32)>,
-    /// 本帧认领按下的控件**个数**（诊断：正常情况下控件级遮挡保证只有 1 个）。
-    pub press_claimants: u32,
     /// **本帧录制过的窗口绝对 ID**（各段累加；帧首用它清 `window_rects` 里的陈旧项）。
     ///
     /// ⚠ 必须存在帧级暂存里、并在**下一帧开场**清：`Ui::finish` 末尾的 `save_frame_state`
@@ -196,6 +187,16 @@ pub(crate) struct UiFrameState {
     /// 结果是**每帧把整张遮挡表清空**，窗口遮挡退化成"只看本帧已录制的窗口"：本帧录在
     /// 后面的窗口挡不住前面的窗口的控件（用户报的"上层窗口背后的控件仍被触发"）。
     pub window_ids_seen: Vec<IdAbsolute<'static>>,
+    /// **本帧认领了按下的控件**（`(控件绝对 ID, 所在窗口的绝对 ID)`；`None` = 没有）。
+    ///
+    /// 由 `Ui::hit_impl` 在"命中且本帧按下沿"时记下**第一个**认领者；帧末由
+    /// `Ui::resolve_widget_press` 用**完备的遮挡表**复核：若它所在窗口并非鼠标下最上层
+    /// （被更高 z 的窗口盖住）则撤销这次认领。命中的那一刻几何还没录全，帧末才是唯一能
+    /// 拿到完备几何的时机——这是"被盖住的控件仍被触发"的兜底修复。
+    ///
+    /// ⚠ 窗口**必须存 ID 而不是 z**：z 会在帧末被"点击置顶"抬到 `max+1`，复核时要解它的
+    /// **当前** z；拿认领时的旧 z 比，窗口会把自己判成"被别人盖住"，把窗口内所有拖拽撤掉。
+    pub press_widget: Option<(IdAbsolute<'static>, Option<IdAbsolute<'static>>)>,
 }
 
 impl Default for UiFrameState {
@@ -227,7 +228,6 @@ impl Default for UiFrameState {
             segment: 0,
             z0_seen: Vec::new(),
             press_widget: None,
-            press_claimants: 0,
             window_ids_seen: Vec::new(),
         }
     }
