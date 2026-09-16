@@ -1086,3 +1086,44 @@ fn scroll_thumb_respects_minimum_and_roundtrips() {
     // 无行程（内容装得下）时拖拽不产生偏移。
     assert_eq!(scroll_offset_for_thumb(50.0, 0.0, 900.0), 0.0);
 }
+
+#[test]
+fn window_chrome_bar_and_collapse_flags() {
+    // **默认零影响**：不调 `.title` / `.close_button` / `.shrink` ⇒ 不画标题栏 ——
+    // 这是"新特性不移动任何既有几何"的机器化保证（截图 / 仿真基线因此不需要更新）。
+    let none = WindowChrome::none();
+    assert!(!none.bar_on(), "空外框不画标题栏");
+    assert!(!none.collapsed(), "空外框不收起");
+    assert_eq!(none.title, None);
+
+    // 标题 ⇒ 有栏；单独 `title` 不产生按钮。
+    let c = WindowChrome { title: Some("T"), ..WindowChrome::none() };
+    assert!(c.bar_on());
+    assert!(c.close.is_none() && c.shrink.is_none());
+
+    // `close_button` ⇒ 有栏（只有 × 也是标题栏）。
+    let mut open = true;
+    let c = WindowChrome { close: Some(&mut open), ..WindowChrome::none() };
+    assert!(c.bar_on(), "只有关闭按钮时也要有栏（否则 × 没有落脚处）");
+
+    // `shrink(false, &mut c)`：**不画栏**，但状态照旧生效 —— 菜单/代码收起窗口用。
+    let mut collapsed = true;
+    let c = WindowChrome { shrink: Some((false, &mut collapsed)), ..WindowChrome::none() };
+    assert!(!c.bar_on(), "show=false ⇒ 不画标题栏（按钮不画）");
+    assert!(c.collapsed(), "show=false 时 *collapsed 仍管布局");
+    assert_eq!(c.shrink.as_ref().map(|(s, _)| *s), Some(false));
+
+    // `shrink(true, ..)` ⇒ 有栏 + 收起状态透传。
+    let mut collapsed2 = true;
+    let c = WindowChrome { shrink: Some((true, &mut collapsed2)), ..WindowChrome::none() };
+    assert!(c.bar_on());
+    assert!(c.collapsed());
+    // 标题 + 收起按钮 = 典型标题栏（demo 的 win_a 就是这种）。
+    let mut c3 = false;
+    let c = WindowChrome {
+        title: Some("图形"),
+        shrink: Some((true, &mut c3)),
+        ..WindowChrome::none()
+    };
+    assert!(c.bar_on() && !c.collapsed());
+}

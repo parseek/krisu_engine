@@ -917,6 +917,23 @@ const CHECK_R: IconPart = &[
     Vec2::new(0.932, 0.241),
     Vec2::new(0.372, 0.721),
 ];
+/// 关闭"✕"的第一笔（左上 → 右下；凸四边形，笔画宽 ~0.18）。
+///
+/// 与勾选同规格的**对角笔画**：常按 12~16px 画，0.18 单位 ≈ 2~3px 实心，
+/// 加羽化边缘后两笔交叠处读得出来（更细会被 AA 糊成一片）。
+const CLOSE_A: IconPart = &[
+    Vec2::new(0.13, 0.31),
+    Vec2::new(0.31, 0.13),
+    Vec2::new(0.87, 0.69),
+    Vec2::new(0.69, 0.87),
+];
+/// 关闭"✕"的第二笔（右上 → 左下）。
+const CLOSE_B: IconPart = &[
+    Vec2::new(0.13, 0.69),
+    Vec2::new(0.69, 0.13),
+    Vec2::new(0.87, 0.31),
+    Vec2::new(0.31, 0.87),
+];
 /// 拖拽手柄：三横（每横一个凸四边形）。
 ///
 /// ⚠ 每横的高度别低于 ~0.14：图标常按 12~14px 画，1 个"单位"才 1.2~1.4px——再薄就只剩
@@ -1015,6 +1032,8 @@ pub enum Icon {
     Grip,
     /// 警告 / 非法输入（三角 + 感叹号）——错误提示、取色器"文本无法识别"按钮用。
     Warning,
+    /// 关闭"✕"（两条对角笔画）——窗口标题栏的关闭按钮用。
+    Close,
 }
 
 impl Icon {
@@ -1029,6 +1048,7 @@ impl Icon {
             Icon::Check => &[CHECK_L, CHECK_R],
             Icon::Grip => &[GRIP_1, GRIP_2, GRIP_3],
             Icon::Warning => &[WARN_TRI, WARN_BAR, WARN_DOT],
+            Icon::Close => &[CLOSE_A, CLOSE_B],
         }
     }
 }

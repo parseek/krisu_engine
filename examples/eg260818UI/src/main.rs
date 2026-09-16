@@ -304,6 +304,15 @@ struct Windows {
     auto_tick: u64,
     /// **背景图**（`init` 里建的棋盘纹理）——四个窗口分别演示四种铺排（`ImageFit`）。
     bg_image: Option<ImageBg>,
+    /// 窗口 A 是否显示（`close_button` 绑定的开关；× 点击 ⇒ `false`，本窗口**整窗短路**）。
+    win_a_open: bool,
+    /// 窗口 A 是否**收起**（`shrink` 绑定的状态；`true` = 只留标题栏）。
+    win_a_collapsed: bool,
+    /// --sim-chrome：上一次窗口 A 的结算尺寸（只在**变化**时打印，作为标题栏 / 收起 /
+    /// 关闭三条路径的机器可读证据）。
+    last_win_a_size: Vec2,
+    /// --sim-chrome：是否打印上面的证据。
+    sim_chrome: bool,
 }
 
 impl Windows {
@@ -320,6 +329,10 @@ impl Windows {
             cshi_tint: Color::WHITE,
             auto_tick: 0,
             bg_image: None,
+            win_a_open: true,
+            win_a_collapsed: false,
+            last_win_a_size: Vec2::ZERO,
+            sim_chrome: false,
         }
     }
 
@@ -347,7 +360,8 @@ impl Windows {
         // 圆角用 [`CornerRadius`]：**只圆上面两个角**（标签页 / 附着在工具栏下方的面板
         // 就是这么做的），下面两个角贴齐直角。
         let panel_a = ui.theme().panel.clone();
-        ui.window("win_a")
+        let a_size = ui
+            .window("win_a")
             .pos(self.win_a_pos)
             .width(220.0)
             .style(
@@ -356,6 +370,18 @@ impl Windows {
                     .with_radius(CornerRadius { tl: 12.0, tr: 12.0, br: 0.0, bl: 0.0 }),
             )
             .clamp(WindowClamp::Screen)
+            // **窗口外框**（责任链 builder）：标题栏 + 关闭 × + 收起 ⌃。
+            // - `title("窗口 A")`：标题栏 = 内容**第一行**（窗口高度自然包含它）；空白处
+            //   仍可拖动窗口，只有按钮上的按下不算"拖窗口"。
+            // - `close_button(&mut self.win_a_open)`：点 × ⇒ `*open = false`；为 `false`
+            //   时**整窗短路**（不录制、不占命中 / 遮挡矩形），重新打开由应用决定
+            //   （下面 win_b 里的"窗口 A 显示"勾选框就是那条重开路径）。
+            // - `shrink(true, &mut self.win_a_collapsed)`：点 ⌃ ⇒ 收起（只留标题栏、
+            //   跳过内容闭包）。第一个参数是"要不要画按钮"——`false` 时仍能由代码 /
+            //   菜单翻转状态（win_b 里的"窗口 A 收起"勾选框演示这条）。
+            .title("窗口 A")
+            .close_button(&mut self.win_a_open)
+            .shrink(true, &mut self.win_a_collapsed)
             .show(|w| {
                 w.label("窗口 A（点击置顶 · 拖动移动）");
                 if w.button("win_a_btn", "A 按钮").clicked() {
@@ -369,6 +395,20 @@ impl Windows {
                 w.add(Divider::new());
                 w.label("分割线下方");
             });
+        // --sim-chrome：结算尺寸**变化**即打印一行（收起 ⇒ 高度掉到一行标题栏；
+        // 关闭 ⇒ `show` 返回 `(0,0)`）。这是三条外框路径的机器可读证据。
+        if self.sim_chrome && a_size != self.last_win_a_size {
+            eprintln!(
+                "sim-chrome: win_a open={} collapsed={} pos=({:.0},{:.0}) size=({:.0},{:.0})",
+                self.win_a_open,
+                self.win_a_collapsed,
+                self.win_a_pos.x,
+                self.win_a_pos.y,
+                a_size.x,
+                a_size.y
+            );
+            self.last_win_a_size = a_size;
+        }
         // 窗口 B（覆盖在 A 之上）：输入框 + 多行 TextArea。
         ui.window("win_b").pos(self.win_b_pos).show(|w| {
             w.label("窗口 B（覆盖在 A 之上）");
@@ -377,6 +417,10 @@ impl Windows {
             if w.button("win_b_btn", "B 按钮").clicked() {
                 *clicks += 1;
             }
+            // **窗口 A 的开关**（`close_button` / `shrink` 的宿主状态）：× 关掉 A 之后
+            // 只有这里能把它勾回来（引擎不替应用决定"重开"）。
+            w.checkbox_mut(Some("win_a_show"), "窗口 A 显示", &mut self.win_a_open);
+            w.checkbox_mut(Some("win_a_fold"), "窗口 A 收起", &mut self.win_a_collapsed);
             w.text_input("win_b_input", &mut self.win_b_note);
             w.checkbox_mut(Some("ta_wrap"), "自动换行", &mut self.ta_wrap);
             w.label("多行备注（Enter 换行 · 双击按词选择 · 拖选复制粘贴）");
@@ -930,6 +974,10 @@ struct UiApp {
     overlap: OverlapDemo,
     /// --sim-cover：**脚本化复现**"被上层窗口盖住的控件仍收到按下"（见 `cover` 模块）。
     sim_cover: bool,
+    /// --sim-chrome：**脚本化驱动窗口外框**（标题栏 / 关闭 × / 收起）——在固定帧翻转
+    /// `win_a_open` / `win_a_collapsed`，并由 `Windows` 打印每次结算尺寸变化
+    /// （收起 ⇒ 高度塌到一行标题栏；关闭 ⇒ `(0,0)` 整窗短路）。见 docs/DEBUGGING.md。
+    sim_chrome: bool,
     /// 「被遮挡控件仍被触发」复现器。
     cover: CoverDemo,
     /// `--sim-cover` 段 A 结束时的认领次数（段 B 不许再涨）。
@@ -968,6 +1016,7 @@ impl UiApp {
             sim_click: None,
             overlap: OverlapDemo::default(),
             sim_cover: false,
+            sim_chrome: false,
             cover: CoverDemo::default(),
             cover_starts_after_a: 0,
             image_file: None,
@@ -1347,6 +1396,53 @@ impl App for UiApp {
             }
         }
 
+        // ── 调试：脚本化鼠标（`--sim-chrome`）────────────────────
+        // **真的去点**标题栏那两个按钮（不是直接翻 flag）：命中 → 按下认领 → 释放结算
+        // 这条完整路径才被验证。坐标由**主题尺寸解算**（不写死像素）：按钮在内容行右端，
+        // 从右往左依次是 × 与 ⌃，边长 `row_h - 2`（同 `TitleIconButton::size`）。
+        //
+        // 调度（注入只对**下一帧**生效 ⇒ 按下/抬起各留两帧）：
+        //   12..13 ↓⌃ / 14..15 ↑⌃（点收起）→ 60 帧由应用重开（等价菜单勾选）
+        //   40..41 ↓× / 42..43 ↑×（点关闭）→ 80 帧由应用展开
+        if self.sim_chrome {
+            // 尺寸取自**本帧主题**（与下面 `let theme` 同一套输入 ⇒ 值一致）；
+            // `Theme` 在 `Ui` 内才按 DPI 预乘 ⇒ 这里手动乘 `scale`（同 `--sim-picker`）。
+            let th = self.theme_tuner.theme(self.top.font_name());
+            let (pad, row, gap) =
+                ((th.panel.padding + th.panel.border_w) * scale, th.row_h * scale, th.gap * scale);
+            // 按钮边长 = `row_h - 2`，**减号作用在已缩放的 row_h 上**（同 `TitleIconButton::size`）。
+            let btn = (row - 2.0).max(12.0);
+            let origin = (self.windows.win_a_pos * scale).round();
+            let right = origin.x + 220.0 * scale + pad; // 行右缘 = 内容右缘
+            let cy = origin.y + pad + row * 0.5;
+            let close_p = Vec2::new(right - btn * 0.5, cy);
+            let fold_p = Vec2::new(right - btn * 1.5 - gap, cy);
+            let away = Vec2::new(1800.0, 1050.0);
+            if f.frames() == 12 {
+                eprintln!("sim-chrome: scale={scale} ⌃={fold_p:?} ×={close_p:?}");
+            }
+            match f.frames() {
+                // 先把 win_a 挪到**没有别的窗口压着**的空位（默认布局里 win_b / chishi 正盖着
+                // 它的右上角——那正是"点击置顶"演示）：× 被压住时点不到，这是引擎**正确**的
+                // 遮挡行为；脚本要的只是让按钮露出来（同 `--sim-cover` 调 z）。
+                // 空位 `(40,470)`（逻辑）= 物理 `(60,705)`：`theme_tuner` 从 x=420 起、
+                // `strict_win` 从 y=690 起，两者都够不着这块。
+                8 => self.windows.win_a_pos = Vec2::new(40.0, 470.0),
+                12..=13 => f.debug_inject_mouse(fold_p, true),
+                14..=15 => f.debug_inject_mouse(fold_p, false),
+                40..=41 => f.debug_inject_mouse(close_p, true),
+                42..=43 => f.debug_inject_mouse(close_p, false),
+                _ => {
+                    f.debug_inject_mouse(away, false);
+                    // 应用侧重开 / 展开（引擎不替应用决定"何时重开"）。
+                    match f.frames() {
+                        60 => self.windows.win_a_open = true,
+                        80 => self.windows.win_a_collapsed = false,
+                        _ => {}
+                    }
+                }
+            }
+        }
         // ── 调试：脚本化鼠标（`--sim-click X,Y`）──────────────────
         // 在**指定屏幕物理点**按下 + 释放（第 20/21 帧，之后停在原地到第 40 帧）——
         // 配合 `RJ_HIT_TRACE=1`（引擎打印每次命中归属）就能回答"这一像素到底是谁的"：
@@ -1686,6 +1782,8 @@ fn main() -> Result<(), RunError> {
     app.sim_picker = args.iter().any(|a| a == "--sim-picker");
     app.sim_overlap = args.iter().any(|a| a == "--sim-overlap");
     app.sim_cover = args.iter().any(|a| a == "--sim-cover");
+    app.sim_chrome = args.iter().any(|a| a == "--sim-chrome");
+    app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
         .iter()
         .any(|a| a == "--sim-click")

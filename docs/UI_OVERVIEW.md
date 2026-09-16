@@ -140,6 +140,14 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 通用原语，持久于 `UiState.window_widths` / `UiState.sizes`）。`.placement(Placement::Clip)`
 内容严格裁剪（Clip 沙箱）；默认 `.placement(Expand)`（内容自动换行 / 撑高）。
 
+**窗口外框**：`.title(&str)` / `.close_button(&mut bool)` / `.shrink(bool, &mut bool)` 三个
+**独立可选**的外框部件（都不调 = 逐像素等于旧行为）。标题栏是内容**第一行**（窗口高度自然
+包含它，通条底色 `surface_raised` + 面板边框，底边那条即分隔线）；`×` 点击置 `*open = false`
+后**整窗短路**（不录制、不占遮挡矩形），**重开由应用负责**；`shrink(show, collapsed)` 的
+`show = false` 仍尊重 `*collapsed`（菜单/代码收起展开）。按钮是**几何图标**而非字形，且按下
+即 `claim_press` ⇒ 点按钮不会顺带拖动窗口。细节见 `docs/ENGINE_GUIDE.md` §18.12，
+脚本化验证见 `--sim-chrome`（`docs/DEBUGGING.md`）。
+
 **窗口遮挡（重叠区只有最上层窗口可交互）**：判定表 `UiState.window_rects` **按窗口绝对 ID
 键、跨帧存活**（矩形 = 窗口盒子 ∪ 本帧子控件命中区），查询时把 ID 解成**当前 z**——z 会在
 帧末被"点击置顶"改，按旧 z 比较会让刚抬高的窗口"消失一帧"。另加一道**帧末复核**

@@ -1503,7 +1503,68 @@ clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位�
 （无 GPU，可单测）；新增编辑控件时复用 `edit::*` 与 `clipboard_get/set`，并在按下
 响应中置位 `press_claimed`。
 
-### 18.12 维护约定（对 AI）
+### 18.12 窗口外框（标题栏 / 关闭 / 收起）与缩放柄令牌
+
+窗口的**外框**是三个独立选项，责任链上按需开启（`ui.window(id)` 的 builder）：
+
+```rust
+let mut open = true;        // 应用持有：× 点击直接置 false
+let mut folded = false;     // 应用持有：收起状态
+ui.window("win_a")
+    .pos(vec2(560.0, 240.0))
+    .width(220.0)
+    .title("窗口 A")              // 标题栏（不调 = 完全没有栏）
+    .close_button(&mut open)      // 右上角 ×（点击 ⇒ *open = false）
+    .shrink(true, &mut folded)    // 右上角 ⌃（show = 是否画按钮；点击 ⇒ *folded 取反）
+    .show(|w| {
+        w.label("内容（收起时整块跳过）");
+    });
+// ⌃ 收起后同一窗口只剩标题栏；× 关掉后**整窗短路**，重开由应用决定：
+if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
+```
+
+| 现象 | 机制 |
+|---|---|
+| **不调三个选项 = 逐像素等于旧行为** | `WindowChrome::bar_on()` 为假 ⇒ 不录标题栏、不加通条、不动任何几何（既有截图 / sim 基线不受影响） |
+| 标题栏 = 内容**第一行** | 先录标题栏再录用户闭包（同一个 `Frame` 结算）⇒ 窗口高度**自然**包含它；`title` 过长按**省略号**截断（不撑宽窗口） |
+| 通条底色 + 分隔线 | 整窗宽矩形，高 = `pad_total + row_h`（含面板上内边距才"通"），底边那条就是面板边框色的 1px 分隔线；圆角取面板**上面两角**，与面板边框**连续**（不会"标题栏把上边框啃掉"） |
+| 标题栏空白处仍可拖窗 | 只有 `×` / `⌃` 上的按下会 `claim_press()`（与滑块 / 滚动条同一机制）——点按钮不会顺带把窗口拖走 |
+| `×` 的关闭语义 | `*open = false` 时**整窗短路**：不录制、不写原点 / 尺寸、**不占遮挡矩形**（不会留下"看不见却挡点击"的窗口）；下一帧起彻底消失，**重开是应用的责任** |
+| `shrink(show, collapsed)` | `collapsed` 在录制**开头**读取（点击当帧不变、下一帧生效）；`show = false` 时按钮不画，但 `*collapsed` **照旧生效**——菜单 / 代码可收起展开而不必放按钮 |
+| 按钮是**几何**不是字形 | `Icon::Close` / `ChevronUp` / `ChevronDown`（`TitleIconButton`，只依赖公开 API）⇒ 换字体不会变豆腐块 |
+
+> ⚠ **右对齐要实测标题宽**：按钮行用 `min_size` + 空标签做 spacer（同 `FontModal`）。
+> spacer 若按"内容宽 − 按钮区"算，行总宽会多出 `标题宽 + gap − 4`，两个按钮被整体推出
+> 内容右缘（画到面板外）。所以先 `ui.text_size(..)` 实测标题，再
+> `spacer = 内容宽 − 标题宽 − 按钮区`。同时注意 `Ui::avail_w()` 返回的是
+> `fixed_w − 2×pad`（`Frame::fixed_avail_w`），而子项实际被 clamp 到 `fixed_w`
+> （`layout.rs::fixed_w_clamps_children_and_settles_width`）⇒ 这里要补回 `2×pad` 才是
+> 真正的内容宽。排查开关：`RJ_CHROME_TRACE=1` 打印 `content_w / title_w / spacer / btn`。
+
+**缩放柄令牌**（固定宽窗口右下角那个"拖拽按钮"）：
+
+`PanelStyle::grip: GripStyle { shape: GripShape, color, size, step, count }`，
+`GripShape::{Squares（默认，历史观感）, Bars（内置 `Icon::Grip` 三条横线）, Hidden}`；
+逐窗口入口 `PanelStyle::{with_grip, with_grip_color, with_grip_shape, without_grip}`。
+`Hidden` 只是**不画图案**，**拖动缩放照旧**——命中区独立存在（`grip.extent()`，
+下限 14px）。它只对 `.width(..)` 的固定宽窗口生效（那是唯一带缩放柄的容器）。
+
+**验证**（都不需要人眼看屏幕）：
+
+```bash
+cargo run -p eg260818UI -- --sim-chrome --frames 100      # 真的去点 ⌃ / ×（坐标由主题 + DPI 解算）
+# sim-chrome: win_a open=true  collapsed=false size=(358,320)   ← 初始
+# sim-chrome: win_a open=true  collapsed=true  size=(358,67)    ← 点 ⌃：只剩一行标题栏
+# sim-chrome: win_a open=false collapsed=true  size=(0,0)       ← 点 ×：整窗短路
+# sim-chrome: win_a open=true  collapsed=true  size=(358,67)    ← 应用重开
+# sim-chrome: win_a open=true  collapsed=false size=(358,320)   ← 应用展开
+```
+
+`size` 是 `.show(..)` 的返回值（窗口结算尺寸），`pos` 不变即证明**按钮上的按下没有变成
+窗口拖拽**。引擎侧的不变量由 `ui::tests::window_chrome_bar_and_collapse_flags` 守着
+（"空外框不画栏" / "`shrink(false, ..)` 不画栏但状态生效"）。
+
+### 18.13 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。

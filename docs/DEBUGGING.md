@@ -138,6 +138,26 @@ fn update(&mut self, ctx: &mut Ctx) {
   sim-click: 背包已选中 1 个 / 控件遮挡拦截 1 / 窗口遮挡拦截 0 [OK] 一次点击最多切换一个控件
   ```
 
+- **"标题栏的 × / ⌃ 点不中、或者点按钮把窗口拖走了"**：示例的 `--sim-chrome` 脚本化
+  **真的去点**窗口 A 标题栏那两个按钮（坐标由主题 + DPI 解算，不写死像素）：
+
+  ```
+  cargo run -p eg260818UI -- --sim-chrome --frames 100
+  sim-chrome: scale=1.5 ⌃=Vec2(339.0, 738.0) ×=Vec2(385.0, 738.0)
+  sim-chrome: win_a open=true  collapsed=false pos=(560,240) size=(358,320)
+  sim-chrome: win_a open=true  collapsed=true  pos=(40,470) size=(358,67)    # 点 ⌃：只剩标题栏
+  sim-chrome: win_a open=false collapsed=true  pos=(40,470) size=(0,0)       # 点 ×：整窗短路
+  sim-chrome: win_a open=true  collapsed=true  pos=(40,470) size=(358,67)    # 应用重开
+  sim-chrome: win_a open=true  collapsed=false pos=(40,470) size=(358,320)   # 应用展开
+  ```
+
+  脚本先把窗口 A 挪到**没有别的窗口压着**的空位（默认布局里 `win_b` / `chishi` 正盖着它的
+  右上角——那正是"点击置顶"演示；被压住时点不到是引擎**正确**的遮挡行为）。
+  `size` 是 `.show(..)` 的返回值，`pos` 全程不变 ⇒ 按钮上的按下**没有**变成窗口拖拽
+  （`claim_press` 生效）。坐标算错时点空的典型症状：`size` 只在"点错的那个按钮"的动作上变，
+  或干脆一行都不打。两边都排查：`RJ_CHROME_TRACE=1`（引擎侧打印
+  `content_w / title_w / spacer / btn`）+ `RJ_HIT_TRACE=1`（这个像素到底命中谁）。
+
   同一命令在"控件级遮挡"关掉时输出 `背包已选中 2 个 … [FAIL]`——相邻格子的**共享边**
   被两个格子同时命中（`hit_test` 含边界）正是"一次点击切换两个物品"的现场。
   排查别的控件同理：换成它的中心 / 边缘坐标即可。

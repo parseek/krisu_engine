@@ -2636,6 +2636,7 @@ impl<'a> Ui<'a> {
         strict: bool,
         style: Option<&PanelStyle>,
         clamp: WindowClamp,
+        chrome: &mut WindowChrome<'_>,
         f: impl FnOnce(&mut Window<'_, '_>),
     ) -> Vec2 {
         let id_for = self.id_for(id);
@@ -2779,9 +2780,21 @@ impl<'a> Ui<'a> {
 
         // ID 命名空间：窗口进入压栈、退出弹栈（闭包作用域保证配对——取代手动
         // push_id/pop_id，杜绝漏配对/多弹出）。窗口内子控件 ID 自动带窗口前缀。
+        //
+        // **标题栏先录**（窗口内容第一行，与用户内容同一个 `Frame` 结算 ⇒ 窗口高度自然
+        // 包含它）；**收起**时只录标题栏、跳过用户闭包（`*collapsed` 由调用方持有）。
+        // 通条高度 = **面板上内边距 + 一行**：标题行录在内容流的第一行，起点是
+        // `pad_total`，所以底色要从窗口顶边（0）铺到该行的下沿才"通"。
+        let bar_h = if chrome.bar_on() { pad_total + self.theme.row_h } else { 0.0 };
+        let collapsed = chrome.collapsed();
         self.with_id(id, |ui| {
             let mut w = Window { ui };
-            f(&mut w);
+            if chrome.bar_on() {
+                window_title_bar(&mut w, chrome, collapsed, pad_total);
+            }
+            if !collapsed {
+                f(&mut w);
+            }
         });
 
         let frame = self.frames.pop().expect("window frame");
@@ -2895,6 +2908,31 @@ impl<'a> Ui<'a> {
         if width.is_some() {
             self.push_resize_grip(size, &style.grip);
         }
+        // **标题栏通条**（整窗宽、含面板内边距 ⇒ 通条观感）：在**这里**画（`size` 已知）、
+        // `elem = 0` 且晚于面板背景入队 ⇒ 按 `(elem, seq)` 排在面板背景**之上**、
+        // 所有控件（`elem ≥ 1`）**之下**。
+        //
+        // 一次 `push_panel_like` 就够：底色 `surface_raised` + 面板同色同宽边框 ⇒
+        // 上/左/右三段边框与面板边框**连续**（不会"标题栏把上边框啃掉"），底边那条
+        // 就是 1px 分隔线。圆角取面板的**上面两角**（只有下面两角贴直角的面板，
+        // 通条才不会在圆角处出框）。
+        if bar_h > 0.0 && size.x > 0.0 {
+            let bar = Rect::new(0.0, 0.0, size.x, bar_h);
+            let top_radius = CornerRadius {
+                tl: style.radius.tl,
+                tr: style.radius.tr,
+                br: 0.0,
+                bl: 0.0,
+            };
+            self.push_panel_like(
+                bar,
+                self.theme.palette.surface_raised,
+                style.border,
+                style.border_w,
+                top_radius,
+                0,
+            );
+        }
         for d in &mut self.queue[start..] {
             d.translate(display_pos);
         }
@@ -2977,7 +3015,17 @@ impl<'a> Ui<'a> {
         self.cur_win = saved_win;
         // 对话框窗口（window_impl 按 max+1 分配 → z = z_dim + 1，浮于遮罩之上；
         // **不主动置顶**——点击对话框/背景不触发 z 提升）。
-        self.window_impl(id, pos, width, false, false, None, WindowClamp::Screen, f)
+        self.window_impl(
+            id,
+            pos,
+            width,
+            false,
+            false,
+            None,
+            WindowClamp::Screen,
+            &mut WindowChrome::none(),
+            f,
+        )
     }
 
     // ── 容器责任链 builder 入口（window / panel / modal） ──────────
@@ -3000,7 +3048,14 @@ impl<'a> Ui<'a> {
     ///     .show(|w| { w.label("HUD"); });
     /// ```
     pub fn window<'s>(&'s mut self, id: &'s str) -> WindowBuilder<'s, 'a> {
-        WindowBuilder { ui: self, id, o: WindowOptions::default() }
+        WindowBuilder {
+            ui: self,
+            id,
+            o: WindowOptions::default(),
+            title: None,
+            close: None,
+            shrink: None,
+        }
     }
 
     /// 建**面板**（背景 + 边框 + 内容垂直堆叠）：返回 [`PanelBuilder`]，链式设置后
@@ -4988,11 +5043,47 @@ impl std::fmt::Display for UiDebugDump {
 }
 
 /// **窗口责任链 builder**：[`Ui::window`] 返回。选项链式设置（`.pos` / `.width` /
-/// `.level` / `.placement` / `.style` / `.clamp`）后以 `.show(f)` 终结执行。
+/// `.level` / `.placement` / `.style` / `.clamp` / `.title` / `.close_button` / `.shrink`）
+/// 后以 `.show(f)` 终结执行。
 pub struct WindowBuilder<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
     id: &'ui str,
     o: WindowOptions,
+    /// 标题栏文字（`None` = 不画标题栏）。
+    title: Option<&'ui str>,
+    /// 关闭按钮绑定的开关（点 × ⇒ 置 `false`；为 `false` 时整个窗口不录制）。
+    close: Option<&'ui mut bool>,
+    /// 收缩按钮：`(是否画按钮, 收起状态)`。
+    shrink: Option<(bool, &'ui mut bool)>,
+}
+
+/// **窗口外框部件**（标题栏 / 关闭 / 收缩）：由 [`WindowBuilder`] 收集后交给
+/// `window_impl`。单独成结构体是为了不再往那个已经很长的参数表里加东西。
+pub(crate) struct WindowChrome<'c> {
+    pub title: Option<&'c str>,
+    pub close: Option<&'c mut bool>,
+    /// `(是否画按钮, 收起状态)`。
+    pub shrink: Option<(bool, &'c mut bool)>,
+}
+
+impl WindowChrome<'_> {
+    /// 空的窗口外框（无标题栏、无按钮）：modal 这类"已有自己外框"的路径用。
+    pub(crate) const fn none() -> WindowChrome<'static> {
+        WindowChrome { title: None, close: None, shrink: None }
+    }
+
+    /// 是否需要**标题栏**：三者都不给 ⇒ 不画（与不启用本特性时逐像素一致）。
+    ///
+    /// ⚠ 只给 `shrink(false, &mut c)` 时**不画标题栏**，但 `*c` 照旧生效
+    /// （"按钮不画、状态仍管布局"）——这是两个参数分开的用处。
+    fn bar_on(&self) -> bool {
+        self.title.is_some() || self.close.is_some() || self.shrink.as_ref().is_some_and(|(s, _)| *s)
+    }
+
+    /// 本帧是否**收起**（只留标题栏）。
+    fn collapsed(&self) -> bool {
+        self.shrink.as_ref().is_some_and(|(_, c)| **c)
+    }
 }
 
 impl<'ui, 'a> WindowBuilder<'ui, 'a> {
@@ -5028,16 +5119,62 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
         self.o.clamp = mode;
         self
     }
+    /// **标题栏**（可选）：画一条标题栏作为窗口内容**第一行** —— 底色
+    /// `Palette::surface_raised`、底边 1px `PanelStyle::border` 分隔线、文字用 `label` 样式。
+    ///
+    /// 标题栏空白处**仍可拖动窗口**；不调本方法就完全没有标题栏（默认零影响）。
+    pub fn title(mut self, t: &'ui str) -> Self {
+        self.title = Some(t);
+        self
+    }
+    /// **关闭按钮**（可选）：标题栏右侧画一个 × ；点击把 `*open` 置 `false`。
+    ///
+    /// `*open == false` 时**整个窗口不录制** —— 不产生绘制命令、不写窗口原点 / 尺寸、
+    /// 也**不占遮挡矩形**（不会留下"看不见却挡点击"的窗口）。重新打开由调用方把
+    /// `*open` 置回 `true`（例如菜单里勾回来）。
+    pub fn close_button(mut self, open: &'ui mut bool) -> Self {
+        self.close = Some(open);
+        self
+    }
+    /// **收缩按钮**（可选）：`show` = 是否画按钮，`collapsed` = 收起状态
+    /// （`true` = 只留标题栏、跳过内容闭包）。
+    ///
+    /// `show = false` 时按钮不画，但 `*collapsed` **照旧生效** —— 于是可以由菜单项 /
+    /// 代码把窗口收起展开，而不必在标题栏上放按钮。点击按钮把 `*collapsed` 取反。
+    pub fn shrink(mut self, show: bool, collapsed: &'ui mut bool) -> Self {
+        self.shrink = Some((show, collapsed));
+        self
+    }
     /// 终结：录制窗口内容并返回窗口结算尺寸（`Vec2`，物理像素）。
+    ///
+    /// 关闭（`close_button` 绑定的开关为 `false`）时返回 `Vec2::ZERO` 且**不录制任何东西**。
     pub fn show(self, f: impl FnOnce(&mut Window<'_, '_>)) -> Vec2 {
-        let Self { ui, id, o } = self;
+        let Self { ui, id, o, title, close, shrink } = self;
+        // **关闭**：整窗短路。放在最前面：连 z 分配 / 位置解析都不做 —— 关闭的窗口
+        // 不该在 `UiState` 里留下任何本帧痕迹。
+        if let Some(open) = &close
+            && !**open
+        {
+            return Vec2::ZERO;
+        }
         // API 边界换算：Logical → Physical（内部布局/绘制全物理）。
         let pos = o.pos.to_physical(ui.scale);
         let width = o.width.map(|w| w.to_physical(ui.scale));
         // 枚举 → 内部两个开关（公开面不再出现裸布尔）。
         let topmost = o.level == Level::Topmost;
         let strict = o.placement == Placement::Clip;
-        ui.window_impl(id, pos, width, topmost, strict, o.style.as_ref(), o.clamp, f)
+        let mut chrome = WindowChrome { title, close, shrink };
+        ui.window_impl(
+            id,
+            pos,
+            width,
+            topmost,
+            strict,
+            o.style.as_ref(),
+            o.clamp,
+            &mut chrome,
+            f,
+        )
     }
 }
 
@@ -6993,6 +7130,111 @@ impl From<TextAlign> for Align {
             TextAlign::Center => Align::Center,
             TextAlign::Right => Align::Right,
         }
+    }
+}
+
+// ─── 窗口标题栏（窗口外框部件） ──────────────────────────────────
+
+/// **窗口标题栏**（窗口内容**第一行**）：标题文字 + 右侧"收缩 / 关闭"图标按钮。
+///
+/// 要素：
+/// - 走 `Window`/`UiAdd::row`（与用户内容同一个 `Frame` 结算）⇒ 窗口高度自然包含标题栏，
+///   收起时只留它一条；通条底色由 `window_impl` 在 `size` 已知后补画（见那里的注释）；
+/// - 按钮是 [`TitleIconButton`]（**几何图标**，不是 `×` / `_` 字形 —— 换字体不变形），
+///   且按下时 `claim_press()` ⇒ **按按钮不会建立窗口拖拽基准**；标题栏空白处仍可拖窗口；
+/// - 点击效果：关闭 ⇒ `*close = false`（该窗口**下一帧**整体不录）；收缩 ⇒ `*collapsed` 取反
+///   （本帧起只录标题栏）。都是 1 帧生效的立即模式语义。
+fn window_title_bar(
+    w: &mut Window<'_, '_>,
+    chrome: &mut WindowChrome<'_>,
+    collapsed: bool,
+    pad_total: f32,
+) {
+    let ui = w.ui_mut();
+    let title = chrome.title.unwrap_or("");
+    let show_close = chrome.close.is_some();
+    let show_shrink = chrome.shrink.as_ref().is_some_and(|(show, _)| *show);
+    // 行内尺寸全部取**缩放后**主题（`Ui::theme` 已按 DPI 预乘）。
+    let (gap, row_h, font_size, family) = (
+        ui.theme.gap,
+        ui.theme.row_h,
+        ui.theme.label.font_size,
+        ui.theme.label.font_family.clone(),
+    );
+    // 按钮边长与 `TitleIconButton::size` 一致（`row_h - 2`）。
+    let btn = (row_h - 2.0).max(12.0);
+    let n_btn = (show_close as u32 + show_shrink as u32) as f32;
+    // 内容宽：`Ui::avail_w()` 是"固定宽 − 2×pad"（[`Frame::fixed_avail_w`]），而子项实际被
+    // clamp 到**固定宽**（`layout.rs::fixed_w_clamps_children_and_settles_width`）——即真正的
+    // 内容盒比它报的多 2×pad。这里补回来，按钮才贴内容右缘（否则差 2×pad，肉眼可见）。
+    let content_w = ui.avail_w().map(|a| a + pad_total * 2.0);
+    // 标题可用宽 = 内容宽 − 按钮区（含按钮**之间**以及标题与按钮之间的间隙）− 余量 4px。
+    // ⚠ 必须**实测标题宽**：spacer 若按"内容宽 − 按钮区"算，行总宽就会多出
+    // `标题宽 + gap − 4`，按钮被推出内容右缘（画到面板外，虽然仍可点，但视觉错位）。
+    let natural = ui.text_size(title, font_size, family.as_deref()).x;
+    let (title_max, spacer) = match content_w {
+        Some(cw) => {
+            let m = (cw - n_btn * btn - (n_btn + 1.0) * gap - 4.0).max(0.0);
+            (Some(m), m - natural.min(m))
+        }
+        // 自动宽窗口（无 `.width()`）：不设上限、不留 spacer —— 标题 + 按钮就是自然宽
+        // （窗口随内容长）。`avail_w()` 此时为 `None`（内容自然宽度）。
+        None => (None, 0.0),
+    };
+    trace_title_bar(collapsed, content_w, natural, spacer, btn);
+
+    let mut close_clicked = false;
+    let mut shrink_clicked = false;
+    w.row(|r| {
+        // 标题：省略号模式 ⇒ 过长时按 `title_max` 截断（不撑宽窗口、不挤走按钮）；
+        // 不超长时绘制与普通 `label` 完全一致。
+        if let Some(m) = title_max {
+            r.max_size(m, 0.0);
+        }
+        r.add(crate::widgets::Label::new(title).ellipsis());
+        // 撑开剩余宽 ⇒ 按钮**贴内容右缘**（`min_size` + 空标签 = spacer，见 `FontModal`）。
+        if spacer > 0.0 {
+            r.min_size(spacer, 0.0);
+            r.label("");
+        }
+        if show_shrink {
+            // 收起时显示"展开"箭头（↓），展开时显示"收起"箭头（↑）。
+            let icon = if collapsed { Icon::ChevronDown } else { Icon::ChevronUp };
+            shrink_clicked = r
+                .add(crate::widgets::title_button::TitleIconButton::new("::shrink", icon))
+                .clicked();
+        }
+        if show_close {
+            close_clicked = r
+                .add(crate::widgets::title_button::TitleIconButton::new("::close", Icon::Close))
+                .clicked();
+        }
+    });
+    if shrink_clicked && let Some((_, c)) = chrome.shrink.as_mut() {
+        **c = !**c;
+    }
+    if close_clicked && let Some(open) = chrome.close.as_mut() {
+        **open = false;
+    }
+}
+
+/// `RJ_CHROME_TRACE=1`：打印标题栏布局解算（内容宽 / 标题实测宽 / spacer / 按钮边长）。
+///
+/// 为什么留一个开关而不是删掉临时打印：标题栏的**右对齐**依赖"实测标题宽 + 内容宽"，
+/// 而文本测量随字体 / 字号变化——出问题时第一件事就是看这几个数（`--sim-chrome` 点空
+/// 按钮那次就是靠它定位的：spacer 少了标题宽，按钮整体左移了一个按钮位）。
+fn trace_title_bar(
+    collapsed: bool,
+    content_w: Option<f32>,
+    natural: f32,
+    spacer: f32,
+    btn: f32,
+) {
+    if std::env::var_os("RJ_CHROME_TRACE").is_some() {
+        let cw = content_w.map_or("none".to_owned(), |v| format!("{v:.1}"));
+        eprintln!(
+            "chrome[collapsed={collapsed}] content_w={cw} title_w={natural:.1} spacer={spacer:.1} btn={btn:.1}"
+        );
     }
 }
 

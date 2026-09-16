@@ -308,6 +308,7 @@ mod fontmodal;
 mod label;
 mod numberinput;
 mod slider;
+pub(crate) mod title_button;
 
 pub use button::Button;
 pub use checkbox::Checkbox;

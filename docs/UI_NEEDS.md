@@ -65,3 +65,13 @@ Issue 20260820 20:15:
 
 ISSUE:
 * 然后是合批问题：能不能以窗口为单位合并 DrawCall？对于现在的 Render2D 依赖，每个窗口可传入包含位移信息的 Transform 矩阵（可以实现在不改变顶点的情况下拖动）、混合颜色信息，可以方便整窗口动画&特效
+
+需求 20260821（逐项落地，每项都带引擎测试 + 示例演示 + `docs` 更新）：
+* ✅ 标题栏 + 窗口关闭收缩按钮（`WindowBuilder::{title, close_button, shrink}`；`shrink(显示按钮: bool, &mut 收起状态)`；关闭 = 整窗短路不占遮挡矩形，重开由应用负责；脚本验证 `--sim-chrome`）
+* ✅ 拖拽按钮（右下角缩放柄）样式可配（`GripStyle{GripShape::Squares/Bars/Hidden, color, size, step, count}` + `PanelStyle::with_grip*`；`Hidden` 仍可拖）
+* ✅ 直角（radius 0）窗口的背景图不再被丢掉（`push_panel_img_cmds` 把"背景刷形状"与"图/边框"解耦；回归测试 A/B 可复现）
+* 字重选项（`Theme::font_weight` + 字体 Modal 的字重下拉）
+* 文件导入（系统文件选择器 `rfd`：图片 → 背景纹理，字体 → 运行时文本子系统）
+* 阴影颜色（主题调节窗口里加 `ColorPicker`）
+* 主题调节窗口：每根滑杆后跟 `NumberInput`（Slider 后 NumberInput）
+* 菜单栏（横向 + 闭包式下拉；左侧竖排主菜单保留）

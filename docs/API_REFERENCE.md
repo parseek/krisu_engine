@@ -855,9 +855,22 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.window(id)` | `.pos(..)` `.width(w)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制 |
+| `ui.window(id)` | `.pos(..)` `.width(w)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` `.title(&str)` `.close_button(&mut bool)` `.shrink(bool, &mut bool)` `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**外框**（标题栏 / × / 收起）见下 |
 | `ui.panel()` | `.pos(..)` `.drag(id)` `.style(..)` `.show(\|pp\| ..)` | 面板 = `panel_at` + `drag_panel_at` 统一入口 |
 | `ui.modal(id)` | `.pos(..)` `.width(w)` `.show(\|m\| ..)` | 模态对话框（唯一入口） |
+
+**窗口外框（标题栏 / 关闭 / 收起）**：三个选项各自独立、**都不调就完全没有外框**
+（逐像素等于旧行为）；任一开启都在窗口内容**第一行**录一条标题栏（底色
+`Palette::surface_raised` + 面板同色边框 ⇒ 通条，底边那条就是分隔线）。
+
+| 选项 | 签名 | 语义 |
+|---|---|---|
+| `.title(t)` | `title(text: &str) -> Self` | 标题文字（过长按省略号截断，不撑宽窗口）；标题栏空白处**仍可拖动窗口** |
+| `.close_button(open)` | `close_button(open: &mut bool) -> Self` | 标题栏右侧画 ×；点击把 `*open` 置 `false`。`*open == false` 时**整窗短路**——不录制、不写原点/尺寸、**不占遮挡矩形**（不会留下"看不见却挡点击"的窗口）；重新打开是**应用的责任**（把 `*open` 置回 `true`，如菜单勾选） |
+| `.shrink(show, collapsed)` | `shrink(show: bool, collapsed: &mut bool) -> Self` | `collapsed = true` = 只留标题栏（跳过内容闭包）；点 ⌃ 取反。`show = false` 时**不画按钮**，但 `*collapsed` 照旧生效（由菜单/代码收起展开）——这是两个参数分开的用处 |
+
+`*collapsed` 在录制**开头**读取（点击当帧不变、下一帧生效）；`×` / `⌃` 上的按下会
+**认领**（`claim_press`）⇒ 点按钮不会顺带拖动窗口。
 
 选项载体 `WindowOptions` / `PanelOptions`（公开，可独立构造/复用）。容器闭包内经
 `UiAdd::window(id)` / `UiAdd::panel()` 同样可用。
@@ -1051,7 +1064,7 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 | `gradient_rect` | `ui.gradient_rect(size, gradient)` | 同上，但位置来自当前容器游标（随布局流） |
 | `icon_at` | `ui.icon_at(pos, size, icon, color)` | **矢量图标**（绝对定位；`size` 为方框，非方形时按 `min(w,h)` 居中等比） |
 | `icon` | `ui.icon(size, icon, color)` | 同上，但位置来自当前容器游标——`row` 内连续调用即得工具栏 |
-| `Icon` | `Check` / `ChevronUp` / `ChevronDown` / `ChevronLeft` / `ChevronRight` / `Grip` / `Warning` | **画出来的几何**（单位方框 `[0,1]²` 内的凸分片，`Icon::parts()` 公开） |
+| `Icon` | `Check` / `ChevronUp` / `ChevronDown` / `ChevronLeft` / `ChevronRight` / `Close` / `Grip` / `Warning` | **画出来的几何**（单位方框 `[0,1]²` 内的凸分片，`Icon::parts()` 公开；`Close` = 两条顺时针凸平行四边形拼的 ×，标题栏关闭按钮用） |
 | `image_at` | `ui.image_at(pos, size, bg)` | **背景图**（绝对定位；`bg: ImageBg` 决定铺排 / 染色 / 圆角遮罩） |
 | `image` | `ui.image(size, bg)` | 同上，但位置来自当前容器游标 |
 | `ImageBg` | `new(tex, texel)` + `.fit(..)` / `.radius(..)` / `.tint(..)` | 纹理 uid + **纹素尺寸** + 铺排 + 染色 + 圆角遮罩；`PanelStyle::with_bg_image` 可直接当窗口/面板底图 |
