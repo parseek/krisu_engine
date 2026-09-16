@@ -944,7 +944,10 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 **投影令牌**：`PanelStyle::shadow: ShadowStyle { blur, offset, color }`（色令牌 `Palette::shadow`），
 主题级入口 `Theme::with_shadow(ShadowStyle)` / `Theme::without_shadow()`，逐容器入口
 `PanelStyle::{with_shadow, with_shadow_color, without_shadow}`。`blur = 0` = 不画（不是
-`Option`）。见 §11「渲染增强」下方的说明。
+`Option`）。**颜色是任意色**：顶点 RGB 原样带出、只有 alpha 按圈衰减 ⇒ alpha 管深浅
+（深色预设 120 / 浅色 48）、RGB 管色相；`blur > 0` 而 alpha = 0 仍会镶嵌几何（看不见而已），
+要省几何请归零 `blur`。见 §11「渲染增强」下方的说明。`eg260818UI` 的「主题调节」窗口里
+「投影」滑杆后面那个色块就是它（可拖 alpha），`--sim-shadow` 脚本化守护这条通路。
 
 **缩放柄令牌**：`PanelStyle::grip: GripStyle { shape: GripShape, color, size, step, count }`
 —— 只对**固定宽窗口**（`WindowBuilder::width(..)`）生效，就是右下角那个"拖拽按钮"。

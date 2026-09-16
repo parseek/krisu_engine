@@ -138,6 +138,20 @@ fn update(&mut self, ctx: &mut Ctx) {
   则是**几何签名前缀**漏了字重——`Ui::hash_cmds` 与 `UiState::text_buffers` /
   `WidgetState::text_buf` 三处键都在 `docs/ENGINE_GUIDE.md` §18.7 列着。
 
+- **"投影颜色调了没反应"**（色块 → `ShadowStyle::color` → 主题这条线断在哪）：
+  示例的 `--sim-shadow` 在第 30 帧把投影换成半透明红，前后打印主题里的值：
+
+  ```
+  cargo run -p eg260818UI -- --sim-shadow --frames 50
+  sim-shadow: frame=20 panel.shadow.color = (0.00,0.00,0.00,a0.47)     # 深色预设 rgba_u8(0,0,0,120)
+  sim-shadow: frame=40 panel.shadow.color = (0.90,0.15,0.10,a0.55)
+  sim-shadow: 主题投影色 已跟随色块变化 [OK] 阴影颜色进了主题
+  ```
+
+  主题值不变 = 应用没把色块喂进 `ShadowStyle`；主题值变了但画面颜色没变 = 镶嵌层把
+  颜色丢了（引擎侧由单测 `tess::tests::shadow_keeps_the_callers_rgb_and_alpha` 守着：
+  顶点 RGB 必须与调用方给的颜色逐位相同）。
+
 - **"这一像素到底是谁的"**（重叠 / 相邻控件边界、跨窗口遮挡、滚动条条带）：
 
   ```

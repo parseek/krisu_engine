@@ -691,6 +691,9 @@ struct ThemeTuner {
     line_spacing: f32,
     /// **投影模糊宽**（逻辑像素；0 = 不画投影——立面 / 扁平风格）。
     shadow_blur: f32,
+    /// **投影颜色**（含 alpha；`PanelStyle::shadow.color`，预设已带"深色 alpha 120 /
+    /// 浅色 48"）。alpha 拖到 0 = 投影看不见（但 `blur > 0` 仍会镶嵌几何）。
+    shadow_color: Color,
     /// **右下角缩放柄形状**（[`GripShape`]；只对固定宽窗口生效）。
     grip_shape: GripShape,
     /// 缩放柄颜色（默认跟预设的描边色）。
@@ -734,6 +737,10 @@ impl ThemeTuner {
             spacing_scale: 1.0,
             line_spacing: DEFAULT_LINE_SPACING,
             shadow_blur: ShadowStyle::default().blur,
+            // 投影颜色取**预设调色板**的 `shadow`（深色 alpha 120 / 浅色 48）——
+            // 那正是 `Theme::themed` 灌进 `PanelStyle::shadow.color` 的值 ⇒ 不动色块
+            // 时与扩展前逐像素一致。
+            shadow_color: p.shadow,
             grip_shape: GripShape::default(),
             grip_color: p.border,
             bg: p.surface,
@@ -754,6 +761,8 @@ impl ThemeTuner {
         self.accent = p.accent;
         // 柄色默认跟描边色（形状是造型选择，切预设不动它）。
         self.grip_color = p.border;
+        // 投影色跟预设的 `Palette::shadow`（投影是预设的一部分）。
+        self.shadow_color = p.shadow;
     }
 
     /// **切密度档并把三个倍率滑杆对齐到该档的规范值**（与 [`Self::set_preset`] 同思路：
@@ -805,12 +814,13 @@ impl ThemeTuner {
             .with_line_spacing(self.line_spacing)
             // **全局字重**（`字体…` 弹窗里选；默认 400 = 与扩展前逐像素一致）。
             .with_font_weight(weight);
-        // **投影**：> 0 = 按滑杆改模糊宽（偏移 / 颜色沿用预设令牌）；拖到 0 = 平面风格。
+        // **投影**：模糊宽 + 颜色（偏移沿用预设令牌）；模糊宽拖到 0 = 平面风格。
         // `with_shadow` 吃 `self`，故先拷出现值再整体替换（`ShadowStyle` 是 `Copy`）。
         let shadow = t.panel.shadow;
         let mut t = if self.shadow_blur > 0.0 {
             t.with_shadow(ShadowStyle {
                 blur: self.shadow_blur,
+                color: self.shadow_color,
                 ..shadow
             })
         } else {
@@ -921,18 +931,23 @@ impl ThemeTuner {
                     self.line_spacing = w.slider("th_lsp", 0.80..=2.00, self.line_spacing);
                 });
                 // 投影模糊宽：0 = 不画（平面风格）；拖大 = 窗口"浮"得更高。
+                // 后面紧跟**投影颜色**（色令牌 `Palette::shadow`；alpha 也归它管 ⇒
+                // 拖 alpha 可以做出"很淡的浮起"或"很重的压深"）。
                 w.row(|w| {
                     w.label("投影");
                     self.shadow_blur = w.slider("th_shd", 0.0..=32.0, self.shadow_blur);
+                    w.add(ColorPicker::new("th_shadow_color", &mut self.shadow_color).alpha(true));
                 });
                 w.label(&format!(
-                    "{} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 边框宽 {:.1} · 投影 {:.0} · 柄 {}",
+                    "{} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 边框宽 {:.1} · 投影 {:.0}/a{:.0} · 柄 {}",
                     ["dark", "light", "legacy"][self.preset.min(2) as usize],
                     self.radius,
                     self.feather,
                     self.bevel,
                     self.border_w,
                     self.shadow_blur,
+                    // 投影色的 alpha（0..1 → 0..255 显示，与色块里的读数一致）。
+                    self.shadow_color.a * 255.0,
                     match self.grip_shape {
                         GripShape::Squares => "方块",
                         GripShape::Bars => "三横",
@@ -1010,6 +1025,11 @@ struct UiApp {
     weight_probe: Option<f32>,
     /// --sim-weight：**脚本化切字重**（第 30 帧 NORMAL → BOLD），前后量同一串文本。
     sim_weight: bool,
+    /// --sim-shadow：**脚本化改投影颜色**（第 30 帧换成红色），打印主题里的
+    /// `panel.shadow.color` 证明"色块 → ShadowStyle → 主题"这条线是通的。
+    sim_shadow: bool,
+    /// --sim-shadow：第 20 帧的主题投影色（第 40 帧对比用）。
+    shadow_probe: Option<Color>,
     /// 「被遮挡控件仍被触发」复现器。
     cover: CoverDemo,
     /// `--sim-cover` 段 A 结束时的认领次数（段 B 不许再涨）。
@@ -1050,6 +1070,8 @@ impl UiApp {
             sim_cover: false,
             sim_chrome: false,
             sim_weight: false,
+            sim_shadow: false,
+            shadow_probe: None,
             weight_probe: None,
             cover: CoverDemo::default(),
             cover_starts_after_a: 0,
@@ -1555,6 +1577,39 @@ impl App for UiApp {
                     st.color_picker.text
                 );
             }
+            // ── `--sim-shadow`：投影颜色的**主题通路**（色块 → `ShadowStyle::color`
+            //    → 主题 → 镶嵌）。第 30 帧把投影换成半透明红，前后各打印一次主题值：
+            //    主题值必须真的变（改色块没反应 = 主题没吃这个令牌）。
+            //    ⚠ 引擎侧的"任意色都原样带出顶点"由单测
+            //    `tess::tests::shadow_keeps_the_callers_rgb_and_alpha` 守着。
+            if self.sim_shadow {
+                if sim_frame == 30 {
+                    self.theme_tuner.shadow_color = Color::rgba(0.9, 0.15, 0.1, 0.55);
+                }
+                if sim_frame == 20 || sim_frame == 40 {
+                    let c = ui.theme().panel.shadow.color;
+                    eprintln!(
+                        "sim-shadow: frame={sim_frame} panel.shadow.color = ({:.2},{:.2},{:.2},a{:.2})",
+                        c.r, c.g, c.b, c.a
+                    );
+                    match self.shadow_probe {
+                        None => self.shadow_probe = Some(c),
+                        Some(c0) => {
+                            // **判定**：主题里的投影色必须真的跟着色块变（RGB 与 alpha 都比）。
+                            let ok = (c.r - c0.r).abs() > 0.1 || (c.a - c0.a).abs() > 0.05;
+                            eprintln!(
+                                "sim-shadow: 主题投影色 {} {}",
+                                if ok { "已跟随色块变化" } else { "没跟着变" },
+                                if ok {
+                                    "[OK] 阴影颜色进了主题"
+                                } else {
+                                    "[FAIL] 阴影颜色没进主题（色块白调）"
+                                }
+                            );
+                        }
+                    }
+                }
+            }
             // ── `--sim-weight`：字重是**排版输入**（改字形 + 步进宽度）──
             // 第 30 帧 NORMAL → BOLD，并在 20 / 40 帧量同一串文本：宽度应变化
             // （字体没有该字面时 cosmic-text 回落最接近的字面，宽度可能不变 ⇒ 打印是
@@ -1883,6 +1938,7 @@ fn main() -> Result<(), RunError> {
     app.sim_cover = args.iter().any(|a| a == "--sim-cover");
     app.sim_chrome = args.iter().any(|a| a == "--sim-chrome");
     app.sim_weight = args.iter().any(|a| a == "--sim-weight");
+    app.sim_shadow = args.iter().any(|a| a == "--sim-shadow");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
         .iter()

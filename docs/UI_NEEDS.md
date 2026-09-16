@@ -72,6 +72,6 @@ ISSUE:
 * ✅ 直角（radius 0）窗口的背景图不再被丢掉（`push_panel_img_cmds` 把"背景刷形状"与"图/边框"解耦；回归测试 A/B 可复现）
 * ✅ 字重选项（`Theme::font_weight` 全局令牌 + `FontModal` 字重下拉七档 300…900；字重进排版缓冲缓存键 + 窗口几何签名前缀，`--sim-weight` 实测宽度 112→116）
 * 文件导入（系统文件选择器 `rfd`：图片 → 背景纹理，字体 → 运行时文本子系统）
-* 阴影颜色（主题调节窗口里加 `ColorPicker`）
+* ✅ 阴影颜色（主题调节窗口「投影」滑杆后跟 `ColorPicker`（可拖 alpha），`ShadowStyle { color, .. }`；顶点 RGB 原样带出，`--sim-shadow` 实测主题值 0,0,0/0.47 → 0.9,0.15,0.1/0.55）
 * 主题调节窗口：每根滑杆后跟 `NumberInput`（Slider 后 NumberInput）
 * 菜单栏（横向 + 闭包式下拉；左侧竖排主菜单保留）

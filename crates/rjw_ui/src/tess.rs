@@ -2010,6 +2010,37 @@ mod tests {
     }
 
     #[test]
+    fn shadow_keeps_the_callers_rgb_and_alpha() {
+        // **阴影颜色**（`ShadowStyle::color` / `Palette::shadow`）是任意色，不只是黑：
+        // 顶点 RGB 必须**原样**带出（只有 alpha 按圈衰减）——否则"投影颜色"调了没反应。
+        // 内轮廓 alpha 必须等于调用方给的值（颜色 alpha 不被吞、也不被放大）。
+        let t = table();
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        let c = Color::rgba(0.25, 0.5, 0.9, 0.35);
+        push_rounded_shadow(
+            &mut v,
+            &mut tr,
+            &t,
+            Rect::new(20.0, 20.0, 80.0, 40.0),
+            CornerRadius::all(4.0),
+            10.0,
+            Vec2::new(0.0, 2.0),
+            c,
+            TEST_UV,
+        );
+        assert!(!v.is_empty(), "应产生几何");
+        assert!(
+            v.iter().all(|x| (x.color[0] - 0.25).abs() < 1e-6
+                && (x.color[1] - 0.5).abs() < 1e-6
+                && (x.color[2] - 0.9).abs() < 1e-6),
+            "顶点 RGB 必须与调用方给的颜色一致（阴影可以是任意色）"
+        );
+        let max_a = v.iter().map(|x| x.color[3]).fold(0.0f32, f32::max);
+        assert!((max_a - 0.35).abs() < 1e-5, "内轮廓 alpha = 调用方给的值，实际 {max_a}");
+    }
+
+    #[test]
     fn shadow_skips_when_invisible_or_degenerate() {
         let t = table();
         let rect = Rect::new(0.0, 0.0, 100.0, 60.0);
