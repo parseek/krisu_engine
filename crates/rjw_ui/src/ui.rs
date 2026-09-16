@@ -69,10 +69,6 @@ use crate::widgets::Widget as _;
 
 // ─── 文本编辑辅助（纯函数，可单测） ─────────────────────────────
 
-/// TextArea **行距倍率**：行高 = 字号 × 该值（1.2 = 略宽松，多行可读性；与
-/// `ensure_text_buf` 的 `line_mult` 一致，cosmic 行盒按此递增）。
-pub(crate) const TEXT_AREA_LINE_SPACING: f32 = 1.2;
-
 /// 滚动条**条带**宽（物理像素；`scroll_at` 与文本编辑框共用）。文本编辑框的滚动条
 /// 条带排除（按下滚动条不建立文本选择）也用它。
 ///
@@ -1401,7 +1397,8 @@ impl<'a> Ui<'a> {
     /// 换行宽/**行距**/版本），未命中直接构建——**不写** `UiState::text_buffers` 全局缓存
     /// （文本频繁变化的输入框不污染静态标签缓存）。
     ///
-    /// `line_mult`：行高 = 字号 × 行距倍率（1.0 = 无行距；TextArea 多行用 1.2 加行距）。
+    /// `line_mult`：行高 = 字号 × 行距倍率（1.0 = 无行距；TextArea 多行用
+    /// `Theme::line_spacing`，默认 [`crate::DEFAULT_LINE_SPACING`] = 1.2 加行距）。
     /// 用两次独立借用实现（`self.state` 与 `self.text` 不能同时可变借用）。
     fn ensure_text_buf(
         &mut self,
@@ -1495,8 +1492,9 @@ impl<'a> Ui<'a> {
     /// `wrap <= 0` = 不换行（默认宽裕宽度）；`> 0` = 按该**物理像素**宽度换行
     /// （换行宽度参与缓存键，不同宽度各自缓存）。
     ///
-    /// 行高 = 字号（`size_px`），保证文本框内字形垂直居中位置正确。
-    /// 缓存键包含 `TEXT_LINE_HEIGHT_VERSION`，修改行高策略后旧缓存自动失效。
+    /// 行高 = 字号（`size_px`）× 主题行距倍率（`wrap <= 0` 的单行文本不受行距影响：
+    /// 盒子高度仍是字号，保证文本框内字形垂直居中的位置正确）。
+    /// 缓存键包含 `TEXT_LINE_HEIGHT_VERSION` 与行距本身，修改行高策略后旧缓存自动失效。
     fn cache_buffer_wrap(
         &mut self,
         s: &str,
@@ -1507,20 +1505,22 @@ impl<'a> Ui<'a> {
         // 物理字号取整：字形在像素网格上，避免亚像素渲染模糊；测量/绘制/缓存键一致
         let size_px = size.round();
         let wrap_px = wrap.round().max(0.0);
+        // 换行文本按主题行距排版（单行不受影响）；倍率进缓存键（不同行距各自缓存）。
+        let mult = if wrap_px > 0.0 { self.theme.line_spacing } else { 1.0 };
         let key = (
             s.to_owned(),
             size_px.to_bits(),
             family.map(|f| f.to_owned()),
             wrap_px.to_bits(),
-            TEXT_LINE_HEIGHT_VERSION,
+            (mult.to_bits(), TEXT_LINE_HEIGHT_VERSION),
         );
         if let Some(b) = self.state.text_buffers.get_mut(&key) {
             // 命中：刷新"最后使用帧号"（帧级近似 LRU 驱逐依据）
             b.1 = self.state.frame;
             return b.0.clone();
         }
-        // 行高 = 字号（精确 1:1），让字形在行盒中垂直居中更准确
-        let lh = size_px;
+        // 行高 = 字号 × 行距倍率（单行 = 字号，字形在行盒中垂直居中更准确）
+        let lh = (size_px * mult.max(1.0)).round();
         let style = match family {
             Some(f) if !f.is_empty() => TextStyle::new().font_family(f),
             _ => TextStyle::new(),
@@ -3485,9 +3485,15 @@ impl<'a> Ui<'a> {
     /// 或复用已逐出字形的槽位，旧 UV 就指向**别的像素**（"陈旧文字"/"背景消失"），
     /// 而命令内容没变 ⇒ 只靠命令哈希永远不失效。世代号只由图集整理（分配失败触发）
     /// 推进，不是每帧变化。
+    ///
+    /// 签名还**以主题行距为前缀**（[`Theme::line_spacing`]）：`DrawKind::Text` 的
+    /// `buf` 是排版结果、按设计**不参与哈希**（命令内容相同），而换行文本的实际
+    /// 行高 / 整体高度取决于行距 ⇒ 不并入就会被"改了行距但窗口几何仍命中旧
+    /// 缓存"卡住。行距是主题令牌、只在主题变更时改，代价可忽略。
     fn hash_cmds<'c>(&self, cmds: impl IntoIterator<Item = &'c UiDraw>) -> u64 {
         use std::hash::Hasher;
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write_u32(self.theme.line_spacing.to_bits());
         for d in cmds {
             self.cmd_sig(&mut h, d);
         }
@@ -6315,9 +6321,12 @@ impl Ui<'_> {
         let btn = self.mouse_left();
         self.register_focus(&id_for, rect, FocusKind::TextInput);
         let style = self.theme.input.clone();
-        // **行距**：多行行高 = 字号 × 1.2（与排版缓冲 `line_mult` 一致；cosmic 行盒
-        // 按此递增，光标/高亮按视觉行序号 × 行高对齐）。
-        let line_h = (style.font_size * TEXT_AREA_LINE_SPACING).max(1.0);
+        // **行距**：多行行高 = 字号 × `Theme::line_spacing`（与排版缓冲 `line_mult`
+        // 一致；cosmic 行盒按此递增，光标/高亮按视觉行序号 × 行高对齐）。
+        // 行距是主题令牌：`Theme::density` 的紧凑 / 宽松就是改它（默认
+        // `DEFAULT_LINE_SPACING` = 1.2）。
+        let line_mult = self.theme.line_spacing;
+        let line_h = (style.font_size * line_mult).max(1.0);
         let content_w = (rect.w - style.padding_x * 2.0).max(0.0);
         let content_rect = Rect::new(rect.x + style.padding_x, rect.y, content_w, rect.h);
         // 视觉框裁剪（**绝对坐标**：`UiDraw.clip` 收集期按绝对逻辑矩形求交；局部
@@ -6334,7 +6343,7 @@ impl Ui<'_> {
             style.font_size,
             style.font_family.as_deref(),
             wrap_w,
-            TEXT_AREA_LINE_SPACING,
+            line_mult,
         );
         let vlines = Text::lines(&vbuf);
         // 字节 → 视觉行（半开区间 + 换行边界归属修正，见 edit::vline_of_byte）
@@ -6563,7 +6572,7 @@ impl Ui<'_> {
             style.font_size,
             style.font_family.as_deref(),
             wrap_w,
-            TEXT_AREA_LINE_SPACING,
+            line_mult,
         );
         let vlines = Text::lines(&vbuf);
         // **IME 组合内联融入**（多行）：显示串 = value[..caret] + preedit + value[caret..]，
@@ -6598,7 +6607,7 @@ impl Ui<'_> {
                         style.font_size,
                         style.font_family.as_deref(),
                         wrap_w,
-                        TEXT_AREA_LINE_SPACING,
+                        line_mult,
                     );
                     (b.clone(), Text::lines(&b), Some(disp.clone()))
                 }

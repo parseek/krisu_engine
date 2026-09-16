@@ -1,4 +1,4 @@
-﻿//! 主题样式：`Theme` + 各控件子样式（默认 / dark 两套预设，可 clone 覆盖）。
+//! 主题样式：`Theme` + 各控件子样式（默认 / dark 两套预设，可 clone 覆盖）。
 
 use std::sync::Arc;
 
@@ -139,6 +139,12 @@ pub struct Theme {
     /// `1.0`（默认）≈ 标准 1px 抗锯齿；调大 = 更软的边（背景带一点朦胧感），
     /// 调小 / 归零 = 完全硬边。由 [`Theme::scaled`] 按 DPI 预乘为物理像素。
     pub feather: f32,
+    /// **多行行距倍率**（行高 = 字号 × 该值；默认 [`DEFAULT_LINE_SPACING`] = 1.2）。
+    ///
+    /// 作用于**可能换行的文本**（TextArea / 自动换行标签 / 换行预览）；单行文本的盒子
+    /// 高度仍是字号 ⇒ 不受影响。**不是** DPI 量（[`Theme::scaled`] 不缩放它），因为它
+    /// 本来就是"相对字号"的倍率。见 [`Theme::with_line_spacing`]。
+    pub line_spacing: f32,
     /// **本主题的调色板**（换肤 / 回退 / 诊断用；由 [`Theme::themed`] 记录）。
     ///
     /// 手工改过子样式字段后它可能与实际颜色不一致——它记录的是"组装来源"，
@@ -779,6 +785,39 @@ impl ShadowStyle {
     #[inline]
     pub fn is_visible(&self) -> bool {
         self.blur > 0.0 && <[f32; 4]>::from(self.color)[3] > 0.0
+    }
+}
+
+/// **默认多行行距倍率**（行高 = 字号 × 该值）。
+///
+/// 多行编辑框 / 换行文本的默认行高倍率，也是 [`Theme::line_spacing`] 的初值；
+/// 可经 [`Theme::with_line_spacing`] 或 [`Theme::density`] 调整。
+pub const DEFAULT_LINE_SPACING: f32 = 1.2;
+
+/// **UI 密度预设**（[`Theme::density`]）：一趟把间距令牌与字号按比例缩放，
+/// 让同一套界面在小屏上紧凑、在大屏 / 触屏上疏朗。
+///
+/// 用枚举而非裸 bool（R2）：三档语义明确，且以后加档位不改签名。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Density {
+    /// **紧凑**：间距 ×0.84、字号 ×0.92、行距 ×1.10（工具面板 / 小屏 / 高信息密度表格）。
+    Compact,
+    /// **标准**（默认）：保持各子样式的默认值不变。
+    #[default]
+    Cozy,
+    /// **宽松**：间距 ×1.18、字号 ×1.08、行距 ×1.30（触屏 / 演示 / 大屏）。
+    Spacious,
+}
+
+impl Density {
+    /// 三档的 `(间距倍率, 字号倍率, 行距倍率)`。
+    #[inline]
+    pub fn scales(self) -> (f32, f32, f32) {
+        match self {
+            Density::Compact => (0.84, 0.92, 1.10),
+            Density::Cozy => (1.0, 1.0, DEFAULT_LINE_SPACING),
+            Density::Spacious => (1.18, 1.08, 1.30),
+        }
     }
 }
 
@@ -1440,6 +1479,7 @@ impl Theme {
             row_h: 26.0,
             gap: 6.0,
             feather: crate::tess::DEFAULT_FEATHER,
+            line_spacing: DEFAULT_LINE_SPACING,
             palette: *p,
         }
     }
@@ -1447,6 +1487,35 @@ impl Theme {
     /// **边缘羽化宽度**（逻辑像素；0 = 硬边）。见 [`Theme::feather`] 字段文档。
     pub fn with_feather(mut self, px: f32) -> Self {
         self.feather = px.max(0.0);
+        self
+    }
+
+    /// **全局投影**（窗口 / 面板 / 浮层的软阴影；整对象替换 `blur` + `offset` + `color`）。
+    ///
+    /// 只改 `panel.shadow`——**不级联**：只有 [`PanelStyle`] 带投影（按钮 / 输入框
+    /// 这类薄控件加投影会糊成一团）。与 [`Self::with_border_w`] 的"级联到多个子样式"
+    /// 语义不同，故这里刻意分开命名。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{Palette, ShadowStyle, Theme};
+    /// # use glam::Vec2;
+    /// let t = Theme::themed(&Palette::light()).with_shadow(ShadowStyle {
+    ///     blur: 24.0,
+    ///     offset: Vec2::new(0.0, 8.0),
+    ///     ..Default::default()
+    /// });
+    /// let flat = Theme::light().without_shadow();   // 平面风格：blur = 0
+    /// # let _ = (t, flat);
+    /// ```
+    pub fn with_shadow(mut self, s: ShadowStyle) -> Self {
+        self.panel.shadow = s;
+        self
+    }
+
+    /// **关闭全局投影**（等价 `blur = 0`；与 `PanelStyle::without_shadow` 同风格，
+    /// 约定 R3：用"0 = 关闭"而不是 `Option`）。
+    pub fn without_shadow(mut self) -> Self {
+        self.panel.shadow.blur = 0.0;
         self
     }
 
@@ -1555,6 +1624,84 @@ impl Theme {
     /// **单行控件统一高度**（水平行 `row(...)` 内子项强制等高；默认 26）。
     pub fn with_row_h(mut self, row_h: f32) -> Self {
         self.row_h = row_h;
+        self
+    }
+
+    /// **UI 密度预设**（紧凑 / 标准 / 宽松）：一次性把"间距类"令牌与字号按比例缩放，
+    /// 于是同一个界面既可以在小屏上排得下，也可以在大屏上更舒展。
+    ///
+    /// - [`Density::Compact`]：间距 ×0.84、字号 ×0.92、行距 ×1.10；
+    /// - [`Density::Cozy`]（默认）：×1.0 / ×1.0 / ×[`DEFAULT_LINE_SPACING`]（= 今天的样子）；
+    /// - [`Density::Spacious`]：间距 ×1.18、字号 ×1.08、行距 ×1.30。
+    ///
+    /// ⚠ 与其它 `with_*` 一样是**责任链**（链上后设覆盖先设，且**叠乘**）：先
+    /// `.density(..)` 再 `.with_gap(20.0)` ⇒ gap = 20；反序则 gap 会被密度再缩放。
+    /// 只想调某一维时用 [`Self::with_font_scale`] / [`Self::with_spacing_scale`] /
+    /// [`Self::with_line_spacing`]。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{Density, Theme};
+    /// let compact = Theme::dark().density(Density::Compact);   // 小巧：小屏 / 工具面板
+    /// let loose = Theme::dark().density(Density::Spacious);    // 宽松：触屏 / 演示
+    /// # let _ = (compact, loose);
+    /// ```
+    pub fn density(self, d: Density) -> Self {
+        let (sp, fs, ls) = d.scales();
+        self.with_spacing_scale(sp)
+            .with_font_scale(fs)
+            .with_line_spacing(ls)
+    }
+
+    /// **只缩字号**（全部文本子样式：`label` / `button` / `checkbox` / `input` / `combo`）。
+    ///
+    /// 与 [`Self::with_font_size`] 的区别：后者是**绝对值**，本方法是**倍率**（在现值上叠乘）。
+    pub fn with_font_scale(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).max(1.0).round();
+        self.label.font_size = m(self.label.font_size);
+        self.button.font_size = m(self.button.font_size);
+        self.checkbox.font_size = m(self.checkbox.font_size);
+        self.input.font_size = m(self.input.font_size);
+        self.combo.font_size = m(self.combo.font_size);
+        self
+    }
+
+    /// **只缩间距类令牌**（间距 / 行高 / 内边距 / 控件尺寸 / 浮层留白）。
+    ///
+    /// **不碰**：圆角（用户的造型选择）、边框宽 / 羽化（亚像素级观感）、颜色、阴影。
+    pub fn with_spacing_scale(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.gap = m(self.gap).max(1.0);
+        self.row_h = m(self.row_h).max(1.0);
+        self.panel.padding = m(self.panel.padding);
+        self.button.padding = Vec2::new(m(self.button.padding.x), m(self.button.padding.y));
+        self.slider.track_h = m(self.slider.track_h).max(1.0);
+        self.slider.handle_w = m(self.slider.handle_w).max(2.0);
+        self.slider.height = m(self.slider.height).max(1.0);
+        self.slider.min_w = m(self.slider.min_w);
+        self.input.padding_x = m(self.input.padding_x);
+        self.input.height = m(self.input.height).max(1.0);
+        self.input.min_w = m(self.input.min_w);
+        self.checkbox.box_size = m(self.checkbox.box_size).max(2.0);
+        self.checkbox.gap = m(self.checkbox.gap);
+        self.divider.margin = m(self.divider.margin);
+        self.combo.menu_pad_v = m(self.combo.menu_pad_v);
+        self.combo.item_pad_x = m(self.combo.item_pad_x);
+        self.combo.item_min_w = m(self.combo.item_min_w);
+        self
+    }
+
+    /// **多行行距倍率**（行高 = 字号 × 该值；默认 [`DEFAULT_LINE_SPACING`] = 1.2）。
+    ///
+    /// 作用于**可能换行的文本**：TextArea、自动换行标签、换行预览（单行文本的盒子高度
+    /// 仍是字号，不受影响）。调小 = 更紧凑的多行排版，调大 = 更疏朗。
+    pub fn with_line_spacing(mut self, mult: f32) -> Self {
+        self.line_spacing = mult.max(0.5);
         self
     }
 
@@ -1994,6 +2141,119 @@ mod tests {
         assert_eq!(a.button.radius, 9.0);
         // s <= 0 → 不缩放。
         assert_eq!(Theme::default().scaled(0.0).label.font_size, Theme::default().label.font_size);
+        // **行距是倍率、不是尺寸**：预乘 DPI 不该改它（1.2 × 1.5 = 1.8 会把多行
+        // 排版拉稀）。行高最终仍随字号变高，因为行高 = 字号 × 行距。
+        assert_eq!(
+            Theme::default().with_line_spacing(1.2).scaled(1.5).line_spacing,
+            1.2,
+            "行距倍率不随 DPI 预乘"
+        );
+    }
+
+    #[test]
+    fn density_cozy_is_the_identity() {
+        // 默认档 = 今天的观感：间距 / 字号 / 行距全部原样（既有的 sim 坐标、
+        // 截图对比因此不受主题扩展影响）。
+        let base = Theme::themed(&Palette::light());
+        let cozy = base.clone().density(Density::Cozy);
+        assert_eq!(cozy.gap, base.gap);
+        assert_eq!(cozy.row_h, base.row_h);
+        assert_eq!(cozy.panel.padding, base.panel.padding);
+        assert_eq!(cozy.button.padding, base.button.padding);
+        assert_eq!(cozy.input.height, base.input.height);
+        assert_eq!(cozy.label.font_size, base.label.font_size);
+        assert_eq!(cozy.button.font_size, base.button.font_size);
+        assert_eq!(cozy.combo.font_size, base.combo.font_size);
+        assert_eq!(cozy.line_spacing, DEFAULT_LINE_SPACING);
+        // 默认 Density 就是 Cozy（枚举 Default derive）。
+        assert_eq!(Density::default(), Density::Cozy);
+    }
+
+    #[test]
+    fn density_scales_spacing_font_and_line_height_monotonically() {
+        let base = Theme::themed(&Palette::light());
+        let (c, cozy, s) = (
+            base.clone().density(Density::Compact),
+            base.clone().density(Density::Cozy),
+            base.clone().density(Density::Spacious),
+        );
+        // 单调：紧凑 < 标准 < 宽松（间距 / 字号 / 行距三个维度都要满足，
+        // 否则"更紧凑"只是变窄却没变矮，或反之）。
+        for (lo, mid, hi) in [
+            (c.gap, cozy.gap, s.gap),
+            (c.row_h, cozy.row_h, s.row_h),
+            (c.panel.padding, cozy.panel.padding, s.panel.padding),
+            (c.input.height, cozy.input.height, s.input.height),
+            (c.combo.item_min_w, cozy.combo.item_min_w, s.combo.item_min_w),
+            (c.label.font_size, cozy.label.font_size, s.label.font_size),
+            (c.input.font_size, cozy.input.font_size, s.input.font_size),
+            (c.line_spacing, cozy.line_spacing, s.line_spacing),
+        ] {
+            assert!(lo < mid, "紧凑应小于标准：{lo} !< {mid}");
+            assert!(mid < hi, "标准应小于宽松：{mid} !< {hi}");
+        }
+        // 具体倍率：间距 ×0.84、字号 ×0.92（取整）。
+        assert_eq!(c.gap, (base.gap * 0.84).round().max(1.0));
+        assert_eq!(c.label.font_size, (base.label.font_size * 0.92).round().max(1.0));
+        assert_eq!(s.line_spacing, 1.30);
+    }
+
+    #[test]
+    fn theme_shadow_builders_replace_and_disable() {
+        // 预设自带投影（浅色 alpha 48 / 深色 120），且只挂在 panel 上。
+        let light = Theme::light();
+        assert!(light.panel.shadow.is_visible());
+        assert_eq!(light.panel.shadow.color, Palette::light().shadow);
+        assert_eq!(light.panel.shadow.blur, ShadowStyle::default().blur);
+        // 整对象替换（blur / offset / color 一起换）。
+        let lifted = Theme::light().with_shadow(ShadowStyle {
+            blur: 24.0,
+            offset: Vec2::new(0.0, 8.0),
+            color: Color::rgba_u8(0, 0, 0, 90),
+        });
+        assert_eq!(lifted.panel.shadow.blur, 24.0);
+        assert_eq!(lifted.panel.shadow.offset, Vec2::new(0.0, 8.0));
+        // without_shadow = blur 0 = 不画（不产生几何），其余字段原样保留。
+        let flat = Theme::light().without_shadow();
+        assert_eq!(flat.panel.shadow.blur, 0.0);
+        assert!(!flat.panel.shadow.is_visible());
+        assert_eq!(flat.panel.shadow.color, light.panel.shadow.color);
+        // 只碰 panel：其它子样式本来就没有 shadow 字段（编译期保证），
+        // 这里断言"没顺手改坏 padding / 圆角"。
+        assert_eq!(flat.panel.padding, light.panel.padding);
+        assert_eq!(flat.panel.radius, light.panel.radius);
+    }
+
+    #[test]
+    fn density_leaves_radius_border_colour_and_shadow_alone() {
+        // 密度只负责"排布疏密"：造型（圆角）、亚像素观感（边框宽 / 羽化）、
+        // 颜色、投影都不该被密度改动——那是用户的造型选择。
+        let base = Theme::themed(&Palette::dark()).with_radius(7.0);
+        let c = base.clone().density(Density::Compact);
+        assert_eq!(c.panel.radius, base.panel.radius);
+        assert_eq!(c.button.radius, base.button.radius);
+        assert_eq!(c.panel.border_w, base.panel.border_w);
+        assert_eq!(c.feather, base.feather);
+        assert_eq!(c.panel.bg, base.panel.bg);
+        assert_eq!(c.panel.shadow.blur, base.panel.shadow.blur);
+        // 圆角即便在宽松档也保持 7（间距档不碰圆角）。
+        assert_eq!(base.density(Density::Spacious).panel.radius, 7.0);
+    }
+
+    #[test]
+    fn with_line_spacing_clamps_and_partial_scales_compose() {
+        // 单维调节：只改行距时字号 / 间距原样。
+        let t = Theme::themed(&Palette::light()).with_line_spacing(1.6);
+        assert_eq!(t.line_spacing, 1.6);
+        assert_eq!(t.gap, Theme::themed(&Palette::light()).gap);
+        // 下界 0.5：行高 < 字号的一半会行盒重叠、光标定位失去意义。
+        assert_eq!(Theme::default().with_line_spacing(0.0).line_spacing, 0.5);
+        assert_eq!(Theme::default().with_line_spacing(-3.0).line_spacing, 0.5);
+        // 非法倍率（<= 0）视为"不改"，不产生 NaN / 0 尺寸。
+        let b = Theme::default();
+        assert_eq!(b.clone().with_font_scale(0.0).label.font_size, b.label.font_size);
+        assert_eq!(b.clone().with_spacing_scale(-1.0).gap, b.gap);
+        assert_eq!(b.clone().with_font_scale(-2.0).input.height, b.input.height);
     }
 }
 

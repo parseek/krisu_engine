@@ -44,6 +44,15 @@ krusie 引擎的 UI 模块：**hybrid 模式**（立即外观 + ID 持久状态�
   checkbox`r/2` / combo.menu_radius`min(r,6)`）；`Theme::with_border_w` 级联边框宽
   （0 = 不画），边框**颜色**是 `Palette::{border, border_strong}` 令牌。
   背景颜色按顶点位置双线性 lerp（圆角弧上的顶点也按位置取色 ⇒ 渐变不被"压进中间"）。
+- **窗口投影也是顶点色**（v0.4）：`PanelStyle::shadow`（`ShadowStyle { blur, offset, color }`，
+  色令牌 `Palette::shadow`）向外铺 4 圈同心圆角带、alpha 按 `a·(1−t)²` 衰减，**偏移逐环分摊**
+  （只平移整体会在本体下方留一条等浓度暗带）；`blur = 0` = 不画
+  （`Theme::without_shadow()`）。零纹理、零着色器改动、不增 draw call，进窗口顶点缓存。
+- **布局密度可调**（v0.4）：`Theme::density(Density::{Compact,Cozy,Spacious})` 一趟缩放
+  间距 / 字号 / 行距；单维微调 `with_font_scale` / `with_spacing_scale` / `with_line_spacing`。
+  行距 `Theme::line_spacing`（行高 = 字号 × 该值，默认 `DEFAULT_LINE_SPACING` = 1.2）只作用于
+  **可能换行**的文本；它同时进排版缓冲缓存键与窗口几何签名（`Ui::hash_cmds`），
+  所以调它不会留下陈旧几何。默认档与扩展前逐像素一致。
 - **状态持久**：交互控件（按钮/滑块/勾选/输入框）通过 **ID**（`&str`）把 hover / 按下 / 焦点 / 输入内容 / 拖拽标记持久化在 `UiState` 中（应用持有，跨帧复用）。
 - **自动尺寸**（DOM 风格）：叶子控件由内容测量（`rjw_text::Text::measure` + padding）自然撑开，容器（panel / pack / grid）在闭包结束时按子控件结算自身尺寸——**默认无需手写宽高**；任何控件可显式 `.size(w, h)` 或传 `Rect` 覆盖。
 - **屏幕空间**：控件坐标一律为屏幕像素（左上角原点、Y+ 向下），内部经相机屏幕固定变换绘制，命中测试直接在屏幕像素进行（旋转/缩放相机依然准确）。

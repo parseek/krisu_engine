@@ -43,7 +43,10 @@ use std::time::Instant;
 
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
-use rjw_krusie::ui::{ColorPicker, CornerRadius, FontModal, IdAbsolute, Label, Palette, Position};
+use rjw_krusie::ui::{
+    ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, FontModal, IdAbsolute, Label, Palette,
+    Position, ShadowStyle,
+};
 
 /// 「重叠控件」演示模块（控件级遮挡：重叠处只有最上层被触发 + `--sim-overlap` 自证）。
 mod overlap;
@@ -595,6 +598,16 @@ struct ThemeTuner {
     bevel: f32,
     /// 全局边框宽（逻辑像素；0 = 无边框）。
     border_w: f32,
+    /// **布局密度档**（[`Density`]）：一键铺开"间距 / 字号 / 行距"三个倍率。
+    density: Density,
+    /// 字号倍率（在密度档基础上叠乘；1.0 = 不额外缩放）。
+    font_scale: f32,
+    /// 间距类令牌倍率（间距 / 行高 / 内边距 / 控件尺寸）。
+    spacing_scale: f32,
+    /// **多行行距倍率**（行高 = 字号 × 该值；作用于自动换行标签与多行输入框）。
+    line_spacing: f32,
+    /// **投影模糊宽**（逻辑像素；0 = 不画投影——立面 / 扁平风格）。
+    shadow_blur: f32,
     /// 表面基色（整条 `surface*` 阶梯按**逐通道比**一起缩）。
     bg: Color,
     /// 描边色；`border_strong` 由它派生。
@@ -629,6 +642,11 @@ impl ThemeTuner {
             feather: 1.0,
             bevel: p.bevel,
             border_w: 1.0,
+            density: Density::default(),
+            font_scale: 1.0,
+            spacing_scale: 1.0,
+            line_spacing: DEFAULT_LINE_SPACING,
+            shadow_blur: ShadowStyle::default().blur,
             bg: p.surface,
             border: p.border,
             accent: p.accent,
@@ -645,6 +663,16 @@ impl ThemeTuner {
         self.bg = p.surface;
         self.border = p.border;
         self.accent = p.accent;
+    }
+
+    /// **切密度档并把三个倍率滑杆对齐到该档的规范值**（与 [`Self::set_preset`] 同思路：
+    /// 一键到"标准答案"，之后滑杆仍可自由微调）。
+    fn set_density(&mut self, d: Density) {
+        let (spacing, font, line) = d.scales();
+        self.density = d;
+        self.spacing_scale = spacing;
+        self.font_scale = font;
+        self.line_spacing = line;
     }
 
     /// 按当前旋钮组装主题（`frame.ui(..)` 之前调用——闭包借用 `self`，闭包内不能构造）。
@@ -674,10 +702,27 @@ impl ThemeTuner {
         p.accent = self.accent;
         p.accent_hover = scale_luma(self.accent, 1.25);
         p.accent_active = scale_luma(self.accent, 0.80);
-        let mut t = Theme::themed(&p)
+        let t = Theme::themed(&p)
             .with_radius(self.radius)
             .with_feather(self.feather)
-            .with_border_w(self.border_w);
+            .with_border_w(self.border_w)
+            // **布局密度**：先铺密度档，再叠三个手动倍率（倍率是"在现值上叠乘"，
+            // 故顺序无关；密度档只负责给出起点）。
+            .density(self.density)
+            .with_font_scale(self.font_scale)
+            .with_spacing_scale(self.spacing_scale)
+            .with_line_spacing(self.line_spacing);
+        // **投影**：> 0 = 按滑杆改模糊宽（偏移 / 颜色沿用预设令牌）；拖到 0 = 平面风格。
+        // `with_shadow` 吃 `self`，故先拷出现值再整体替换（`ShadowStyle` 是 `Copy`）。
+        let shadow = t.panel.shadow;
+        let mut t = if self.shadow_blur > 0.0 {
+            t.with_shadow(ShadowStyle {
+                blur: self.shadow_blur,
+                ..shadow
+            })
+        } else {
+            t.without_shadow()
+        };
         if !font.is_empty() {
             t = t.with_font_family(font);
         }
@@ -734,13 +779,52 @@ impl ThemeTuner {
                     w.label("边框宽");
                     self.border_w = w.slider("th_bdw", 0.0..=5.0, self.border_w);
                 });
+                // ── 布局密度（主题扩展：紧凑 / 标准 / 宽松）──────────────────
+                // 三个按钮一键铺开"间距 / 字号 / 行距"，三根滑杆随后可自由微调
+                // （点档位 = 把滑杆对齐到该档的规范值，与"预设"按钮同思路）。
+                w.row(|w| {
+                    w.label("密度:");
+                    if w.button("th_cmp", "紧凑").clicked() {
+                        self.set_density(Density::Compact);
+                    }
+                    if w.button("th_coz", "标准").clicked() {
+                        self.set_density(Density::Cozy);
+                    }
+                    if w.button("th_spa", "宽松").clicked() {
+                        self.set_density(Density::Spacious);
+                    }
+                });
+                w.row(|w| {
+                    w.label("字号");
+                    self.font_scale = w.slider("th_fsc", 0.70..=1.50, self.font_scale);
+                });
+                // 间距与行距并排（省一行纵向空间；两者都是"排布疏密"、常一起调）。
+                w.row(|w| {
+                    w.label("间距");
+                    self.spacing_scale = w.slider("th_ssc", 0.70..=1.50, self.spacing_scale);
+                    w.label("行距");
+                    self.line_spacing = w.slider("th_lsp", 0.80..=2.00, self.line_spacing);
+                });
+                // 投影模糊宽：0 = 不画（平面风格）；拖大 = 窗口"浮"得更高。
+                w.row(|w| {
+                    w.label("投影");
+                    self.shadow_blur = w.slider("th_shd", 0.0..=32.0, self.shadow_blur);
+                });
                 w.label(&format!(
-                    "{} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 边框宽 {:.1}",
+                    "{} · 圆角 {:.0} · 羽化 {:.1} · 微渐变 {:.2} · 边框宽 {:.1} · 投影 {:.0}",
                     ["dark", "light", "legacy"][self.preset.min(2) as usize],
                     self.radius,
                     self.feather,
                     self.bevel,
                     self.border_w,
+                    self.shadow_blur,
+                ));
+                w.label(&format!(
+                    "密度 {} · 字号 ×{:.2} · 间距 ×{:.2} · 行距 ×{:.2}",
+                    ["紧凑", "标准", "宽松"][self.density as usize],
+                    self.font_scale,
+                    self.spacing_scale,
+                    self.line_spacing,
                 ));
             });
     }

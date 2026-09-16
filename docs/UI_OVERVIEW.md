@@ -22,6 +22,11 @@
 任意函数 / 模块；帧级账（帧号 / 命中区翻页 / 输入快照 / 焦点导航 + 描边 / 光标 / 统计）
 **每帧只做一次**（开场在第一段懒执行，收尾由运行时在提交前补齐）。
 
+**主题即令牌表**：颜色（`Palette`）、圆角 / 羽化 / 边框宽、**投影**（`ShadowStyle`）与
+**布局密度**（`Theme::density` + `line_spacing` / 字号 / 间距倍率）都在 `Theme` 里；
+`with_*` 是责任链，`Theme::scaled(DPI)` 统一预乘。默认档 `Density::Cozy` 与扩展前逐像素
+一致，所以"没去调它的界面"观感不变。
+
 布局是 **DOM 风格自动尺寸**（叶子控件由内容撑开、容器闭包结束时按子控件结算），几何
 管理是 **Tkinter 风格**（`pack` 堆叠 / `grid` 网格 / `*_at` 绝对定位）。
 
@@ -154,6 +159,16 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 因此圆角图形与文字/白填充**同页同纹理**，窗口内仍合并成一次 draw。
 （旧的 `rjw_ui::proc` 32×32 圆角 9-patch 纹理已删除。）
 
+**窗口投影同样是顶点色**（`PanelStyle::shadow`）：向外 4 圈同心圆角带、alpha 按
+`a·(1−t)²` 衰减（`tess::push_rounded_shadow`），偏移**逐环分摊**。它画在本体之下、
+更低 z 的窗口之上，并进窗口顶点缓存 —— **不增 draw call、不改着色器**。
+`blur = 0` = 不画（`Theme::without_shadow()`）。
+
+**布局密度是可调主题令牌**：`Theme::density(Density::{Compact,Cozy,Spacious})` 一趟缩放
+间距 / 字号 / 行距，`with_font_scale` / `with_spacing_scale` / `with_line_spacing` 单维微调；
+行距（`Theme::line_spacing`）作用于一切**可能换行**的文本，它既是排版缓冲缓存键的一部分，
+也进窗口几何签名（`Ui::hash_cmds`）——所以改行距不会留下陈旧几何。
+
 **几何**：`UiBatch` 携带 `vertices` + `indices`（`Tri = [u16; 3]`），UI 全程直出三角形。
 索引与顶点同段存放、`Geom::append` 拼接时自动平移，二者永不脱节。为空索引时后端按
 「每 4 顶点一组、`TL,TR,BL,BR`」的旧约定回退，保证外部后端兼容。
@@ -241,7 +256,7 @@ fn update(&mut self, ctx: &mut Ctx) {
 ```rust
 let mut ui = Ui::begin(&window, &mut text, &mut state)
     .capture(&mouse, &keyboard)
-    .theme(Theme::dark().with_radius(8.0))      // with_font_family / with_font_size / with_radius / with_border_w / with_feather / ...
+    .theme(Theme::dark().with_radius(8.0))      // with_font_family / with_font_size / with_radius / with_border_w / with_feather / with_shadow / density / with_line_spacing / ...
     .scale_factor(ctx.scale_factor().unwrap_or(1.0))
     .build();
 // ... 录制（同上）...

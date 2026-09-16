@@ -897,13 +897,26 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 ### 样式（`Theme`，可 clone 覆盖）
 
-`Theme { label, panel, button, slider, input, checkbox, divider, debug, focus, modal, combo, gap, row_h }`，子样式见 `crates/rjw_ui/src/style.rs`：
-`LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**）、`ButtonStyle`（三态 bg + padding + **radius**）、
+`Theme { label, panel, button, slider, input, checkbox, divider, debug, focus, modal, combo, gap, row_h, feather, line_spacing }`，子样式见 `crates/rjw_ui/src/style.rs`：
+`LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**/**shadow**）、`ButtonStyle`（三态 bg + padding + **radius**）、
 `SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius**）、
 `CheckboxStyle`（box_size/checked_fill/gap）、`DividerStyle`、`DebugStyle`（layout_outline / layout_outline_width）、
 `FocusStyle`（color / width，键盘导航焦点描边）、`ModalStyle`（dim / size）、
 `ComboStyle`（下拉浮层现代菜单：menu_bg/border/radius/pad_v + item_hover/selected/pad_x/min_w + fg/fg_mark）。
 `Theme::default()` 浅色，`Theme::dark()` 深色。
+
+**布局令牌**（"同一套界面在小屏排得下、在大屏更舒展"）：`Theme::density(Density)` 一趟按比例
+缩放间距 + 字号 + 行距（`Compact` 0.84/0.92/1.10、`Cozy` **默认** = 1.0/1.0/1.2、
+`Spacious` 1.18/1.08/1.30）；单维微调用 `with_font_scale` / `with_spacing_scale` /
+`with_line_spacing`（都是**倍率**、在现值上叠乘）。`Theme::line_spacing`（行高 = 字号 × 该值，
+默认 `DEFAULT_LINE_SPACING` = 1.2）只作用于**可能换行的文本**（多行 TextArea / `wrap(..)`
+标签），`wrap <= 0` 的单行文本行高恒等于字号；`Theme::scaled(DPI)` 不缩放它（倍率不是尺寸）。
+`eg260818UI` 的「主题调节」窗口可实时切档 + 拖三根倍率滑杆。
+
+**投影令牌**：`PanelStyle::shadow: ShadowStyle { blur, offset, color }`（色令牌 `Palette::shadow`），
+主题级入口 `Theme::with_shadow(ShadowStyle)` / `Theme::without_shadow()`，逐容器入口
+`PanelStyle::{with_shadow, with_shadow_color, without_shadow}`。`blur = 0` = 不画（不是
+`Option`）。见 §11「渲染增强」下方的说明。
 
 **子样式责任链**：每个子样式都有 `with_*` builder setter（返回 `Self`，只改链上字段，
 其余回落默认）——`PanelStyle::default().with_radius(8.0)` / `ButtonStyle::default().
@@ -954,7 +967,15 @@ with_bg(c).with_radius(6.0)` / `SliderStyle::default().with_track(c).with_fill(c
 >   `panel` / `button` / `input` / `checkbox`（取 `r/2`）/ `combo.menu_radius`（取 `min(r, 6)`）。
 >
 > 实时调参：`eg260818UI` 的「主题调节…」窗口可拖圆角 / 羽化 / 微渐变 / **背景 RGB** /
-> **边框 RGB** / **边框宽** / 强调 RGB，并一键切 dark / light / legacy 预设。
+> **边框 RGB** / **边框宽** / 强调 RGB / **投影模糊宽**，并一键切 dark / light / legacy
+> 预设与紧凑 / 标准 / 宽松三档密度。
+>
+> **投影**（`ShadowStyle`，v0.4 新增）：从面板矩形向外 `blur` 像素铺 `SHADOW_STEPS = 4` 段
+> **同心**圆角带，第 `t` 圈外扩 `blur·t` 并偏移 `offset·t`，alpha = `a·(1−t)²`（本体边缘
+> 最浓、最外圈为 0，天然抗锯齿）。**完全靠顶点色**——无纹理、无着色器改动，进窗口顶点
+> 缓存（内容不变时零开销），与背景同段合批。`offset` 必须**逐环分摊**，只平移内轮廓会在
+> 本体正下方留下一条等浓度暗带（看起来像"阴影下方突出"）；`blur <= 0` / 颜色全透明 /
+> 退化矩形 ⇒ **零几何**。只挂 `PanelStyle`（窗口 / 面板 / 浮层），薄控件不加投影。
 
 #### 调试样式（`DebugStyle`）
 
@@ -1010,7 +1031,7 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 | **复制 / 粘贴 / 剪切 / 全选** | `Ctrl+C` / `Ctrl+V` / `Ctrl+X` / `Ctrl+A`（`arboard` 系统剪贴板；TextArea 跨行选择）；**单行粘贴过滤换行**（多行拼接成一行） |
 | **Shift 选择** | `Shift + ←/→/↑/↓/Home/End` 扩展 / 收缩选择；**无 Shift 方向键移动 = 单选**（清除选择） |
 | **IME 组合候选浮动提示框** | 组合串（preedit）画在输入框**下方浮动小框**（底色 + 边框 + 灰色文本，自动宽度），不再占行内；系统候选框 `set_ime_cursor_area` 跟随光标（含水平/垂直滚动） |
-| **多行 TextArea** | `p.text_area(id, &mut String)` / `text_area_at(id, rect, ...)`：Enter 换行、↑/↓ 跨**视觉行**（保持列）、Home/End 行首尾、按内容区宽度自动换行（`create_buffer_wrap`）、**光标/点击/选择按视觉行定位与显示一致**（`Text::visual_lines`）、行距 1.2、跨视觉行选择高亮逐行绘制 |
+| **多行 TextArea** | `p.text_area(id, &mut String)` / `text_area_at(id, rect, ...)`：Enter 换行、↑/↓ 跨**视觉行**（保持列）、Home/End 行首尾、按内容区宽度自动换行（`create_buffer_wrap`）、**光标/点击/选择按视觉行定位与显示一致**（`Text::visual_lines`）、行距 = `Theme::line_spacing`、跨视觉行选择高亮逐行绘制 |
 
 - 输入框按下时置位 `press_claimed`：窗口/面板**不建立拖拽基准**（选择拖拽优先；窗口从空白/标题区拖动），并清除旧拖拽基准（防"瞬移"）；
 - 主题：`InputStyle::sel_bg`（选择高亮色，默认浅蓝 / dark 深蓝）。

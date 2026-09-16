@@ -174,9 +174,9 @@ pub use hit::{hit_test, InteractEvents};
 pub use layout::{Child, PackSide};
 pub use state::{ButtonState, CheckboxState, TextFocus, UiState, UiStats, WidgetState};
 pub use style::{
-    Brush, ButtonStyle, CheckboxStyle, ComboStyle, DividerStyle, FocusStyle, InputStyle,
-    LabelStyle, ModalStyle, Palette, PanelStyle, SliderStyle, Theme, bevel_raised, bevel_sunken,
-    hgrad, vgrad,
+    Brush, ButtonStyle, CheckboxStyle, ComboStyle, DEFAULT_LINE_SPACING, Density, DividerStyle,
+    FocusStyle, InputStyle, LabelStyle, ModalStyle, Palette, PanelStyle, ShadowStyle, SliderStyle,
+    Theme, bevel_raised, bevel_sunken, hgrad, vgrad,
 };
 pub use input::{KeyboardSnapshot, MouseSnapshot};
 pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Placement, Resize, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};

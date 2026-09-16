@@ -1261,7 +1261,82 @@ ui.gradient_rect_at(Vec2::new(0.0, 0.0), Vec2::new(1280.0, 56.0),
 - `rjw_atlas` 的 Guillotine 打包 / `clamp_margin` / 页纹理注册机制不变；
   `rjw_text::Text::user_texture` 仍是对外可用的自定义纹理入口（UI 自己不再用它做圆角）。
 
-### 18.7 滚动容器（scroll_at）
+### 18.7 主题扩展（密度 / 行距 / 阴影）
+
+`Theme` 除了"颜色 + 圆角 + 羽化 + 边框宽"，还有两组**布局 / 深度**令牌。都是纯令牌，
+**不改着色器、不加绘制通道**。
+
+**布局密度**（"同一套界面在小屏排得下、在大屏更舒展"）：
+
+```rust
+use rjw_ui::{Density, Theme};
+
+let compact = Theme::dark().density(Density::Compact);   // 小屏 / 工具面板 / 高信息密度
+let loose   = Theme::dark().density(Density::Spacious);  // 触屏 / 演示 / 大屏
+// 单维微调（都是"在现值上叠乘"的倍率，可任意组合）：
+let t = Theme::dark()
+    .with_font_scale(1.10)      // 只放大字号
+    .with_spacing_scale(0.90)   // 只收紧间距
+    .with_line_spacing(1.45);   // 只放松多行行距
+```
+
+| 档位 | 间距 × | 字号 × | 行距 × |
+|---|---|---|---|
+| `Density::Compact` | 0.84 | 0.92 | 1.10 |
+| `Density::Cozy`（默认） | 1.0 | 1.0 | 1.2 = `DEFAULT_LINE_SPACING` |
+| `Density::Spacious` | 1.18 | 1.08 | 1.30 |
+
+- **间距类** = `gap` / `row_h` / `panel.padding` / `button.padding` / `slider.{track_h,
+  handle_w,height,min_w}` / `input.{padding_x,height,min_w}` / `checkbox.{box_size,gap}` /
+  `divider.margin` / `combo.{menu_pad_v,item_pad_x,item_min_w}`；
+- **字号类** = `label` / `button` / `checkbox` / `input` / `combo` 的 `font_size`；
+- **密度不碰**：圆角（造型选择）、边框宽 / 羽化（亚像素观感）、颜色、阴影；
+- `Density` 是枚举而不是裸 bool（约定 R2），`Density::default()` = `Cozy` ⇒
+  **默认观感与扩展前逐像素一致**（既有 sim 坐标 / 截图基线不受影响）。
+
+**行距**（`Theme::line_spacing`，行高 = 字号 × 该值）：作用于**可能换行的文本**——
+多行 `TextArea`、`wrap(..)` 标签、换行预览。`wrap <= 0` 的**单行**文本行高恒等于字号
+（盒子高度不变，文本框内字形垂直居中位置才不会漂）。下界 0.5（行盒重叠会让光标定位
+失去意义）。`Theme::scaled(DPI)` **不缩放**行距——它是倍率不是尺寸。
+
+> ⚠ **缓存正确性**（改这里必须两边都改）：行距是**运行时可变**的主题令牌，而
+> `DrawKind::Text` 的 `buf`（排版结果）按设计**不进命令哈希**。所以：
+> ① 排版缓冲缓存键含行距位（`UiState.text_buffers`，`(mult_bits, TEXT_LINE_HEIGHT_VERSION)`）；
+> ② 窗口 / `win=0` 子槽的**几何签名**以 `theme.line_spacing.to_bits()` 为前缀
+>   （`Ui::hash_cmds`）。漏掉 ②，改了行距后窗口会继续命中旧顶点缓存（内容含换行文本时，
+>  窗口 / 标签高度就停在旧值不更新）。
+
+**阴影**（`PanelStyle::shadow` / `ShadowStyle { blur, offset, color }`，色令牌
+`Palette::shadow`）：
+
+```rust
+use rjw_ui::{Palette, ShadowStyle, Theme};
+use glam::Vec2;
+
+let theme = Theme::themed(&Palette::dark());          // 预设已带投影（深色 alpha 120 / 浅色 48）
+let flat  = Theme::dark().without_shadow();           // 平面：blur = 0 = 不画（约定 R3，不用 Option）
+let lifted = Theme::dark().with_shadow(ShadowStyle {  // 主题级：整对象替换
+    blur: 24.0,
+    offset: Vec2::new(0.0, 8.0),
+    ..ShadowStyle::default()
+});
+// 逐容器（只让某一个窗口不一样）：
+let one = PanelStyle::default().with_shadow_color(Color::rgba_u8(0, 0, 0, 90));
+```
+
+- 画在**本体之下、更低 z 的窗口之上**——"投影落在下面的窗口上"；
+- `tess::push_rounded_shadow` 用 `SHADOW_STEPS = 4` 圈**同心**轮廓：第 `t` 圈是
+  `rect.grow(blur·t)` 再**整体平移 `offset·t`**，alpha 按 `a·(1−t)²` 衰减（无平台段）；
+- **offset 必须逐环分配**，不能只平移整体轮廓：只平移内轮廓会在窗口正下方留下
+  **等 alpha 的实心条带**（"阴影下方突出"——已修）。回归测试断言
+  "边缘下方 1px 的 alpha < 面板 alpha" 且随距离**单调下降**；
+- 半径 0 的直角矩形同样支持；`blur <= 0` / 颜色透明 / 退化矩形 ⇒ **零几何**；
+- 整块阴影完全在裁剪层之外时整个跳过（不进顶点）。
+
+`eg260818UI` 的「主题调节（实时）」窗口把上表全部做成了按钮 + 滑杆（密度三档一键
+铺开、字号 / 间距 / 行距 / 圆角 / 羽化 / 边框宽 / 三组颜色实时可拖）。
+
+### 18.8 滚动容器（scroll_at）
 
 ```rust
 ui.scroll_at(Vec2::new(880.0, 130.0), Vec2::new(240.0, 300.0), "scroll_demo", |s| {
@@ -1282,7 +1357,7 @@ ui.scroll_at(Vec2::new(880.0, 130.0), Vec2::new(240.0, 300.0), "scroll_demo", |s
 - 维护约定：新增控件时，录制命令必须带上 `self.clip`（`UiDraw.clip` 字段），
   否则滚动容器内无法裁剪；`UiDraw::translate` 会同步平移 `clip`。
 
-### 18.8 键盘导航（焦点遍历）
+### 18.9 键盘导航（焦点遍历）
 
 交互控件（按钮 / 勾选 / 单选 / 滑块 / 输入框 / 下拉框）录制时调用 `Ui::register_focus`
 登记进**本帧焦点链**（`focus.rs` 的 `FocusEntry`：**绝对 ID** / 窗口 z / 类型 / **绝对逻辑矩形** /
@@ -1307,7 +1382,7 @@ ui.scroll_at(Vec2::new(880.0, 130.0), Vec2::new(240.0, 300.0), "scroll_demo", |s
 > ⚠️ 焦点是**跨帧持久状态**（`UiState.focused`），但焦点链**每帧重建**（immediate-mode：
 > 控件动态增删自动反映）；焦点描边改变窗口内容签名 → 窗口顶点缓存自动失效重建。
 
-### 18.9 布局增强（换行 / min-max / flex）
+### 18.10 布局增强（换行 / min-max / flex）
 
 **自动换行标签**（宽度内按词/字换行，多行垂直居中）：
 
@@ -1347,7 +1422,7 @@ ui.flex_at(Vec2::new(880.0, 450.0), 150.0, &[1, 2, 1], |f, i| {
 - 子项内容超高时**溢出可见**（需要滚动时在子项内嵌 `scroll_at`）；
 - `pos` 相对当前容器原点，不占父容器光标。
 
-### 18.10 文本输入增强（单行 / 多行 / IME / 剪贴板）
+### 18.11 文本输入增强（单行 / 多行 / IME / 剪贴板）
 
 **滚动跟随光标（超长文本）**：单行输入框在绘制时把文本左移 `WidgetState::text_scroll`
 （`edit::scroll_follow_caret(caret_x, content_w, text_w, margin=8)`：光标移出右侧 → 左移，
@@ -1383,13 +1458,14 @@ clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位�
 - **光标 / 点击 / 选择按"视觉行"（自动换行后）定位，与显示完全一致**
   （[`rjw_text::Text::visual_lines`]：每个 `LayoutRun` 一个视觉行，含全文字节范围；
   `edit::char_to_byte` / `byte_to_char` 换算）；跨视觉行选择高亮逐行绘制；
-- **行距**：行高 = 字号 × `TEXT_AREA_LINE_SPACING`（1.2）——排版缓冲（`line_mult`）、
-  光标 y、高亮、内容测量（`measure_buffer`）全部一致。
+- **行距**：行高 = 字号 × `Theme::line_spacing`（默认 `DEFAULT_LINE_SPACING` = 1.2）——
+  排版缓冲（`line_mult`）、光标 y、高亮、内容测量（`measure_buffer`）全部一致。
 
 **控件自持排版缓冲**：输入框 / TextArea 的 `Arc<Buffer>` 缓存在
 `WidgetState::text_buf`（key 含文本/字号/字体/换行宽/行距/版本）——文本频繁变化的
 输入框**不写** `UiState::text_buffers` 全局缓存（不污染静态标签缓存）；`DrawKind::Text`
-带 `buf` 字段（不进窗口内容签名——排版由 text/size/family 决定）。
+带 `buf` 字段（不进窗口内容签名——排版由 text/size/family 决定，**行距另经签名前缀并入**，
+见 §18.7）。
 
 **IME 组合候选浮动提示框**：preedit 非空时在输入框**下方**画浮动小框（底色 + 边框 +
 灰色候选，自动宽度），不再占行内；系统候选框 `set_ime_cursor_area` 跟随光标
@@ -1399,7 +1475,7 @@ clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位�
 （无 GPU，可单测）；新增编辑控件时复用 `edit::*` 与 `clipboard_get/set`，并在按下
 响应中置位 `press_claimed`。
 
-### 18.11 维护约定（对 AI）
+### 18.12 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。
