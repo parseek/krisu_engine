@@ -382,7 +382,7 @@ impl QuadCollector {
 
     /// **CPU 镶嵌的圆角软阴影**（图形组；白纹理 + 顶点色 alpha 渐隐）。
     ///
-    /// `rect` = 阴影内轮廓、`blur` = 向外渐隐宽度；见
+    /// `rect` = 本体矩形、`blur` = 向外渐隐宽度、`offset` = 最外圈偏移；见
     /// [`crate::tess::push_rounded_shadow`]（无纹理、无着色器、不增 draw call）。
     pub(crate) fn push_rounded_shadow(
         &mut self,
@@ -391,6 +391,7 @@ impl QuadCollector {
         rect: Rect,
         radius: CornerRadius,
         blur: f32,
+        offset: Vec2,
         color: Color,
     ) -> crate::tess::TessOutput {
         let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
@@ -403,6 +404,7 @@ impl QuadCollector {
             rect,
             radius,
             blur,
+            offset,
             color,
             uv,
         )
@@ -632,10 +634,12 @@ pub(crate) fn cmd_sig_hash(h: &mut std::collections::hash_map::DefaultHasher, d:
             radius.br.to_bits().hash(h);
             radius.bl.to_bits().hash(h);
         }
-        DrawKind::Shadow { color, blur, radius } => {
+        DrawKind::Shadow { color, blur, offset, radius } => {
             10u8.hash(h);
             color_bits(*color).hash(h);
             blur.to_bits().hash(h);
+            offset.x.to_bits().hash(h);
+            offset.y.to_bits().hash(h);
             radius.tl.to_bits().hash(h);
             radius.tr.to_bits().hash(h);
             radius.br.to_bits().hash(h);

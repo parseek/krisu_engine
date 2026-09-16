@@ -1171,11 +1171,11 @@ impl App for UiApp {
         // 在**指定屏幕物理点**按下 + 释放（第 20/21 帧，之后停在原地到第 40 帧）——
         // 配合 `RJ_HIT_TRACE=1`（引擎打印每次命中归属）就能回答"这一像素到底是谁的"：
         // 重叠 / 相邻控件的边界、跨窗口遮挡、滚动条条带都能一眼定位。
-        // 第 22 帧起鼠标一直停在原地 ⇒ 断言不受后续真实鼠标移动影响。
+        // 第 22 帧起鼠标一直停在原地（**到断言帧之后**）⇒ 读数不被真实鼠标移动顶掉。
         if let Some(p) = self.sim_click {
             match f.frames() {
                 20..=21 => f.debug_inject_mouse(p, true),
-                22..=40 => f.debug_inject_mouse(p, false),
+                22..=48 => f.debug_inject_mouse(p, false),
                 _ => {}
             }
         }

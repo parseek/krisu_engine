@@ -85,16 +85,25 @@ pub(crate) const SHADOW_STEPS: u32 = 4;
 /// **圆角软阴影**（**顶点色**软阴影；无纹理、无着色器、不增 draw call）。
 ///
 /// 从内轮廓（`rect`，颜色 = `color`）向外 `blur` 像素铺 [`SHADOW_STEPS`] 段同心圆角带，
-/// 每段颜色 RGB 不变、**alpha 按二次曲线** (`a·(1−t)²`) 渐隐到 0 ⇒ 光栅化器在段内做
+/// 每段颜色 RGB 不变、**alpha 按二次曲线**（`a·(1−t)²`）渐隐到 0 ⇒ 光栅化器在段内做
 /// 线性插值，整条影调是"二次折线"，落在 0 上的最外圈天然完成抗锯齿（不需要额外羽化圈）。
 ///
-/// - `rect` = **阴影内轮廓**（一般就是窗口 / 面板矩形，可先按 `offset` 平移出光源方向）；
-/// - `radius` = 内轮廓圆角（`0` 会被夹到 [`MIN_AA_RADIUS`]：直角窗口的投影走同一套弧表，
+/// - `rect` = **本体矩形**（阴影的**内轮廓恒在本体边缘**：alpha 从本体边开始往外衰减，
+///   **没有"等浓度平台"**——见下）；
+/// - `blur` = 向外渐隐宽度；`offset` = 最外圈相对本体的偏移（光源方向的反向：光从上方来
+///   ⇒ `(0, +3)`）——**偏移按圈数线性分摊**（第 `t` 圈偏 `offset·t`），于是投影整体向下
+///   偏、上方更窄，而**本体边缘处浓度最高且立即开始衰减**；
+/// - `radius` = 本体圆角（`0` 会被夹到 [`MIN_AA_RADIUS`]：直角窗口的投影走同一套弧表，
 ///   0.5px 的圆角在视觉上与直角无异，却能避免内圈点重合产生零面积三角形）；
 /// - `blur <= 0`、`color` 全透明、或退化矩形 ⇒ 不产生任何几何。
 ///
+/// ⚠ **不要**把"偏移"做成"把内轮廓整体下移"：那样本体下缘到内轮廓之间是一段**等浓度**
+/// 暗带（本体底边像贴了一条硬黑边——"窗口阴影下方突出"）。本实现让偏移随圈数分摊，
+/// 浓度从本体边缘单调下降，是正常的柔和投影。
+///
 /// 之所以用这个原语：窗口投影若用"大一圈的半透明实心圆角矩形"会得到一个**硬边**黑框，
 /// 而用纹理 / 着色器模糊又违背本仓"UI 只走顶点色 + CPU 镶嵌"的路线。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn push_rounded_shadow(
     verts: &mut Vec<VertexP3U2C4>,
     tris: &mut Vec<Tri>,
@@ -102,6 +111,7 @@ pub(crate) fn push_rounded_shadow(
     rect: Rect,
     radius: CornerRadius,
     blur: f32,
+    offset: Vec2,
     color: Color,
     uv: [f32; 2],
 ) -> TessOutput {
@@ -131,12 +141,19 @@ pub(crate) fn push_rounded_shadow(
     let segs = CornerTable::segs_of(stride);
     let n = (4 * (segs + 1)) as u16;
 
-    // 逐圈写入：第 i 圈（i = 0 = 内轮廓）外扩 `blur·i/steps`，alpha = a·(1−t)²。
+    // 逐圈写入：第 i 圈（i = 0 = 本体边缘）外扩 `blur·t`、再按 `offset·t` 偏移，
+    // alpha = a·(1−t)²（本体边缘 = a，最外圈 = 0）。
     let mut rings: Vec<u16> = Vec::with_capacity(SHADOW_STEPS as usize + 1);
     for i in 0..=SHADOW_STEPS {
         let t = i as f32 / SHADOW_STEPS as f32;
         let d = blur * t;
-        let rr = Rect::new(rect.x - d, rect.y - d, w + d * 2.0, h + d * 2.0);
+        let o = offset * t;
+        let rr = Rect::new(
+            rect.x - d + o.x,
+            rect.y - d + o.y,
+            w + d * 2.0,
+            h + d * 2.0,
+        );
         let rad = r0.map(|r| r + d).fit(rr.w, rr.h);
         let mut c = base;
         c[3] = base[3] * (1.0 - t) * (1.0 - t);
@@ -1908,12 +1925,13 @@ mod tests {
     #[test]
     fn shadow_is_alpha_ramped_ring_within_blur_bounds() {
         // **顶点色软阴影**：内轮廓 alpha = 给定值，向外按二次曲线渐隐到 0；
-        // 所有顶点都落在"内轮廓向外 blur"的范围内（否则会把别的窗口涂黑）。
+        // 所有顶点都落在"本体向外 blur + 最外圈偏移"的范围内（否则会把别的窗口涂黑）。
         let t = table();
         let mut v = Vec::new();
         let mut tr = Vec::new();
         let rect = Rect::new(100.0, 50.0, 200.0, 120.0);
         let (blur, a) = (16.0, 0.6);
+        let offset = Vec2::new(0.0, 4.0);
         let out = push_rounded_shadow(
             &mut v,
             &mut tr,
@@ -1921,28 +1939,55 @@ mod tests {
             rect,
             CornerRadius::all(8.0),
             blur,
+            offset,
             Color::rgba(0.0, 0.0, 0.0, a),
             TEST_UV,
         );
         assert!(out.verts > 0 && out.tris > 0, "应产生几何");
         assert_well_formed(&v, &tr);
-        // 顶点必须全在 `rect` 外扩 blur 的矩形内（含 0.5px 的浮点余量）。
+        // 顶点必须全在 `rect` 外扩 blur、再按 offset 偏移的矩形内（含 0.5px 浮点余量）。
         let (lo, hi) = (
-            Vec2::new(rect.x - blur, rect.y - blur),
-            Vec2::new(rect.x + rect.w + blur, rect.y + rect.h + blur),
+            Vec2::new(rect.x - blur + offset.x, rect.y - blur + offset.y),
+            Vec2::new(
+                rect.x + rect.w + blur + offset.x,
+                rect.y + rect.h + blur + offset.y,
+            ),
         );
         for x in &v {
             let p = Vec2::new(x.pos[0], x.pos[1]);
             assert!(p.x >= lo.x - 0.5 && p.y >= lo.y - 0.5, "顶点越界（外扩）{p:?}");
             assert!(p.x <= hi.x + 0.5 && p.y <= hi.y + 0.5, "顶点越界（外扩）{p:?}");
         }
+        // **本体边缘处浓度最高、且没有等浓度平台**（"窗口阴影下方突出"的根因）：
+        // 本体下缘正下方 1px 处的 alpha 必须**小于**内轮廓的 `a`，且随距离单调下降。
+        let alpha_below = |dy: f32| -> f32 {
+            // 取本体下缘中点正下方 dy 处的 alpha（按圈插值：找包含该点的相邻两圈）。
+            let y = rect.y + rect.h + dy;
+            let mut best = 0.0f32;
+            for i in 0..SHADOW_STEPS {
+                let t0 = i as f32 / SHADOW_STEPS as f32;
+                let t1 = (i + 1) as f32 / SHADOW_STEPS as f32;
+                let y0 = rect.y + rect.h + blur * t0 + offset.y * t0;
+                let y1 = rect.y + rect.h + blur * t1 + offset.y * t1;
+                if y >= y0 && y <= y1 && (y1 - y0) > 1e-3 {
+                    let k = (y - y0) / (y1 - y0);
+                    let a0 = a * (1.0 - t0) * (1.0 - t0);
+                    let a1 = a * (1.0 - t1) * (1.0 - t1);
+                    best = best.max(a0 + (a1 - a0) * k);
+                }
+            }
+            best
+        };
+        let (a1, a2, a3) = (alpha_below(1.0), alpha_below(6.0), alpha_below(12.0));
+        assert!(a1 > 0.0 && a1 < a, "本体边缘外 1px 必须已低于内轮廓浓度（无平台）");
+        assert!(a1 > a2 && a2 > a3, "浓度必须随离本体距离单调下降：{a1} {a2} {a3}");
         // alpha 只有 `a·(1−t)²` 这 `SHADOW_STEPS + 1` 档，且最外圈必须为 0（天然 AA）。
         let mut alphas: Vec<f32> = v.iter().map(|x| x.color[3]).collect();
         alphas.sort_by(|p, q| p.partial_cmp(q).unwrap());
         alphas.dedup_by(|p, q| (*p - *q).abs() < 1e-6);
         assert_eq!(alphas.len(), SHADOW_STEPS as usize + 1, "影调档数 = 段数 + 1");
         assert!((alphas[0]).abs() < 1e-6, "最外圈 alpha 必须为 0");
-        assert!((alphas[alphas.len() - 1] - a).abs() < 1e-5, "最内圈 alpha = 调用方给的值");
+        assert!((alphas[alphas.len() - 1] - a).abs() < 1e-5, "内轮廓 alpha = 调用方给的值");
         // RGB 全程不变（纯 alpha 斜坡，不夹带色偏）。
         assert!(v.iter().all(|x| x.color[0] == 0.0 && x.color[1] == 0.0 && x.color[2] == 0.0));
         // 直角窗口（radius = 0）走同一套弧表，不得产生退化三角形。
@@ -1955,6 +2000,7 @@ mod tests {
             rect,
             CornerRadius::default(),
             blur,
+            offset,
             Color::rgba(0.0, 0.0, 0.0, 0.5),
             TEST_UV,
         );
@@ -1969,7 +2015,17 @@ mod tests {
         let run = |blur: f32, color: Color, r: Rect| {
             let mut v = Vec::new();
             let mut tr = Vec::new();
-            push_rounded_shadow(&mut v, &mut tr, &t, r, CornerRadius::all(6.0), blur, color, TEST_UV)
+            push_rounded_shadow(
+                &mut v,
+                &mut tr,
+                &t,
+                r,
+                CornerRadius::all(6.0),
+                blur,
+                Vec2::ZERO,
+                color,
+                TEST_UV,
+            )
         };
         assert_eq!(run(0.0, Color::rgba(0.0, 0.0, 0.0, 0.5), rect).verts, 0, "blur = 0 不画");
         assert_eq!(run(12.0, Color::rgba(0.0, 0.0, 0.0, 0.0), rect).verts, 0, "全透明不画");

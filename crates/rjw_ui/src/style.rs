@@ -1,4 +1,4 @@
-//! 主题样式：`Theme` + 各控件子样式（默认 / dark 两套预设，可 clone 覆盖）。
+﻿//! 主题样式：`Theme` + 各控件子样式（默认 / dark 两套预设，可 clone 覆盖）。
 
 use std::sync::Arc;
 
@@ -500,7 +500,7 @@ impl Palette {
             handle: Color::rgba_u8(240, 240, 240, 255),
             debug_outline: Color::CYAN,
             scrim: Color::rgba_u8(0, 0, 0, 140),
-            shadow: Color::rgba_u8(0, 0, 0, 56),
+            shadow: Color::rgba_u8(0, 0, 0, 48),
             bevel: 0.02,
         }
     }
@@ -534,7 +534,7 @@ impl Palette {
             handle: Color::rgba_u8(200, 208, 220, 255),
             debug_outline: Color::rgba_u8(96, 200, 255, 255),
             scrim: Color::rgba_u8(0, 0, 0, 180),
-            shadow: Color::rgba_u8(0, 0, 0, 170),
+            shadow: Color::rgba_u8(0, 0, 0, 120),
             bevel: 0.10,
         }
     }
@@ -563,7 +563,7 @@ impl Palette {
             handle: Color::rgba_u8(200, 210, 225, 255),
             debug_outline: Color::rgba_u8(96, 200, 255, 255),
             scrim: Color::rgba_u8(0, 0, 0, 180),
-            shadow: Color::rgba_u8(0, 0, 0, 170),
+            shadow: Color::rgba_u8(0, 0, 0, 120),
             bevel: 0.0,
         }
     }
@@ -743,7 +743,11 @@ impl Default for LabelStyle {
 pub struct ShadowStyle {
     /// 向外渐隐宽度（**逻辑像素**；**0 = 不画投影**）。
     pub blur: f32,
-    /// 相对本体向下的偏移（逻辑像素；模拟光从上方来，投影落在下方）。
+    /// 最外圈相对本体的偏移（逻辑像素；模拟光从上方来，投影**整体**偏下）。
+    ///
+    /// ⚠ 不是"把内轮廓整体下移"：偏移按圈数线性分摊（第 `t` 圈偏 `offset·t`），
+    /// 于是本体边缘处浓度最高且**立即开始衰减**——不会在本体下缘留下一条等浓度暗带
+    /// （那会看起来像"阴影下方突出"）。
     pub offset: Vec2,
     /// 投影颜色（含 alpha；一般半透明黑，见 [`Palette::shadow`]）。
     pub color: Color,
@@ -752,9 +756,9 @@ pub struct ShadowStyle {
 impl Default for ShadowStyle {
     fn default() -> Self {
         Self {
-            blur: 16.0,
-            offset: Vec2::new(0.0, 6.0),
-            color: Color::rgba_u8(0, 0, 0, 96),
+            blur: 14.0,
+            offset: Vec2::new(0.0, 3.0),
+            color: Color::rgba_u8(0, 0, 0, 110),
         }
     }
 }

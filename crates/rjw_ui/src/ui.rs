@@ -1207,7 +1207,8 @@ impl<'a> Ui<'a> {
     /// ⇒ 本体背景、内容、边框都盖在它上面；而窗口自己的整段提交在更低 z 的窗口之后 ⇒
     /// **投影落在下面的窗口上**（正确的投影观感）。
     ///
-    /// `rect` 会按 `shadow.offset` 平移（光从上方来 ⇒ 向下偏），圆角沿用本体 `radius`。
+    /// `rect` 即本体矩形（**内轮廓恒在本体边缘**，浓度从本体边向外单调衰减，没有
+    /// "等浓度暗带"——`shadow.offset` 由镶嵌器按圈数分摊，见 [`crate::tess`]）。
     /// 纯顶点色 + CPU 镶嵌：无纹理、无新 draw call，且**进窗口顶点缓存**（静态窗口零开销）。
     /// `shadow.blur <= 0`（或全透明色）时不产生任何命令。
     pub fn push_panel_shadow(
@@ -1219,16 +1220,11 @@ impl<'a> Ui<'a> {
         if !shadow.is_visible() {
             return;
         }
-        let rect = Rect::new(
-            rect.x + shadow.offset.x,
-            rect.y + shadow.offset.y,
-            rect.w,
-            rect.h,
-        );
         self.push_draw(
             DrawKind::Shadow {
                 color: shadow.color,
                 blur: shadow.blur,
+                offset: shadow.offset,
                 radius: radius.into(),
             },
             rect,
@@ -3781,15 +3777,16 @@ impl<'a> Ui<'a> {
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
                 }
-                DrawKind::Shadow { color, blur, radius } => {
+                DrawKind::Shadow { color, blur, offset, radius } => {
                     // **顶点色软阴影**（无纹理 / 无着色器 / 不增 draw call）。
-                    // `rect` = 阴影**内轮廓**（窗口矩形，可带光源偏移）。
+                    // `rect` = 本体矩形（内轮廓恒在本体边缘，无"等浓度平台"）。
                     let pr = snap_rect(&d.rect);
+                    // 投影的**实际外沿**（最外圈 = 本体外扩 blur 再偏 offset）。
                     let outer = Rect::new(
-                        pr.x - *blur,
-                        pr.y - *blur,
-                        pr.w + *blur * 2.0,
-                        pr.h + *blur * 2.0,
+                        pr.x - *blur + offset.x,
+                        pr.y - *blur + offset.y,
+                        pr.w + (*blur + offset.x.abs()) * 2.0,
+                        pr.h + (*blur + offset.y.abs()) * 2.0,
                     );
                     // 投影**整体**必须在裁剪区内才画：被裁掉一部分时"内轮廓"也跟着变形，
                     // 画出来是一圈错位的暗带（严格裁剪窗口 / 滚动容器内）。那种场景下
@@ -3802,7 +3799,9 @@ impl<'a> Ui<'a> {
                         && local.w > 0.0 && local.h > 0.0 && *blur > 0.0
                     {
                         let table = self.state.tess.table();
-                        quads.push_rounded_shadow(win, &table, local, *radius, *blur, *color);
+                        quads.push_rounded_shadow(
+                            win, &table, local, *radius, *blur, *offset, *color,
+                        );
                     }
                 }
                 DrawKind::Rect(gradient) => {
