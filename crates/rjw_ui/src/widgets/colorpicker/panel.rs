@@ -124,7 +124,7 @@ pub(super) fn show_popup(
     (color_out, inside)
 }
 
-/// 面板背景样式（菜单底 + 细边框 + 小圆角，与下拉框浮层一致）。
+/// 面板背景样式（菜单底 + 细边框 + 小圆角，与下拉框浮层一致；投影沿用主题）。
 fn popup_panel_style(ui: &Ui) -> PanelStyle {
     let cs = ui.theme.combo.clone();
     PanelStyle {
@@ -134,6 +134,7 @@ fn popup_panel_style(ui: &Ui) -> PanelStyle {
         padding: 0.0,
         radius: cs.menu_radius,
         bg_image: None,
+        ..ui.theme.panel.clone()
     }
 }
 

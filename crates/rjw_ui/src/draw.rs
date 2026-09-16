@@ -838,6 +838,17 @@ pub enum DrawKind {
     /// `max(0, radius - width)` 逐角计算；见 `crate::tess::push_rounded_ring`），
     /// 与 [`Self::RoundedRect`] 的圆角语义一致（四角可各自独立）。
     Border { color: Color, width: f32, radius: CornerRadius },
+    /// **窗口 / 面板投影**（**顶点色**软阴影：无纹理、无着色器、不增 draw call）。
+    ///
+    /// `rect` = **阴影内轮廓**（一般就是窗口 / 面板矩形，可先按 [`ShadowStyle::offset`]
+    /// 平移出光源方向），`blur` = 向外渐隐宽度：镶嵌器从内轮廓向外铺若干同心圆角带，
+    /// alpha 二次曲线渐隐到 0（见 `crate::tess::push_rounded_shadow`）。
+    ///
+    /// 遮蔽与元素序：画在窗口背景**之下**（`elem = 0`，且先于背景入队）——于是它
+    /// 覆盖在**更低 z 的窗口**（"投影落在下面的窗口上"）与窗口自身内容之下。
+    ///
+    /// [`ShadowStyle::offset`]: crate::style::ShadowStyle::offset
+    Shadow { color: Color, blur: f32, radius: CornerRadius },
     /// **矢量图标**（画出来的几何，与字体无关）：`rect` 是图标方框，几何取
     /// [`Icon::parts`] 的单位坐标映射进去，并按 `Theme::feather` 做边缘羽化。
     Icon { icon: Icon, color: Color },

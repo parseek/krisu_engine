@@ -75,6 +75,93 @@ pub(crate) const ARC_STEP_PX: f32 = 2.0;
 /// 1 逻辑像素 ≈ 标准 1px 抗锯齿。
 pub(crate) const DEFAULT_FEATHER: f32 = 1.0;
 
+/// 圆角软阴影的**影调段数**（同心轮廓圈数 − 1）。
+///
+/// 单段（内外两圈）的 alpha 是**线性**斜坡，边缘一圈能看出"硬边"；两段折线已足够接近
+/// 高斯的观感（`alpha(t) = a·(1−t)²`），再多就只是顶点数——阴影是**窗口顶点缓存**里
+/// 的静态几何，但每多一圈就多 `4·(segs+1)` 个顶点。
+pub(crate) const SHADOW_STEPS: u32 = 4;
+
+/// **圆角软阴影**（**顶点色**软阴影；无纹理、无着色器、不增 draw call）。
+///
+/// 从内轮廓（`rect`，颜色 = `color`）向外 `blur` 像素铺 [`SHADOW_STEPS`] 段同心圆角带，
+/// 每段颜色 RGB 不变、**alpha 按二次曲线** (`a·(1−t)²`) 渐隐到 0 ⇒ 光栅化器在段内做
+/// 线性插值，整条影调是"二次折线"，落在 0 上的最外圈天然完成抗锯齿（不需要额外羽化圈）。
+///
+/// - `rect` = **阴影内轮廓**（一般就是窗口 / 面板矩形，可先按 `offset` 平移出光源方向）；
+/// - `radius` = 内轮廓圆角（`0` 会被夹到 [`MIN_AA_RADIUS`]：直角窗口的投影走同一套弧表，
+///   0.5px 的圆角在视觉上与直角无异，却能避免内圈点重合产生零面积三角形）；
+/// - `blur <= 0`、`color` 全透明、或退化矩形 ⇒ 不产生任何几何。
+///
+/// 之所以用这个原语：窗口投影若用"大一圈的半透明实心圆角矩形"会得到一个**硬边**黑框，
+/// 而用纹理 / 着色器模糊又违背本仓"UI 只走顶点色 + CPU 镶嵌"的路线。
+pub(crate) fn push_rounded_shadow(
+    verts: &mut Vec<VertexP3U2C4>,
+    tris: &mut Vec<Tri>,
+    table: &CornerTable,
+    rect: Rect,
+    radius: CornerRadius,
+    blur: f32,
+    color: Color,
+    uv: [f32; 2],
+) -> TessOutput {
+    let (w, h) = (rect.w, rect.h);
+    if w <= 0.0 || h <= 0.0 || blur <= 0.0 {
+        return TessOutput { verts: 0, tris: 0 };
+    }
+    let base: [f32; 4] = color.into();
+    if base[3] <= 0.0 {
+        return TessOutput { verts: 0, tris: 0 };
+    }
+    let verts_before = verts.len();
+    let tris_before = tris.len();
+
+    // 半径先夹到放得下；直角走 `MIN_AA_RADIUS`（见函数文档）。
+    let r0 = {
+        let r = if radius.is_zero() {
+            CornerRadius::all(MIN_AA_RADIUS)
+        } else {
+            radius
+        };
+        r.fit(w, h)
+    };
+    // 弧段数由**最外圈**半径决定（那一圈弧最长，需要的段数最多）。
+    let r_out = r0.max() + blur;
+    let stride = table.stride_for(r_out);
+    let segs = CornerTable::segs_of(stride);
+    let n = (4 * (segs + 1)) as u16;
+
+    // 逐圈写入：第 i 圈（i = 0 = 内轮廓）外扩 `blur·i/steps`，alpha = a·(1−t)²。
+    let mut rings: Vec<u16> = Vec::with_capacity(SHADOW_STEPS as usize + 1);
+    for i in 0..=SHADOW_STEPS {
+        let t = i as f32 / SHADOW_STEPS as f32;
+        let d = blur * t;
+        let rr = Rect::new(rect.x - d, rect.y - d, w + d * 2.0, h + d * 2.0);
+        let rad = r0.map(|r| r + d).fit(rr.w, rr.h);
+        let mut c = base;
+        c[3] = base[3] * (1.0 - t) * (1.0 - t);
+        let col = |_i: usize, _p: Vec2| c;
+        rings.push(push_outline(
+            verts,
+            table,
+            stride,
+            segs,
+            &corners_of(rr, rad),
+            &|_p| uv,
+            col,
+        ));
+    }
+    // 相邻两圈之间成带：内圈在前（`push_band` 的绕序约定与边框环带一致）。
+    for pair in rings.windows(2) {
+        push_band(tris, pair[0], pair[1], n);
+    }
+
+    TessOutput {
+        verts: verts.len() - verts_before,
+        tris: tris.len() - tris_before,
+    }
+}
+
 /// 单位四分之一圆弧上的一个点：`(cos t, sin t)`，`t ∈ [0, π/2]`。
 ///
 /// 圆上点的单位外法线就是该点方向本身，故不重复存。
@@ -1819,8 +1906,78 @@ mod tests {
     }
 
     #[test]
-    fn translucent_ring_keeps_its_alpha() {
-        // 同一条约定作用于边框环带：半透明边框必须真的半透明。
+    fn shadow_is_alpha_ramped_ring_within_blur_bounds() {
+        // **顶点色软阴影**：内轮廓 alpha = 给定值，向外按二次曲线渐隐到 0；
+        // 所有顶点都落在"内轮廓向外 blur"的范围内（否则会把别的窗口涂黑）。
+        let t = table();
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        let rect = Rect::new(100.0, 50.0, 200.0, 120.0);
+        let (blur, a) = (16.0, 0.6);
+        let out = push_rounded_shadow(
+            &mut v,
+            &mut tr,
+            &t,
+            rect,
+            CornerRadius::all(8.0),
+            blur,
+            Color::rgba(0.0, 0.0, 0.0, a),
+            TEST_UV,
+        );
+        assert!(out.verts > 0 && out.tris > 0, "应产生几何");
+        assert_well_formed(&v, &tr);
+        // 顶点必须全在 `rect` 外扩 blur 的矩形内（含 0.5px 的浮点余量）。
+        let (lo, hi) = (
+            Vec2::new(rect.x - blur, rect.y - blur),
+            Vec2::new(rect.x + rect.w + blur, rect.y + rect.h + blur),
+        );
+        for x in &v {
+            let p = Vec2::new(x.pos[0], x.pos[1]);
+            assert!(p.x >= lo.x - 0.5 && p.y >= lo.y - 0.5, "顶点越界（外扩）{p:?}");
+            assert!(p.x <= hi.x + 0.5 && p.y <= hi.y + 0.5, "顶点越界（外扩）{p:?}");
+        }
+        // alpha 只有 `a·(1−t)²` 这 `SHADOW_STEPS + 1` 档，且最外圈必须为 0（天然 AA）。
+        let mut alphas: Vec<f32> = v.iter().map(|x| x.color[3]).collect();
+        alphas.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        alphas.dedup_by(|p, q| (*p - *q).abs() < 1e-6);
+        assert_eq!(alphas.len(), SHADOW_STEPS as usize + 1, "影调档数 = 段数 + 1");
+        assert!((alphas[0]).abs() < 1e-6, "最外圈 alpha 必须为 0");
+        assert!((alphas[alphas.len() - 1] - a).abs() < 1e-5, "最内圈 alpha = 调用方给的值");
+        // RGB 全程不变（纯 alpha 斜坡，不夹带色偏）。
+        assert!(v.iter().all(|x| x.color[0] == 0.0 && x.color[1] == 0.0 && x.color[2] == 0.0));
+        // 直角窗口（radius = 0）走同一套弧表，不得产生退化三角形。
+        let mut v2 = Vec::new();
+        let mut tr2 = Vec::new();
+        push_rounded_shadow(
+            &mut v2,
+            &mut tr2,
+            &t,
+            rect,
+            CornerRadius::default(),
+            blur,
+            Color::rgba(0.0, 0.0, 0.0, 0.5),
+            TEST_UV,
+        );
+        assert_well_formed(&v2, &tr2);
+        assert!(v2.iter().all(|x| x.color[3] <= 0.5 + 1e-6));
+    }
+
+    #[test]
+    fn shadow_skips_when_invisible_or_degenerate() {
+        let t = table();
+        let rect = Rect::new(0.0, 0.0, 100.0, 60.0);
+        let run = |blur: f32, color: Color, r: Rect| {
+            let mut v = Vec::new();
+            let mut tr = Vec::new();
+            push_rounded_shadow(&mut v, &mut tr, &t, r, CornerRadius::all(6.0), blur, color, TEST_UV)
+        };
+        assert_eq!(run(0.0, Color::rgba(0.0, 0.0, 0.0, 0.5), rect).verts, 0, "blur = 0 不画");
+        assert_eq!(run(12.0, Color::rgba(0.0, 0.0, 0.0, 0.0), rect).verts, 0, "全透明不画");
+        assert_eq!(run(12.0, Color::rgba(0.0, 0.0, 0.0, 0.5), Rect::new(0.0, 0.0, 0.0, 60.0)).verts, 0, "退化矩形不画");
+    }
+
+    #[test]
+    fn translucent_ring_keeps_its_alpha() {        // 同一条约定作用于边框环带：半透明边框必须真的半透明。
         let t = table();
         let mut v = Vec::new();
         let mut tr = Vec::new();

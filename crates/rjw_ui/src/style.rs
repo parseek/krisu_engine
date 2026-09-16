@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use glam::Vec2;
 use rjw_color::Color;
 use rjw_text::Align;
 
@@ -217,6 +218,7 @@ impl PanelStyle {
         self.border_w = m(self.border_w);
         self.padding = m(self.padding);
         self.radius = self.radius.scaled_rounded(s);
+        self.shadow = self.shadow.scaled(s);
         self
     }
 }
@@ -456,6 +458,11 @@ pub struct Palette {
     pub debug_outline: Color,
     /// 模态遮罩。
     pub scrim: Color,
+    /// **投影**（窗口 / 面板 / 浮层的软阴影；`PanelStyle::shadow.color`）。
+    ///
+    /// 语义是"本体下方的暗部"：浅色主题用淡黑（投影落在浅底上很显眼），深色主题要更黑
+    /// （落在深底上否则看不出来）。
+    pub shadow: Color,
     /// **表面微渐变强度**（0 = 纯平色）。见 [`bevel_raised`] / [`bevel_sunken`]。
     ///
     /// 深色下一点明暗差能把相邻表面"分"开；浅色主题通常取更小值或 0（扁平观感）。
@@ -493,6 +500,7 @@ impl Palette {
             handle: Color::rgba_u8(240, 240, 240, 255),
             debug_outline: Color::CYAN,
             scrim: Color::rgba_u8(0, 0, 0, 140),
+            shadow: Color::rgba_u8(0, 0, 0, 56),
             bevel: 0.02,
         }
     }
@@ -526,6 +534,7 @@ impl Palette {
             handle: Color::rgba_u8(200, 208, 220, 255),
             debug_outline: Color::rgba_u8(96, 200, 255, 255),
             scrim: Color::rgba_u8(0, 0, 0, 180),
+            shadow: Color::rgba_u8(0, 0, 0, 170),
             bevel: 0.10,
         }
     }
@@ -554,6 +563,7 @@ impl Palette {
             handle: Color::rgba_u8(200, 210, 225, 255),
             debug_outline: Color::rgba_u8(96, 200, 255, 255),
             scrim: Color::rgba_u8(0, 0, 0, 180),
+            shadow: Color::rgba_u8(0, 0, 0, 170),
             bevel: 0.0,
         }
     }
@@ -570,11 +580,15 @@ impl LabelStyle {
 }
 
 impl PanelStyle {
-    /// 从调色板派生：`surface` 面板 + 常规描边（背景带调色板强度的微渐变）。
+    /// 从调色板派生：`surface` 面板 + 常规描边（背景带调色板强度的微渐变）+ `shadow` 投影色。
     pub fn themed(p: &Palette) -> Self {
         Self {
             bg: bevel_raised(p.surface, p.bevel),
             border: p.border,
+            shadow: ShadowStyle {
+                color: p.shadow,
+                ..ShadowStyle::default()
+            },
             ..Self::default()
         }
     }
@@ -720,6 +734,50 @@ impl Default for LabelStyle {
     }
 }
 
+/// **投影样式**（窗口 / 面板的**顶点色软阴影**：无纹理、无着色器、不增 draw call）。
+///
+/// 实现见 `crate::tess::push_rounded_shadow`：从面板矩形向外 `blur` 像素铺若干同心圆角带，
+/// alpha 按二次曲线渐隐到 0。因为完全是顶点色，它**进窗口顶点缓存**——窗口内容不变时
+/// 零额外开销，也不增加 draw call（与背景同纹理同变换，合批成一段）。
+#[derive(Clone, Copy, Debug)]
+pub struct ShadowStyle {
+    /// 向外渐隐宽度（**逻辑像素**；**0 = 不画投影**）。
+    pub blur: f32,
+    /// 相对本体向下的偏移（逻辑像素；模拟光从上方来，投影落在下方）。
+    pub offset: Vec2,
+    /// 投影颜色（含 alpha；一般半透明黑，见 [`Palette::shadow`]）。
+    pub color: Color,
+}
+
+impl Default for ShadowStyle {
+    fn default() -> Self {
+        Self {
+            blur: 16.0,
+            offset: Vec2::new(0.0, 6.0),
+            color: Color::rgba_u8(0, 0, 0, 96),
+        }
+    }
+}
+
+impl ShadowStyle {
+    /// 预乘 DPI scale（模糊宽 / 偏移 × s 取整；颜色不变）。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.blur = m(self.blur);
+        self.offset = Vec2::new(m(self.offset.x), m(self.offset.y));
+        self
+    }
+
+    /// 是否会产生几何（`blur <= 0` 或全透明色 ⇒ 不画）。
+    #[inline]
+    pub fn is_visible(&self) -> bool {
+        self.blur > 0.0 && <[f32; 4]>::from(self.color)[3] > 0.0
+    }
+}
+
 /// 面板（背景 + 边框）样式。
 #[derive(Clone, Debug)]
 pub struct PanelStyle {
@@ -737,6 +795,10 @@ pub struct PanelStyle {
     /// 典型用途：窗口 / 面板的纹理底（木纹、纸张、渐变图、平铺图案）。`bg` 仍可
     /// 作为底色（图片半透明时透出）。
     pub bg_image: Option<crate::draw::ImageBg>,
+    /// **投影**（窗口 / 面板 / 浮层的软阴影；`blur = 0` = 不画）。
+    ///
+    /// 画在本体**之下**、**更低 z 的窗口之上**（"投影落在下面的窗口上"）。
+    pub shadow: ShadowStyle,
 }
 
 impl Default for PanelStyle {
@@ -748,6 +810,7 @@ impl Default for PanelStyle {
             padding: 8.0,
             radius: CornerRadius::default(),
             bg_image: None,
+            shadow: ShadowStyle::default(),
         }
     }
 }
@@ -1032,6 +1095,21 @@ impl PanelStyle {
     /// **背景图**（画在 `bg` 之上、内容之下；圆角遮罩恒用面板 `radius`）。
     pub fn with_bg_image(mut self, img: crate::draw::ImageBg) -> Self {
         self.bg_image = Some(img);
+        self
+    }
+    /// **投影**（整对象替换：模糊宽 / 偏移 / 颜色一起换）。
+    pub fn with_shadow(mut self, shadow: ShadowStyle) -> Self {
+        self.shadow = shadow;
+        self
+    }
+    /// **投影颜色**（只改色，模糊宽 / 偏移沿用现值）。
+    pub fn with_shadow_color(mut self, c: Color) -> Self {
+        self.shadow.color = c;
+        self
+    }
+    /// **关闭投影**（等价 `blur = 0`；语义与 `debug_layout()` / `without_debug_layout()` 同风格）。
+    pub fn without_shadow(mut self) -> Self {
+        self.shadow.blur = 0.0;
         self
     }
 }

@@ -1201,6 +1201,41 @@ impl<'a> Ui<'a> {
         self.push_panel_like_img(rect, bg, None, border, border_w, radius, elem);
     }
 
+    /// **投影**（窗口 / 面板的**顶点色软阴影**；控件作者绘制原语）。
+    ///
+    /// 画在 `rect`（本体矩形）**之下**：命令 `elem = 0`（容器装饰层，先于本体背景入队）
+    /// ⇒ 本体背景、内容、边框都盖在它上面；而窗口自己的整段提交在更低 z 的窗口之后 ⇒
+    /// **投影落在下面的窗口上**（正确的投影观感）。
+    ///
+    /// `rect` 会按 `shadow.offset` 平移（光从上方来 ⇒ 向下偏），圆角沿用本体 `radius`。
+    /// 纯顶点色 + CPU 镶嵌：无纹理、无新 draw call，且**进窗口顶点缓存**（静态窗口零开销）。
+    /// `shadow.blur <= 0`（或全透明色）时不产生任何命令。
+    pub fn push_panel_shadow(
+        &mut self,
+        rect: Rect,
+        shadow: &crate::style::ShadowStyle,
+        radius: impl Into<CornerRadius>,
+    ) {
+        if !shadow.is_visible() {
+            return;
+        }
+        let rect = Rect::new(
+            rect.x + shadow.offset.x,
+            rect.y + shadow.offset.y,
+            rect.w,
+            rect.h,
+        );
+        self.push_draw(
+            DrawKind::Shadow {
+                color: shadow.color,
+                blur: shadow.blur,
+                radius: radius.into(),
+            },
+            rect,
+            0,
+        );
+    }
+
     /// 同 [`Self::push_panel_like`]，另带可选**背景图**（[`ImageBg`]）。
     ///
     /// 绘制层次：**背景刷 → 背景图 → 边框**（图在刷之上，半透明图能透出底色；边框
@@ -2554,6 +2589,7 @@ impl<'a> Ui<'a> {
         }
         // 背景 + 边框（depth = 进入前深度，画在子控件之下；radius > 0 走圆角双层矩形）
         let bg_rect = Rect::new(0.0, 0.0, size.x, size.y);
+        self.push_panel_shadow(bg_rect, &style.shadow, style.radius);
         self.push_panel_like_img(bg_rect, style.bg, style.bg_image, style.border, style.border_w, style.radius, 0);
         // 平移全部（子命令 + 背景/边框）：
         // 用 `display_pos`（拖拽中 = 本帧新位置）→ 文字/矩形**当帧生效**。
@@ -2854,6 +2890,7 @@ impl<'a> Ui<'a> {
         }
         // 背景 + 边框（win = z，画在窗口子控件之下；radius > 0 走圆角双层矩形）
         let bg_rect = Rect::new(0.0, 0.0, size.x, size.y);
+        self.push_panel_shadow(bg_rect, &style.shadow, style.radius);
         self.push_panel_like_img(bg_rect, style.bg, style.bg_image, style.border, style.border_w, style.radius, 0);
         // 固定宽窗口：右下角缩放柄图案（3 条递减小斜杠；窗口局部坐标，随窗口平移）
         if width.is_some() {
@@ -3743,6 +3780,30 @@ impl<'a> Ui<'a> {
                             quads.push_rounded(win, &table, local, *radius, self.theme.feather, c);
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
+                }
+                DrawKind::Shadow { color, blur, radius } => {
+                    // **顶点色软阴影**（无纹理 / 无着色器 / 不增 draw call）。
+                    // `rect` = 阴影**内轮廓**（窗口矩形，可带光源偏移）。
+                    let pr = snap_rect(&d.rect);
+                    let outer = Rect::new(
+                        pr.x - *blur,
+                        pr.y - *blur,
+                        pr.w + *blur * 2.0,
+                        pr.h + *blur * 2.0,
+                    );
+                    // 投影**整体**必须在裁剪区内才画：被裁掉一部分时"内轮廓"也跟着变形，
+                    // 画出来是一圈错位的暗带（严格裁剪窗口 / 滚动容器内）。那种场景下
+                    // 投影本来也会被裁掉，直接跳过更干净。
+                    let fully_visible = clip_abs.is_none_or(|c| c.contains(&outer));
+                    if fully_visible
+                        && let Some(local) = clipped(pr, clip_abs).map(|r| {
+                            Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
+                        })
+                        && local.w > 0.0 && local.h > 0.0 && *blur > 0.0
+                    {
+                        let table = self.state.tess.table();
+                        quads.push_rounded_shadow(win, &table, local, *radius, *blur, *color);
+                    }
                 }
                 DrawKind::Rect(gradient) => {
                     let pr = snap_rect(&d.rect);
@@ -5097,6 +5158,7 @@ impl Ui<'_> {
                 menu_w = menu_w.max(tw + cs.item_pad_x * 2.0 + cs.font_size);
             }
             // 浮层窗口背景 = 菜单面板样式（window builder `.style` 覆盖默认 Theme::panel）。
+            // 投影沿用主题（浮层更该"浮起来"），故整对象从主题 clone 后只改菜单相关字段。
             let panel_style = PanelStyle {
                 bg: cs.menu_bg.into(),
                 border: cs.menu_border,
@@ -5104,6 +5166,7 @@ impl Ui<'_> {
                 padding: 0.0,
                 radius: cs.menu_radius,
                 bg_image: None,
+                ..self.theme.panel.clone()
             };
             let popup_size = self
                 .window(&popup_id)
