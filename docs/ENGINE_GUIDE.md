@@ -1106,6 +1106,12 @@ ui.end_frame(r2d);   // 帧收尾 + 免全量排序提交（视口/渲染器此�
 - **白纹理合批（单窗口一次 DrawCall）**：WHITE 基础纹理（1×1，`clamp_margin`）预置进**字形图集页**（[`rjw_text::Text::white_region`]；`DynamicAtlas::white` 为与 key 无关的内置槽位，参与 compact 重排）——实心填充（Solid / 边框 / 光标 / 调试叠加）与字形**同页同纹理**：按控件级顺序提交（背景+文字相邻）且同纹理，Render2D 合批为**单个 draw call**，省去图形↔文字的纹理状态切换。字形本体保持 `InsertOpts::no_clamp()`（避免 clamp margin 挤压）。
 - **窗口 transform**：四边形顶点为**相对窗口原点的局部像素**，提交时经 `screen_fixed_tf(窗口原点)` 变换到世界——**移动窗口只改变换、顶点不变**（也支持将窗口嵌入游戏场景，给任意世界变换）。`quads` / `mesh(..).transform(..)` 均支持 `Transform2D`（`IDENTITY` = 顶点即世界坐标）。
 - **窗口顶点缓存**：窗口内容不变时，四边形顶点**跨帧缓存**（`UiState.window_quads` 按**内容签名**命中）——静态窗口每帧零字形收集/重建；hover 变色、文字编辑等任何内容变化都会使签名变化而自动重建。**移动窗口不影响缓存**（顶点是局部的，transform 每帧用当前原点）。
+- **win=0（非窗口）放置子槽缓存**：顶层 `pack_at` / `flex_at` / `scroll_at` / `add_at` 等各自一个**子槽**（`UiState.z0_quads`），逐槽全量签名 —— 一处变化只重建那一槽。
+  ⚠ **两个坑（都踩过，实测把 UI 帧时间翻倍）**：
+  1. **键必须带段号**：组号是"**段内**第几个顶层放置"（`Ui::z0_ranges` 随 `Ui` 视图每段重建），各段都从 0 起且兜底组恒为 0 ⇒ 只用组号会让不同段的同号槽**互相覆盖**，每帧交替 miss；
+  2. **陈旧清理必须按帧、且只做一次**：清理语句若写在**段收尾**，一次调用只见到本段的槽，会把同帧其它段刚写好的缓存删掉。
+  正确做法：键 = `(段号, 组号)`，清理在**下一帧开场**按"上一帧的完整槽集合"（`UiFrameState::z0_seen`）做一次。验证：`collect` 602µs → 2µs、`cache_miss` 7 → 0（`--frames 240` + `RJ_CACHE_TRACE=1`）。
+- **帧时间三分解**：`UiStats` 的 `ui_frame_us ≈ prologue_us`（各段开场：懒开场 / 冻结输入 / 装载帧级事实 / 建根容器）`+ 应用录制（含主题构造）+ finish_us`（分桶 → 顶点 → 提交）。排查"UI 变慢了"先看这三项，能立刻分清**引擎 bug** 还是**应用内容增长**（示例 `[perf]` 行直接打印）。
 - **深度测试**：`RStates::default()` 深度测试**默认关闭**，QuadVertices 纯 2D 覆盖无需深度；世界层需要深度时用 `render2d.states_mut(RStates::new().depth_test(true))`（UI 独立 Render2D 不受影响）。
 - **独立 UI 渲染（推荐）**：UI 录制到**单独 Render2D**（`Render2D::set_sort_mode(SortMode::None)` 关闭排序，UI 自行管理绘制顺序），与世界合并提交：`r2d.encode(clear, &view, None)`（世界）→ `r2d_ui.encode(...)`（UI，color: None 不覆盖）→ `queue.submit([cb_world, cb_ui])` → `queue.present(st)`（一次 present）。
 - **输入屏蔽**：文本输入框聚焦时应用快捷键不应触发——检查 `ui.state().text_focus()`（`Some` 表示**文本控件**持焦点；如示例中 `R` 重置 / `Esc` 退出前）；输入框内 `Esc` 取消焦点（不再传给应用层）。
@@ -1173,10 +1179,26 @@ theme.debug.layout_outline_width = 2.0;        // 2 物理像素宽
 
 **点击穿透（窗口遮挡）**：重叠区域**只有鼠标下最上层窗口**的控件响应——`hit_abs`
 （所有控件共用）与窗口/面板自身的拖拽命中都过 `window_occluded(z, mouse, window_rects)`
-闸门（`z=0` 的非窗口内容被任意窗口遮挡）；窗口矩形跨帧缓存于 `UiState.window_rects`
-（`ui.window(id)` 录制时更新，`finish` 末尾只保留本帧录制过的窗口，销毁/置顶换 z 的旧条目
-自动清理）。已知边界：窗口**首次出现的那一帧**矩形尚不可知（跨帧缓存盲区），下一帧起
-严格生效——置顶方向从第一帧就正确（`win_press_top` 只保留最上层按下窗口）。
+闸门（`z=0` 的非窗口内容被任意窗口遮挡）。要素（**踩过坑，别改回去**）：
+
+- **表按窗口绝对 ID 键**（`UiState::window_rects`），查询时把 ID 解成**当前 z**
+  （`Ui::window_rects_iter`）：z 会在帧末被"点击置顶"抬到 `max+1`，而矩形是那一刻录下的；
+  按 z 存 + 按旧 z 比较，会让**刚被抬高的窗口"消失一帧"**——它画在上面却挡不住本在它下面
+  （但 z 大于它旧 z）的窗口的控件；
+- **表跨帧存活**：矩形 = 窗口盒子 ∪ 本帧子控件命中区（`Ui::win_hit_bounds`），录制时按 ID
+  写入；陈旧清理在**帧末**、数据源是 `UiFrameState::window_ids_seen`（帧级清单）。
+  ⚠ **不要用本视图的 `win_ids` / `win_origins` 去清**：它们在同帧更早的 `finish()` 末尾
+  已被 `save_frame_state()` swap 走（空表）⇒ 会把整张遮挡表**每帧清光**，遮挡判定退化成
+  "只看本帧已录制的窗口"，于是**本帧录在后面的窗口挡不住前面窗口的控件**
+  （"被遮挡的控件仍被触发"，用 `--sim-cover` 可复现，见 `docs/DEBUGGING.md` §8.2）；
+- **帧末复核按下归属**（`Ui::resolve_widget_press`）：命中那一刻本帧几何可能还没录完
+  （盖住我的窗口本帧才移过来），而**帧末**所有窗口都录完了——于是帧末再看一次"我是不是
+  被更高 z 的窗口盖住"，是则撤销这次认领（清 `pressed` / `clicked` / `dragging`），
+  诊断计数 `UiState::press_cancelled_by_window()`。它保证的是**状态不延续**（不会一直拖到
+  释放）；同帧内按下 + 抬起（极快点击）不受保护——所以控件作者**别在 `down_edge` 上直接
+  执行一次性动作**，用 `hit::update_interact` + `clicked()`（释放帧才成立，天然安全）。
+- 已知边界：窗口**首次出现的那一帧**矩形尚不可知（跨帧缓存盲区），下一帧起严格生效——
+  置顶方向从第一帧就正确（`win_press_top` 只保留最上层按下窗口）。
 
 **点击穿透（控件遮挡）**：**同一窗口 / 面板内**的重叠控件同理——`ui.hit_abs(控件绝对 id, rect)`
 登记的命中区域按**录制次序**（后录制 = 画在上面）比较，鼠标下若有更上层的**别的控件**覆盖，

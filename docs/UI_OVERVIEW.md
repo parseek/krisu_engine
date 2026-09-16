@@ -140,6 +140,14 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 通用原语，持久于 `UiState.window_widths` / `UiState.sizes`）。`.placement(Placement::Clip)`
 内容严格裁剪（Clip 沙箱）；默认 `.placement(Expand)`（内容自动换行 / 撑高）。
 
+**窗口遮挡（重叠区只有最上层窗口可交互）**：判定表 `UiState.window_rects` **按窗口绝对 ID
+键、跨帧存活**（矩形 = 窗口盒子 ∪ 本帧子控件命中区），查询时把 ID 解成**当前 z**——z 会在
+帧末被"点击置顶"改，按旧 z 比较会让刚抬高的窗口"消失一帧"。另加一道**帧末复核**
+（`Ui::resolve_widget_press`）：命中那一刻本帧几何可能还没录完，帧末所有窗口都录完了，再看
+一次"我是不是被更高 z 的窗口盖住"，是则撤销这次按下认领（清 `pressed` / `clicked` /
+`dragging`，计数 `UiState::press_cancelled_by_window()`）。两条真实路径（同帧移动 / 应用改 z）
+用 `--sim-cover` 脚本化守护，见 `docs/DEBUGGING.md` §8.2。
+
 ### 8. 文本编辑（`edit.rs` 纯逻辑，可单测）
 
 - 编辑状态机 `apply_frame_edits`：剪贴板（Ctrl+C/V/X/A）→ 选择替换 → IME 上屏 →

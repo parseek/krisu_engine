@@ -1189,6 +1189,9 @@ let theme = rjw_ui::Theme::themed(&p);
 | `window_under_mouse` | `ui.window_under_mouse() -> Option<(String, u32)>` | 诊断：鼠标下**最上层**窗口（重叠点击时唯一可交互的窗口） |
 | `UiState::last_press_window` | `state.last_press_window() -> Option<(&str, u32)>` | 诊断：上次按下由哪个窗口接收（重叠点击"赢家"） |
 | `UiState::occluded_hits` | `state.occluded_hits() -> u32` | 诊断：上帧**命中但被更高窗口遮挡而未响应**的控件次数（点击穿透拦截计数） |
+| `UiState::widget_occluded_hits` | `state.widget_occluded_hits() -> u32` | 诊断：上帧**命中但被同窗口内更上层控件遮挡而未响应**的次数（控件级遮挡拦截计数） |
+| `UiState::press_cancelled_by_window` | `state.press_cancelled_by_window() -> u32` | 诊断：上帧**认领按下后被帧末复核撤销**的次数——命中那一刻被判"没被遮挡"、而帧末完备的遮挡表表明它其实被更高 z 的窗口盖住了（见 `Ui::resolve_widget_press`；应为 0） |
+| `UiStats::prologue_us` | `stats.prologue_us`（f64，µs） | 各段**开场**耗时（懒开场 / 冻结输入 / 装载帧级事实 / 建根容器）。与 `finish_us` 一起把 `ui_frame_us` 三分解：`prologue + 应用录制 + finish` |
 
 > 世界坐标调试图元（游戏场景：碰撞盒 / 网格 / 速度矢量）见 `rjw_2d_render::debug_draw`
 > （`draw_line` / `draw_rect_outline` / `draw_circle_outline` / `draw_circle_filled` /

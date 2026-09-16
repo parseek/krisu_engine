@@ -287,6 +287,11 @@
 //! - 命中不生效？先查**窗口遮挡**（`UiState::occluded_hits`，重叠窗口只让最上层可交互）、
 //!   **控件级遮挡**（`UiState::widget_occluded_hits`，同窗口内重叠控件只让最上层可交互）
 //!   与**强制裁剪层**（`Scroll` / Clip 沙箱外命中失效）。
+//! - **别在 `down_edge` 上直接执行一次性动作**：命中那一刻本帧几何可能还没录完（盖住你的
+//!   窗口本帧才移过来 / 才被抬高 z），引擎会在**帧末**用完备的遮挡表复核并撤销这次认领
+//!   （清 `pressed` / `clicked` / `dragging`，计数 `UiState::press_cancelled_by_window()`）
+//!   ——**状态**会被回滚，但你在那一帧已经执行的副作用回不来。用
+//!   `hit::update_interact` + `Response::clicked`（释放帧才成立）就天然安全。
 
 
 use glam::Vec2;

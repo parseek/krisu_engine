@@ -52,6 +52,10 @@ use rjw_krusie::ui::{
 mod overlap;
 use overlap::OverlapDemo;
 
+/// 「上层窗口没挡住背后窗口的控件」脚本化复现（`--sim-cover`）。
+mod cover;
+use cover::CoverDemo;
+
 /// 顶部状态栏模块：FPS / 点击次数标签 + 字体按钮（打开 Modal）+ 玩家名输入框 + 字体 Modal。
 struct TopBar {
     /// 玩家名输入框内容（跨帧持久）。
@@ -879,6 +883,12 @@ struct UiApp {
     sim_click: Option<Vec2>,
     /// 「重叠控件」演示（两个探针的点击计数）。
     overlap: OverlapDemo,
+    /// --sim-cover：**脚本化复现**"被上层窗口盖住的控件仍收到按下"（见 `cover` 模块）。
+    sim_cover: bool,
+    /// 「被遮挡控件仍被触发」复现器。
+    cover: CoverDemo,
+    /// `--sim-cover` 段 A 结束时的认领次数（段 B 不许再涨）。
+    cover_starts_after_a: u32,
     /// --image <路径>：**加载用户图片文件**当背景图（`ImageBg`；PNG / JPEG / BMP / GIF），
     /// 替代内建棋盘纹理——四个窗口仍分别演示四种铺排（`ImageFit`）。
     image_file: Option<String>,
@@ -912,6 +922,9 @@ impl UiApp {
             sim_overlap: false,
             sim_click: None,
             overlap: OverlapDemo::default(),
+            sim_cover: false,
+            cover: CoverDemo::default(),
+            cover_starts_after_a: 0,
             image_file: None,
             font_file: None,
             perf: PerfAgg::new(),
@@ -930,6 +943,8 @@ struct PerfAgg {
     frames: u32,
     frame_us: f64,
     ui_us: f64,
+    /// 各段开场（引擎：懒开场 / 冻结输入 / 装载帧级事实 / 建根容器）累计。
+    prologue_us: f64,
     finish_us: f64,
     render_us: f64,
     begin_us: f64,
@@ -956,6 +971,7 @@ impl PerfAgg {
             frames: 0,
             frame_us: 0.0,
             ui_us: 0.0,
+            prologue_us: 0.0,
             finish_us: 0.0,
             render_us: 0.0,
             begin_us: 0.0,
@@ -989,6 +1005,7 @@ impl PerfAgg {
         self.frames += 1;
         self.frame_us += frame_us;
         self.ui_us += s.ui_frame_us;
+        self.prologue_us += s.prologue_us;
         self.finish_us += s.finish_us;
         self.render_us += render_us;
         self.begin_us += begin_us;
@@ -1009,14 +1026,19 @@ impl PerfAgg {
     /// 打印近 N 帧均值（ms / µs）后清零。
     fn flush(&mut self, fps: f64) {
         let n = self.frames.max(1) as f64;
+        // `record` = 应用侧录制（控件代码 + 主题构造）= 整帧 − 引擎开场 − 引擎收尾。
+        // 三分解是"UI 时间翻倍"排查的第一把尺子：引擎 bug 还是应用内容增长，一眼可分。
+        let ui_ms = self.ui_us / n / 1000.0;
+        let prologue_ms = self.prologue_us / n / 1000.0;
+        let finish_ms = self.finish_us / n / 1000.0;
+        let record_ms = (ui_ms - prologue_ms - finish_ms).max(0.0);
         println!(
-            "[perf] fps={fps:.0} frame={:.2}ms ui={:.2}ms finish={:.2}ms \
+            "[perf] fps={fps:.0} frame={:.2}ms ui={ui_ms:.2}ms (prologue={prologue_ms:.2} \
+             record={record_ms:.2} finish={finish_ms:.2}) \
              | ui: sort={:.1}us sig={:.1}us collect={:.1}us clone={:.1}us submit={:.1}us \
              | render: total={:.2}ms begin={:.1}us encode={:.1}us submit={:.1}us present={:.1}us \
              | cmds={:.0} wins={:.0} cache_hit={:.0} cache_miss={:.0}",
             self.frame_us / n / 1000.0,
-            self.ui_us / n / 1000.0,
-            self.finish_us / n / 1000.0,
             self.sort_us / n,
             self.sig_us / n,
             self.collect_us / n,
@@ -1251,6 +1273,31 @@ impl App for UiApp {
             }
         }
 
+        // ── 调试：脚本化鼠标（`--sim-cover`）───────────────────────
+        // 两段脚本，各自暴露一条"遮挡表与本帧几何不同步"的路径（详见 `cover` 模块文档）：
+        //   段 A（帧 30）**同帧移动**：移动窗本帧才移到探针上，按下也在本帧；
+        //   段 B（帧 60）**应用改 z**：录制前把移动窗 z 抬到最前（不占鼠标键），本帧再按下。
+        // 命中点由 `cover` 模块按本帧结算尺寸解算（`overlap` 模块同一套"不写死像素"做法）。
+        // z 的改动在段内、`cover.ui` **之前**做（见下方录制处）——那正是"应用置顶"的时机。
+        let mut cover_over = false;
+        if self.sim_cover {
+            let n = f.frames();
+            let p = self.cover.probe_point;
+            cover_over = n >= 30;
+            // 注入**只对下一帧生效**（引擎把边沿合成到下一帧快照）。于是要让"按下那一帧"
+            // 正好是"几何变化那一帧"（缺陷窗口），注入必须比几何变化**早一帧**：
+            // 段 A 几何在 `n = 30` 变（按下注入在 n=30 ⇒ 落在同一帧）；
+            // 段 B z 在 `n = 59` 变（注入同样在 n=59）。
+            match n {
+                1..=29 => f.debug_inject_mouse(Vec2::new(1800.0, 1050.0), false),
+                30..=33 => f.debug_inject_mouse(p, true), // 段 A：同帧移动 + 按下
+                34..=58 => f.debug_inject_mouse(Vec2::new(1800.0, 1050.0), false),
+                59..=62 => f.debug_inject_mouse(p, true), // 段 B：同帧改 z + 按下
+                63..=75 => f.debug_inject_mouse(Vec2::new(1800.0, 1050.0), false),
+                _ => {}
+            }
+        }
+
         // ── 调试：脚本化鼠标（`--sim-click X,Y`）──────────────────
         // 在**指定屏幕物理点**按下 + 释放（第 20/21 帧，之后停在原地到第 40 帧）——
         // 配合 `RJ_HIT_TRACE=1`（引擎打印每次命中归属）就能回答"这一像素到底是谁的"：
@@ -1289,6 +1336,8 @@ impl App for UiApp {
         let sim_picker = self.sim_picker;
         let sim_overlap = self.sim_overlap;
         let sim_click = self.sim_click;
+        // `--sim-cover`：本帧移动窗是否移到探针上（脚本解算，与录制同源）。
+        let sim_cover = self.sim_cover;
         // `--sim-overlap`：本帧被**控件级遮挡**拦下的命中次数（重叠区里下层探针的那次）。
         let mut widget_blocked = 0u32;
         // 本帧被**窗口遮挡**拦下的命中次数（`--sim-click` 诊断用）。
@@ -1359,6 +1408,18 @@ impl App for UiApp {
             self.windows.ui(&mut ui, &mut clicks);
             // 重叠控件探针（顶层 win=0；位置在全屏所有窗口下方 ⇒ 不会被窗口遮挡）。
             self.overlap.ui(&mut ui);
+            // 「被遮挡控件仍被触发」复现（`--sim-cover`）：z 改动在**录制前**做——那正是
+            // "应用把某窗口置顶"的时机（本帧它按新 z 绘制，而遮挡表里还是上一帧的旧 z）。
+            if sim_cover {
+                if sim_frame == 50 {
+                    // 段 B 前置：把移动窗压到探针窗**之下**（此时它盖住探针也不算"该挡住"）。
+                    CoverDemo::lower_mover_z(&mut ui);
+                } else if sim_frame == 59 {
+                    // 段 B：本帧把它抬到最前——本帧它画在探针之上，而遮挡表里还是旧 z。
+                    CoverDemo::lift_mover(&mut ui);
+                }
+                self.cover.ui(&mut ui, cover_over);
+            }
             // `--ui-dump`：段 1 也打印一份——两段应打印**同一个 `frame=`**（帧号每帧只 +1），
             // 且段 2 那份还应包含段 1 录的窗口（帧级暂存跨段共享）。
             if ui_dump {
@@ -1466,6 +1527,36 @@ impl App for UiApp {
             );
         }
 
+        // --sim-cover：**被上层窗口盖住的控件不该收到按下**。
+        // 判定口径（两段各管一处修复，见 `cover` 模块文档）：
+        // - `covered_drags`：被盖住却还带着拖拽状态进来（错误认领的按下会一直拖到释放）
+        //   —— 帧末复核（`Ui::resolve_widget_press`）必须把它压成 0；
+        // - 段 B 的 `starts` **不许再涨**：遮挡表按窗口 ID 跨帧存活后，"应用改 z"那一帧
+        //   就不该再让被盖住的控件认领按下。
+        // 段 A（同帧移动）的 `starts` 允许为 1：命中发生在几何变化那一帧，那一刻**本帧
+        // 几何还没录完**，任何帧内判定都拿不到新位置——这条只能靠帧末复核兜住后果。
+        if sim_cover && (f.frames() == 42 || f.frames() == 72) {
+            let (s, d) = (self.cover.starts, self.cover.covered_drags);
+            if f.frames() == 42 {
+                self.cover_starts_after_a = s;
+                let ok = d == 0 && self.cover.covers;
+                eprintln!(
+                    "sim-cover[A 同帧移动]: 认领按下={s} / 被盖住却还在拖={d} 帧 / 移动窗确实盖住探针={} {}",
+                    self.cover.covers,
+                    if ok { "[OK] 被盖住的控件没留下按下状态" } else { "[FAIL] 被盖住的控件带着按下状态继续拖" }
+                );
+            } else {
+                let no_new = s == self.cover_starts_after_a;
+                let ok = d == 0 && no_new && self.cover.covers;
+                eprintln!(
+                    "sim-cover[B 应用改 z]: 段 B 新增认领={} / 累计被盖住却还在拖={d} 帧 / 移动窗确实盖住探针={} {}",
+                    s - self.cover_starts_after_a,
+                    self.cover.covers,
+                    if ok { "[OK] 抬高 z 后背后的控件不再被触发" } else { "[FAIL] 抬高 z 后背后的控件仍被触发" }
+                );
+            }
+        }
+
         // ── 提交：世界层与 UI 层进同一个 pass（清色 + 一次 present）──────
         // `f.submit` 负责写入画面矩形 → 取 VP → 开 pass → 提交世界与 UI → 编码提交；
         // `f.present()` 呈现（可省略：`Frame` 析构自动呈现）。
@@ -1533,6 +1624,7 @@ fn main() -> Result<(), RunError> {
     app.sim_drag = args.iter().any(|a| a == "--sim-drag");
     app.sim_picker = args.iter().any(|a| a == "--sim-picker");
     app.sim_overlap = args.iter().any(|a| a == "--sim-overlap");
+    app.sim_cover = args.iter().any(|a| a == "--sim-cover");
     app.sim_click = args
         .iter()
         .any(|a| a == "--sim-click")

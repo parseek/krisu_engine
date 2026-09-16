@@ -109,6 +109,14 @@ pub struct UiStats {
     pub submit_us: f64,
     /// `Ui::finish` 总耗时（µs）。
     pub finish_us: f64,
+    /// **各段开场**（`UiInit::build()`：懒开场 + 冻结输入快照 + 装载帧级事实 + 建根容器）
+    /// 累计耗时（µs）。
+    ///
+    /// 与 `finish_us` 一起把 `ui_frame_us` 三分解：
+    /// `ui_frame_us ≈ prologue_us + (应用录制 + 主题构造) + finish_us`。
+    /// 缺了它就只能看到"UI 一帧花了多少"，无法判断该算引擎还是应用的账——
+    /// 这正是"UI 时间翻倍"排查时第一步需要的信息。
+    pub prologue_us: f64,
     /// 整个 UI 帧（`begin` → `finish` 结束）耗时（µs）。
     pub ui_frame_us: f64,
 }
@@ -162,6 +170,32 @@ pub(crate) struct UiFrameState {
     pub cur_z0_group: u32,
     /// 各段累加的统计（帧尾写回 `UiState::stats`）。
     pub stats: UiStats,
+    /// **本段段号**（帧内第几段，从 `1` 起；帧首重置）。用于给 win=0 放置子槽编号
+    /// 加**段前缀**——组号本身是"段内第几个顶层放置"，各段都从 0 起（兜底组恒为 0），
+    /// 只用组号做缓存键会让不同段的同号槽互相覆盖（见 `UiState::z0_quads`）。
+    pub segment: u32,
+    /// **本帧已见到的 win=0 槽**（`(段号, 组号)`；各段累加，帧首/帧末用于清陈旧槽）。
+    ///
+    /// 必须**按帧**汇总：`cache_z0_window` 每段各跑一次，段只见到自己那部分槽——按段清
+    /// 会把同帧其它段刚写好的缓存删掉，那些槽于是每帧都 miss、每帧重镶嵌整个 win=0 几何。
+    pub z0_seen: Vec<(u32, u32)>,
+    /// **本帧认领了按下的控件**（`(控件绝对 ID, 认领时所在窗口的 z)`；`None` = 没有）。
+    ///
+    /// 由 `Ui::hit_impl` 在"命中且本帧按下沿"时记下**第一个**认领者；帧末由
+    /// `Ui::resolve_widget_press` 用**完备的遮挡表**复核：若它所在窗口并非鼠标下最上层
+    /// （被更高 z 的窗口盖住）则撤销这次认领。命中的那一刻几何还没录全，帧末才是唯一能
+    /// 拿到完备几何的时机——这是"被盖住的控件仍被触发"的兜底修复。
+    pub press_widget: Option<(IdAbsolute<'static>, u32)>,
+    /// 本帧认领按下的控件**个数**（诊断：正常情况下控件级遮挡保证只有 1 个）。
+    pub press_claimants: u32,
+    /// **本帧录制过的窗口绝对 ID**（各段累加；帧首用它清 `window_rects` 里的陈旧项）。
+    ///
+    /// ⚠ 必须存在帧级暂存里、并在**下一帧开场**清：`Ui::finish` 末尾的 `save_frame_state`
+    /// 会把视图上的 `win_ids` / `win_origins` **换走**（swap 回暂存），于是 `finish` 之后的
+    /// `finalize_cursor_and_reset` 看到的是**空表**——曾经用它在帧末清 `window_rects`，
+    /// 结果是**每帧把整张遮挡表清空**，窗口遮挡退化成"只看本帧已录制的窗口"：本帧录在
+    /// 后面的窗口挡不住前面的窗口的控件（用户报的"上层窗口背后的控件仍被触发"）。
+    pub window_ids_seen: Vec<IdAbsolute<'static>>,
 }
 
 impl Default for UiFrameState {
@@ -190,6 +224,11 @@ impl Default for UiFrameState {
             frame_t0: std::time::Instant::now(),
             cur_z0_group: 0,
             stats: UiStats::default(),
+            segment: 0,
+            z0_seen: Vec::new(),
+            press_widget: None,
+            press_claimants: 0,
+            window_ids_seen: Vec::new(),
         }
     }
 }
@@ -273,7 +312,16 @@ pub struct UiState {
     /// 检查鼠标下是否有更高 z 的窗口覆盖，修复"点击穿透"（背后窗口的控件在重叠
     /// 区域不响应）。录制窗口时更新（[`crate::Ui::window`]），`finish` 末尾只保留
     /// **本帧录制过**的窗口（销毁/停用窗口自动清除，z 变化时旧条目随帧清理）。
-    pub(crate) window_rects: HashMap<u32, Rect>,
+    /// **窗口遮挡矩形**：窗口**绝对 ID** → 本帧的遮挡矩形（逻辑像素、绝对坐标）。
+    ///
+    /// ⚠ **键是窗口 ID，不是 z**：z 会在帧末被"点击置顶"抬到 `max+1`，而矩形是那一刻
+    /// 录下的。按 z 存会留下"旧 z → 新位置的矩形"，于是被抬高的窗口在**下一帧重录之前**
+    /// 挡不住本来在它下面（但 z 大于它旧 z）的窗口——表现为"上层窗口背后的控件仍被点到"。
+    /// 按键存 + 查询时把 ID 解成**当前 z**（[`crate::Ui::window_rects_iter`]）即可消除。
+    ///
+    /// 矩形 = 窗口盒子 ∪ 本帧子控件命中区（`Ui::win_hit_bounds`，见其字段文档）；
+    /// 每帧录到时写入，帧末只保留本帧录过的窗口。
+    pub(crate) window_rects: HashMap<IdAbsolute<'static>, Rect>,
     /// grid 容器：**绝对 ID** → 结算后的单元格尺寸（跨帧缓存，保证布局稳定）。
     pub grid_cells: HashMap<IdAbsolute<'static>, Vec2>,
     /// 控件文本排版缓存：`(文本, 字号位模式, 字体族, 换行宽度位模式, 版本)` →
@@ -317,7 +365,14 @@ pub struct UiState {
     /// **顶层非窗口放置**（pack / flex / scroll / list / drag_panel / container 等，
     /// 分组见 [`crate::ui::Ui::z0_ranges`]）。值/交互变化只重建对应子槽，其余 win=0
     /// 放置仍命中复用（缓解"任何 win=0 变化 → 整区重建"）。
-    pub(crate) z0_quads: HashMap<u32, (u64, Vec<(u32, u8, u64, crate::gpu_batch::Geom)>)>,
+    ///
+    /// **键 = `(段号, 组号)`**（[`crate::UiState::frame_state`] 的 `segment`）：组号是
+    /// "段内第几个顶层放置"，**各段都从 0 起且兜底组恒为 0** —— 只用组号会让不同段的
+    /// 同号槽互相覆盖：本帧段 1 写入 → 段 2 查同一个键、判 miss、覆盖 → 下帧段 1 再
+    /// 判 miss…… 两个槽**永远命中不了**，每帧各自重镶嵌一遍（实测 7 个 win=0 槽每帧
+    /// 全量重建 ≈ 0.6ms，`cache_miss` 恒等于槽数）。加段前缀后同帧各段互不干扰。
+    pub(crate) z0_quads:
+        HashMap<(u32, u32), (u64, Vec<(u32, u8, u64, crate::gpu_batch::Geom)>)>,
     /// **圆角镶嵌缓存**：单位四分之一圆弧表（一张表服务所有半径）。
     ///
     /// 住这里而不是 `Ui`：`Ui` 每帧由 `begin` 重建，放它里面等于每帧重建表。
@@ -330,6 +385,10 @@ pub struct UiState {
     /// （控件级遮挡拦截计数；`Ui::hit_abs` 累加，`begin_frame` 清零）——
     /// 与 [`Self::occluded_hits`]（窗口级）分开，便于区分"被窗口挡"与"被控件挡"。
     pub(crate) widget_occluded_hits: u32,
+    /// **诊断**：本帧**认领按下后被帧末复核撤销**的次数（`Ui::resolve_widget_press` 累加，
+    /// `begin_frame` 清零）——说明该控件在命中那一刻被判"没被遮挡"，而帧末完备的遮挡表
+    /// 表明它其实被更高 z 的窗口盖住了（"被盖住的控件仍被触发"的兜底修复触发次数）。
+    pub(crate) press_cancelled_by_window: u32,
     /// **控件级遮挡登记**：本帧录制期写入的可交互控件命中区域（[`crate::hit::HitRegion`]）。
     ///
     /// 每帧重建；`begin_frame` 把**上一帧**整表翻页进 [`Self::prev_hit_regions`]。
@@ -397,11 +456,22 @@ impl UiState {
         // 遮挡拦截计数按帧清零（诊断机制：读的是"上一帧"的累计值）。
         self.occluded_hits = 0;
         self.widget_occluded_hits = 0;
+        self.press_cancelled_by_window = 0;
         // 控件级遮挡登记**整表翻页**：同窗口内"后录制的控件画在上面"，而本帧录制到
         // 某控件时**后面的控件还没录制** → 只能用**上一帧**的区域判定谁盖住谁
         // （与窗口级 `window_rects` 同一思路）。swap 复用两块缓冲，无每帧分配。
         std::mem::swap(&mut self.hit_regions, &mut self.prev_hit_regions);
         self.hit_regions.clear();
+        // **win=0 放置子槽缓存：按"上一帧的完整槽集合"清陈旧**——必须在
+        // `frame_state.begin()` **之前**（begin 会把上一帧的 `z0_seen` 清空）。
+        //
+        // ⚠ 这一步**不能在段收尾做**：`cache_z0_window` 每段各跑一次，而一次调用只见到
+        // **本段**录制的槽 —— 按段清会把同帧其它段刚写好的缓存删掉 ⇒ 那些槽每帧都 miss、
+        // 每帧重镶嵌整个 win=0 几何（实测 7/7 个 win=0 槽恒 miss、`collect` ≈ 0.6ms）。
+        let seen = std::mem::take(&mut self.frame_state.z0_seen);
+        if !seen.is_empty() {
+            self.z0_quads.retain(|slot, _| seen.contains(slot));
+        }
         // 帧级暂存开场：清空 + 种入内置责任链环（输入快照由 `UiInit::build()` 冻结）。
         self.frame_state.begin();
     }
@@ -453,8 +523,10 @@ impl UiState {
         self.frame = 0;
         self.ime_composing = false;
         self.window_quads.clear();
+        self.z0_quads.clear();
         self.occluded_hits = 0;
         self.widget_occluded_hits = 0;
+        self.press_cancelled_by_window = 0;
         self.hit_regions.clear();
         self.prev_hit_regions.clear();
         self.last_press_window = None;
@@ -518,6 +590,17 @@ impl UiState {
         self.last_press_window
             .as_ref()
             .map(|(id, z)| (id.as_str(), *z))
+    }
+
+    /// **诊断**：上一帧"认领按下后被帧末复核撤销"的次数（见 `Ui::resolve_widget_press`
+    /// 与 `UiFrameState::press_widget`）。
+    ///
+    /// 大于 0 说明**命中那一刻**控件被判"没被遮挡"，而**帧末**完备的遮挡表表明它其实被
+    /// 更高 z 的窗口盖住了——即"盖住它的窗口本帧才移过来 / 才被抬高 z"。这是兜底修复，
+    /// 出现次数应当是 0；持续大于 0 说明还有更早的时序问题值得查。
+    #[inline]
+    pub fn press_cancelled_by_window(&self) -> u32 {
+        self.press_cancelled_by_window
     }
 }
 
@@ -630,5 +713,34 @@ mod tests {
         let cloned = state.clone();
         assert!(!cloned.frame_open(), "克隆的 UiState 帧内暂存为空（未开场）");
         assert!(state.frame_open(), "原 state 不受克隆影响");
+    }
+
+    /// **win=0 放置子槽缓存：按帧清理，且同帧各段的槽都要留下**。
+    ///
+    /// 回归防线（实测过的一次真实性能事故）：`cache_z0_window` **每段各跑一次**，一段只
+    /// 见到自己录制的槽。若在段收尾按"本段见到的集合"清理：
+    /// ① 段 1 的槽被段 2 的清理删掉、段 2 的槽又被下帧段 1 删掉 ⇒ 每个槽永远命中不了、
+    ///    每帧重镶嵌整个 win=0 几何（实测 `cache_miss` 恒 = 槽数、`collect` ≈ 0.6ms，
+    ///    UI 帧时间翻倍）；
+    /// ② 兜底组 0 在每段都存在，只用组号做键还会让两段的同号槽**互相覆盖**。
+    /// 故：键带段前缀 + 清理按帧（[`UiState::begin_frame`] 用上一帧的完整集合）。
+    #[test]
+    fn z0_slots_are_segment_scoped_and_pruned_once_per_frame() {
+        let mut st = UiState::new();
+        // 上一帧两个段各自的兜底组（以及一个已经消失的陈旧槽）。
+        st.z0_quads.insert((1, 0), (0x11, Vec::new()));
+        st.z0_quads.insert((2, 0), (0x22, Vec::new()));
+        st.z0_quads.insert((1, 9), (0x99, Vec::new()));
+        st.frame_state.z0_seen = vec![(1, 0), (2, 0)];
+        st.begin_frame();
+        assert!(st.frame_state.z0_seen.is_empty(), "帧首清空上一帧的累计集");
+        assert_eq!(st.z0_quads.len(), 2, "只清上一帧未出现的槽");
+        assert!(
+            st.z0_quads.contains_key(&(1, 0)) && st.z0_quads.contains_key(&(2, 0)),
+            "同帧各段的槽都必须留下——按段清会删掉其中一段 ⇒ 那些槽每帧 miss"
+        );
+        assert!(!st.z0_quads.contains_key(&(1, 9)), "上一帧未出现的槽被清掉（防跨帧误复用）");
+        // 键带段前缀：两段的同号组是**不同槽**（否则互相覆盖、永远 miss）。
+        assert_ne!((1u32, 0u32), (2u32, 0u32));
     }
 }

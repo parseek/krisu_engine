@@ -207,6 +207,10 @@ impl<'a> UiInit<'a> {
             scale,
             debug_layout,
         } = self;
+        // 段开场计时：只覆盖**引擎**的段开场工作（懒开场 / 冻结输入 / 装载帧级事实 /
+        // 建根容器 / Theme 预乘），用于把 `ui_frame_us` 三分解成
+        // `prologue + 应用录制 + finish`（见 `UiStats::prologue_us`）。
+        let t_prologue = Instant::now();
         // ── 帧级账（**懒开场**）──────────────────────────────────────────
         // 本帧第一段才开帧：帧号 +1 / 命中区表翻页 / 帧级暂存清零 + **冻结输入快照**。
         // 后续段（同帧第二次起录制）**不再开场**——否则帧号 +2、命中表二次翻页、
@@ -219,6 +223,11 @@ impl<'a> UiInit<'a> {
                 .frame_state
                 .freeze_input(mouse.clone(), keyboard.clone());
         }
+        // **段号**（帧内第几段，从 1 起）：给 win=0 放置子槽的缓存键加段前缀。
+        // 组号是"段内第几个顶层放置"（各段从 0 起、兜底组恒为 0），不加段前缀会让
+        // 不同段的同号槽互相覆盖 ⇒ 每帧都判 miss（见 `UiState::z0_quads`）。
+        state.frame_state.segment += 1;
+        let segment = state.frame_state.segment;
         // 本帧统一使用**开场时冻结**的快照（段间注入只影响下一帧）。
         let frame_mouse = state.frame_state.mouse.clone();
         let frame_keyboard = state.frame_state.keyboard.clone();
@@ -251,6 +260,7 @@ impl<'a> UiInit<'a> {
             win_hit_bounds: None,
             z0_ranges: Vec::new(),
             cur_z0_group: 0,
+            segment,
             // 鼠标屏幕坐标：物理（拖拽 / IME 基准与命中测试统一物理像素，无逻辑之分）
             mouse_screen,
             mouse_logical: mouse_screen,
@@ -287,6 +297,8 @@ impl<'a> UiInit<'a> {
         let mut root = Frame::new_stack(PackSide::Top, ui.theme.gap, 0.0);
         root.set_fixed_w(vw);
         ui.frames.push(root);
+        // 段开场耗时累加进帧级统计（`ui_frame_us` 三分解的引擎那一份）。
+        ui.state.frame_state.stats.prologue_us += t_prologue.elapsed().as_secs_f64() * 1e6;
         ui
     }
 }
@@ -427,9 +439,14 @@ pub struct Ui<'a> {
     /// 由顶层放置入口在 `depth == 0` 时记录（[`Self::begin_top_placement`]）；
     /// `finish` 按 `seq` 把 win=0 命令归入对应子槽，逐槽做**全量签名**顶点缓存，
     /// 使值/交互变化只重建对应放置，其余 win=0 内容复用。未分组的独立顶层命令 → 组 0。
+    ///
+    /// ⚠ `z0_ranges` 是**段内**的（`Ui` 视图每段新建）：组号因此只在段内唯一——
+    /// 缓存键必须带上 [`Self::segment`]（见 `UiState::z0_quads`）。
     z0_ranges: Vec<(u32, u32, u32)>,
-    /// 下一个 win=0 放置子槽组号（每帧从 1 递增；0 = 未分组 / 独立顶层内容）。
+    /// 下一个 win=0 放置子槽组号（每段从 1 递增；0 = 未分组 / 独立顶层内容）。
     cur_z0_group: u32,
+    /// **本段段号**（帧内第几段，从 1 起）——win=0 放置子槽缓存键的段前缀。
+    segment: u32,
     /// 鼠标屏幕坐标（**物理像素**；命中测试用——内部坐标全物理）。
     mouse_logical: Vec2,
     /// 鼠标屏幕坐标（**物理像素**，面板拖拽 / IME 基准用）。
@@ -525,6 +542,7 @@ impl<'a> Ui<'a> {
         self.cursor_custom = fs.cursor_custom;
         self.frame_t0 = fs.frame_t0;
         self.cur_z0_group = fs.cur_z0_group;
+        self.segment = fs.segment;
         // 集合 / `Option` 用 take（`save_frame_state` 会原样换回去）：段与帧之间**搬移**
         // 而不是克隆——窗口原点表 / 焦点链在大 UI 下可不小。
         self.drag_panel = fs.drag_panel.take();
@@ -773,7 +791,7 @@ impl<'a> Ui<'a> {
                 .or_else(|| {
                     self.state
                         .window_rects
-                        .get(z)
+                        .get(id.as_str())
                         .map(|r| Vec2::new(r.w, r.h))
                 })
                 .unwrap_or(Vec2::ZERO);
@@ -1813,13 +1831,31 @@ impl<'a> Ui<'a> {
                 self.mouse_logical.x, self.mouse_logical.y
             );
         }
+        // **记下"本帧由谁认领了按下"**（帧末复核用，见 `resolve_widget_press`）：
+        // 只记第一个认领者——正常情况下（控件级遮挡生效）也只有一个。
+        if self.mouse_left().down_edge() {
+            if self.state.frame_state.press_widget.is_none() {
+                self.state.frame_state.press_widget = Some((owner.to_static(), self.cur_win));
+            }
+            self.state.frame_state.press_claimants += 1;
+        }
         true
     }
 
-    /// 窗口遮挡判定用的窗口矩形迭代器（`(z, rect)`；逻辑像素）。
+    /// **窗口遮挡判定用的窗口矩形迭代器**（`(z, rect)`；逻辑像素）。
+    ///
+    /// ⚠ 表按**窗口绝对 ID** 键（[`UiState::window_rects`]），这里把每条的 z **解成"当前
+    /// z"**：矩形是上一帧录下的，而 z 可能在帧末被"点击置顶"改过——若按矩形写入时的旧 z
+    /// 参与比较，被抬高的那个窗口就会**在它下面的窗口面前"消失"一帧**（它画在上面却挡不住
+    /// 别人）。按 ID 查当前 z 从根上消除这处错位。
     #[inline]
     fn window_rects_iter(&self) -> impl Iterator<Item = (u32, Rect)> + '_ {
-        self.state.window_rects.iter().map(|(&z, &r)| (z, r))
+        self.state.window_rects.iter().map(|(id, &r)| {
+            (
+                self.state.window_z.get(id.as_str()).copied().unwrap_or(0),
+                r,
+            )
+        })
     }
 
     /// **诊断**：当前窗口 z-order（按 z 升序）：`(id, z)`。
@@ -1839,7 +1875,7 @@ impl<'a> Ui<'a> {
     pub fn window_under_mouse(&self) -> Option<(String, u32)> {
         let mut best: Option<(String, u32)> = None;
         for (id, &z) in &self.state.window_z {
-            if let Some(r) = self.state.window_rects.get(&z)
+            if let Some(r) = self.state.window_rects.get(id.as_str())
                 && r.contains_point(self.mouse_logical) {
                     match &best {
                         Some((_, bz)) if *bz >= z => {}
@@ -2696,7 +2732,7 @@ impl<'a> Ui<'a> {
             .or_else(|| {
                 self.state
                     .window_rects
-                    .get(&z)
+                    .get(id_for.as_str())
                     .map(|r| Vec2::new(r.w, r.h))
             });
         // ─── ① 位置与交互**先于内容录制**求解 ────────────────────────────
@@ -2869,7 +2905,15 @@ impl<'a> Ui<'a> {
             Some(b) => win_abs.union(&b),
             None => win_abs,
         };
-        self.state.window_rects.insert(z, occl);
+        // **键 = 窗口绝对 ID**（不是 z）：z 会在帧末被"点击置顶"改，而矩形是这一刻录下的；
+        // 按 ID 存 + 查询时解当前 z，才能让"刚被抬高的窗口"立刻按**新 z**参与遮挡判定。
+        let wid = id_for.to_static();
+        self.state.window_rects.insert(wid.clone(), occl);
+        // 记入**帧级**"本帧录过的窗口"清单：帧末视图的 `win_ids` 会被 `save_frame_state`
+        // 换空，只有这里记下的清单能在**下一帧开场**用来清陈旧（见 `window_ids_seen`）。
+        if !self.state.frame_state.window_ids_seen.contains(&wid) {
+            self.state.frame_state.window_ids_seen.push(wid);
+        }
         // 严格裁剪（`window_at_strict`）：窗口内容**强制裁剪**到窗口矩形——结算后
         // 统一改写本窗口命令的裁剪层（录制期窗口尺寸未知，背景/子控件命令都覆盖；
         // 命中裁剪由窗口遮挡机制负责）。默认窗口为 Expand 语义（不裁剪）。
@@ -2969,8 +3013,12 @@ impl<'a> Ui<'a> {
             clip: self.clip,
             kind: DrawKind::Solid(self.theme.modal.dim),
         });
-        // 遮罩窗口矩形（遮挡判定用；绝对）。
-        self.state.window_rects.insert(z_dim, dim_rect);
+        // 遮罩窗口矩形（遮挡判定用；绝对）。键按**遮罩的绝对 ID**（同 `window_impl`）。
+        let dim_wid = dim_abs.to_static();
+        self.state.window_rects.insert(dim_wid.clone(), dim_rect);
+        if !self.state.frame_state.window_ids_seen.contains(&dim_wid) {
+            self.state.frame_state.window_ids_seen.push(dim_wid);
+        }
         self.win_ids.insert(z_dim, dim_abs.to_static());
         self.win_origins.insert(z_dim, Vec2::ZERO);
         self.cur_win = saved_win;
@@ -3310,8 +3358,38 @@ impl<'a> Ui<'a> {
         }
         // 窗口按下裁决：重叠点击只让**最上层**窗口获得拖拽与置顶（见 window_at）
         self.resolve_win_press();
+        // 控件按下裁决：**用帧末完备的遮挡表复核**本帧认领按下的控件（见该方法文档）。
+        self.resolve_widget_press();
         // 键盘导航：Tab / Shift+Tab / 方向键遍历焦点链、Esc 关浮层/失焦、焦点描边。
         self.handle_focus_keys();
+    }
+
+    /// **控件按下裁决**（帧末复核）：本帧有控件认领了按下，但**帧末**看它所在的窗口并非
+    /// 鼠标下最上层（被更高 z 的窗口盖住）⇒ 撤销这次认领。
+    ///
+    /// # 为什么需要"帧末复核"
+    ///
+    /// 窗口遮挡判定用的是 `UiState::window_rects`——一张**录制期逐步写入**的表：本帧还没
+    /// 录到的窗口，表里是**上一帧**的矩形（甚至是旧 z 下的矩形）。于是"盖住我的那个窗口
+    /// 本帧才移过来 / 本帧才被抬高 z"这两种情况下，控件命中时会被判成"没被遮挡"而收下按下。
+    /// 命中的那一刻几何还没录全，**唯一能拿到完备几何的时机就是帧末**（所有窗口都录完了），
+    /// 所以复核放在这里。
+    ///
+    /// 代价与边界：一次按下已在命中那一帧被应用侧读到（动作已发生）——本条只保证
+    /// **状态不再延续**（`pressed` / `clicked` / `dragging` 全清、`press_claimed` 保持），
+    /// 因此不会出现"被盖住的控件一直拖到释放"。同帧内按下 + 抬起（极快点击）不受保护。
+    fn resolve_widget_press(&mut self) {
+        let Some((id, z)) = self.state.frame_state.press_widget.take() else {
+            return;
+        };
+        if !window_occluded(z, self.mouse_logical, self.window_rects_iter()) {
+            return;
+        }
+        let ws = self.state.widgets.entry(id).or_default();
+        ws.pressed = false;
+        ws.clicked = false;
+        ws.dragging = false;
+        self.state.press_cancelled_by_window = self.state.press_cancelled_by_window.saturating_add(1);
     }
 
     /// **按窗口生成可提交顶点**（`finish` 的核心缓存步骤）：遍历分桶后的窗口——
@@ -3383,7 +3461,6 @@ impl<'a> Ui<'a> {
         white_uv_wh: Vec2,
         stats: &mut CacheStats,
     ) {
-        let mut seen = Vec::new();
         let mut by_group: Vec<(u32, Vec<&UiDraw>)> = Vec::new();
         for d in cmds.iter().flatten() {
             let g = self.z0_group_for_seq(d.seq);
@@ -3393,11 +3470,16 @@ impl<'a> Ui<'a> {
             }
         }
         for (g, refs) in by_group {
-            seen.push(g);
+            // **槽 = (段号, 组号)**：组号只在段内唯一（每段兜底组都是 0），故必须带段前缀，
+            // 否则不同段的同号槽共用一个缓存条目、每帧交替覆盖 → 永远 miss。
+            let slot = (self.segment, g);
+            if !self.state.frame_state.z0_seen.contains(&slot) {
+                self.state.frame_state.z0_seen.push(slot);
+            }
             let t_sig = Instant::now();
             let sig = self.hash_cmds(refs.iter().copied());
             stats.sig_us += t_sig.elapsed().as_secs_f64() * 1e6;
-            let entry = self.state.z0_quads.entry(g).or_insert((0, Vec::new()));
+            let entry = self.state.z0_quads.entry(slot).or_insert((0, Vec::new()));
             if entry.0 == sig {
                 stats.cache_hits += 1;
                 let t_clone = Instant::now();
@@ -3414,6 +3496,7 @@ impl<'a> Ui<'a> {
             let owned: Vec<UiDraw> = refs.iter().map(|d| (*d).clone()).collect();
             self.collect_cmds(&mut q, 0, std::slice::from_ref(&owned));
             stats.collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
+            self.trace_cache_miss(&format!("z0 group {g}"), refs.len(), t_collect);
             let mut grp: Vec<(u32, u8, u64, Geom)> = Vec::new();
             for ((_, elem, gg, tex), geom) in q.quads {
                 // 缓存存克隆、本帧提交原几何（各一份）——重建帧照常绘制，不"消失 1 帧"。
@@ -3421,10 +3504,11 @@ impl<'a> Ui<'a> {
                 cached.push((0, elem, gg, tex, geom, vec![elem]));
             }
             grp.sort_by_key(|&(elem, gg, tex, _)| (elem, gg, tex));
-            self.state.z0_quads.insert(g, (sig, grp));
+            self.state.z0_quads.insert(slot, (sig, grp));
         }
-        // 仅保留本帧录制过的子槽（放置消失/条件渲染时清陈旧，防跨帧误复用）。
-        self.state.z0_quads.retain(|g, _| seen.contains(g));
+        // 陈旧子槽的清理**不在这里**：本函数每段跑一次、只见到本段的槽，按段清会把同帧
+        // 其它段刚写好的缓存删掉（那些槽于是每帧 miss）。这里只把本段见到的槽记进帧级
+        // 暂存（`z0_seen`），由 `UiState::begin_frame` 在**下一帧开场**按完整集合清一次。
     }
 
     /// **窗口顶点缓存**：对窗口命令做**全量签名**（[`Self::hash_cmds`]），命中
@@ -3464,6 +3548,7 @@ impl<'a> Ui<'a> {
         let mut q = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh);
         self.collect_cmds(&mut q, win, cmds);
         stats.collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
+        self.trace_cache_miss(&format!("win {win} id={}", id.as_str()), cmds.iter().map(|v| v.len()).sum(), t_collect);
         let mut grp: Vec<(u32, u8, u64, Geom)> = Vec::new();
         for ((_, elem, g, tex), geom) in q.quads {
             // 缓存存克隆、本帧提交原几何（各一份）——**重建帧窗口照常绘制**：
@@ -3476,6 +3561,25 @@ impl<'a> Ui<'a> {
         // 缓存组顺序与提交顺序一致：控件序 → 元素内图形 → 文字 → 纹理——跨帧稳定。
         grp.sort_by_key(|&(elem, g, tex, _)| (elem, g, tex));
         self.state.window_quads.insert(id, (sig, grp));
+    }
+
+    /// **缓存未命中的逐窗 / 逐槽归因**（诊断，`RJ_CACHE_TRACE=1`）：窗口 id（或 win=0 槽号）、
+    /// 命令条数、本次重建耗时。用来回答"稳态下到底是哪几扇窗 / 哪几个 win=0 槽每帧
+    /// 重镶嵌、各占多少"——顶点缓存 miss 的代价远高于命中（整块重新镶嵌，含投影的同心环）。
+    ///
+    /// 只在 miss 分支调用（命中路径零开销）；env 读取也只发生在未命中时。
+    /// 历史战绩：稳态 `cache_miss` 恒等于槽数、`collect` ≈ 0.6ms 时，靠它一眼看出
+    /// "miss 全在 win=0 槽、一扇窗都没 miss"，从而定位到槽键跨段冲突（见
+    /// [`crate::UiState::z0_quads`]）。
+    fn trace_cache_miss(&self, what: &str, cmds: usize, t_collect: Instant) {
+        if std::env::var_os("RJ_CACHE_TRACE").is_none() {
+            return;
+        }
+        eprintln!(
+            "cache[frame {}] MISS {what} cmds={cmds} collect={:.1}us",
+            self.state.frame,
+            t_collect.elapsed().as_secs_f64() * 1e6
+        );
     }
 
     /// 对一组命令做**全量内容签名**（`cmd_sig` 哈希）：窗口 / win=0 子槽顶点缓存的 key。
@@ -3582,10 +3686,11 @@ impl<'a> Ui<'a> {
                 // 应用 t，再平移回锚点，最后基础屏幕固定。组合验证：
                 // `T_anc⁻¹.with_transform(&t)` = t·T_anc⁻¹；再 `.with_transform(&T_anc)`
                 // = T_anc·t·T_anc⁻¹。t = IDENTITY 时 = T_anc·T_anc⁻¹ = IDENTITY ✓。
+                // 遮挡表按**窗口 ID** 键，这里只有 z（win）⇒ 先经 `win_ids` 解出 ID。
                 let size = self
-                    .state
-                    .window_rects
+                    .win_ids
                     .get(&win)
+                    .and_then(|id| self.state.window_rects.get(id.as_str()))
                     .map(|r| Vec2::new(r.w, r.h))
                     .unwrap_or(Vec2::ZERO);
                 let anchor_local = Vec2::new(fx.anchor.x * size.x, fx.anchor.y * size.y);
@@ -3699,7 +3804,15 @@ impl<'a> Ui<'a> {
         self.cursor_grabbing = false;
         self.cursor_window_drag = false;
         self.cursor_custom = None;
-        self.state.window_rects.retain(|z, _| self.win_origins.contains_key(z));
+        // ⚠ `window_rects` 的陈旧清理在**帧末**（这里），但数据源必须是
+        // `frame_state.window_ids_seen`——**不能**用本视图的 `win_ids` / `win_origins`：
+        // 它们已被上面 `finish()` 末尾的 `save_frame_state` 换走（空表），按它清会把整张
+        // 遮挡表清光 ⇒ 遮挡判定退化成"只看本帧已录制的窗口"，上层窗口就挡不住背后窗口的
+        // 控件（用户报的"被遮挡的控件仍被触发"）。这是那次事故的根因，别再改回去。
+        let seen_wins = &self.state.frame_state.window_ids_seen;
+        self.state
+            .window_rects
+            .retain(|id, _| seen_wins.iter().any(|w| w == id));
         self.depth = 0;
         self.seq = 0;
         self.cur_win = 0;
