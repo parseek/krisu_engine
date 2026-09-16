@@ -1536,6 +1536,30 @@ clamp 到 `max(0, text_w - content_w)`）；光标 / 选择 / IME 候选定位�
 （无 GPU，可单测）；新增编辑控件时复用 `edit::*` 与 `clipboard_get/set`，并在按下
 响应中置位 `press_claimed`。
 
+**运行时导入字体 / 图片**（应用侧"文件 → 资源"，引擎只提供通路）：
+
+```rust
+// 字体：加载进**运行时**文本子系统（UI 排版与字形图集都用它），拿回新增族名
+let fams = text.load_font_data(std::fs::read(path)?);   // → Vec<String>（空 = 该族已在库）
+if let Some(name) = fams.first() { theme = theme.with_font_family(name); }
+
+// 图片：帧内注册纹理（世界层与 UI 层共用同一个 Arc<TextureRegistry>）
+let tex = f.draw().gpu().texture("imported", Rgba8::new(&rgba, (w, h)));  //  → uid
+let bg = ImageBg::new(tex.uid, Vec2::new(w as f32, h as f32));
+window.style(style.with_bg_image(bg));
+```
+
+- `Text::load_font_data` **返回新增族名**（与 `fontdb` 的槽位顺序无关的集合求差）：
+  `label.font_family(name)` 只认族名，应用必须知道"这个文件叫什么族"才能用；
+  `FontSystem::new()` 启动时已索引系统字体 ⇒ 导入**系统字体自己的文件**会返回空
+  （"该族已在库里"），这不是失败。
+- 图片通路与启动期（`Gfx::texture`）**共用一张纹理表** ⇒ 拿到的 `uid` 在 UI 后端
+  一样解析得到；`Gpu` 已进 `rjw_kruskie::prelude`（运行时上传要它）。
+- ⚠ 应用侧的两个坑（示例 `examples/eg260818UI/src/filedialog.rs` 有完整实现）：
+  ① **系统文件选择器是阻塞调用**，只能在**帧外**弹（UI 里点按钮只记待办）；
+  ② `Gpu` 只能从 `Frame::draw()` 拿（`Ctx` 没有）⇒ 图片注册在**帧内**做。
+  脚本化验证（不弹对话框）：`--sim-import <路径>`，见 `docs/DEBUGGING.md`。
+
 ### 18.12 窗口外框（标题栏 / 关闭 / 收起）与缩放柄令牌
 
 窗口的**外框**是三个独立选项，责任链上按需开启（`ui.window(id)` 的 builder）：

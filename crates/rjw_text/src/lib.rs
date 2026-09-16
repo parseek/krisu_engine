@@ -530,11 +530,35 @@ impl Text {
     }
 
     /// 加载额外的字体数据（如自定义 ttf/otf 文件）；已加载的系统字体不受影响。
-    pub fn load_font_data(&mut self, data: Vec<u8>) {
+    ///
+    /// **返回本次新增的字体族名**（去重、按发现顺序）；同一族已存在时返回空。
+    /// 为什么要返回：`Text::label(..).font_family(name)` 只认**族名**——应用从文件
+    /// 导入字体后必须知道"这个文件叫什么族名"才能用它（否则只能让用户手打，
+    /// 见示例的「导入字体…」）。`*.ttc` 会一次加入多个字面 ⇒ 返回多个族名。
+    ///
+    /// ⚠ 用"族名集合求差"而不是"按字面下标取后 N 个"：`fontdb` 内部是 `SlotMap`，
+    /// 字面迭代顺序不保证等于插入顺序（槽位可复用）；集合差与顺序无关。
+    pub fn load_font_data(&mut self, data: Vec<u8>) -> Vec<String> {
+        let before = Self::font_families(self.font_system.db());
         self.font_system.db_mut().load_font_data(data);
+        let after = Self::font_families(self.font_system.db());
         // 追加字体后旧排版与“无图字形”判定可能不再正确，作废缓存。
         self.layout_cache.clear();
         self.no_image.clear();
+        after.into_iter().filter(|f| !before.contains(f)).collect()
+    }
+
+    /// 当前字体库里的全部族名（去重；`load_font_data` 的差集用）。
+    fn font_families(db: &cosmic_text::fontdb::Database) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for face in db.faces() {
+            for (fam, _) in &face.families {
+                if !out.iter().any(|f| f == fam) {
+                    out.push(fam.clone());
+                }
+            }
+        }
+        out
     }
 
     /// 排版文本为共享 `Arc<Buffer>`（cosmic-text）。
@@ -807,6 +831,37 @@ mod tests {
         );
         assert!(!crate::chain::location_usable(false, true), "位置缺失 ⇒ 必须光栅化");
         assert!(!crate::chain::location_usable(false, false));
+    }
+
+    #[test]
+    fn load_font_data_reports_only_the_new_families() {
+        // 「导入字体」要能告诉应用**这个文件叫什么族名**（否则只能让用户手打）。
+        // 用一个**空** `Database`（不含系统字体）验证求差逻辑：加载前 0 个族，加载后
+        // 恰好是文件里的族名；再加载一次 ⇒ **没有新增**（同名族不重复报）。
+        //
+        // 没装字体文件的环境自动跳过（不 fail）：测试只依赖"能找到某个 ttf"。
+        let candidates = [
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\segoeui.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ];
+        let Some(data) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
+            return;
+        };
+        let mut db = cosmic_text::fontdb::Database::new();
+        assert!(Text::font_families(&db).is_empty(), "空库不应有族名");
+        db.load_font_data(data.clone());
+        let after = Text::font_families(&db);
+        assert!(!after.is_empty(), "加载字体文件后必须能枚举出族名：{after:?}");
+        // 求差口径 = `load_font_data` 的返回值：新库的族全是"新增"。
+        let before: Vec<String> = Vec::new();
+        let new: Vec<String> = after.iter().filter(|f| !before.contains(f)).cloned().collect();
+        assert_eq!(new, after);
+        // 再加载同一个文件：族名集合不变（第二次的"新增"为空）——
+        // 这正是"导入系统字体自己的文件时提示'该族已在库里'"的依据。
+        db.load_font_data(data);
+        assert_eq!(Text::font_families(&db), after, "重复加载不得改变族名集合");
     }
 
     fn shaped(text: &str, size: f32, line_height: f32, align: Align) -> Buffer {

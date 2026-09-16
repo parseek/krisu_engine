@@ -115,7 +115,9 @@ pub mod prelude {
     pub use crate::render2d::RStates;
 
     // ── 资源句柄 / 参数对象 ──
-    pub use crate::gpu::{ArcTextureWrapped, MeshId, MeshSpec, Rgba8};
+    // `Gpu`：**运行时**注册纹理 / 网格要用（`Frame::draw().gpu().texture(..)`）——
+    // 启动期走 `Gfx::texture(..)`，但"导入文件换纹理"这类**运行时**上传必须拿到 `Gpu`。
+    pub use crate::gpu::{ArcTextureWrapped, Gpu, MeshId, MeshSpec, Rgba8};
 
     // ── 颜色 ──
     pub use crate::color::{Color, ColorF64};

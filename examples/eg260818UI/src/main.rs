@@ -52,6 +52,10 @@ use rjw_krusie::ui::{
 mod overlap;
 use overlap::OverlapDemo;
 
+/// **文件导入**（系统文件选择器 → 字节 → 引擎资源）：图片当背景纹理、字体进运行时字体库。
+mod filedialog;
+use filedialog::ImportKind;
+
 /// 「上层窗口没挡住背后窗口的控件」脚本化复现（`--sim-cover`）。
 mod cover;
 use cover::CoverDemo;
@@ -72,6 +76,11 @@ struct TopBar {
     font_modal_open: bool,
     /// **固定位置**的取色器颜色（物理定位：`--sim-picker` 的脚本化点击要能算到坐标）。
     demo_color: Color,
+    /// **待处理的导入请求**（点「导入图片…」/「导入字体…」只记请求：系统选择器是
+    /// **阻塞**调用，录制期不能弹——见 `filedialog` 模块文档）。
+    import_request: Option<ImportKind>,
+    /// 导入结果 / 失败原因（顶栏状态标签显示）。
+    import_status: String,
 }
 
 impl TopBar {
@@ -83,6 +92,8 @@ impl TopBar {
             font_input: String::new(),
             font_modal_open: false,
             demo_color: Color::rgba_u8(255, 128, 40, 255),
+            import_request: None,
+            import_status: String::new(),
         }
     }
 
@@ -113,6 +124,19 @@ impl TopBar {
                 }
                 if r.button("theme_btn", "主题调节…").clicked() {
                     tuner.open = !tuner.open;
+                }
+                // **文件导入**（系统文件选择器）：点击只**记待办**——`rfd` 的选择器是阻塞
+                // 调用，而这里还在录制帧（`f` 借着 `ctx`）⇒ 帧外再弹（见 `update`）。
+                // 三条来源（两个按钮 / `--font-file` / `--sim-import`）共用 `apply_import`。
+                if r.button("import_img_btn", "导入图片…").clicked() {
+                    self.import_request = Some(ImportKind::Image);
+                }
+                if r.button("import_font_btn", "导入字体…").clicked() {
+                    self.import_request = Some(ImportKind::Font);
+                }
+                // 导入结果 / 失败原因（空 = 不占位）。
+                if !self.import_status.is_empty() {
+                    r.add(Label::new(&self.import_status).ellipsis());
                 }
             });
         });
@@ -536,7 +560,11 @@ impl Windows {
         }
         // 赤石窗口：整窗旋转（角度 = cshi_num）+ 染色（**用 ColorPicker 调**：
         // 一个控件顶掉原来那 4 条 RGBA 滑条，alpha 也由面板的 A 行负责）。
-        ui.window("chishi").pos(vec2(155., 32.)).show(|w| {
+        //
+        // ⚠ 位置从 `(155, 32)` 挪到 `(175, 170)`：原来它**压着顶部按钮行**（字体… /
+        //    主题调节… 那一行在 y 56..82、x 155..314 正落在它下面）——窗口遮挡让那几个
+        //    按钮**点不动**（点下去命中 `chishi/chisN1`）。现在让开顶部整条。
+        ui.window("chishi").pos(vec2(175., 170.)).show(|w| {
             w.label("赤石");
             w.add(NumberInput::new("chisN1", &mut self.cshi_num).step(0.1));
             self.cshi_num = w.slider("sb", 0.0..=360., self.cshi_num);
@@ -1049,6 +1077,12 @@ struct UiApp {
     tuner_probe: Option<f32>,
     /// --sim-tuner：**实操主题调节窗口里的"滑杆 + 数字条"**（坐标运行时解算，不写死像素）。
     sim_tuner: bool,
+    /// --sim-import <路径>：脚本化导入（**不弹对话框**，走同一条应用通路）——验证
+    /// "字节 → 纹理 / 字体"这条线（真人点选择器那步无法在无头环境里跑）。
+    sim_import: Option<String>,
+    /// 文件导入：**已选好、等帧内应用**的图片路径（要 `f.draw().gpu()`；`Ctx` 在帧外
+    /// 拿不到 `Gpu`）。请求与状态在 [`TopBar`]（那是显示它们的模块）。
+    import_image_path: Option<std::path::PathBuf>,
     /// 「被遮挡控件仍被触发」复现器。
     cover: CoverDemo,
     /// `--sim-cover` 段 A 结束时的认领次数（段 B 不许再涨）。
@@ -1072,6 +1106,57 @@ struct UiApp {
 }
 
 impl UiApp {
+    /// **应用一个导入路径**（「导入图片…」/「导入字体…」选择器、`--font-file`、
+    /// `--sim-import` **共用**的那条线）：
+    ///
+    /// - **字体**：当场加载进**运行时**文本子系统（`Ctx::text_mut()`；应用自建的
+    ///   `Gfx::text()` 是另一套图集，UI 不会用），成功则**自动切到新族名**（导入即刻生效，
+    ///   「字体…」弹窗仍可换回去）。`ttc` 会一次进多个族，取第一个。
+    /// - **图片**：只记待办——`Gpu` 只能在帧内从 `f.draw()` 拿到（见 `update` 里的
+    ///   "图片导入要帧内应用"那段）。
+    /// - **失败不致命**：原因写进顶栏状态（`TopBar::import_status`），画面照旧。
+    ///
+    /// `verbose`：`--font-file` 这类 CLI 开关额外打一行 stderr（脚本 / 日志里可见）。
+    fn apply_import(&mut self, ctx: &mut Ctx, path: std::path::PathBuf, verbose: bool) {
+        let label = filedialog::file_label(&path);
+        match ImportKind::from_path(&path) {
+            Some(ImportKind::Font) => {
+                let Some(text) = ctx.text_mut() else {
+                    self.top.import_status = "字体导入失败：文本子系统不可用".to_owned();
+                    return;
+                };
+                match filedialog::apply_font(text, &path) {
+                    Ok(fams) if fams.is_empty() => {
+                        // 已加载但族已存在（系统字体默认已在库里）——不是失败。
+                        self.top.import_status = format!("字体：{label}（该族已在库里）");
+                        if verbose {
+                            eprintln!("--font-file: 已加载 {label}（族已在库里，无新增）");
+                        }
+                    }
+                    Ok(fams) => {
+                        let first = fams[0].clone();
+                        self.top.font_name = first.clone();
+                        self.top.import_status = format!("字体：{label} → {first}");
+                        if verbose {
+                            eprintln!(
+                                "--font-file: 已加载 {label} → 族名 {first}（其余新增：{:?}）",
+                                &fams[1..]
+                            );
+                        }
+                    }
+                    Err(e) => self.top.import_status = format!("字体导入失败：{e}"),
+                }
+            }
+            Some(ImportKind::Image) => self.import_image_path = Some(path),
+            None => {
+                self.top.import_status = format!("不认得的文件类型：{label}（要图片或 ttf/otf/ttc）");
+                if verbose {
+                    eprintln!("--font-file: 不认得的文件类型 {label}");
+                }
+            }
+        }
+    }
+
     fn new() -> Self {
         Self {
             cam: Camera2D::default(),
@@ -1094,6 +1179,8 @@ impl UiApp {
             sim_tuner_pts: None,
             tuner_probe: None,
             sim_tuner: false,
+            sim_import: None,
+            import_image_path: None,
             weight_probe: None,
             cover: CoverDemo::default(),
             cover_starts_after_a: 0,
@@ -1316,24 +1403,44 @@ impl App for UiApp {
         // `--sim-picker` 需要 DPI（`Theme` 在 `Ui` 内才被 `scaled`——主题 builder 返回的是
         // 未缩放值），而 `f` 借走 `ctx` 后不能再读，故先取。
         let scale = ctx.scale();
-        // ── `--font-file <路径>`：**加载用户字体文件**（只需第一帧）──────────
-        // 必须加载进**运行时**的文本子系统（UI 排版/图集都用它，`Ctx::text_mut`），
-        // 而不是应用自建的 `Gfx::text()`（那是另一套图集，UI 不会用）。
-        // 加载成功后，在 `字体…`（FontModal）里输入该字体的**族名**即可全局换字。
-        if let Some(path) = self.font_file.take() {
-            match (std::fs::read(&path), ctx.text_mut()) {
-                (Ok(data), Some(text)) => {
-                    let n = data.len();
-                    text.load_font_data(data);
-                    eprintln!("--font-file: 已加载 {n} 字节 ← {path}（在「字体…」里输入其族名生效）");
-                }
-                (Ok(_), None) => eprintln!("--font-file: 文本子系统不可用（feature = text？）"),
-                (Err(e), _) => eprintln!("--font-file: 读取失败 {path}: {e}"),
+        // ── 文件导入：**对话框在帧外弹**（`rfd` 阻塞，且 `f` 会借走 `ctx`）──────
+        // 三条来源共用 `apply_import`：
+        //   ① 「导入图片…」/「导入字体…」按钮 → 弹系统文件选择器；
+        //   ② `--font-file <路径>` → 启动期直接加载（老开关，走同一条通路）；
+        //   ③ `--sim-import <路径>` → 脚本化导入（**不弹对话框**，验证字节→资源这条线）。
+        if let Some(kind) = self.top.import_request.take() {
+            match filedialog::pick(kind) {
+                Some(path) => self.apply_import(ctx, path, false),
+                None => self.top.import_status = "导入已取消".to_owned(),
             }
+        }
+        if let Some(path) = self.font_file.take() {
+            self.apply_import(ctx, std::path::PathBuf::from(path), true);
+        }
+        if let Some(p) = self.sim_import.clone()
+            && ctx.frames() == 20
+        {
+            self.apply_import(ctx, std::path::PathBuf::from(p), false);
         }
         let Some(mut f) = ctx.frame() else {
             return;
         };
+        // ── 图片导入要**帧内**应用：`Gpu` 只能从 `f.draw()` 拿到（`Ctx` 没有 `Gpu`）──
+        // 放在这里（任何录制之前）⇒ 本帧 `self.windows.ui(..)` 就用上新纹理，不等下一帧。
+        if let Some(path) = self.import_image_path.take() {
+            match filedialog::import_image(f.draw().gpu(), "eg260818UI.imported_image", &path) {
+                Ok(bg) => {
+                    self.top.import_status = format!(
+                        "图片：{} {:.0}×{:.0}",
+                        filedialog::file_label(&path),
+                        bg.texel.x,
+                        bg.texel.y
+                    );
+                    self.windows.bg_image = Some(bg);
+                }
+                Err(e) => self.top.import_status = format!("图片导入失败：{e}"),
+            }
+        }
         // ── 调试：脚本化鼠标（`--sim-picker`）──────────────────────
         // 复现"打开取色面板 → 在面板里拖/点"：面板路径（SV 平面 / 色相条 / 通道滑块 /
         // 文本框 / **警告按钮恢复** / 模式切换）只有交互才会录制，普通冒烟跑不到——
@@ -1626,6 +1733,28 @@ impl App for UiApp {
                     st.color_picker.text
                 );
             }
+            // ── `--sim-import`：**导入的字体真的进了排版**吗 ────────────────────
+            // 第 20 帧应用导入（帧外），这里在第 30 帧用**导入的族名**与"不指定族名"
+            // （系统默认）各量一次同一串文本：宽度必须不同 ⇒ 新字体真的参与了整形
+            // （族名写错 / 没进运行时字体库时，cosmic-text 会回落到默认族 ⇒ 两者相等）。
+            if self.sim_import.is_some() && sim_frame == 30 {
+                let size = ui.theme().label.font_size;
+                let fam = self.top.font_name.clone();
+                // 样本刻意混排（汉字 + 拉丁 + 数字）：导入字体与回落字体在任一类字形上
+                // 步进不同都会体现出来，比"只量两个汉字"更不容易撞上等宽巧合。
+                const SAMPLE: &str = "字体导入测试 ABCDEFG 0123456789";
+                let w_default = ui.text_size(SAMPLE, size, None).x;
+                let w_imported = ui.text_size(SAMPLE, size, Some(&fam)).x;
+                let ok = !fam.is_empty() && (w_default - w_imported).abs() > 0.5;
+                eprintln!(
+                    "sim-import: 排版实测「{SAMPLE}」默认族 {w_default:.1} vs 导入族 {fam:?} {w_imported:.1} {}",
+                    if ok {
+                        "[OK] 导入的字体真的参与了整形"
+                    } else {
+                        "[FAIL] 导入的族名没生效（回落默认族）"
+                    }
+                );
+            }
             // ── `--sim-shadow`：投影颜色的**主题通路**（色块 → `ShadowStyle::color`
             //    → 主题 → 镶嵌）。第 30 帧把投影换成半透明红，前后各打印一次主题值：
             //    主题值必须真的变（改色块没反应 = 主题没吃这个令牌）。
@@ -1892,6 +2021,25 @@ impl App for UiApp {
                 }
             );
         }
+        // --sim-import：打印导入结果 + 应用侧真的拿到了什么（字体族 / 背景纹理尺寸）——
+        // 覆盖"字节 → 纹理 / 字体"这条线（**不含**真人点系统选择器那一步：阻塞对话框在
+        // 无头环境里没法跑，而且那一步没有引擎逻辑）。
+        if self.sim_import.is_some() && f.frames() == 30 {
+            let bg = self
+                .windows
+                .bg_image
+                .map(|b| format!("{:.0}×{:.0}", b.texel.x, b.texel.y))
+                .unwrap_or_else(|| "无".to_owned());
+            let ok = !self.top.import_status.contains("失败")
+                && !self.top.import_status.contains("不认得")
+                && !self.top.import_status.is_empty();
+            eprintln!(
+                "sim-import: status={:?} · 字体族={:?} · 背景纹理={bg} {}",
+                self.top.import_status,
+                self.top.font_name,
+                if ok { "[OK] 导入通路走通" } else { "[FAIL] 导入没成功" }
+            );
+        }
         // --sim-picker：打印脚本化拖动后演示取色器的颜色（守护"面板确实改了值"：
         // 只有点击命中色块 → 面板打开 → SV 平面/色相条/滑块被拖到，颜色才会变）。
         if self.sim_picker && f.frames() == 90 {
@@ -2058,6 +2206,7 @@ fn main() -> Result<(), RunError> {
     app.sim_weight = args.iter().any(|a| a == "--sim-weight");
     app.sim_shadow = args.iter().any(|a| a == "--sim-shadow");
     app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
+    app.sim_import = parse_str_arg(&args, "--sim-import");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
         .iter()

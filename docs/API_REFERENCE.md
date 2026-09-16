@@ -672,7 +672,7 @@ pub enum AtlasKey {
 | 方法 | 说明 |
 |---|---|
 | `Text::new(gfx: &Gpu)` | 创建字体管理器（自动加载系统字体） |
-| `load_font_data(data: Vec<u8>)` | 加载额外的 ttf/otf 字体数据 |
+| `load_font_data(data: Vec<u8>) -> Vec<String>` | 加载额外的 ttf/otf/ttc 字体数据，**返回本次新增的字体族名**（去重；空 = 该族已在库里）。应用"导入字体"时必须拿到族名才能用（`label.font_family(name)` 只认族名）——见 `Text::font_families`（内部求差，与 `fontdb` 的槽位顺序无关） |
 | `Text::label(text) -> Label` | ★ 责任链入口 → `.size/.line_height/.align/.font_family/.at/.center/.anchor/.draw(layer)` |
 | `Text::label_from(&Arc<Buffer>) -> Label` | 从用户保存的共享 `Arc<Buffer>` 进入（跳过整形） |
 | `Text::measure_buffer(buffer) -> Vec2` | 已排版 Buffer 的内容宽高（空文本返回 (0,0)） |

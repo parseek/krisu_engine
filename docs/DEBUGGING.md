@@ -225,6 +225,31 @@ fn update(&mut self, ctx: &mut Ctx) {
   cargo run -p eg260818UI -- --image .\shot.png --font-file C:\Windows\Fonts\consola.ttf
   ```
 
+- **「导入图片…」/「导入字体…」这条运行时通路**（系统文件选择器 → 字节 → 纹理 / 字体）：
+  选择器是**阻塞**调用、无头环境里没法跑，所以脚本化的等价开关是 `--sim-import <路径>`
+  ——**不弹对话框**，直接走同一条 `apply_import`：
+
+  ```
+  # 字体：新族名必须被识别出来 + 真的参与整形
+  cargo run -p eg260818UI -- --sim-import C:\Users\me\Documents\MyFont.ttf --frames 40
+  sim-import: 排版实测「字体导入测试 ABCDEFG 0123456789」默认族 340.0 vs 导入族 "SJnenglianghei" 348.0 [OK] 导入的字体真的参与了整形
+  sim-import: status="字体：MyFont.ttf → SJnenglianghei" · 字体族="SJnenglianghei" · 背景纹理=32×32 [OK] 导入通路走通
+
+  # 图片：纹理尺寸从内建棋盘的 32×32 变成图片自己的尺寸
+  cargo run -p eg260818UI -- --sim-import .\shot.png --frames 40
+  sim-import: status="图片：shot.png 1920×1200" · 字体族="" · 背景纹理=1920×1200 [OK] 导入通路走通
+  ```
+
+  错误路径同样可脚本化（**这些是"应当失败"的用例**，输出 `[FAIL] 导入没成功` 才对）：
+  `--sim-import Cargo.toml` → `不认得的文件类型：…`；
+  `--sim-import C:\nope.png` → `图片导入失败：图片打不开：…`。
+  ⚠ 用**系统字体自己的文件**（如 `C:\Windows\Fonts\arial.ttf`）测会得到
+  `字体：arial.ttf（该族已在库里）`——`FontSystem::new()` 启动时已索引系统字体，
+  要验证"新增族名"必须用**系统字体目录之外**的字体文件。
+  真人在窗口里点按钮那条链路（按钮 → `import_request` → 帧外弹选择器）不走脚本；
+  它的两个前提由代码结构保证：请求只在帧外消费（`rfd` 阻塞，且录制期 `f` 借着 `ctx`）、
+  图片应用在**帧内**（`Gpu` 只能从 `f.draw()` 拿）。
+
 ---
 
 ## 3. 多画面 / 分屏：先看"哪块是哪块"

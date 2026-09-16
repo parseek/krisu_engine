@@ -9,3 +9,7 @@ rjw_krusie = { path = "../../crates/rjw_krusie" }
 # `--image <路径>`：加载用户图片当 `ImageBg`（PNG / JPEG / BMP / GIF）。
 # `default-features = false` + 显式列解码器 ⇒ 不引入用不到的格式依赖。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
+# 「文件导入…」的**系统文件选择器**（跨平台：Windows / macOS / Linux(GTK/XDG)）。
+# 引擎不背这个依赖——**文件对话框是应用侧的事**（引擎只提供"从路径读出字节 →
+# 纹理 / 字体"的通路），所以它只出现在示例的 Cargo.toml 里。
+rfd = "0.17"
