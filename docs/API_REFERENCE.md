@@ -859,6 +859,12 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 | `ui.panel()` | `.pos(..)` `.drag(id)` `.style(..)` `.show(\|pp\| ..)` | 面板 = `panel_at` + `drag_panel_at` 统一入口 |
 | `ui.modal(id)` | `.pos(..)` `.width(w)` `.show(\|m\| ..)` | 模态对话框（唯一入口） |
 
+**菜单栏**（横向触发器 + 闭包下拉面板）：
+
+| 入口 | 链 | 语义 |
+|---|---|---|
+| `ui.menu_bar(id, pos, \|bar\| ..)` | `bar.menu(label, \|m\| ..)` → `MenuCtx::{item, item_checked, caption, separator}` | 返回栏尺寸；`pos` = 栏左上角（顶层 = 屏幕坐标）。展开状态跨帧持久于 `UiState::menu_open`（触发器绝对 ID）；**同一时刻只有一个菜单开着**，点菜单项 / 点栏外 / Esc 都收起。`MenuCtx` **`Deref` 到 `Window`** ⇒ 菜单里同样能放 `label` / `button` / `divider` / `row`（横向排版）/ `text_input` / `add(..)`。下拉面板是 `Level::Normal` 浮层窗口——**想盖住别的窗口就把菜单栏录在各窗口之后**（窗口 z 按首次录制的 `max+1` 分配）。细节见 `docs/ENGINE_GUIDE.md` §18.13 |
+
 **窗口外框（标题栏 / 关闭 / 收起）**：三个选项各自独立、**都不调就完全没有外框**
 （逐像素等于旧行为）；任一开启都在窗口内容**第一行**录一条标题栏（底色
 `Palette::surface_raised` + 面板同色边框 ⇒ 通条，底边那条就是分隔线）。

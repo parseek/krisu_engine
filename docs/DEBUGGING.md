@@ -225,6 +225,25 @@ fn update(&mut self, ctx: &mut Ctx) {
   cargo run -p eg260818UI -- --image .\shot.png --font-file C:\Windows\Fonts\consola.ttf
   ```
 
+- **"菜单栏点了没反应 / 菜单项点了菜单不收"**：示例的 `--sim-menu` 脚本化走两阶段
+  （点「视图」触发器 → 点下拉里第一个菜单项），坐标同样**运行时解算**（触发器按主题
+  尺寸算、菜单项按**下拉窗口原点**算，见 `update` 里那段注释）：
+
+  ```
+  cargo run -p eg260818UI -- --sim-menu --frames 40
+  sim-menu: menu_open=None · 主题调节窗口=关 [OK] 点触发器开菜单 + 点菜单项执行并自动收起
+  ```
+
+  判定同时看**引擎状态**（`UiState::menu_open` 必须已收起）与**应用状态**
+  （菜单项真的改了 `theme_tuner.open`）。两个典型失败：
+
+  | 症状 | 成因 |
+  |---|---|
+  | 触发器点不着 | 坐标错（栏位置 / 触发器宽 = 文字宽 + `button.padding.x`）；`RJ_HIT_TRACE=1` 看这个像素命中谁（`menubar::视图` / `menubar::视图/item::…`） |
+  | 菜单开着但点菜单项后不收 | `MenuCtx` 的 `close` 标志没被 `MenuBar` 读回（`item_clicked`）⇒ `finish()` 不会写 `menu_open = None` |
+  | 下拉被别的窗口压住 | 菜单栏录得太早（窗口 z 按首次录制的 `max+1` 分配）⇒ 录在各窗口之后 |
+  | `m.row(..)` 编译报 "method `row` is private" | `MenuCtx` 上加过私有 `fn row` helper，遮蔽了 `Deref` 出来的 `Window::row` |
+
 - **「导入图片…」/「导入字体…」这条运行时通路**（系统文件选择器 → 字节 → 纹理 / 字体）：
   选择器是**阻塞**调用、无头环境里没法跑，所以脚本化的等价开关是 `--sim-import <路径>`
   ——**不弹对话框**，直接走同一条 `apply_import`：

@@ -2949,6 +2949,34 @@ impl<'a> Ui<'a> {
         size
     }
 
+    /// **菜单栏**（横向；见 [`crate::widgets::MenuBar`] 的模块文档与用法示例）。
+    ///
+    /// `pos` 是栏左上角（带单位，顶层放置时即屏幕坐标）；`f` 里逐个 `bar.menu(label, |m| ..)`
+    /// 加菜单，下拉面板内容用闭包写（`item` / `item_checked` / `caption` / `separator`，
+    /// 并 `Deref` 到 [`Window`] ⇒ 文本输入 / 分割线 / 按钮 / 横向排版都能放）。返回栏尺寸。
+    ///
+    /// - 展开状态跨帧持久于 [`UiState::menu_open`]（触发器的**绝对 ID**）；
+    /// - **同一时刻只有一个菜单开着**；点菜单项 / 点栏外 / Esc 都会收起；
+    /// - 下拉面板是 [`Level::Normal`] 浮层窗口 —— 想让它盖住别的窗口就把菜单栏录在
+    ///   **各窗口之后**（窗口 z 在首次录制时按 `max+1` 分配）。
+    pub fn menu_bar(
+        &mut self,
+        id: &str,
+        pos: impl Into<Position>,
+        f: impl FnOnce(&mut crate::widgets::MenuBar<'_, '_>),
+    ) -> Vec2 {
+        let pos = pos.into().to_physical(self.scale);
+        let open = self.state.menu_open.as_ref().map(|s| s.as_str().to_owned());
+        let mut bar = crate::widgets::MenuBar::new(self, id, pos, open);
+        f(&mut bar);
+        let (size, action) = bar.finish();
+        if let Some(a) = action {
+            // `None` = 收起；`Some(id)` = 展开到该触发器。
+            self.state.menu_open = a.map(IdAbsolute::owned);
+        }
+        size
+    }
+
     /// **模态对话框**：全屏半透明遮罩（[`Theme::modal`](crate::style::Theme::modal)
     /// 的颜色/尺寸，默认全屏半透明黑）置于最上层，背后一切交互被遮挡（遮罩矩形
     /// 经窗口遮挡判定阻断，含顶层 win=0 内容）；对话框（可拖拽）浮于遮罩之上。

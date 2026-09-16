@@ -1621,7 +1621,57 @@ cargo run -p eg260818UI -- --sim-chrome --frames 100      # 真的去点 ⌃ / �
 窗口拖拽**。引擎侧的不变量由 `ui::tests::window_chrome_bar_and_collapse_flags` 守着
 （"空外框不画栏" / "`shrink(false, ..)` 不画栏但状态生效"）。
 
-### 18.13 维护约定（对 AI）
+### 18.13 菜单栏（menu_bar）
+
+横向一排触发器 + 点开的**下拉面板**，面板内容是**闭包上下文**（与窗口同一套 API）：
+
+```rust
+use rjw_ui::{Ui, UiAdd};   // `UiAdd` 让 `m.label` / `m.row` / `m.text_input` 可用
+
+ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {      // 位置 = 栏左上角（顶层 = 屏幕坐标）
+    bar.menu("文件", |m| {
+        m.caption("文件名过滤");                        // 纯文本行（不可点）
+        m.text_input("menu_filter", &mut self.filter);  // 菜单里也能放**文本输入**
+        m.separator();                                  // 分割线
+        if m.item("导入图片…") { /* 点完自动收起 */ }
+        if m.item("保存") { }
+    });
+    bar.menu("视图", |m| {
+        m.item_checked("窗口 A 显示", &mut self.show_a); // 带勾选：点击翻转 `&mut bool`
+        m.row(|r| {                                     // **横向排版**（`Deref` 到 `Window`）
+            if r.button("d0", "紧凑").clicked() { }
+            if r.button("d1", "标准").clicked() { }
+        });
+    });
+});
+```
+
+| 行为 | 机制 |
+|---|---|
+| 展开状态 | `UiState::menu_open`（**触发器绝对 ID**；与 `combo_open` 分开存——同一时刻只该有一个菜单开着，而下拉框属于某个控件） |
+| 点另一个触发器 | 切换（旧的关、新的开）；再点自己 = 收起 |
+| 点菜单项 | **执行 + 自动收起**（`item` / `item_checked` 内部把 `close` 标志交给栏） |
+| 点栏外 | 收起（栏外 = 既不在触发器上、也不在下拉面板矩形内） |
+| **Esc** | 收起。应用自己的 Esc 语义先看 `UiState::menu_open()`（菜单开着那一帧别抢） |
+| 下拉面板 | 一个 [`Level::Normal`] 浮层窗口（点它不置顶） |
+
+> ⚠ **想让下拉盖住别的窗口，就把菜单栏录在各窗口之后**：窗口 z 在**首次录制**时按
+> `max+1` 分配 —— 录在前面的话，本帧后面录的窗口 z 更高、会压住下拉。
+> `eg260818UI` 把菜单栏放在段 2 的模块之后、字体弹窗之前。
+>
+> ⚠ `MenuCtx` 经 `Deref` 暴露 `Window`（所以 `label` / `button` / `divider` / `row` /
+> `text_input` / `add` 全可用）。给 `MenuCtx` 加 helper 时**别用会撞名的私有方法**
+> （如私有 `fn row`）：私有方法会**遮蔽** deref 出来的 `Window::row`，应用的
+> `m.row(..)` 会转去调私有那个（编译报 "method `row` is private"）。
+>
+> ⚠ 菜单栏**手排**而不是用 `pack`：`menu()` 展开时会在同一帧立刻录下拉窗口，而
+> `pack_at` 闭包里录窗口会把浮层算进 pack 结算尺寸（栏被撑成浮层那么大）。
+
+**验证**：`--sim-menu`（点「视图」触发器 → 菜单打开；再点第一个菜单项 → 勾选翻转 +
+菜单自动收起，打印引擎状态与应用状态），引擎侧不变量由
+`state::tests::menu_open_is_readable_and_cleared_by_reset` 守着（读得到 + `reset` 清空）。
+
+### 18.14 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。

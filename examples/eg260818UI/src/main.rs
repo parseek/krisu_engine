@@ -1083,6 +1083,14 @@ struct UiApp {
     /// 文件导入：**已选好、等帧内应用**的图片路径（要 `f.draw().gpu()`；`Ctx` 在帧外
     /// 拿不到 `Gpu`）。请求与状态在 [`TopBar`]（那是显示它们的模块）。
     import_image_path: Option<std::path::PathBuf>,
+    /// **菜单栏**里的"文件名过滤"输入框内容（演示"菜单里也能放文本输入"）。
+    menu_filter: String,
+    /// --sim-menu：脚本化点击菜单栏（第一阶段点开「视图」，第二阶段点第一个菜单项）。
+    sim_menu: bool,
+    /// --sim-menu：解算出的「视图」触发器中心（**每帧都算**：栏位置只跟主题有关）。
+    menu_trigger_pt: Option<Vec2>,
+    /// --sim-menu：下拉里第一个菜单项中心（**菜单展开后**才知道下拉窗口在哪）。
+    menu_item_pt: Option<Vec2>,
     /// 「被遮挡控件仍被触发」复现器。
     cover: CoverDemo,
     /// `--sim-cover` 段 A 结束时的认领次数（段 B 不许再涨）。
@@ -1181,6 +1189,10 @@ impl UiApp {
             sim_tuner: false,
             sim_import: None,
             import_image_path: None,
+            menu_filter: String::new(),
+            sim_menu: false,
+            menu_trigger_pt: None,
+            menu_item_pt: None,
             weight_probe: None,
             cover: CoverDemo::default(),
             cover_starts_after_a: 0,
@@ -1656,6 +1668,22 @@ impl App for UiApp {
                 _ => {}
             }
         }
+        // ── 调试：脚本化鼠标（`--sim-menu`）──────────────────────
+        // 行程：10..11 移到「视图」触发器 → 12..13 按下 → 14..15 抬起（菜单打开）
+        //      → 22..23 按下第一个菜单项（"主题调节窗口"）→ 24..25 抬起
+        // （坐标由上一帧录制时解算：触发器按主题尺寸算，菜单项按**下拉窗口原点**算。）
+        if self.sim_menu {
+            let trigger = self.menu_trigger_pt.unwrap_or(Vec2::ZERO);
+            let item = self.menu_item_pt.unwrap_or(trigger);
+            match f.frames() {
+                10..=11 => f.debug_inject_mouse(trigger, false),
+                12..=13 => f.debug_inject_mouse(trigger, true),
+                14..=15 => f.debug_inject_mouse(trigger, false),
+                22..=23 => f.debug_inject_mouse(item, true),
+                24..=25 => f.debug_inject_mouse(item, false),
+                _ => {}
+            }
+        }
         // ── 调试：脚本化鼠标（`--sim-click X,Y`）──────────────────
         // 在**指定屏幕物理点**按下 + 释放（第 20/21 帧，之后停在原地到第 40 帧）——
         // 配合 `RJ_HIT_TRACE=1`（引擎打印每次命中归属）就能回答"这一像素到底是谁的"：
@@ -1831,7 +1859,9 @@ impl App for UiApp {
             //    与旧 `capturing_text()`（任何控件持焦点都为真）不同：只有**文本控件**
             //    持焦点才屏蔽快捷键（按钮/滑块 Tab 焦点不吞应用按键）。
             if ui.state().text_focus().is_none() {
-                if ui.key_down_edge(KeyCode::Escape) {
+                // `Esc` 先让给**菜单栏**（菜单开着时那一帧不退出）：引擎在菜单栏里消费了
+                // `Esc`（收起菜单），这里看**上一帧**的展开状态就够（菜单栏录在本帧后段）。
+                if ui.key_down_edge(KeyCode::Escape) && ui.state().menu_open().is_none() {
                     exit_requested = true;
                 }
                 if ui.key_down_edge(KeyCode::KeyR) {
@@ -1917,6 +1947,107 @@ impl App for UiApp {
             self.right
                 .ui(&mut ui, &mut clicks, &prev_press, prev_blocked, prev_widget_blocked);
             self.theme_tuner.ui(&mut ui);
+
+            // ── **菜单栏**（横向；`Ui::menu_bar`）────────────────────────────────
+            // 录在各窗口**之后**：下拉面板是浮层窗口，窗口 z 在**首次录制**时按 `max+1`
+            // 分配 ⇒ 放最后才能保证它盖住别的窗口（见 `widgets/menubar.rs` 模块文档）。
+            //
+            // 三个菜单覆盖不同内容形态，把"闭包上下文"的能力演示全：
+            // - 「文件」：**文本输入**（文件名过滤，实时回显）+ 分割线 + 菜单项（导入 / 退出）；
+            // - 「视图」：**带勾选的菜单项**（窗口显隐 / 收起，直接绑应用自己的 `&mut bool`）
+            //   + 标题行 + **横向排版**（密度三档按钮 —— `MenuCtx` 解引用到 `Window`）；
+            // - 「帮助」：纯文本行（操作提示）。
+            let menu_size = ui.menu_bar("menubar", Vec2::new(620.0, 12.0), |bar| {
+                bar.menu("文件", |m| {
+                    m.caption("文件名过滤（菜单里也能放文本输入）");
+                    m.text_input("menu_filter", &mut self.menu_filter);
+                    if !self.menu_filter.is_empty() {
+                        m.caption(&format!("当前：{}", self.menu_filter));
+                    }
+                    m.separator();
+                    if m.item("导入图片…") {
+                        self.top.import_request = Some(ImportKind::Image);
+                    }
+                    if m.item("导入字体…") {
+                        self.top.import_request = Some(ImportKind::Font);
+                    }
+                    m.separator();
+                    if m.item("退出（Esc）") {
+                        exit_requested = true;
+                    }
+                });
+                bar.menu("视图", |m| {
+                    m.item_checked("主题调节窗口", &mut self.theme_tuner.open);
+                    m.item_checked("窗口 A 显示", &mut self.windows.win_a_open);
+                    // 收起状态是**应用自己的 bool**：菜单能收起窗口，标题栏按钮也能
+                    // （`shrink(show, &mut bool)` 里 `show = false` 正是给这种用法留的）。
+                    m.item_checked("窗口 A 收起", &mut self.windows.win_a_collapsed);
+                    m.separator();
+                    m.caption("密度");
+                    m.row(|r| {
+                        if r.button("mb_cmp", "紧凑").clicked() {
+                            self.theme_tuner.set_density(Density::Compact);
+                        }
+                        if r.button("mb_coz", "标准").clicked() {
+                            self.theme_tuner.set_density(Density::Cozy);
+                        }
+                        if r.button("mb_spa", "宽松").clicked() {
+                            self.theme_tuner.set_density(Density::Spacious);
+                        }
+                    });
+                });
+                bar.menu("帮助", |m| {
+                    m.caption("操作提示");
+                    m.separator();
+                    m.label("拖动 = 移动窗口 · 点击 = 置顶");
+                    m.label("Tab 遍历焦点 · Enter / Space 激活");
+                    m.label("Esc 先关菜单，再按才退出");
+                });
+            });
+            debug_assert!(menu_size.x > 0.0, "菜单栏至少有宽度");
+
+            // `--sim-menu`：坐标解算（**本帧录制后**已知栏在哪、下拉面板在哪）——
+            // 注入只能经 `Frame` 且在段之前，所以这里只算、段外下一帧注（同 `--sim-tuner`）。
+            if self.sim_menu {
+                let dump = ui.debug_dump();
+                let (fs, pad_x, row_h, gap) = {
+                    let t = ui.theme();
+                    (t.button.font_size, t.button.padding.x, t.row_h, t.gap)
+                };
+                // 触发器：「视图」是第 2 个（三个都是两个字 ⇒ 等宽），栏在 (620,12) 逻辑。
+                let tw = ui.text_size("视图", fs, None).x;
+                let w = tw + pad_x * 2.0;
+                self.menu_trigger_pt =
+                    Some(Vec2::new(930.0 + (w + gap) + w * 0.5, 18.0 + row_h * 0.5));
+                // 下拉里**第一个菜单项**（窗口原点 + 半项高；面板 padding = 0）。
+                let item_h = (fs * 1.3).round() + 6.0;
+                self.menu_item_pt = dump
+                    .windows
+                    .iter()
+                    .find(|p| p.id == "menubar::视图")
+                    .map(|p| Vec2::new(p.origin.x + w * 0.5, p.origin.y + item_h * 0.5));
+            }
+            // `--sim-menu` 判定（在菜单栏录制**之后**读状态：本帧的展开 / 收起已定）。
+            // ① 点「视图」触发器 → 菜单打开（`UiState::menu_open` = 该触发器绝对 ID）；
+            // ② 点下拉第一个菜单项（"主题调节窗口"）→ 勾选翻转（窗口关掉）+ 菜单自动收起。
+            if self.sim_menu && sim_frame == 30 {
+                let open = ui.state().menu_open().map(|s| s.to_owned());
+                let tuner_open = self.theme_tuner.open;
+                let ok = open.is_none() && !tuner_open;
+                eprintln!(
+                    "sim-menu: menu_open={open:?} · 主题调节窗口={} {}",
+                    if tuner_open { "开" } else { "关" },
+                    if ok {
+                        "[OK] 点触发器开菜单 + 点菜单项执行并自动收起"
+                    } else {
+                        "[FAIL] 菜单没开 / 菜单项没执行 / 没自动收起"
+                    }
+                );
+            }
+
+            // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
+            // 不被本帧后录的窗口盖住——见 `modal_at` 文档）。
+            self.top.show_font_modal(&mut ui);
 
             // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
             // 不被本帧后录的窗口盖住——见 modal_at 文档）。
@@ -2207,6 +2338,7 @@ fn main() -> Result<(), RunError> {
     app.sim_shadow = args.iter().any(|a| a == "--sim-shadow");
     app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
     app.sim_import = parse_str_arg(&args, "--sim-import");
+    app.sim_menu = args.iter().any(|a| a == "--sim-menu");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
         .iter()

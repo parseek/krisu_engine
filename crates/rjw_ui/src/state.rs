@@ -408,6 +408,12 @@ pub struct UiState {
     pub(crate) scrolls: HashMap<IdAbsolute<'static>, ScrollState>,
     /// **下拉框展开状态**：当前展开的 `combo` 的 **绝对 ID**（`None` = 全部收起）。
     pub(crate) combo_open: Option<IdAbsolute<'static>>,
+    /// **菜单栏展开状态**：当前展开的菜单（[`crate::Ui::menu_bar`] 的**触发器绝对 ID**；
+    /// `None` = 全部收起）。点菜单项 / 点栏外 / Esc 都会清空。
+    ///
+    /// 与 `combo_open` 分开存：菜单栏的展开是"应用级 UI"（同一时刻只该有一个菜单开着），
+    /// 而下拉框属于某个控件——混用一个槽会在"菜单开着时点下拉框"上打架。
+    pub(crate) menu_open: Option<IdAbsolute<'static>>,
     /// **颜色选择器的全局跨帧数据**（呈现模式 / 替补输入缓冲 / 展开的面板 / HSV 缓存）。
     ///
     /// 类型定义在**控件自己的模块**里（[`crate::widgets::ColorPickerState`]，见
@@ -533,7 +539,7 @@ impl UiState {
         self.last_press_window = None;
         self.scrolls.clear();
         self.combo_open = None;
-        self.color_picker = crate::widgets::ColorPickerState::default();
+        self.menu_open = None;        self.color_picker = crate::widgets::ColorPickerState::default();
         self.sizes.clear();
         self.window_fx.clear();
         self.stats = UiStats::default();
@@ -591,6 +597,20 @@ impl UiState {
         self.last_press_window
             .as_ref()
             .map(|(id, z)| (id.as_str(), *z))
+    }
+
+    /// 当前**展开的菜单栏菜单**（触发器绝对 ID；`None` = 全部收起）。
+    ///
+    /// 应用侧的用法：别和菜单抢 `Esc`——
+    /// ```no_run
+    /// # use rjw_ui::UiState;
+    /// # fn f(state: &UiState, esc: bool) -> bool {
+    /// if state.menu_open().is_none() && esc { /* 应用自己的 Esc 语义（如退出） */ }
+    /// # true }
+    /// ```
+    #[inline]
+    pub fn menu_open(&self) -> Option<&str> {
+        self.menu_open.as_ref().map(|s| s.as_str())
     }
 
     /// **诊断**：上一帧"认领按下后被帧末复核撤销"的次数（见 `Ui::resolve_widget_press`
@@ -683,6 +703,18 @@ impl CheckboxState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_open_is_readable_and_cleared_by_reset() {
+        // 菜单栏的展开状态是**应用可见**的（`menu_open()`：应用据此决定 Esc / 快捷键要不要让位），
+        // 且 `reset()` 必须清掉——否则重置 UI 状态后菜单"看起来还开着"、点击行为错乱。
+        let mut st = UiState::new();
+        assert_eq!(st.menu_open(), None, "初始收起");
+        st.menu_open = Some(IdAbsolute::owned("menubar::文件".to_owned()));
+        assert_eq!(st.menu_open(), Some("menubar::文件"), "读到触发器绝对 ID");
+        st.reset();
+        assert_eq!(st.menu_open(), None, "reset 清空菜单展开状态");
+    }
 
     /// **帧级暂存**：一帧开场一次、收尾关场；`UiState::clone` 不带帧内暂存。
     ///

@@ -309,6 +309,8 @@ mod label;
 mod numberinput;
 mod slider;
 pub(crate) mod title_button;
+/// **菜单栏**（横向触发器 + 闭包下拉面板；状态在 `UiState.menu_open`）。
+pub mod menubar;
 
 pub use button::Button;
 pub use checkbox::Checkbox;
@@ -318,6 +320,7 @@ pub use colorpicker::{
 };
 pub use divider::Divider;
 pub use fontmodal::{FONT_WEIGHT_CHOICES, FontModal, weight_label};
+pub use menubar::{MenuBar, MenuCtx};
 pub use label::Label;
 pub use numberinput::{GRIP_W, NumberInput};
 pub use slider::{Slider, SliderValue};

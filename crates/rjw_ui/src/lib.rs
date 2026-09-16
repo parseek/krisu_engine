@@ -186,8 +186,8 @@ pub use view::{ViewCtx, ViewMode};
 pub use rjw_text::{Stretch, Style, Weight};
 pub use widgets::{
     Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, FONT_WEIGHT_CHOICES,
-    FontModal, GRIP_W, Label, NumberInput, Response, Slider, SliderValue, Widget, WidgetId,
-    color_hex, format_color, format_f, format_u8, ink_on, luma, parse_color, parse_hex,
+    FontModal, GRIP_W, Label, MenuBar, MenuCtx, NumberInput, Response, Slider, SliderValue, Widget,
+    WidgetId, color_hex, format_color, format_f, format_u8, ink_on, luma, parse_color, parse_hex,
     weight_label,
 };
 

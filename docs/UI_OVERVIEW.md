@@ -156,8 +156,13 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 `dragging`，计数 `UiState::press_cancelled_by_window()`）。两条真实路径（同帧移动 / 应用改 z）
 用 `--sim-cover` 脚本化守护，见 `docs/DEBUGGING.md` §8.2。
 
-### 8. 文本编辑（`edit.rs` 纯逻辑，可单测）
+**菜单栏**（`Ui::menu_bar`）：横向触发器 + 点开的**闭包下拉面板**（`MenuCtx` 提供
+`item` / `item_checked` / `caption` / `separator`，并 `Deref` 到 `Window` ⇒ 菜单里也能放
+文本输入 / 分割线 / 按钮 / 横向排版）。展开状态 = `UiState::menu_open`（同一时刻只有一个
+菜单开着），点菜单项 / 点栏外 / Esc 收起。下拉是 `Level::Normal` 浮层窗口 ⇒ 菜单栏要录在
+**各窗口之后**才盖得住它们。细节见 `docs/ENGINE_GUIDE.md` §18.13，脚本化验证 `--sim-menu`。
 
+### 8. 文本编辑（`edit.rs` 纯逻辑，可单测）
 - 编辑状态机 `apply_frame_edits`：剪贴板（Ctrl+C/V/X/A）→ 选择替换 → IME 上屏 →
   普通字符 → 退格/删除（单行/多行共用）；
 - 光标移动 `caret_horiz`（←/→，Shift 扩展）；
