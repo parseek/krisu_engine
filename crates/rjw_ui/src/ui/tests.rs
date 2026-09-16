@@ -94,6 +94,57 @@ fn cmd_sig_invalidates_on_content_change() {
 }
 
 #[test]
+fn panel_cmds_draw_image_and_border_at_any_radius() {
+    // 回归防线（真实 bug）：背景图与边框曾经被写在"圆角分支"里 ⇒ `radius == 0`（直角）
+    // 的面板**静默丢掉背景图**——演示里「背景图：Tile（1:1 平铺，直角）」那个窗口因此
+    // 一片空白（像素采样证实窗口体只有平渐变、找不到棋盘两色）。
+    let rect = Rect::new(0.0, 0.0, 120.0, 60.0);
+    let bg = crate::style::Brush::Solid(Color::rgba_u8(30, 40, 50, 255));
+    let img = ImageBg::new(7, Vec2::new(32.0, 32.0));
+    let run = |radius: CornerRadius, img: Option<ImageBg>, border_w: f32| -> Vec<DrawKind> {
+        let mut out = Vec::new();
+        push_panel_img_cmds(
+            &mut out,
+            PanelCmdCtx { depth: 0, win: 0, elem: 1, rect, clip: None, seq: 1 },
+            &bg,
+            img,
+            Color::WHITE,
+            border_w,
+            radius,
+        );
+        out.into_iter().map(|d| d.kind).collect()
+    };
+    let kinds = |v: &[DrawKind]| -> Vec<&'static str> {
+        v.iter()
+            .map(|k| match k {
+                DrawKind::Solid(_) => "solid",
+                DrawKind::Rect(_) => "grad",
+                DrawKind::RoundedRect { .. } => "rounded",
+                DrawKind::Image(_) => "image",
+                DrawKind::Border { .. } => "border",
+                _ => "other",
+            })
+            .collect()
+    };
+    // 直角 + 纯色：实心 + 图 + 边框 —— **图必须在**（就是这条曾经缺失）。
+    let flat = run(CornerRadius::default(), Some(img), 1.0);
+    assert_eq!(kinds(&flat), ["solid", "image", "border"], "直角面板必须画背景图");
+    // 圆角 + 纯色：整块圆角 + 图 + 边框。
+    let rounded = run(CornerRadius::all(8.0), Some(img), 1.0);
+    assert_eq!(kinds(&rounded), ["rounded", "image", "border"]);
+    // 无图 / 无边框时不多推命令（层数随参数收缩，命令序仍连续）。
+    assert_eq!(kinds(&run(CornerRadius::default(), None, 0.0)), ["solid"]);
+    assert_eq!(kinds(&run(CornerRadius::default(), None, 2.0)), ["solid", "border"]);
+    assert_eq!(kinds(&run(CornerRadius::default(), Some(img), 0.0)), ["solid", "image"]);
+    // 图带的 radius 被面板 radius 覆盖（免得"图与面板圆角不一致"）。
+    let with_r = run(CornerRadius::all(6.0), Some(img), 0.0);
+    match with_r.iter().find(|k| matches!(k, DrawKind::Image(_))) {
+        Some(DrawKind::Image(b)) => assert_eq!(b.radius, CornerRadius::all(6.0)),
+        _ => panic!("应有一条 Image 命令"),
+    }
+}
+
+#[test]
 fn cmd_sig_covers_image_fields() {
     // 背景图的每个渲染输入都必须进签名：否则改铺排 / 染色 / 圆角 / 换纹理时
     // 窗口顶点缓存会误判"内容未变"而继续用旧顶点（图片不刷新）。

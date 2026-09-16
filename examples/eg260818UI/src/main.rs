@@ -420,40 +420,50 @@ impl Windows {
             });
             w.label("绝对定位版：ui.icon_at(pos, size, icon, color)");
         });
-        // ── 背景图（`ImageBg`）：四种铺排 ─────────────────────────────
+        // ── 背景图（`ImageBg`）：四种铺排收进**一个窗口** ───────────────
         // 棋盘纹理在 `init` 里建（`Gfx::texture`），这里只拿 uid + 纹素尺寸。
         // 窗口背景图经 `PanelStyle::with_bg_image`（画在背景刷之上、内容之下，
-        // 圆角遮罩**恒用面板 radius**——所以下面这个圆角窗口的图也被圆角裁掉）。
+        // 圆角遮罩**恒用面板 radius**）。
+        //
+        // **为什么是一个窗口、且在这个位置**：旧实现是四个独立演示硬编码在左侧
+        // `(16,300)/(16,400)/(16,470)/(16,536)`，而左侧主菜单 pack 是 **win=0 同层**
+        // 内容、已长到 y≈560 —— 于是 `image_at` 那两块棋盘**压在菜单文字上**
+        // （"数字条 ×2 + 按钮"那行），两个图片窗口又盖住菜单中段。现在：
+        // ① 四种铺排全在窗口内（窗口画在 win=0 之上，层次天然正确）；
+        // ② 位置挪到右侧空白带（x 1120..1278 / y 545..~690：`flex_at` 之右、
+        //    `strict_win` 之下、底部说明之上），与菜单 / 列表 / flex 全不重叠。
+        //
+        // 窗口本体 = **Tile 1:1 + 直角**：这正是"直角面板丢背景图"那个历史 bug 的现场
+        // （`push_panel_like_img` 曾把背景图写在圆角分支里），修好后应能看见满窗棋盘。
         if let Some(bg) = self.bg_image {
-            let base = ui.theme().panel.clone().with_radius(10.0);
-            ui.window("img_fill")
-                .pos(Vec2::new(16.0, 300.0))
-                .width(200.0)
-                .style(base.clone().with_bg_image(bg.fit(ImageFit::Fill)))
+            let base = ui.theme().panel.clone();
+            let tile = bg.fit(ImageFit::Tile);
+            ui.window("img_box")
+                .pos(Vec2::new(1120.0, 548.0))
+                .width(140.0)
+                .style(base.with_radius(0.0).with_bg_image(tile))
                 .show(|w| {
-                    w.label("背景图：Fill（等比覆盖 + 圆角遮罩）");
-                    w.label("窗口拉大 / 缩小，图不变形");
+                    // 三行内嵌图片演示其余三种铺排（等比覆盖 / 拉伸 / 居中半透明）。
+                    // ⚠ 行内文本 + 图片的**总宽必须 < 固定宽 − 内边距**：窗口会比
+                    // 内容包围盒只大不小（`settle_size` 取并集），内容一宽就会被
+                    // `WindowClamp::Screen` 顶到屏幕边、压到隔壁的 flex 演示上。
+                    w.row(|r| {
+                        r.label("Fill");
+                        r.image(Vec2::new(56.0, 26.0), bg.fit(ImageFit::Fill).radius(4.0));
+                    });
+                    w.row(|r| {
+                        r.label("Stretch");
+                        r.image(Vec2::new(56.0, 26.0), bg.fit(ImageFit::Stretch).radius(4.0));
+                    });
+                    w.row(|r| {
+                        r.label("Center");
+                        r.image(
+                            Vec2::new(56.0, 26.0),
+                            bg.fit(ImageFit::Center).tint(Color::rgba(1.0, 1.0, 1.0, 0.6)),
+                        );
+                    });
+                    w.label("本体 Tile 1:1");
                 });
-            ui.window("img_tile")
-                .pos(Vec2::new(16.0, 400.0))
-                .width(200.0)
-                // 平铺不支持圆角（UV 需要环绕才能配合扇形三角化）→ 直角 + 边框
-                .style(base.clone().with_radius(0.0).with_bg_image(bg.fit(ImageFit::Tile)))
-                .show(|w| {
-                    w.label("背景图：Tile（1:1 平铺，直角）");
-                });
-            // 绝对定位原语：Stretch / Center 各来一块（不带窗口）
-            ui.image_at(
-                Vec2::new(16.0, 470.0),
-                Vec2::new(90.0, 60.0),
-                bg.fit(ImageFit::Stretch).radius(6.0),
-            );
-            ui.image_at(
-                Vec2::new(116.0, 470.0),
-                Vec2::new(90.0, 60.0),
-                bg.fit(ImageFit::Center).tint(Color::rgba(1.0, 1.0, 1.0, 0.6)),
-            );
-            ui.label_at(Vec2::new(16.0, 536.0), "image_at：Stretch（左）/ Center 半透明（右）");
         }
         // 赤石窗口：整窗旋转（角度 = cshi_num）+ 染色（**用 ColorPicker 调**：
         // 一个控件顶掉原来那 4 条 RGBA 滑条，alpha 也由面板的 A 行负责）。
