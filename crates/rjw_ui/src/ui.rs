@@ -1292,6 +1292,20 @@ impl<'a> Ui<'a> {
                     );
                 }
             }
+            GripShape::Diagonal => {
+                // 三条**斜线**（45°，从左下到右上）：一条斜线没法用 `push_solid_rect`
+                // （它只有轴对齐矩形）⇒ 走矢量图标 `Icon::GripDiagonal`。
+                // 方框取 `size*count*1.5`（比横线版大 1.5×）：三条斜线在 `size*count`
+                // 的小方框里间距只有 ~1px，羽化会把它们糊成一片。
+                let d = grip.size * grip.count as f32 * 1.5;
+                let m = grip.step;
+                self.icon_at(
+                    Position::Physical(Vec2::new(size.x - d - m, size.y - d - m)),
+                    Size::Physical(Vec2::splat(d)),
+                    Icon::GripDiagonal,
+                    grip.color,
+                );
+            }
         }
     }
 
@@ -2724,27 +2738,57 @@ impl<'a> Ui<'a> {
         };
         // 命中矩形 = 屏幕上那个矩形（首帧无 `prev_size` ⇒ 本帧不参与交互）。
         let panel_rect = prev_size.map(|ps| Rect::new(base_pos.x, base_pos.y, ps.x, ps.y));
-        // 固定宽窗口：右下角**缩放柄**（鼠标拖动改宽度，高度自动；跨帧持久于
-        // `UiState::window_widths`）。⚠ 交互须在窗口拖拽判定**之前**（claim_press
+        // **拖拽缩放**（右下角柄）：宽度跨帧持久于 `UiState::window_widths`、高度持久于
+        // `UiState::window_heights`。⚠ 交互须在窗口拖拽判定**之前**（`claim_press`
         // 阻止按下缩放柄时同时建立窗口拖拽基准）。基于通用 [`Self::resize_handle`]。
-        // handle 为**外层容器局部坐标**（此处 abs_base 仍为外层原点）；用 clamp 后
+        // handle 为**外层容器局部坐标**（此处 `abs_base` 仍为外层原点）；用 clamp 后
         // 位置 `base_pos`（而非 origin）——与显示一致，贴边窗口缩放柄可命中。
-        if let (Some(w), Some(ps)) = (width, prev_size) {
+        //
+        // `(allow, axes)`：`None` = 旧行为（**有 `.width(..)` 就能横向拖**）；
+        // `allow = false` ⇒ 不画柄也不响应拖拽（`.width(..)` 仍作布局固定宽）；
+        // `axes = Both` ⇒ 宽高同调（`↖↘` 光标）。
+        let (allow_resize, resize_axes) = resolve_window_resize(chrome.resize, width.is_some());
+        let resize_on = allow_resize && resize_axes != Resize::None;
+        if resize_on
+            && let Some(ps) = prev_size
+        {
             // **命中区跟随柄的图案尺寸**（`GripStyle::extent`），下限 14px（太小的柄点不中）；
             // `GripShape::Hidden` 时退回下限 —— 图案可以不画，但**缩放能力保留**。
             let hw = style.grip.extent().max(14.0);
             let handle = Rect::new(base_pos.x + ps.x - hw, base_pos.y + ps.y - hw, hw, hw);
             let h_id = format!("{id}::resize");
+            // 当前尺寸 = 屏幕上那个（宽取持久固定宽，高取持久高度 / 结算高）。
+            let cur_w = width.unwrap_or(ps.x);
+            let cur_h = self
+                .state
+                .window_heights
+                .get(id_for.as_str())
+                .copied()
+                .unwrap_or(ps.y);
+            let cursor = if resize_axes == Resize::Both {
+                crate::UiCursor::NwseResize
+            } else {
+                crate::UiCursor::EwResize
+            };
             if let Some(new_size) = self.resize_handle(
                 &h_id,
                 handle,
-                Vec2::new(w, ps.y),
-                Vec2::new(120.0, ps.y),
-                crate::UiCursor::EwResize,
+                Vec2::new(cur_w, cur_h),
+                // 最小尺寸：宽 120；高至少装得下一行 + 上下内边距（拖到 0 高的窗口
+                // 会变成"一条线"，既点不中柄也看不出是什么）。
+                Vec2::new(120.0, (self.theme.row_h + pad_total * 2.0).max(40.0)),
+                cursor,
             ) {
-                // 新宽度下帧生效（`width` 于本函数开头读取）——与旧版一致，避免
-                // 同帧内布局宽度与 clamp 尺寸互相矛盾。
-                self.state.window_widths.insert(id_for.to_static(), new_size.x);
+                // 新尺寸下帧生效（`width` / 高度于本函数开头读取）——与旧版一致，避免
+                // 同帧内布局尺寸与 clamp 尺寸互相矛盾。
+                if resize_axes != Resize::None {
+                    self.state.window_widths.insert(id_for.to_static(), new_size.x);
+                }
+                if resize_axes == Resize::Both {
+                    self.state
+                        .window_heights
+                        .insert(id_for.to_static(), new_size.y);
+                }
             }
         }
         let btn = self.mouse_left();
@@ -2785,6 +2829,16 @@ impl<'a> Ui<'a> {
         let mut frame = Frame::new_stack(PackSide::Top, gap, pad_total);
         if let Some(w) = width {
             frame.set_fixed_w(w);
+        }
+        // **高度固定**（只有"宽高同调"拖拽过的窗口才会走到这里）：高度被拖过之后由
+        // 用户接管 —— 与宽度同理（固定轴不参与内容撑开；要裁剪配 `Placement::Clip`）。
+        let fixed_h = if resize_axes == Resize::Both {
+            self.state.window_heights.get(id_for.as_str()).copied()
+        } else {
+            None
+        };
+        if let Some(h) = fixed_h {
+            frame.set_fixed_h(h);
         }
         self.frames.push(frame);
         self.depth += 1;
@@ -2899,7 +2953,15 @@ impl<'a> Ui<'a> {
         // 严格裁剪（`window_at_strict`）：窗口内容**强制裁剪**到窗口矩形——结算后
         // 统一改写本窗口命令的裁剪层（录制期窗口尺寸未知，背景/子控件命令都覆盖；
         // 命中裁剪由窗口遮挡机制负责）。默认窗口为 Expand 语义（不裁剪）。
-        if strict {
+        // 严格裁剪：窗口内容**强制裁剪**到窗口矩形——结算后统一改写本窗口命令的裁剪层
+        // （录制期窗口尺寸未知，背景/子控件命令都覆盖；命中裁剪由窗口遮挡机制负责）。
+        //
+        // 触发条件两条：
+        // ① `.placement(Placement::Clip)`（应用的显式选择，`window_at_strict` 语义）；
+        // ② **高度被用户固定**（拖过 `Resize::Both` 的柄）——此时窗口是一个"固定尺寸的
+        //    视口"，内容再撑不高它了；不裁剪的话内容会**画到窗口外面**（用户实测：
+        //    "TTT 窗口的内容不会被裁剪"）。裁剪之后里面的 `scroll_at` 才谈得上滚动。
+        if window_content_clipped(strict, fixed_h) {
             let win_abs = Rect::new(
                 saved_base.x + display_pos.x,
                 saved_base.y + display_pos.y,
@@ -2914,9 +2976,10 @@ impl<'a> Ui<'a> {
         let bg_rect = Rect::new(0.0, 0.0, size.x, size.y);
         self.push_panel_shadow(bg_rect, &style.shadow, style.radius);
         self.push_panel_like_img(bg_rect, style.bg, style.bg_image, style.border, style.border_w, style.radius, 0);
-        // 固定宽窗口：右下角**缩放柄图案**（样式见 [`GripStyle`]；窗口局部坐标，随窗口平移）。
-        // 只对固定宽窗口生效 —— 那是唯一带缩放柄的容器；命中区在上面的 `resize_handle`。
-        if width.is_some() {
+        // **拖拽缩放柄图案**：只在"允许拖拽 + 有轴"时画（`GripShape::Hidden` 时
+        // `push_resize_grip` 自己短路）——菜单 / 下拉浮层用 `resize(false, Resize::None)`
+        // 拿到"固定宽但不画柄、不可拖"的效果。
+        if resize_on {
             self.push_resize_grip(size, &style.grip);
         }
         // **标题栏通条**（整窗宽、含面板内边距 ⇒ 通条观感）：在**这里**画（`size` 已知）、
@@ -5105,12 +5168,14 @@ pub(crate) struct WindowChrome<'c> {
     pub close: Option<&'c mut bool>,
     /// `(是否画按钮, 收起状态)`。
     pub shrink: Option<(bool, &'c mut bool)>,
+    /// **拖拽缩放** `(是否允许拖动, 允许的轴)`；`None` = 旧行为（**有 `.width(..)` 就能横向拖**）。
+    pub resize: Option<(bool, Resize)>,
 }
 
 impl WindowChrome<'_> {
-    /// 空的窗口外框（无标题栏、无按钮）：modal 这类"已有自己外框"的路径用。
+    /// 空的窗口外框（无标题栏、无按钮、缩放走旧行为）：modal 这类"已有自己外框"的路径用。
     pub(crate) const fn none() -> WindowChrome<'static> {
-        WindowChrome { title: None, close: None, shrink: None }
+        WindowChrome { title: None, close: None, shrink: None, resize: None }
     }
 
     /// 是否需要**标题栏**：三者都不给 ⇒ 不画（与不启用本特性时逐像素一致）。
@@ -5160,6 +5225,20 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
         self.o.clamp = mode;
         self
     }
+    /// **拖拽缩放**：`allow` = 是否允许用户**拖动右下角柄**改尺寸，`axes` = 允许的轴。
+    ///
+    /// - **不调本方法** = 旧行为：`.width(..)` 的窗口可**横向**拖拽缩放，否则没有柄；
+    /// - `resize(false, Resize::None)`：**不画柄、也不响应拖拽**，但 `.width(..)` 仍是
+    ///   布局固定宽（菜单 / 下拉浮层这类"尺寸由内容定"的窗口就是这么用的）；
+    /// - `resize(true, Resize::Both)`：右下角柄**宽高同调**（高度跨帧持久于
+    ///   `UiState::window_heights`，`↖↘` 光标）——高度一旦被拖过就固定下来，
+    ///   与宽度同理（固定轴不参与内容撑开；要裁剪请配 `Placement::Clip`）。
+    ///
+    /// `allow` 是**显式 bool**（用户要的签名）：枚举只表达"哪条轴"，"允不允许"用布尔更直白。
+    pub fn resize(mut self, allow: bool, axes: Resize) -> Self {
+        self.o.resize = Some((allow, axes));
+        self
+    }
     /// **标题栏**（可选）：画一条标题栏作为窗口内容**第一行** —— 底色
     /// `Palette::surface_raised`、底边 1px `PanelStyle::border` 分隔线、文字用 `label` 样式。
     ///
@@ -5204,7 +5283,7 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
         // 枚举 → 内部两个开关（公开面不再出现裸布尔）。
         let topmost = o.level == Level::Topmost;
         let strict = o.placement == Placement::Clip;
-        let mut chrome = WindowChrome { title, close, shrink };
+        let mut chrome = WindowChrome { title, close, shrink, resize: o.resize };
         ui.window_impl(
             id,
             pos,
@@ -7381,6 +7460,30 @@ pub(crate) fn push_panel_img_cmds(
 }
 
 // ─── 单元测试（无 GPU） ─────────────────────────────────────────
+
+/// **窗口拖拽缩放的有效开关**（纯函数，可单测）：`opt` = `WindowBuilder::resize` 的显式设置。
+///
+/// - `Some((allow, axes))` ⇒ 用调用方的（`allow = false` ⇒ 不画柄、不响应拖拽）；
+/// - `None` ⇒ **旧行为**：有 `.width(..)` 就能横向拖（`Resize::Horizontal`），没有就不拖。
+///
+/// 抽成纯函数是为了把"允许 / 轴 / 没设置"三种情况的判定钉在测试里——
+/// 这类"开关没接上"的 bug 在 GUI 里很难肉眼发现（柄画了但不响应、或没画却响应）。
+fn resolve_window_resize(opt: Option<(bool, Resize)>, has_width: bool) -> (bool, Resize) {
+    match opt {
+        Some((allow, axes)) => (allow, axes),
+        None => (has_width, Resize::Horizontal),
+    }
+}
+
+/// **窗口内容是否强制裁剪**（纯函数，可单测）。
+///
+/// - `strict`（`.placement(Placement::Clip)`）：应用的显式选择；
+/// - `fixed_h = Some(..)`：**高度被用户拖过**（`Resize::Both` 的柄）⇒ 窗口成了"固定
+///   尺寸视口"，内容撑不高它；不裁剪就会画到窗口外面（用户实测的 TTT 窗口 bug）。
+///   `.width(..)` 不触发本项：固定宽但高度自然时，内容在垂直方向不会溢出。
+fn window_content_clipped(strict: bool, fixed_h: Option<f32>) -> bool {
+    strict || fixed_h.is_some()
+}
 
 /// 把绘制命令按 `win` 分组、组内按 `depth` 分桶（桶内保持**录制序**）。
 /// 免全量排序的提交序基础：与 `sort_by_key((win, depth, elem, group, seq))`

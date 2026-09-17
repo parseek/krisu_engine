@@ -198,7 +198,7 @@ impl Default for ComboStyle {
             menu_pad_v: 4.0,
             item_hover: Color::rgba_u8(230, 242, 255, 255),
             item_selected: Color::rgba_u8(208, 228, 255, 255),
-            item_pad_x: 12.0,
+            item_pad_x: 4.0,
             item_min_w: 140.0,
             fg: Color::rgba_u8(40, 40, 40, 255),
             fg_mark: Color::rgba_u8(30, 108, 198, 255),
@@ -846,6 +846,10 @@ pub enum GripShape {
     /// **三条横线**（内置矢量图标 [`Icon::Grip`]，画在 `size × count` 的方框里，
     /// 与字体无关、缺字形也不会变形）。
     Bars,
+    /// **三条斜线**（45°，从左下到右上；内置矢量图标 [`Icon::GripDiagonal`]）——
+    /// 经典"缩放角"观感。⚠ 画的方框是 [`GripShape::Bars`] 的 **1.5×**：三条斜线挤在
+    /// `size × count` 的小方框里间距太小，会被羽化糊成一片。
+    Diagonal,
     /// **不画图案**（命中区照旧 —— 仍可拖动缩放，适合"干净"的界面）。
     Hidden,
 }
@@ -908,6 +912,8 @@ impl GripStyle {
             GripShape::Hidden => 0.0,
             GripShape::Squares => self.step * self.count as f32 + self.size,
             GripShape::Bars => self.size * self.count as f32 + self.step,
+            // 斜线版画的方框是横线版的 1.5×（见 [`GripShape::Diagonal`] 的文档）。
+            GripShape::Diagonal => self.size * self.count as f32 * 1.5 + self.step,
         }
     }
 }

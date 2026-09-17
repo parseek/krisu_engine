@@ -84,3 +84,7 @@ ISSUE:
 * ✅ 修：combo 下拉**勾选列恒留位**（未选中项文字不再比选中项凸出一个图标宽 —— "一列像素突兀"）
 * ✅ 字体弹窗预览不再重复显示输入框里的字体名（"文本输入重复"）
 * ✅ 主题调节窗口去掉尾部"当前值一览"两行标签（每行都有滑杆 + 数字条，就近可读）
+* ✅ 缩放柄「斜线」档：三条 45° 斜线（**首端点在水平线等距 / 末端点在竖直线等距** ⇒ 互相平行、垂直间距相等），单测钉住几何；柄方框 1.5× 免得羽化糊成一片；`GripShape::{Squares, Bars, Diagonal, Hidden}`，demo 默认斜线
+* ✅ 窗口拖拽缩放：`.resize(allow: bool, axes: Resize)`（显式 bool + 轴向）+ **Y 轴缩放**（高度持久于 `UiState::window_heights`）；`allow = false` ⇒ 不画柄也不响应拖拽（菜单下拉用它，去掉 resizable）；判定抽成 `resolve_window_resize` 单测；`--sim-resize` 实测 `328×97 → 388×137`（正好等于注入位移 +60/+40）
+* ✅ 修：**高度被用户固定后内容不裁剪**（TTT 窗口缩小后标签画到面板外）⇒ `window_content_clipped(strict, fixed_h)`（固定高 ⇒ 视口裁剪；固定宽不触发）+ 单测
+* ✅ 菜单下拉：勾选标记改成**方框 CheckBox**（画在菜单项内容里、方框列恒留位）、行高收紧（`item_h` 里固定 6px → 2px）、左内边距只留 `item_pad_x`（用户改的），并 `.resize(false, Resize::None)`（**不再 resizable / 不画柄**）

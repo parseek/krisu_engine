@@ -427,6 +427,12 @@ pub struct UiState {
     /// 用——按 **id** 而非窗口 z 索引：**点击置顶 z+1 后尺寸不丢** → clamp 边界稳定
     /// （消除"按下即跳变"）；`window_rects[z]` 仅作兜底。
     pub(crate) window_sizes: HashMap<IdAbsolute<'static>, Vec2>,
+    /// **窗口高度持久值**（**绝对 ID** → 高度；只被"宽高同调"（`Resize::Both`）拖拽过的
+    /// 窗口写入）。
+    ///
+    /// 与 `window_widths` 对称：宽度是"固定宽窗口"的持久值，高度默认由内容自然结算；
+    /// 用户拖过 `↖↘` 柄之后高度才固定下来（此后内容不再撑高窗口，要裁剪配 `Placement::Clip`）。
+    pub(crate) window_heights: HashMap<IdAbsolute<'static>, f32>,
     /// **可拖拽面板的结算尺寸**（**绝对 ID** → 物理尺寸，跨帧持久）。
     ///
     /// 用途与 `window_sizes` 同：命中 / 拖拽 / clamp 用**上一帧屏幕上那个矩形**
@@ -539,7 +545,8 @@ impl UiState {
         self.last_press_window = None;
         self.scrolls.clear();
         self.combo_open = None;
-        self.menu_open = None;        self.color_picker = crate::widgets::ColorPickerState::default();
+        self.menu_open = None;
+        self.color_picker = crate::widgets::ColorPickerState::default();
         self.sizes.clear();
         self.window_fx.clear();
         self.stats = UiStats::default();

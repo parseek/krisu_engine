@@ -147,7 +147,9 @@ pub enum Resize {
 /// - `level`：点击是否置顶（默认 [`Level::Topmost`]）；
 /// - `placement`：内容排布（默认 [`Placement::Expand`]；[`Placement::Clip`] = 严格裁剪）；
 /// - `style`：逐窗口样式覆盖（默认 `None` = 全局 `Theme::panel`）；
-/// - `clamp`：位置约束模式（默认 [`WindowClamp::Screen`]：窗口整体不跑出屏幕）。
+/// - `clamp`：位置约束模式（默认 [`WindowClamp::Screen`]：窗口整体不跑出屏幕）；
+/// - `resize`：**拖拽缩放** `(是否允许拖动, 允许的轴)`；`None` = 旧行为
+///   （**有 `.width(..)` 就能横向拖** —— 见 [`WindowBuilder::resize`](crate::WindowBuilder::resize)）。
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
     pub pos: Position,
@@ -156,6 +158,10 @@ pub struct WindowOptions {
     pub placement: Placement,
     pub style: Option<PanelStyle>,
     pub clamp: WindowClamp,
+    /// `(allow, axes)`：`allow = false` ⇒ 既**不画缩放柄**也**不响应拖拽**
+    /// （`.width(..)` 仍作为布局固定宽生效，菜单 / 下拉浮层就是这么用的）；
+    /// `axes = Resize::Both` ⇒ 右下角柄**宽高同调**（高度跨帧持久）。
+    pub resize: Option<(bool, Resize)>,
 }
 
 impl Default for WindowOptions {
@@ -167,6 +173,7 @@ impl Default for WindowOptions {
             placement: Placement::Expand,
             style: None,
             clamp: WindowClamp::Screen,
+            resize: None,
         }
     }
 }

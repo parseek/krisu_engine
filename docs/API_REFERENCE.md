@@ -855,7 +855,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.window(id)` | `.pos(..)` `.width(w)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` `.title(&str)` `.close_button(&mut bool)` `.shrink(bool, &mut bool)` `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**外框**（标题栏 / × / 收起）见下 |
+| `ui.window(id)` | `.pos(..)` `.width(w)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` **`.resize(allow, axes)`** `.title(&str)` `.close_button(&mut bool)` `.shrink(bool, &mut bool)` `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**拖拽缩放** `.resize(allow: bool, axes: Resize)`：`allow = false` ⇒ 不画柄也不响应拖拽（`.width` 仍是布局固定宽）；`Resize::Both` ⇒ 宽高同调（高度持久于 `UiState::window_heights`，**并自动裁剪内容**）；**不调** = 旧行为（有 `.width` 才能横向拖）。**外框**（标题栏 / × / 收起）见下 |
 | `ui.panel()` | `.pos(..)` `.drag(id)` `.style(..)` `.show(\|pp\| ..)` | 面板 = `panel_at` + `drag_panel_at` 统一入口 |
 | `ui.modal(id)` | `.pos(..)` `.width(w)` `.show(\|m\| ..)` | 模态对话框（唯一入口） |
 
@@ -958,11 +958,12 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 「投影」滑杆后面那个色块就是它（可拖 alpha），`--sim-shadow` 脚本化守护这条通路。
 
 **缩放柄令牌**：`PanelStyle::grip: GripStyle { shape: GripShape, color, size, step, count }`
-—— 只对**固定宽窗口**（`WindowBuilder::width(..)`）生效，就是右下角那个"拖拽按钮"。
-`GripShape::{Squares（默认，历史观感）, Bars（**三条实心横杠**：宽 `size*count`、高 `size`、间距 `step`）, Hidden}`；
+—— 只对**允许拖拽缩放**的窗口（`.resize(true, ..)`，或没调 `.resize` 但设了 `.width(..)`）生效。
+`GripShape::{Squares（默认，历史观感）, Bars（**三条实心横杠**）, Diagonal（**三条 45° 斜线**：首端点在同一水平线上等距、末端点在同一竖直线上等距）, Hidden}`；
 逐窗口入口 `PanelStyle::{with_grip, with_grip_color, with_grip_shape, without_grip}`。
 `Hidden` 只是**不画图案**，**拖动缩放照旧**（命中区独立存在，跟随 `size*step*count`，下限 14px）。
-`Bars` 用实心矩形而不是 `Icon::Grip` 图标——小尺寸下图标会被 `Theme::feather` 糊成一坨。
+`Bars` 用实心矩形（小尺寸下图标会被 `Theme::feather` 糊成一坨）；`Diagonal` 只能走图标，
+方框取 1.5× 免得三条斜线糊在一起。
 
 **边框归零（`border_w = 0`）的可见性**：未勾选的 `Checkbox` 本来只画一圈描边，边框关掉后
 会**整个消失**（标签看起来"没有控件"）⇒ 此时改画**实心底**（`surface_sunken` / 悬停

@@ -1127,3 +1127,35 @@ fn window_chrome_bar_and_collapse_flags() {
     };
     assert!(c.bar_on() && !c.collapsed());
 }
+
+#[test]
+fn window_resize_switch_resolves_old_default_and_explicit_false() {
+    // **没设 `.resize(..)` = 旧行为**：有 `.width(..)` 就能横向拖，没有就不出来柄。
+    // （这是"新开关不改变既有窗口行为"的机器化保证。）
+    assert_eq!(resolve_window_resize(None, false), (false, Resize::Horizontal));
+    assert_eq!(resolve_window_resize(None, true), (true, Resize::Horizontal));
+    // **显式关闭**：`resize(false, Resize::None)` ⇒ 不画柄、不响应拖拽（但 `.width(..)`
+    // 仍是布局固定宽）——菜单 / 下拉浮层用它换"固定宽但尺寸不可拖"。
+    assert_eq!(resolve_window_resize(Some((false, Resize::None)), true), (false, Resize::None));
+    // **显式开启**：宽高同调（`Both`）；`allow=false` 时轴怎么写都不生效（不画不拖）。
+    assert_eq!(resolve_window_resize(Some((true, Resize::Both)), false), (true, Resize::Both));
+    assert_eq!(resolve_window_resize(Some((false, Resize::Both)), true), (false, Resize::Both));
+    // 只否允许、轴仍留 Horizontal：等价"不能拖但语义上还是横轴"。
+    assert_eq!(
+        resolve_window_resize(Some((false, Resize::Horizontal)), true),
+        (false, Resize::Horizontal)
+    );
+}
+
+#[test]
+fn window_content_clips_when_height_is_user_fixed() {
+    // **内容裁剪的触发条件**：
+    // ① 应用显式 `.placement(Placement::Clip)`；
+    // ② **高度被用户拖过**（`Resize::Both` 的柄 ⇒ 窗口成了固定尺寸视口）——不裁剪的话
+    //    内容会画到窗口外面（用户实测的 TTT 窗口 bug："内容不会被裁剪"）。
+    // ⚠ 固定**宽**不触发：固定宽窗口的高度仍由内容决定，垂直方向没有溢出可言。
+    assert!(window_content_clipped(true, None), "显式 Clip");
+    assert!(window_content_clipped(false, Some(120.0)), "高度被拖过 ⇒ 视口裁剪");
+    assert!(window_content_clipped(true, Some(120.0)));
+    assert!(!window_content_clipped(false, None), "默认 Expand 不裁剪");
+}

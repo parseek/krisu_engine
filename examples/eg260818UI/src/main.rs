@@ -52,6 +52,10 @@ use rjw_krusie::ui::{
 mod overlap;
 use overlap::OverlapDemo;
 
+/// **菜单栏位置**（逻辑像素，左上角）：录制与 `--sim-menu` 的坐标解算共用同一常量
+/// —— 挪栏不用改脚本（写死像素的脚本一挪就点空）。
+const MENUBAR_POS: Vec2 = Vec2::new(12.0, 12.0);
+
 /// **文件导入**（系统文件选择器 → 字节 → 引擎资源）：图片当背景纹理、字体进运行时字体库。
 mod filedialog;
 use filedialog::ImportKind;
@@ -383,7 +387,7 @@ impl Windows {
             cshi_tint: Color::WHITE,
             auto_tick: 0,
             bg_image: None,
-            win_a_open: true,
+            win_a_open: false,
             win_a_collapsed: false,
             last_win_a_size: Vec2::ZERO,
             chrome_states: Vec::new(),
@@ -546,7 +550,7 @@ impl Windows {
             ui.window("img_box")
                 .pos(Vec2::new(1120.0, 548.0))
                 .width(140.0)
-                .style(base.with_radius(0.0).with_bg_image(tile))
+                .style(base.clone().with_radius(0.0).with_bg_image(tile))
                 .show(|w| {
                     // 三行内嵌图片演示其余三种铺排（等比覆盖 / 拉伸 / 居中半透明）。
                     // ⚠ 行内文本 + 图片的**总宽必须 < 固定宽 − 内边距**：窗口会比
@@ -568,6 +572,19 @@ impl Windows {
                         );
                     });
                     w.label("本体 Tile 1:1");
+                });
+            // **宽高同调**（`resize(true, Resize::Both)`）：右下角柄拖宽拖高，高度跨帧
+            // 持久于 `UiState::window_heights`（高度一旦被拖过就由用户接管，内容不再撑高）。
+            // 这也是"斜线缩放柄"的主要展示窗口（柄形状由主题调节窗口的「拖拽柄」选）。
+            ui.window("img_box_fill")
+                .pos(Vec2::new(16.0, 560.0))
+                .width(200.0)
+                .resize(true, Resize::Both)
+                .title("TTT（可拖宽拖高）")
+                .style(base.with_bg_image(bg.fit(ImageFit::Fill)))
+                .show(|w| {
+                    w.label("另一个窗口");
+                    w.button("btn00", "Awa");
                 });
         }
         // 赤石窗口：整窗旋转（角度 = cshi_num）+ 染色（**用 ColorPicker 调**：
@@ -781,13 +798,13 @@ impl ThemeTuner {
             // 那正是 `Theme::themed` 灌进 `PanelStyle::shadow.color` 的值 ⇒ 不动色块
             // 时与扩展前逐像素一致。
             shadow_color: p.shadow,
-            grip_shape: GripShape::default(),
+            grip_shape: GripShape::Diagonal,
             grip_color: p.border,
             bg: p.surface,
             border: p.border,
             accent: p.accent,
             // 默认打开：这是个"可调的窗口"，开着才能看见效果。
-            open: true,
+            open: false,
         }
     }
 
@@ -887,7 +904,7 @@ impl ThemeTuner {
         // （背景刷 / 边框 / 圆角 / 内边距都跟着滑块实时变）。
         // 早先这里写死 `PanelStyle::default()`——那是**浅色**基底，于是调节窗口自己是
         // 一块浅灰板，跟满屏深色格不入，看着像"另一个主题的窗口"。
-        ui.window("theme_tuner")
+        ui.window("theme_tuner") 
             .pos(vec2(280.0, 420.0))
             .show(|w| {
                 w.label("主题调节（实时）");
@@ -934,18 +951,27 @@ impl ThemeTuner {
                     self.border_w = w.slider("th_bdw", 0.0..=5.0, self.border_w);
                     w.add(NumberInput::new("th_bdw_n", &mut self.border_w).range(0.0, 5.0).step(0.5));
                 });
-                // 右下角**缩放柄**：形状三档 + 颜色。只对固定宽窗口生效（`win_a` / `img_box`）；
+                // 右下角**缩放柄**：形状四档 + 颜色。只对"允许拖拽缩放"的窗口生效；
                 // "不画"只是没有图案，**拖动缩放照旧**（命中区单独存在，见 `GripStyle`）。
                 w.row(|w| {
                     w.label("拖拽柄");
                     let mut gi = match self.grip_shape {
                         GripShape::Squares => 0usize,
                         GripShape::Bars => 1,
-                        GripShape::Hidden => 2,
+                        GripShape::Diagonal => 2,
+                        GripShape::Hidden => 3,
                     };
-                    w.add(Segmented::new("th_grip", &["方块", "三横", "不画"], &mut gi));
-                    self.grip_shape = [GripShape::Squares, GripShape::Bars, GripShape::Hidden]
-                        [gi.min(2)];
+                    w.add(Segmented::new(
+                        "th_grip",
+                        &["方块", "横线", "斜线", "不画"],
+                        &mut gi,
+                    ));
+                    self.grip_shape = [
+                        GripShape::Squares,
+                        GripShape::Bars,
+                        GripShape::Diagonal,
+                        GripShape::Hidden,
+                    ][gi.min(3)];
                     w.add(ColorPicker::new("th_grip_color", &mut self.grip_color));
                 });
                 // ── 布局密度（主题扩展：紧凑 / 标准 / 宽松）──────────────────
@@ -1072,8 +1098,18 @@ struct UiApp {
     import_image_path: Option<std::path::PathBuf>,
     /// **菜单栏**里的"文件名过滤"输入框内容（演示"菜单里也能放文本输入"）。
     menu_filter: String,
-    /// --sim-menu：脚本化点击菜单栏（第一阶段点开「视图」，第二阶段点第一个菜单项）。
+    /// --sim-menu：**实操菜单栏**（坐标运行时解算，不写死像素）。
     sim_menu: bool,
+    /// --sim-resize：脚本化拖拽**右下角缩放柄**（验"宽高同调"与"不允许拖拽就不出柄"）。
+    sim_resize: bool,
+    /// --sim-resize：`img_box_fill` 的把手点（窗口右下角柄中心）与该窗口上一帧尺寸。
+    sim_resize_pt: Option<Vec2>,
+    sim_resize_size: Option<Vec2>,
+    /// --sim-resize：每帧刷新的"当前尺寸"（帧 30 与 `sim_resize_size` 比）。
+    sim_resize_after: Option<Vec2>,
+    /// --sim-resize：**冻结**的拖拽目标点（柄会随窗口长大而移动；目标点若每帧重算，
+    /// 鼠标就被"追着拖"，位移每帧累加——脚本自己会变成 bug 源）。
+    sim_resize_to: Option<Vec2>,
     /// --sim-menu：解算出的「视图」触发器中心（**每帧都算**：栏位置只跟主题有关）。
     menu_trigger_pt: Option<Vec2>,
     /// --sim-menu：下拉里第一个菜单项中心（**菜单展开后**才知道下拉窗口在哪）。
@@ -1183,6 +1219,11 @@ impl UiApp {
             import_image_path: None,
             menu_filter: String::new(),
             sim_menu: false,
+            sim_resize: false,
+            sim_resize_pt: None,
+            sim_resize_size: None,
+            sim_resize_after: None,
+            sim_resize_to: None,
             menu_trigger_pt: None,
             menu_item_pt: None,
             menu_panel: None,
@@ -1447,6 +1488,19 @@ impl App for UiApp {
                 Err(e) => self.top.import_status = format!("图片导入失败：{e}"),
             }
         }
+        // ── 仿真前置：**脚本自己把需要的面板 / 窗口打开** ────────────────────────
+        // 演示的默认开关（`theme_tuner.open` / `win_a_open`）是**应用自己的选择**，
+        // 脚本不该依赖它——否则"把面板默认关掉"就会让一堆仿真莫名其妙地失败。
+        // 这里在开头几帧无条件置位（幂等）。
+        let sim_lead = f.frames() <= 4;
+        if sim_lead {
+            if self.sim_tuner || self.sim_menu {
+                self.theme_tuner.open = true;
+            }
+            if self.sim_chrome {
+                self.windows.win_a_open = true;
+            }
+        }
         // ── 调试：脚本化鼠标（`--sim-picker`）──────────────────────
         // 复现"打开取色面板 → 在面板里拖/点"：面板路径（SV 平面 / 色相条 / 通道滑块 /
         // 文本框 / **警告按钮恢复** / 模式切换）只有交互才会录制，普通冒烟跑不到——
@@ -1664,6 +1718,22 @@ impl App for UiApp {
                 50..=51 => f.debug_inject_mouse(seg, false),
                 52..=53 => f.debug_inject_mouse(seg, true),
                 54..=59 => f.debug_inject_mouse(seg, false),
+                _ => {}
+            }
+        }
+        // ── 调试：脚本化鼠标（`--sim-resize`）──────────────────────
+        // 拖 `img_box_fill` 的右下角柄（**斜向**拖 +60/+40）⇒ 宽高都该变大
+        // （`.resize(true, Resize::Both)`）。坐标 = 窗口原点 + 结算尺寸 − 半个柄。
+        if self.sim_resize {
+            let p = self.sim_resize_pt.unwrap_or(Vec2::ZERO);
+            // **冻结目标点**（帧 8 记录）：柄随窗口长大而移动，每帧重算目标 = 鼠标被
+            // "追着拖"，位移逐帧累加（第一版就这么错：拖 +60 结果宽了 +180）。
+            let to = self.sim_resize_to.unwrap_or(Vec2::new(p.x + 60.0, p.y + 40.0));
+            match f.frames() {
+                10..=11 => f.debug_inject_mouse(p, false),
+                12..=13 => f.debug_inject_mouse(p, true),
+                14..=19 => f.debug_inject_mouse(to, true),
+                20..=24 => f.debug_inject_mouse(to, false),
                 _ => {}
             }
         }
@@ -1975,7 +2045,7 @@ impl App for UiApp {
             // - 「视图」：**带勾选的菜单项**（窗口显隐 / 收起，直接绑应用自己的 `&mut bool`）
             //   + 标题行 + **横向排版**（密度三档按钮 —— `MenuCtx` 解引用到 `Window`）；
             // - 「帮助」：纯文本行（操作提示）。
-            let menu_size = ui.menu_bar("menubar", Vec2::new(620.0, 12.0), |bar| {
+            let menu_size = ui.menu_bar("menubar", MENUBAR_POS, |bar| {
                 bar.menu("文件", |m| {
                     m.caption("文件名过滤（菜单里也能放文本输入）");
                     m.text_input("menu_filter", &mut self.menu_filter);
@@ -2022,6 +2092,24 @@ impl App for UiApp {
             });
             debug_assert!(menu_size.x > 0.0, "菜单栏至少有宽度");
 
+            // `--sim-resize`：坐标解算（窗口原点 + 结算尺寸 = 右下角；柄是那个角上的方块）。
+            if self.sim_resize {
+                let dump = ui.debug_dump();
+                let w = dump.windows.iter().find(|p| p.id == "img_box_fill");
+                if let Some(w) = w {
+                    self.sim_resize_pt =
+                        Some(Vec2::new(w.origin.x + w.size.x - 8.0, w.origin.y + w.size.y - 8.0));
+                    self.sim_resize_after = Some(w.size);
+                    if sim_frame == 8 {
+                        self.sim_resize_size = Some(w.size);
+                        // 目标点也在这里冻结（+60/+40 ⇒ 期望尺寸变化同样只该是这个量级）。
+                        self.sim_resize_to = Some(Vec2::new(
+                            w.origin.x + w.size.x - 8.0 + 60.0,
+                            w.origin.y + w.size.y - 8.0 + 40.0,
+                        ));
+                    }
+                }
+            }
             // `--sim-menu`：坐标解算（**本帧录制后**已知栏在哪、下拉面板在哪）——
             // 注入只能经 `Frame` 且在段之前，所以这里只算、段外下一帧注（同 `--sim-tuner`）。
             if self.sim_menu {
@@ -2030,23 +2118,21 @@ impl App for UiApp {
                     let t = ui.theme();
                     (t.button.font_size, t.button.padding.x, t.row_h, t.gap)
                 };
-                // 触发器：「视图」是第 2 个（三个都是两个字 ⇒ 等宽），栏在 (620,12) 逻辑。
+                // 触发器：「视图」是第 2 个（三个都是两个字 ⇒ 等宽）；栏位置取常量
+                // `MENUBAR_POS`（逻辑 → 物理，与录制同源）——挪栏不用改脚本。
+                let bar = (MENUBAR_POS * scale).round();
                 let tw = ui.text_size("视图", fs, None).x;
                 let w = tw + pad_x * 2.0;
-                let trigger_rect = Rect::new(930.0 + (w + gap), 18.0, w, row_h);
+                let trigger_rect = Rect::new(bar.x + (w + gap), bar.y, w, row_h);
                 self.menu_trigger_pt =
                     Some(Vec2::new(trigger_rect.x + w * 0.5, trigger_rect.y + row_h * 0.5));
                 // 下拉原点（引擎里的 `pos = (t.x, t.y + h + 2)`，见 `MenuBar::popup`）。
                 self.menu_want_origin =
                     Some(Vec2::new(trigger_rect.x, trigger_rect.y + row_h + 2.0));
-                // 下拉里**第一个菜单项**：注意面板有左内边距（= `item_pad_x + 勾选列`）
-                // + 边框 ⇒ 第一项从内容原点起，不是面板顶边。
-                let item_h = (fs * 1.3).round() + 6.0;
-                let (ci_pad, ci_chk, border_w) = {
-                    let t = ui.theme();
-                    (t.combo.item_pad_x, fs + 6.0, t.panel.border_w)
-                };
-                let top_pad = ci_pad + ci_chk + border_w;
+                // 下拉里**第一个菜单项**：注意面板左内边距 = `item_pad_x`（勾选方框画在
+                // 菜单项**内容里**，不占内边距）+ 边框 ⇒ 第一项从内容原点起，不是面板顶边。
+                let item_h = (fs * 1.3).round() + 2.0;
+                let top_pad = ui.theme().combo.item_pad_x + ui.theme().panel.border_w;
                 if let Some(p) = dump.windows.iter().find(|p| p.id == "menubar::视图") {
                     self.menu_item_pt = Some(Vec2::new(
                         p.origin.x + top_pad + 20.0,
@@ -2233,6 +2319,25 @@ impl App for UiApp {
                     "[OK] 分段按钮组可点（拼在一起的那组）"
                 } else {
                     "[FAIL] 分段没被点到 / 没写回选中"
+                }
+            );
+        }
+        // --sim-resize：**宽高同调**判定 —— 拖完后两个轴都必须变大（只变大一个 = 轴没接上）。
+        if self.sim_resize && f.frames() == 30 {
+            let before = self.sim_resize_size;
+            let after = self.sim_resize_after;
+            let (b, a) = (before.unwrap_or(Vec2::ZERO), after.unwrap_or(Vec2::ZERO));
+            let ok = a.x > b.x + 1.0 && a.y > b.y + 1.0;
+            eprintln!(
+                "sim-resize: 拖柄前 {:.0}×{:.0} → 后 {:.0}×{:.0} {}",
+                b.x,
+                b.y,
+                a.x,
+                a.y,
+                if ok {
+                    "[OK] 宽高同调（两个轴都被拖大了）"
+                } else {
+                    "[FAIL] 只有一条轴生效 / 柄没点到"
                 }
             );
         }
@@ -2423,6 +2528,7 @@ fn main() -> Result<(), RunError> {
     app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
     app.sim_import = parse_str_arg(&args, "--sim-import");
     app.sim_menu = args.iter().any(|a| a == "--sim-menu");
+    app.sim_resize = args.iter().any(|a| a == "--sim-resize");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
         .iter()

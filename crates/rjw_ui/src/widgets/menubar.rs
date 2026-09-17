@@ -51,6 +51,7 @@
 //! 问题，且位置语义与顶层 `*_at` 一致（顶层 `abs_base = 0` ⇒ 局部坐标即屏幕坐标）。
 
 use glam::Vec2;
+use rjw_color::Color;
 use rjw_transform::Rect;
 
 use crate::draw::{Icon, Position, Size, TextAlign, TextVAlign};
@@ -180,12 +181,10 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
         font_size: f32,
     ) {
         // 浮层面板样式：`ComboStyle` 的菜单外观（现代扁平菜单）+ 面板 bg / radius；
-        // **内边距 0**（菜单项自己带 padding），边框取 `menu_border`。
+        // 内边距 = `item_pad_x`（**不含勾选列**：勾选标记画在**菜单项内容里**，
+        // 见 `MenuCtx::item_row` —— 用户要的"小边距 + 方框勾选"形态），边框取 `menu_border`。
         let cs = self.ui.theme.combo.clone();
-        // **左内边距 = 勾选列 + 文字左留白**：这样"菜单项文字"与 `caption` / `row` /
-        // 自己画的分割线**天然同列**（都从内容原点起排），不需要任何"给下一子项缩进"
-        // 的花招（垂直栈里子项 x 恒等于内容原点，缩进宽度是无效的）。
-        let pad = cs.item_pad_x + Self::check_w(font_size);
+        let pad = cs.item_pad_x;
         let border_w = self.ui.theme.panel.border_w;
         let pad_total = pad + border_w;
         let style = PanelStyle {
@@ -223,9 +222,11 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
             .ui
             .window(&popup_id)
             .pos(Position::Physical(pos))
-            // **锁定位置**：菜单面板不该能被拖动——拖走了就与触发器脱节，
-            // 点菜单项的命中按窗口走、视觉却跑别处（"控件严重错位"）。
+            // **锁定位置 + 不允许拖拽缩放**：菜单面板不该能被拖动（拖走了就与触发器
+            // 脱节，命中按窗口走、视觉却跑别处），也不该出现缩放柄（尺寸由内容定）。
+            // `.width(..)` 只用来把宽度钉在上帧结算值上（⇒ 子项 / 分割线能铺满）。
             .clamp(WindowClamp::Locked)
+            .resize(false, crate::Resize::None)
             .level(Level::Normal)
             .style(style);
         if let Some(w) = prev {
@@ -240,15 +241,6 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
             self.item_clicked = true;
         }
         self.popup = Some(Rect::new(pos.x, pos.y, size.x, size.y));
-    }
-
-    /// **勾选列宽度**（图标 + 与文字的间隙；菜单项文字相对面板内缘右移的量）。
-    ///
-    /// 面板的左内边距取 `item_pad_x + 勾选列宽`，于是"勾选列"落在内边距里，
-    /// 菜单项 / 标题 / 分割线全部从**同一个内容原点**起排 ⇒ 天然对齐。
-    #[inline]
-    fn check_w(font_size: f32) -> f32 {
-        font_size + 6.0
     }
 
     /// 收尾（由 [`Ui::menu_bar`](crate::Ui::menu_bar) 调用）：定展开状态 + 返回栏尺寸。
@@ -385,19 +377,28 @@ impl MenuCtx<'_, '_, '_> {
         }
     }
 
-    /// 菜单项公共实现：`check = Some(是否勾选)` 时左侧画勾选标记。
+    /// 菜单项公共实现：`check = Some(是否勾选)` 时左侧画一个**方框勾选框**。
+    ///
+    /// 勾选标记是**方框**（与 [`crate::Checkbox`] 同一观感：圆角方框 + 勾选时填充），
+    /// 画在**菜单项内容里**、方框列**恒留位**（勾选与否文字都对齐）。为什么不用"左侧
+    /// 内边距里放一个 ✓"：那需要很大的左内边距（用户实测：边距太大），而方框只占
+    /// `checkbox.box_size`，可以贴着小边距放。
     ///
     /// ⚠ 名字刻意不叫 `row`：`MenuCtx` 经 `Deref` 到 [`Window`]，同名私有方法会**遮蔽**
     /// `Window::row`（deref 方法优先级更低）⇒ 应用的 `m.row(..)` 会去调私有那个。
     fn item_row(&mut self, label: &str, check: Option<bool>) -> bool {
-        let (cs, font_size, item_h, natural_w) = {
+        let (cs, font_size, item_h, natural_w, box_size, box_gap, cb) = {
             let t = self.w.ui_mut().theme.clone();
             let fs = self.font_size.max(1.0);
-            let check_w = MenuBar::check_w(fs);
+            let cb = t.checkbox.clone();
+            // 行高：文字行盒 + 一点上下留白（**比首版更紧**：`item_h` 里的固定 6px 减到 2px，
+            // 行间还剩 `Theme::gap`；用户："item 与 item 的纵向距离可以再缩小一点"）。
+            let item_h = (fs * 1.3).round() + 2.0;
+            let box_size = cb.box_size;
             let tw = self.w.ui_mut().text_size(label, fs, t.combo.font_family.as_deref()).x;
-            let item_h = (fs * 1.3).round() + 6.0;
-            let natural = (check_w + tw + t.combo.item_pad_x * 3.0).max(t.combo.item_min_w);
-            (t.combo.clone(), fs, item_h, natural)
+            let natural =
+                (box_size + cb.gap + tw + t.combo.item_pad_x * 2.0).max(t.combo.item_min_w);
+            (t.combo.clone(), fs, item_h, natural, box_size, cb.gap, cb)
         };
         // **宽度已固定 ⇒ 请求极宽**：窗口把子项 clamp 到内容宽 ⇒ 高亮满宽（与面板等宽），
         // 不再受"当前最宽子项"影响（长标题撑宽面板时高亮仍满宽）。
@@ -421,26 +422,56 @@ impl MenuCtx<'_, '_, '_> {
         // `elem_hint()`：装饰画在本元素背景之上（写死小 elem 会被自己的背景盖住）。
         let hl = Rect::new(rect.x - self.pad, rect.y, rect.w + self.pad * 2.0, rect.h);
         ui.push_panel_like(hl, bg, cs.menu_bg, 0.0, 0.0, ui.elem_hint());
-        if let Some(on) = check
-            && on
-        {
-            // 勾选标记**只在勾选时画**：勾选列由面板左内边距**恒留位**，未勾选时什么都不画
-            // （曾经给它画一个"背景色图标"占位——悬停高亮时那块背景色会在高亮上显形）。
-            let d = font_size;
-            ui.icon_at(
-                // 勾选列在**左内边距里**（内容原点左侧一个勾选列宽）：
-                // 于是所有文字都在同一条竖线上，勾选图标不占文字位置。
-                Position::Physical(Vec2::new(
-                    rect.x - MenuBar::check_w(font_size),
-                    rect.y + (rect.h - d) * 0.5,
-                )),
-                crate::draw::Size::Physical(Vec2::splat(d)),
-                Icon::Check,
-                cs.fg_mark,
-            );
+        // **方框勾选列**（恒留位）：只有 `item_checked` 画方框；普通 `item` 仍然留白
+        // （`check = None` → 文字起点与 `item_checked` 一致，两类项文字对齐）。
+        let cbox = Rect::new(rect.x, rect.y + (rect.h - box_size) * 0.5, box_size, box_size);
+        if let Some(on) = check {
+            let elem = ui.elem_hint();
+            let mark_color = ui.theme().palette.surface;
+            if on {
+                // 勾选：实心（`checked_fill`）+ 矢量勾号（缺字形也不会变豆腐块）。
+                ui.push_panel_like(
+                    cbox,
+                    cb.checked_fill,
+                    cb.box_border,
+                    cb.border_w,
+                    cb.radius,
+                    elem,
+                );
+                let d = box_size * 0.78;
+                ui.icon_at(
+                    Position::Physical(Vec2::new(
+                        cbox.x + (cbox.w - d) * 0.5,
+                        cbox.y + (cbox.h - d) * 0.5,
+                    )),
+                    crate::draw::Size::Physical(Vec2::splat(d)),
+                    Icon::Check,
+                    mark_color,
+                );
+            } else if cb.border_w <= 0.0 {
+                // **边框宽 = 0 的兜底**：空心框只靠描边存在，边框关掉就整个消失 ⇒
+                // 退化成实心底（与 `Checkbox` 同一套规则，见 `Ui::draw_check_common`）。
+                let bg = if hit {
+                    ui.theme().palette.surface_hover
+                } else {
+                    ui.theme().palette.surface_sunken
+                };
+                ui.push_panel_like(cbox, bg, Color::TRANSPARENT, 0.0, cb.radius, elem);
+            } else {
+                // 空心方框（背景透明，只描边）。
+                ui.push_panel_like(
+                    cbox,
+                    Color::TRANSPARENT,
+                    cb.box_border,
+                    cb.border_w,
+                    cb.radius,
+                    elem,
+                );
+            }
         }
+        let text_x = rect.x + box_size + box_gap;
         ui.push_text_rect(
-            Rect::new(rect.x, rect.y, rect.w, rect.h),
+            Rect::new(text_x, rect.y, (rect.w - (text_x - rect.x)).max(0.0), rect.h),
             label,
             font_size,
             cs.fg,

@@ -957,6 +957,30 @@ const GRIP_3: IconPart = &[
     Vec2::new(0.75, 0.80),
     Vec2::new(0.25, 0.80),
 ];
+/// 拖拽手柄：**三斜线**（45°，从左下到右上；每笔一个凸四边形）。
+///
+/// 几何契约（用户给的图）：三条线的**首端点在一条水平线上等距**、**末端点在一条竖直线上
+/// 等距**——即第 `i` 条从 `(s, 0.92)` 到 `(0.92, s)`（`s = 0.20 / 0.40 / 0.60`），
+/// 于是三条都是 45°、互相平行、垂直间距相等。笔宽沿 `(1,1)` 偏 `0.055`（垂直厚度
+/// ≈ 0.078；27px 方框里 ≈ 2.1px 实心）——别更细，羽化会把三条糊在一起。
+const GRIP_D1: IconPart = &[
+    Vec2::new(0.20, 0.92),
+    Vec2::new(0.92, 0.20),
+    Vec2::new(0.975, 0.255),
+    Vec2::new(0.255, 0.975),
+];
+const GRIP_D2: IconPart = &[
+    Vec2::new(0.40, 0.92),
+    Vec2::new(0.92, 0.40),
+    Vec2::new(0.975, 0.455),
+    Vec2::new(0.455, 0.975),
+];
+const GRIP_D3: IconPart = &[
+    Vec2::new(0.60, 0.92),
+    Vec2::new(0.92, 0.60),
+    Vec2::new(0.975, 0.655),
+    Vec2::new(0.655, 0.975),
+];
 /// 箭头（下 / 上 / 左 / 右）——等腰三角形。
 const TRI_DOWN: IconPart = &[
     Vec2::new(0.15, 0.32),
@@ -1030,6 +1054,9 @@ pub enum Icon {
     Check,
     /// 拖拽手柄（三横）。
     Grip,
+    /// **拖拽手柄（三斜线）**：三条平行的 45° 笔画（从左下到右上，越靠右下角越长）——
+    /// 经典"缩放角"观感（见 [`Icon::Grip`] 的横线版本与 [`crate::GripShape::Diagonal`]）。
+    GripDiagonal,
     /// 警告 / 非法输入（三角 + 感叹号）——错误提示、取色器"文本无法识别"按钮用。
     Warning,
     /// 关闭"✕"（两条对角笔画）——窗口标题栏的关闭按钮用。
@@ -1047,6 +1074,7 @@ impl Icon {
             Icon::ChevronRight => &[TRI_RIGHT],
             Icon::Check => &[CHECK_L, CHECK_R],
             Icon::Grip => &[GRIP_1, GRIP_2, GRIP_3],
+            Icon::GripDiagonal => &[GRIP_D1, GRIP_D2, GRIP_D3],
             Icon::Warning => &[WARN_TRI, WARN_BAR, WARN_DOT],
             Icon::Close => &[CLOSE_A, CLOSE_B],
         }
@@ -1145,6 +1173,45 @@ pub fn text_cmd(
 #[cfg(test)]
 mod corner_radius_tests {
     use super::*;
+
+    #[test]
+    fn grip_diagonal_matches_the_spec() {
+        // 用户给的几何契约：三条 45° 斜线的**首端点**在一条水平线上（同 y）**等距**，
+        // **末端点**在一条竖直线上（同 x）**等距**；每条都是 45°（dx == -dy）。
+        let parts = Icon::GripDiagonal.parts();
+        assert_eq!(parts.len(), 3, "三条斜线");
+        let starts: Vec<Vec2> = parts.iter().map(|p| p[0]).collect();
+        let ends: Vec<Vec2> = parts.iter().map(|p| p[1]).collect();
+        // 首端点：同 y、x 等距。
+        assert!(
+            starts.windows(2).all(|w| (w[0].y - w[1].y).abs() < 1e-6),
+            "首端点必须在同一条水平线上：{starts:?}"
+        );
+        let d1 = starts[1].x - starts[0].x;
+        let d2 = starts[2].x - starts[1].x;
+        assert!((d1 - d2).abs() < 1e-6 && d1 > 0.0, "首端点必须等距：{d1} vs {d2}");
+        // 末端点：同 x、y 等距（间距与首端一致）。
+        assert!(
+            ends.windows(2).all(|w| (w[0].x - w[1].x).abs() < 1e-6),
+            "末端点必须在同一条竖直线上：{ends:?}"
+        );
+        let e1 = ends[1].y - ends[0].y;
+        let e2 = ends[2].y - ends[1].y;
+        assert!((e1 - e2).abs() < 1e-6 && e1 > 0.0, "末端点必须等距：{e1} vs {e2}");
+        assert!((e1 - d1).abs() < 1e-6, "两端间距相等 ⇒ 三条平行 45°：{d1} vs {e1}");
+        // 每条 45°（屏幕 y 向下 ⇒ 向右同时向上）。
+        for p in parts {
+            let (dx, dy) = (p[1].x - p[0].x, p[1].y - p[0].y);
+            assert!((dx + dy).abs() < 1e-6, "必须是 45°：{p:?}（dx={dx} dy={dy}）");
+        }
+        // 笔宽：第三、四点相对第一、二点沿 (1,1) 等量偏移（同一方向、同一厚度）。
+        for p in parts {
+            let (ox, oy) = (p[3].x - p[0].x, p[3].y - p[0].y);
+            let (ox2, oy2) = (p[2].x - p[1].x, p[2].y - p[1].y);
+            assert!((ox - ox2).abs() < 1e-6 && (oy - oy2).abs() < 1e-6, "同厚度：{p:?}");
+            assert!(ox > 0.0 && oy > 0.0, "沿 (1,1) 偏移（右下方向）：{ox},{oy}");
+        }
+    }
 
     #[test]
     fn from_scalar_is_uniform_and_compares_against_scalars() {

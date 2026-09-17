@@ -1628,6 +1628,7 @@ mod tests {
             crate::draw::Icon::ChevronRight,
             crate::draw::Icon::Check,
             crate::draw::Icon::Grip,
+            crate::draw::Icon::GripDiagonal,
             crate::draw::Icon::Warning,
             crate::draw::Icon::Close,
         ] {

@@ -1601,15 +1601,55 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 **缩放柄令牌**（固定宽窗口右下角那个"拖拽按钮"）：
 
 `PanelStyle::grip: GripStyle { shape: GripShape, color, size, step, count }`，
-`GripShape::{Squares（默认，历史观感）, Bars（内置 `Icon::Grip` 三条横线）, Hidden}`；
+`GripShape::{Squares（默认，历史观感）, Bars（`Icon::Grip` 三条横线）, Diagonal（三条 45° 斜线）, Hidden}`；
 逐窗口入口 `PanelStyle::{with_grip, with_grip_color, with_grip_shape, without_grip}`。
 `Hidden` 只是**不画图案**，**拖动缩放照旧**——命中区独立存在（`grip.extent()`，
-下限 14px）。它只对 `.width(..)` 的固定宽窗口生效（那是唯一带缩放柄的容器）。
+下限 14px）。只有**允许拖拽缩放**的窗口才画柄（见下节 `.resize(..)`）。
 
 > ⚠ `Bars` 画的是**三条实心横杠**（`push_solid_rect`，宽 `size*count`、高 `size`、
 > 间距 `step`），**不用 `Icon::Grip` 图标**：图标每条杠只有 `size` 高（默认 4 逻辑像素），
 > 再叠上 `Theme::feather` 的羽化带（默认每侧 0.5）就把三条糊成一坨（实测："三横看起来
 > 是斜的一坨"）。实心矩形没有羽化，任意尺寸都读得出三条。
+>
+> `Diagonal` 是**三条 45° 斜线**（从左下到右上；`Icon::GripDiagonal`）——经典"缩放角"观感。
+> 几何契约：三条线的**首端点在一条水平线上等距**、**末端点在一条竖直线上等距**，即第 `i` 条
+> 从 `(s, 0.92)` 到 `(0.92, s)`（`s = 0.20 / 0.40 / 0.60`）⇒ 三条都是 45°、互相平行、
+> 垂直间距相等（单测 `draw::corner_radius_tests::grip_diagonal_matches_the_spec` 钉住）。
+> 它只能走图标（一条斜线不是轴对齐矩形），所以方框取 `size * count * 1.5`（比横线版大 50%）：
+> 斜线在 `size*count` 的小方框里间距不到 1px，羽化会把它们糊成一片。`GripStyle::extent()`
+> （命中区下限的来源）同步按 1.5× 算。
+
+### 拖拽缩放（窗口）：显式 `bool` + 轴向
+
+```rust
+ui.window("w").width(200.0).resize(true, Resize::Both).show(|w| ..);      // 宽高同调
+ui.window("popup").width(300.0).resize(false, Resize::None).show(|w| ..); // 固定宽但不可拖
+```
+
+| 写法 | 效果 |
+|---|---|
+| **不调 `.resize(..)`** | **旧行为**：有 `.width(..)` 就能横向拖（右下角柄），没有就不出柄 |
+| `.resize(false, ..)` | **不画柄、不响应拖拽**；`.width(..)` 仍是布局固定宽（菜单 / 下拉浮层用） |
+| `.resize(true, Resize::Horizontal)` | 只调宽（`↔` 光标） |
+| `.resize(true, Resize::Both)` | **宽高同调**（`↖↘` 光标）：高度跨帧持久于 `UiState::window_heights`，被拖过之后由用户接管（内容不再撑高；**并且内容自动裁剪**，见下） |
+
+> ⚠ **高度被用户固定 ⇒ 内容强制裁剪**（`window_content_clipped(strict, fixed_h)`）：
+> 窗口一旦变成"固定尺寸视口"，内容撑不高它了——不裁剪就会**画到窗口外面**
+> （用户实测：TTT 窗口缩小后标签溢出到面板外）。触发条件是**高度**被拖过，
+> **固定宽不触发**（固定宽窗口的高度仍由内容决定，垂直方向没有溢出可言）；
+> `.placement(Placement::Clip)` 照旧是显式开关。裁剪之后窗口里的 `scroll_at` 才谈得上滚动
+> （可视区之外的内容被裁掉、滚动条能带回来）。单测
+> `ui::tests::window_content_clips_when_height_is_user_fixed`。
+
+- `allow` 是**显式 bool**（用户指定的签名）：枚举 `Resize` 只表达"哪条轴"，
+  "允不允许"用布尔更直白；判定抽成纯函数 `resolve_window_resize` 并单测
+  （"没设置 = 旧行为"最容易在重构里丢，而它在 GUI 里几乎看不出来：柄画了但不响应、
+  或没画却响应）。
+- 拖拽基于通用 `resize_handle`（`current` / `min` **两轴都给**），按下即 `claim_press`
+  ⇒ 拖柄不会顺带把窗口拖走。
+- **验证**：`--sim-resize`（斜向拖 `img_box_fill` 的柄 +60/+40 ⇒ 结算尺寸
+  `328×97 → 388×137`：两条轴都动，且**变化量正好等于注入位移**——若脚本每帧重算目标点，
+  会退化成"追着拖"（+180/+223），所以这条断言同时也守着脚本自身）。
 
 **验证**（都不需要人眼看屏幕）：
 
@@ -1678,8 +1718,10 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {      // 位置 = 栏左上角�
 >    （用户实测："Menu 分割线错位"）。自己画时请求"极宽"由窗口 clamp ⇒ 恒等于内容宽。
 >
 > `caption` 另外做了层级区分：字号 ×0.85 + `Palette::text_muted`（一眼看出是分组标题、
-> 不是可点的项）；勾选标记**只在勾选时画**（勾选列由内边距恒留位，未勾选不画"背景色
-> 图标"——悬停高亮时那块背景色会在高亮上显形）。
+> 不是可点的项）；勾选标记是**方框**（`[☐]/[☑]`，画在菜单项**内容里**、方框列恒留位 ⇒
+> 勾选与否文字都对齐），勾选时填 `CheckboxStyle::checked_fill` + 矢量勾号。
+> 面板左内边距只留 `item_pad_x`（用户要的"小边距"）——方框不占内边距，所以小边距下
+> 也不会被裁掉。
 >
 > 面板 z 用了哨兵，所以**菜单栏录在哪里都盖得住别人**（不必强求录在各窗口之后）。
 > 排查通道：`RJ_MENU_TRACE=1` 打印每个下拉内容的行矩形（`x/y/w/h`）——
