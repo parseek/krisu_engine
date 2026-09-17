@@ -164,7 +164,8 @@ if ui.add(TagButton::new("t1", "标签").bg(Color::ORANGE)).clicked() { … }
 | 焦点 | `register_focus(&id_for, rect, FocusKind)` / `key_click(&id_for, kind)`（`id_for = ui.id_for(id)` 为**绝对 ID**） | 键盘导航（Tab/Enter/方向键）接入 |
 | 状态 | `state_mut().widget(&id_for)` → `WidgetState` + `hit::update_drag` / `update_interact` | 跨帧交互状态机（hover/按下/拖拽基准）；**收绝对 ID** |
 | 绘制 | `push_panel_like` / `push_text_rect` / `push_solid_rect` / `push_border_rect` | 背景边框 / 文本 / 实心 / 描边（逻辑坐标） |
-| 复用 | `button_at_styled` / `checkbox_at_styled` / `slider_at` / `text_input_at` / `text_area_at` / `radio_at` / `combo_at` | 委托现有控件（**内置控件同路径**） |
+| 复用 | `button_at_styled` / `checkbox_at_styled` / `slider_at` / `text_input_at` / `text_area_at` / `radio_at` / `combo_at`（= `Dropdown` 的糖） | 委托现有控件（**内置控件同路径**） |
+| 浮层 | `widgets::menu::popup_show`（`pub(crate)`）+ `MenuCtx` | **下拉 / 菜单类浮层一律走这里**（哨兵 z / 锁定位置 / 无缩放柄 / 面板样式 / 宽度收敛 / 点外·Esc·点项收起都在里面）；`MenuCtx` 是给应用写菜单内容的上下文（`Deref` 到 `Window` ⇒ 全部 `UiAdd`） |
 
 约定：`rect` 均为**相对当前容器 origin 的局部坐标**；`push_*` 内部 ×scale 取整到
 物理像素；交互前先拷出主题值（Copy / owned）避免借用冲突。

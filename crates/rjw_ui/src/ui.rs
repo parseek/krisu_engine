@@ -699,6 +699,14 @@ impl<'a> Ui<'a> {
         self.press_claimed = true;
     }
 
+    /// **声明本次按下被某个控件响应**（控件作者用）：帧末"点空白处清焦点"的判定要
+    /// 区分"按在了控件上"与"按在了空白处"——自定义控件（如 [`crate::Dropdown`] 的
+    /// 触发器）按下时调它。
+    #[inline]
+    pub(crate) fn note_press_handled(&mut self) {
+        self.any_pressed = true;
+    }
+
     /// **通用拖拽缩放柄**（控件作者原语）：`handle` 为**当前容器局部坐标**的柄矩形
     /// （通常右下角）。按住拖拽把 `current` 改为新尺寸（返回 `Some(new)`；`None` =
     /// 本帧无变化）；范围 clamp 到 `min`。拖动中置位 `press_claimed`（阻止外层
@@ -898,7 +906,7 @@ impl<'a> Ui<'a> {
 
     /// 本控件是否持有键盘焦点（`UiState.focused == id`；`id` 为**绝对 ID**）。
     #[inline]
-    fn focused_is(&self, id: &IdAbsolute<'_>) -> bool {
+    pub(crate) fn focused_is(&self, id: &IdAbsolute<'_>) -> bool {
         self.state.focused.as_ref().is_some_and(|f| f.as_str() == id.as_str())
     }
 
@@ -1454,7 +1462,7 @@ impl<'a> Ui<'a> {
     /// 文本超宽时省略（内容自洽，noclip）：宽度 > `max_w` → 返回 "…" 截断串；
     /// 否则 `None`（原样绘制）。按钮 / 勾选 / 下拉等固定 rect 控件的文本自动省略
     /// （Resizable 窗口缩窄 / max 约束下不溢出）。
-    fn ellipsized(
+    pub(crate) fn ellipsized(
         &mut self,
         s: &str,
         size: f32,
@@ -5368,9 +5376,14 @@ impl<'ui, 'a> ModalBuilder<'ui, 'a> {
 impl Ui<'_> {
     /// **下拉框**（显式 rect；`rect` 为相对当前容器 origin 的局部坐标）。
     ///
-    /// 按钮显示 `current`；点击展开**选项浮层**（临时窗口置顶，自动尺寸包裹选项），
-    /// 点击选项选中并收起，点击浮层外收起。`selected` 为当前选中（用于 ✓ 标记）。
-    /// 返回本帧新选中的索引（`None` = 无选择/未展开）。
+    /// ⚠ 本方法现在是 [`Dropdown`](crate::Dropdown) 的**糖**（只有一套浮层实现，
+    /// 见 [`crate::widgets::menu`]）——新代码请直接用
+    /// `p.add(Dropdown::options(..))`（自动尺寸触发器）或
+    /// `p.add(Dropdown::new(..).menu(|m| ..))`（菜单内容自己写，菜单内又是 `UiAdd`）。
+    ///
+    /// 行为与旧版一致：按钮显示 `current`；点击展开选项浮层；点选项 / 点浮层外 / `Esc`
+    /// 收起；`selected` 为当前选中（选中行画方框勾 + 整行高亮）。
+    /// 返回本帧新选中的索引（`None` = 无选择 / 未展开）。
     pub fn combo_at(
         &mut self,
         id: &str,
@@ -5379,246 +5392,14 @@ impl Ui<'_> {
         options: &[String],
         selected: Option<u32>,
     ) -> Option<u32> {
-        // 下拉框自身是命名空间边界：浮层（window）与选项按钮自动带前缀。
-        let abs = self.id_for(id);
-        let mut picked = None;
-        let open = self
-            .state
-            .combo_open
-            .as_ref()
-            .is_some_and(|o| o.as_str() == abs.as_str());
-        // 登记焦点链（键盘导航：Tab 可到；Enter/Space 展开收起；方向键切换选项）。
-        self.register_focus(&abs, rect, FocusKind::Combo);
-        // 按钮交互（点击 toggle）。
-        let hit = self.hit_abs(&abs, &rect);
-        let btn = self.mouse_left();
-        let key_click = self.key_click(&abs, FocusKind::Combo);
-        let mut ev = {
-            let ws = self.state.widgets.entry(abs.to_static()).or_default();
-            let ev = update_interact(ws, hit, btn);
-            if key_click {
-                ws.pressed = true;
-            }
-            ev
-        };
-        if key_click {
-            ev.clicked = true;
+        // 只有"本帧真的点了某一项"才返回 `Some`（`selected` 可能是 `None`，
+        // 也可能被上层夹住；用前后对比而不是"有没有值"）。
+        let mut sel = selected;
+        crate::widgets::Dropdown::opt(id, current, &mut sel, options).show_in(self, rect);
+        match sel {
+            Some(i) if Some(i) != selected => Some(i),
+            _ => None,
         }
-        if ev.pressed {
-            self.any_pressed = true;
-        }
-        if ev.clicked {
-            self.state.combo_open = if open { None } else { Some(abs.to_static()) };
-        }
-        // 键盘：焦点下展开时，上下方向键切换选项（选中即关闭浮层）；Esc 收起。
-        if open {
-            if self.focused_is(&abs) {
-                let n = options.len() as u32;
-                if n > 0 {
-                    let cur = selected.unwrap_or(0).min(n - 1);
-                    if self.keyboard.key(KeyCode::ArrowUp).down_edge() {
-                        picked = Some(if cur == 0 { n - 1 } else { cur - 1 });
-                    }
-                    if self.keyboard.key(KeyCode::ArrowDown).down_edge() {
-                        picked = Some(if cur + 1 >= n { 0 } else { cur + 1 });
-                    }
-                }
-            }
-            if self.keyboard.key(KeyCode::Escape).down_edge() {
-                self.state.combo_open = None;
-            }
-        }
-        // 按钮绘制（三态：按下 / 展开 > 悬停 > 常态）。
-        //
-        // ⚠ 早先只有 `if open { bg_pressed } else { bg }` ——**整个控件没有 hover 反馈**，
-        // 鼠标移上去毫无变化（与按钮 / 滑条的观感不一致）。
-        let style = self.theme.button.clone();
-        let elem = self.seq + 1;
-        let bg = style.pick_bg(ev.pressed || open, hit);
-        self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
-        let text_rect = Rect::new(
-            rect.x + style.padding.x,
-            rect.y,
-            (rect.w - 18.0 - style.padding.x).max(0.0),
-            rect.h,
-        );
-        // 按钮文本自动省略（缩窄 / max 约束下不溢出，内容自洽）。
-        // 文字从 `padding.x` 起（不贴左缘），右侧留 ▼ 箭头位。
-        let cur_owned = self.ellipsized(
-            current,
-            style.font_size,
-            style.font_family.as_deref(),
-            text_rect.w,
-        );
-        let draw_current: &str = cur_owned.as_deref().unwrap_or(current);
-        let seq = self.next_seq();
-        self.queue.push(text_cmd(
-            self.depth,
-            seq,
-            self.cur_win,
-            elem,
-            text_rect,
-            Arc::from(draw_current),
-            style.font_size,
-            style.fg,
-            TextAlign::Left,
-            TextVAlign::Center,
-            style.font_family.clone(),
-            None,
-            self.clip,
-        None,
-        ));
-        // 箭头用**矢量图标**画（不再用 "▼" 字形：字体缺字形会走 fallback，宽度也随字体变）。
-        let arrow = Rect::new(rect.x + rect.w - 18.0, rect.y, 18.0, rect.h);
-        let seq = self.next_seq();
-        self.queue.push(UiDraw {
-            depth: self.depth,
-            seq,
-            win: self.cur_win,
-            elem,
-            rect: arrow,
-            clip: self.clip,
-            kind: DrawKind::Icon { icon: Icon::ChevronDown, color: style.fg },
-        });
-        // 展开的选项浮层：临时窗口，**显式置顶**（z = WIN_TOPMOST → 覆盖一切，
-        // 不受其他窗口置顶书签影响）。**现代右键菜单外观**：浮层面板（细边框 + 小圆角）
-        // + 扁平列表项（hover / 选中整行高亮、✓ 选中标记、无边框）。
-        if open {
-            let popup_pos = Vec2::new(rect.x, rect.y + rect.h + 2.0);
-            let popup_id = format!("{id}::popup");
-            // 强制哨兵 z：window_at 的 entry().or_insert() 保留现有值。
-            // ⚠ 键 = popup 的**绝对 id**（`window_at` 内部按当前栈解析出同一前缀）。
-            self.state
-                .window_z
-                .insert(IdAbsolute::owned(format!("{}::popup", abs.as_str())), WIN_TOPMOST);
-            let cs = self.theme.combo.clone();
-            // 浮层宽 = max(最长选项文本 + padding + ✓ 位, 按钮宽, 项最小宽)。
-            let mut menu_w = cs.item_min_w.max(rect.w);
-            for opt in options {
-                let tw = self.text_size(opt, cs.font_size, cs.font_family.as_deref()).x;
-                menu_w = menu_w.max(tw + cs.item_pad_x * 2.0 + cs.font_size);
-            }
-            // 浮层窗口背景 = 菜单面板样式（window builder `.style` 覆盖默认 Theme::panel）。
-            // 投影沿用主题（浮层更该"浮起来"），故整对象从主题 clone 后只改菜单相关字段。
-            let panel_style = PanelStyle {
-                bg: cs.menu_bg.into(),
-                border: cs.menu_border,
-                border_w: 1.0,
-                padding: 0.0,
-                radius: cs.menu_radius,
-                bg_image: None,
-                ..self.theme.panel.clone()
-            };
-            let popup_size = self
-                .window(&popup_id)
-                .pos(Position::Physical(popup_pos))
-                // **锁定位置**：下拉浮层不该能被拖动——它是"某个控件的展开部分"，
-                // 拖走了就与触发控件脱节（点选项的命中判定按控件走，视觉却跑别处了）。
-                .clamp(WindowClamp::Locked)
-                .style(panel_style)
-                .show(|w| {
-                    let cs = w.ui_mut().theme.combo.clone();
-                    let pad_v = cs.menu_pad_v;
-                    let item_h = (cs.font_size * 1.3).round() + 6.0;
-                    let menu_h = pad_v * 2.0 + options.len() as f32 * item_h;
-                    let ui = w.ui_mut();
-                    for (i, opt) in options.iter().enumerate() {
-                        let sel = selected == Some(i as u32);
-                        let item_rect = Rect::new(0.0, pad_v + i as f32 * item_h, menu_w, item_h);
-                        let item_id = IdAbsolute::owned(format!("{}::opt_{i}", abs.as_str()));
-                        let hit = ui.hit_abs(&item_id, &item_rect);
-                        let btn = ui.mouse_left();
-                        // 菜单项自身有拖拽语义：阻止 popup 窗口把按下当窗口拖拽基准。
-                        if btn.down_edge() && hit {
-                            ui.claim_press();
-                        }
-                        let ev = {
-                            let ws = ui.state_mut().widget(&item_id);
-                            update_interact(ws, hit, btn)
-                        };
-                        // hover / 选中 → 整行高亮（扁平菜单项，无边框）。
-                        let hl = if sel {
-                            cs.item_selected
-                        } else if ev.pressed || hit {
-                            cs.item_hover
-                        } else {
-                            cs.menu_bg
-                        };
-                        ui.push_panel_like(item_rect, hl, cs.menu_bg, 0.0, 0.0, 1);
-                        // 文本：选中项 "✓ " 前缀（fg_mark）+ 选项文本（fg）。
-                        let pad_x = cs.item_pad_x;
-                        let text_rect = Rect::new(
-                            item_rect.x + pad_x,
-                            item_rect.y,
-                            (item_rect.w - pad_x * 2.0).max(0.0),
-                            item_rect.h,
-                        );
-                        // **勾选列恒留位**（不论选中与否）：选中项先画 ✓ 图标、文字再右移
-                        // `font_size`；若未选中项不右移，同一列文字就会左右跳（"一列像素
-                        // 突兀"——未选中的首字比选中项的文字凸出去一个图标宽）。
-                        let check_w = cs.font_size;
-                        if sel {
-                            // 选中标记用**矢量图标**（不再用 "✓" 字形）。
-                            ui.icon_at(
-                                Position::Physical(Vec2::new(
-                                    text_rect.x,
-                                    text_rect.y + (text_rect.h - cs.font_size) * 0.5,
-                                )),
-                                Size::Physical(Vec2::splat(cs.font_size)),
-                                Icon::Check,
-                                cs.fg_mark,
-                            );
-                        }
-                        ui.push_text_rect(
-                            Rect::new(
-                                text_rect.x + check_w,
-                                text_rect.y,
-                                (text_rect.w - check_w).max(0.0),
-                                text_rect.h,
-                            ),
-                            opt,
-                            cs.font_size,
-                            cs.fg,
-                            cs.font_family.clone(),
-                            TextAlign::Left,
-                            TextVAlign::Center,
-                            None,
-                            None,
-                        );
-                        if ev.clicked {
-                            picked = Some(i as u32);
-                        }
-                    }
-                    // 设置窗口内容高（自动宽 = menu_w；高 = 面板 padding + 项数 × 项高）。
-                    w.ui_mut().child_rect(menu_w, menu_h, Child::Expand);
-                });
-            // 点击浮层外（且不在按钮上）→ 收起。
-            // ⚠ popup_pos / rect 是**相对当前容器**的局部坐标，必须转**绝对**再与
-            // 绝对鼠标坐标比较——否则容器有偏移时（如 pack_at(16,90)）判定错位，
-            // 点选项会被误判为"点外部"导致浮层收起且不选中。
-            let popup_abs = Rect::new(
-                self.abs_base.x + popup_pos.x,
-                self.abs_base.y + popup_pos.y,
-                popup_size.x,
-                popup_size.y,
-            );
-            let btn_abs = Rect::new(
-                self.abs_base.x + rect.x,
-                self.abs_base.y + rect.y,
-                rect.w,
-                rect.h,
-            );
-            if btn.down_edge()
-                && !hit_test(&popup_abs, self.mouse_logical)
-                && !hit_test(&btn_abs, self.mouse_logical)
-            {
-                self.state.combo_open = None;
-            }
-        }
-        if picked.is_some() {
-            self.state.combo_open = None;
-        }
-        picked
     }
 
     /// **下拉框**（顶层定位：`pos` 相对当前容器内容原点，绝对定位；尺寸自动）。

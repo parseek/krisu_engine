@@ -44,8 +44,9 @@ use std::time::Instant;
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
 use rjw_krusie::ui::{
-    ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, FontModal, GRIP_W, GripShape,
-    GripStyle, IdAbsolute, Label, Palette, Position, Segmented, ShadowStyle, Weight, weight_label,
+    ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, Dropdown, FontModal, GRIP_W,
+    GripShape, GripStyle, IdAbsolute, Label, Palette, PopupSide, Position, Segmented, ShadowStyle,
+    Weight, item_h, popup_origin, popup_padding, weight_label,
 };
 
 /// 「重叠控件」演示模块（控件级遮挡：重叠处只有最上层被触发 + `--sim-overlap` 自证）。
@@ -55,6 +56,19 @@ use overlap::OverlapDemo;
 /// **菜单栏位置**（逻辑像素，左上角）：录制与 `--sim-menu` 的坐标解算共用同一常量
 /// —— 挪栏不用改脚本（写死像素的脚本一挪就点空）。
 const MENUBAR_POS: Vec2 = Vec2::new(12.0, 12.0);
+
+/// **统一后的「按钮下拉菜单」演示位置**（逻辑像素，左上角；与菜单栏同一行、在其右侧）：
+/// 录制与 `--sim-dropdown` 的坐标解算**共用同一常量**（同理：脚本不写死像素）。
+const DROPDOWN_OPT_POS: Vec2 = Vec2::new(660.0, 12.0);
+/// 演示 ②（富内容模式：菜单里放文本输入 / 分割线 / 菜单项 / 子下拉）的位置。
+const DROPDOWN_FILE_POS: Vec2 = Vec2::new(860.0, 12.0);
+/// 两个演示下拉的**固定触发器宽**（逻辑像素）：仿真按它算点击点，不必复刻
+/// "按文字自动宽"的内部公式（`Dropdown::width`）。
+const DROPDOWN_W: f32 = 160.0;
+/// 演示 ①（选项列表模式）的选项。
+const DIFF_TOP: [&str; 3] = ["简单", "普通", "困难"];
+/// 演示 ②（富内容模式里嵌的子下拉）的选项。
+const ENCODINGS: [&str; 3] = ["ASCII", "UTF-8", "GBK"];
 
 /// **文件导入**（系统文件选择器 → 字节 → 引擎资源）：图片当背景纹理、字体进运行时字体库。
 mod filedialog;
@@ -198,8 +212,8 @@ struct Menu {
     opt7: bool,
     fullscreen: bool,
     difficulty: String,
-    /// combo 选中索引（难度下拉框）。
-    diff_idx: Option<u32>,
+    /// `Dropdown::options` 的选中索引（难度下拉；统一后的下拉菜单**选项列表模式**）。
+    diff_idx: u32,
     /// 本帧是否请求重置 UI 状态（`Frame::ui` 闭包末尾由 `update` 统一处理）。
     reset_requested: bool,
 }
@@ -215,7 +229,7 @@ impl Menu {
             opt7: false,
             fullscreen: false,
             difficulty: "普通".to_owned(),
-            diff_idx: Some(1),
+            diff_idx: 1,
             reset_requested: false,
         }
     }
@@ -271,13 +285,19 @@ impl Menu {
                 self.fullscreen = !self.fullscreen;
             }
             p.label("难度");
-            // combo 下拉框（难度选择）：展开浮层选一项，点击外部收起。
+            // **统一后的下拉菜单**（`Dropdown` 是普通 `Widget` ⇒ `p.add(..)` 放进任何容器）。
+            // 这里是"选项列表模式"：菜单项由引擎排（选中行打勾 + 整行高亮），
+            // 点击写回 `&mut u32` 并自动收起；键盘 ↑/↓ 也能切。
+            // ⚠ 旧入口 `p.combo(..)` 仍然可用（= 本控件 + 固定布局宽的糖）——
+            // `FontModal` 的字重下拉就还在用它（老代码不必改）。
             const DIFFS: [&str; 3] = ["简单", "普通", "困难"];
-            let diff_opts: Vec<String> = DIFFS.iter().map(|s| s.to_string()).collect();
-            if let Some(i) = p.combo("diff_combo", &self.difficulty, &diff_opts, self.diff_idx) {
-                self.diff_idx = Some(i);
-                self.difficulty = DIFFS[i as usize].to_owned();
-            }
+            p.add(Dropdown::options(
+                "diff_dd",
+                DIFFS[self.diff_idx.min(2) as usize],
+                &mut self.diff_idx,
+                &DIFFS,
+            ));
+            self.difficulty = DIFFS[self.diff_idx.min(2) as usize].to_owned();
             p.label(&format!("难度: {}", self.difficulty));
             p.label(&format!("全屏: {}", if self.fullscreen { "开" } else { "关" }));
             // 布局增强演示：换行 + min/max 尺寸约束。
@@ -581,7 +601,7 @@ impl Windows {
                 .width(200.0)
                 .resize(true, Resize::Both)
                 .title("TTT（可拖宽拖高）")
-                .style(base.with_bg_image(bg.fit(ImageFit::Fill)))
+                .style(base.with_bg_image(bg.fit(ImageFit::Fill).tint(Color::WHITE.with_a(0.5))))
                 .show(|w| {
                     w.label("另一个窗口");
                     w.button("btn00", "Awa");
@@ -1097,7 +1117,37 @@ struct UiApp {
     /// 拿不到 `Gpu`）。请求与状态在 [`TopBar`]（那是显示它们的模块）。
     import_image_path: Option<std::path::PathBuf>,
     /// **菜单栏**里的"文件名过滤"输入框内容（演示"菜单里也能放文本输入"）。
+    ///
+    /// ⚠ 富内容下拉菜单里的文本输入**共用同一个缓冲**（同一份内容，两个地方都能改：
+    /// "菜单里能放文本输入"这件事在菜单栏与下拉菜单上是同一套能力）。
     menu_filter: String,
+    /// **统一后的下拉菜单**演示状态 ①：选项列表模式（`Dropdown::options`）的选中索引。
+    dd_opt_idx: u32,
+    /// 演示状态 ②：富内容菜单里**子下拉**（`side(PopupSide::Right)`）的选中索引。
+    dd_enc_idx: u32,
+    /// 演示状态 ③：富内容菜单里点了菜单项的次数。
+    ///
+    /// 为什么不用 `top.import_request` 判定：它在**下一帧开场**就被 `take` 走（真正的
+    /// 导入通路），跨帧断言只会读到 `None`；计数器才跨帧稳定（`--sim-dropdown` 用它）。
+    dd_item_clicks: u32,
+    /// --sim-dropdown：**实操统一后的下拉菜单**（选项列表 + 富内容两段；坐标运行时解算）。
+    sim_dropdown: bool,
+    /// --sim-dropdown：两个触发器的中心（每帧按常量 + 主题尺寸解算）。
+    dd_opt_pt: Option<Vec2>,
+    dd_file_pt: Option<Vec2>,
+    /// --sim-dropdown：选项面板里第 1 行的中心（面板出现后才知道它在哪）。
+    dd_opt_row0_pt: Option<Vec2>,
+    /// --sim-dropdown：富内容面板里**文本输入**的中心（菜单第 1 行）。
+    dd_input_pt: Option<Vec2>,
+    /// --sim-dropdown：富内容面板里**第 1 个菜单项**（"导入图片…"）的中心。
+    dd_item_pt: Option<Vec2>,
+    /// --sim-dropdown：解算出的两个面板原点（判定"面板该在触发器正下方"）。
+    dd_opt_panel: Option<Vec2>,
+    dd_file_panel: Option<Vec2>,
+    /// --sim-dropdown：两个面板**应该**在的原点（= 触发器下方 + 2px；
+    /// 由**公开**助手 `popup_origin` 算出 ⇒ 顺带守住"公开助手与引擎几何同源"）。
+    dd_opt_want: Option<Vec2>,
+    dd_file_want: Option<Vec2>,
     /// --sim-menu：**实操菜单栏**（坐标运行时解算，不写死像素）。
     sim_menu: bool,
     /// --sim-resize：脚本化拖拽**右下角缩放柄**（验"宽高同调"与"不允许拖拽就不出柄"）。
@@ -1218,6 +1268,19 @@ impl UiApp {
             sim_import: None,
             import_image_path: None,
             menu_filter: String::new(),
+            dd_opt_idx: 1,
+            dd_enc_idx: 0,
+            dd_item_clicks: 0,
+            sim_dropdown: false,
+            dd_opt_pt: None,
+            dd_file_pt: None,
+            dd_opt_row0_pt: None,
+            dd_input_pt: None,
+            dd_item_pt: None,
+            dd_opt_panel: None,
+            dd_file_panel: None,
+            dd_opt_want: None,
+            dd_file_want: None,
             sim_menu: false,
             sim_resize: false,
             sim_resize_pt: None,
@@ -1500,6 +1563,12 @@ impl App for UiApp {
             if self.sim_chrome {
                 self.windows.win_a_open = true;
             }
+            // `--sim-dropdown`：两个演示下拉在顶栏右侧的固定位置，**别被别的窗口盖住**
+            // （窗口 z 高于 win=0 内容）⇒ 脚本自己把它们收起来。
+            if self.sim_dropdown {
+                self.theme_tuner.open = false;
+                self.windows.win_a_open = false;
+            }
         }
         // ── 调试：脚本化鼠标（`--sim-picker`）──────────────────────
         // 复现"打开取色面板 → 在面板里拖/点"：面板路径（SV 平面 / 色相条 / 通道滑块 /
@@ -1769,6 +1838,36 @@ impl App for UiApp {
                 46..=47 => f.debug_inject_mouse(grab, true),
                 48..=52 => f.debug_inject_mouse(aside, true),
                 53..=54 => f.debug_inject_mouse(aside, false),
+                _ => {}
+            }
+        }
+        // ── 调试：脚本化鼠标（`--sim-dropdown`）────────────────────
+        // 行程（坐标由上一帧录制时解算：触发器按常量 + 主题尺寸，面板行按**面板窗口原点**
+        // + `popup_padding` / `item_h` —— 与引擎同源，不写死像素）：
+        //   ① 10..15 点选项下拉触发器 → 菜单打开
+        //   ② 22..25 点第 1 个选项（"简单"）→ 选中 + 自动收起
+        //   ③ 40..45 点富内容下拉触发器 → 菜单打开
+        //   ④ 52..55 点菜单里**第 1 行的文本输入** → 聚焦（"菜单内又是 UiAdd"的实证）
+        //   ⑤ 62..65 点第 1 个菜单项（"导入图片…"）→ 执行 + 自动收起
+        if self.sim_dropdown {
+            let opt = self.dd_opt_pt.unwrap_or(Vec2::ZERO);
+            let file = self.dd_file_pt.unwrap_or(Vec2::ZERO);
+            let row0 = self.dd_opt_row0_pt.unwrap_or(opt);
+            let input = self.dd_input_pt.unwrap_or(file);
+            let item = self.dd_item_pt.unwrap_or(file);
+            match f.frames() {
+                10..=11 => f.debug_inject_mouse(opt, false),
+                12..=13 => f.debug_inject_mouse(opt, true),
+                14..=15 => f.debug_inject_mouse(opt, false), // ① 开
+                22..=23 => f.debug_inject_mouse(row0, true), // ② 选第一个选项
+                24..=25 => f.debug_inject_mouse(row0, false),
+                40..=41 => f.debug_inject_mouse(file, false),
+                42..=43 => f.debug_inject_mouse(file, true),
+                44..=45 => f.debug_inject_mouse(file, false), // ③ 开
+                52..=53 => f.debug_inject_mouse(input, true), // ④ 聚焦菜单里的文本输入
+                54..=55 => f.debug_inject_mouse(input, false),
+                62..=63 => f.debug_inject_mouse(item, true), // ⑤ 点菜单项
+                64..=65 => f.debug_inject_mouse(item, false),
                 _ => {}
             }
         }
@@ -2092,6 +2191,97 @@ impl App for UiApp {
             });
             debug_assert!(menu_size.x > 0.0, "菜单栏至少有宽度");
 
+            // ── **按钮下拉菜单**（`UiAdd::add(Dropdown::…)`：与菜单栏**同一套浮层实现**）──
+            // 位置固定（常量 `DROPDOWN_*_POS`）⇒ `--sim-dropdown` 能按同一常量 + 主题尺寸
+            // 解算点击点。① = 选项列表模式（图一的形态）；② = 富内容模式（图二 + 子菜单）。
+            ui.add_at(
+                DROPDOWN_OPT_POS,
+                Dropdown::options(
+                    "dd_opt",
+                    DIFF_TOP[self.dd_opt_idx.min(2) as usize],
+                    &mut self.dd_opt_idx,
+                    &DIFF_TOP,
+                )
+                .width(DROPDOWN_W),
+            );
+            // 子下拉的标题文字先取出来（闭包里同时要 `&mut self.dd_enc_idx`，
+            // 在同一闭包里读 `self.dd_enc_idx` 会与那个可变借用冲突）。
+            let enc_label = ENCODINGS[self.dd_enc_idx.min(2) as usize];
+            ui.add_at(
+                DROPDOWN_FILE_POS,
+                Dropdown::new("dd_file", "文件名过滤")
+                    .width(DROPDOWN_W)
+                    .menu(|m| {
+                        // ↓ 这几行就是「**菜单内又可以 `UiAdd::add`**」：
+                        //   文本输入（普通控件）/ 分割线 / 菜单项 / **再嵌一个下拉**。
+                        m.text_input("dd_filter", &mut self.menu_filter);
+                        m.separator();
+                        if m.item("导入图片…") {
+                            self.dd_item_clicks += 1;
+                            self.top.import_request = Some(ImportKind::Image);
+                        }
+                        if m.item("导入字体…") {
+                            self.dd_item_clicks += 1;
+                            self.top.import_request = Some(ImportKind::Font);
+                        }
+                        m.separator();
+                        // **子菜单**：菜单里 `add` 一个下拉，面板开在触发器**右侧**。
+                        m.add(
+                            Dropdown::options(
+                                "dd_enc",
+                                enc_label,
+                                &mut self.dd_enc_idx,
+                                &ENCODINGS,
+                            )
+                            .side(PopupSide::Right),
+                        );
+                    }),
+            );
+            // `--sim-dropdown`：坐标解算（**本帧录制后**已知面板在哪；注入只能经 `Frame`
+            // 且在段之前 ⇒ 这里只算、下一帧注，与 `--sim-menu` 同一套做法）。
+            if self.sim_dropdown {
+                let dump = ui.debug_dump();
+                let t = ui.theme().clone();
+                let scale = ui.scale();
+                let (fs, pad, fam) = (t.button.font_size, t.button.padding, t.button.font_family.clone());
+                // 触发器 = 常量位置 + `DROPDOWN_W`（`.width(..)` 是逻辑单位）× DPI，
+                // 高 = 上下内边距 + 一行文字（与 `Dropdown::trigger_size` 同源）。
+                let h = pad.y * 2.0 + ui.text_size("文件名过滤", fs, fam.as_deref()).y;
+                let w = DROPDOWN_W * scale;
+                let trigger = |p: Vec2| Rect::new(p.x * scale, p.y * scale, w, h);
+                let (opt_t, file_t) = (trigger(DROPDOWN_OPT_POS), trigger(DROPDOWN_FILE_POS));
+                self.dd_opt_pt = Some(Vec2::new(opt_t.x + w * 0.5, opt_t.y + h * 0.5));
+                self.dd_file_pt = Some(Vec2::new(file_t.x + w * 0.5, file_t.y + h * 0.5));
+                // 面板**应该**在的原点：公开助手 `popup_origin`（与引擎同一函数）——
+                // 判定时拿它和 `debug_dump` 里的真实原点比，顺带守住"同源"。
+                self.dd_opt_want = Some(popup_origin(opt_t, PopupSide::Below));
+                self.dd_file_want = Some(popup_origin(file_t, PopupSide::Below));
+                // 面板内第一行的原点 = 面板原点 + 内边距 + 边框（公开助手，与引擎同源）。
+                let inset = popup_padding(&t) + t.panel.border_w;
+                let ih = item_h(fs);
+                if let Some(p) = dump.windows.iter().find(|p| p.id == "dd_opt::popup") {
+                    self.dd_opt_panel = Some(p.origin);
+                    self.dd_opt_row0_pt = Some(Vec2::new(
+                        p.origin.x + inset + 20.0,
+                        p.origin.y + inset + ih * 0.5,
+                    ));
+                }
+                if let Some(p) = dump.windows.iter().find(|p| p.id == "dd_file::popup") {
+                    self.dd_file_panel = Some(p.origin);
+                    // 富内容菜单第 1 行 = 文本输入（高 `InputStyle::height`）……
+                    self.dd_input_pt = Some(Vec2::new(
+                        p.origin.x + inset + 20.0,
+                        p.origin.y + inset + t.input.height * 0.5,
+                    ));
+                    // ……接着是分割线（厚 + 上下留白），再才是第 1 个菜单项，
+                    // 行与行之间还有一个 `Theme::gap`。
+                    let sep_h = t.divider.thickness + t.divider.margin * 2.0;
+                    self.dd_item_pt = Some(Vec2::new(
+                        p.origin.x + inset + 20.0,
+                        p.origin.y + inset + t.input.height + t.gap + sep_h + t.gap + ih * 0.5,
+                    ));
+                }
+            }
             // `--sim-resize`：坐标解算（窗口原点 + 结算尺寸 = 右下角；柄是那个角上的方块）。
             if self.sim_resize {
                 let dump = ui.debug_dump();
@@ -2184,6 +2374,92 @@ impl App for UiApp {
                         "[FAIL] 面板被拖走了 / 菜单意外关闭"
                     }
                 );
+            }
+
+            // `--sim-dropdown` 判定（**下拉录制之后**读状态：本帧的展开 / 收起已定）。
+            // ① 点触发器 ⇒ 下拉打开（`combo_open` = 面板 id；面板真在 dump 里、且**正好在
+            //    触发器下方 2px** —— 用**公开**助手 `popup_origin` 算期望值，顺带守住"同源"）；
+            // ② 点选项 ⇒ 选中索引变 + 自动收起 + 面板消失；
+            // ③ 富内容下拉同样开得起来（**同一个控件、同一套浮层实现**）；
+            // ④ 菜单里的**文本输入**真的可聚焦（"菜单内又是 `UiAdd`"的实证）；
+            // ⑤ 菜单项点了 ⇒ 执行 + 自动收起。
+            if self.sim_dropdown {
+                let open = ui.state().combo_open().map(|s| s.to_owned());
+                let dump = ui.debug_dump();
+                let at = |id: &str| dump.windows.iter().find(|p| p.id == id).map(|p| p.origin);
+                let near = |got: Option<Vec2>, want: Option<Vec2>| match (got, want) {
+                    (Some(g), Some(w)) => (g.x - w.x).abs() < 2.0 && (g.y - w.y).abs() < 2.0,
+                    _ => false,
+                };
+                match sim_frame {
+                    20 => {
+                        let (got, want) = (at("dd_opt::popup"), self.dd_opt_want);
+                        // ⚠ `combo_open` 记的是**控件（触发器）的绝对 ID**（与 `menu_open`
+                        // 记触发器一致）；面板窗口 id 是它加 `::popup` 后缀。
+                        let ok = open.as_deref() == Some("dd_opt") && near(got, want);
+                        eprintln!(
+                            "sim-dropdown: ① combo_open={open:?}（期望 dd_opt）面板原点={got:?} 期望={want:?} {}",
+                            if ok {
+                                "[OK] 点触发器开下拉（面板在触发器正下方）"
+                            } else {
+                                "[FAIL] 下拉没开 / 面板跑位"
+                            }
+                        );
+                    }
+                    32 => {
+                        let idx = self.dd_opt_idx;
+                        let gone = at("dd_opt::popup").is_none();
+                        let ok = idx == 0 && open.is_none() && gone;
+                        eprintln!(
+                            "sim-dropdown: ② 选中索引={idx}（期望 0）combo_open={open:?} 面板消失={gone} {}",
+                            if ok {
+                                "[OK] 点选项 ⇒ 选中 + 自动收起"
+                            } else {
+                                "[FAIL] 选项没选中 / 没收起"
+                            }
+                        );
+                    }
+                    50 => {
+                        let (got, want) = (at("dd_file::popup"), self.dd_file_want);
+                        let ok = open.as_deref() == Some("dd_file") && near(got, want);
+                        eprintln!(
+                            "sim-dropdown: ③ 富内容下拉 combo_open={open:?}（期望 dd_file）面板原点={got:?} 期望={want:?} {}",
+                            if ok {
+                                "[OK] 同一个控件也能开富内容菜单"
+                            } else {
+                                "[FAIL] 富内容下拉没开 / 面板跑位"
+                            }
+                        );
+                    }
+                    58 => {
+                        let tf = ui.state().text_focus().map(|f| f.id.as_str().to_owned());
+                        let ok = tf
+                            .as_deref()
+                            .is_some_and(|f| f.contains("dd_file::popup"));
+                        eprintln!(
+                            "sim-dropdown: ④ text_focus={tf:?} {}",
+                            if ok {
+                                "[OK] 菜单里的文本输入真的可聚焦（菜单内又是 UiAdd）"
+                            } else {
+                                "[FAIL] 菜单里的文本输入拿不到焦点"
+                            }
+                        );
+                    }
+                    72 => {
+                        let n = self.dd_item_clicks;
+                        let gone = at("dd_file::popup").is_none();
+                        let ok = n == 1 && open.is_none() && gone;
+                        eprintln!(
+                            "sim-dropdown: ⑤ 菜单项点击次数={n}（期望 1）combo_open={open:?} 面板消失={gone} {}",
+                            if ok {
+                                "[OK] 点菜单项 ⇒ 执行 + 自动收起"
+                            } else {
+                                "[FAIL] 菜单项没执行 / 没收起"
+                            }
+                        );
+                    }
+                    _ => {}
+                }
             }
 
             // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
@@ -2528,6 +2804,7 @@ fn main() -> Result<(), RunError> {
     app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
     app.sim_import = parse_str_arg(&args, "--sim-import");
     app.sim_menu = args.iter().any(|a| a == "--sim-menu");
+    app.sim_dropdown = args.iter().any(|a| a == "--sim-dropdown");
     app.sim_resize = args.iter().any(|a| a == "--sim-resize");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args

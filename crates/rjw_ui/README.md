@@ -59,11 +59,20 @@ krusie 引擎的 UI 模块：**hybrid 模式**（立即外观 + ID 持久状态�
   **重开由应用负责**；`shrink(show, collapsed)` 的 `show = false` **仍尊重** `*collapsed`
   （菜单 / 代码收起窗口）。按钮是**几何**（`Icon::Close` / `Chevron*`）而非字形，按下即
   `claim_press` ⇒ 点按钮不会顺带拖动窗口。`eg260818UI --sim-chrome` 脚本化守护。
-- **菜单栏**：`Ui::menu_bar(id, pos, |bar| ..)` —— 横向触发器 + 点开的**闭包下拉面板**；
-  `MenuCtx` 有 `item`（点完自动收起）/ `item_checked`（翻转 `&mut bool`）/ `caption` /
-  `separator`，并 **`Deref` 到 `Window`**（所以菜单里也能放文本输入 / 分割线 / 按钮 /
-  横向排版）。展开状态 `UiState::menu_open`（同一时刻只有一个菜单开着；点项 / 点栏外 /
-  Esc 收起）。下拉是 `Level::Normal` 浮层窗口 ⇒ **菜单栏录在各窗口之后**才盖得住它们。
+- **按钮下拉菜单**：`Dropdown` 是普通 `Widget` ⇒ `p.add(Dropdown::…)` / `ui.add_at(..)` 加进
+  任何容器。① `Dropdown::options(id, label, &mut u32, &[&str])` = 选项列表模式（选中行打勾 +
+  整行高亮 + 点击写回 + ↑/↓ 切换）；② `Dropdown::new(id, label).menu(|m| ..)` = 富内容模式，
+  `m` 是 `MenuCtx`（`Deref` 到 `Window`）⇒ **菜单内又可以 `UiAdd::add`**（文本输入 / 分割线 /
+  菜单项 / 横向排版 / 再嵌一个 `Dropdown::side(PopupSide::Right)` 当子菜单）。展开状态
+  `UiState::combo_open()`（**控件绝对 ID**；面板 = 它 + `::popup`）。旧的 `combo` / `combo_at`
+  退化成糖（签名 / 行为不变）。几何助手 `item_h` / `popup_padding` / `popup_origin` 公开
+  （脚本算坐标与引擎同源）；`eg260818UI --sim-dropdown` 脚本化守护（五段）。
+- **菜单栏**：`Ui::menu_bar(id, pos, |bar| ..)` —— 横向触发器 + **同一套**下拉面板
+  （`MenuCtx` 有 `item`（点完自动收起）/ `item_checked`（翻转 `&mut bool`）/ `caption` /
+  `separator`）。展开状态 `UiState::menu_open`（同一时刻只有一个菜单开着；点项 / 点栏外 /
+  Esc 收起；点**另一个触发器** = 切换）。下拉的**录制 / 样式 / 宽度 / 关闭规则**与 `Dropdown`
+  共用 `widgets::menu::popup_show`（`WIN_TOPMOST` 哨兵 ⇒ 菜单栏录在哪里都盖得住别人；
+  "点在任意 `WIN_TOPMOST` 浮层上不收起"是给**子菜单**留的）。
 - **全局字重**：`Theme::font_weight`（`Weight`，默认 `NORMAL` = 400，任意数值可用）；
   它是**排版输入**（改字形与步进宽度）⇒ 与 `line_spacing` 同样进「排版缓冲缓存键 +
   窗口 / 子槽几何签名前缀」两处，改它不会留下陈旧几何。`Density` / `scaled(DPI)` 都不碰它。

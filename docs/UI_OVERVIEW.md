@@ -156,11 +156,21 @@ fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可
 `dragging`，计数 `UiState::press_cancelled_by_window()`）。两条真实路径（同帧移动 / 应用改 z）
 用 `--sim-cover` 脚本化守护，见 `docs/DEBUGGING.md` §8.2。
 
-**菜单栏**（`Ui::menu_bar`）：横向触发器 + 点开的**闭包下拉面板**（`MenuCtx` 提供
-`item` / `item_checked` / `caption` / `separator`，并 `Deref` 到 `Window` ⇒ 菜单里也能放
-文本输入 / 分割线 / 按钮 / 横向排版）。展开状态 = `UiState::menu_open`（同一时刻只有一个
-菜单开着），点菜单项 / 点栏外 / Esc 收起。下拉是 `Level::Normal` 浮层窗口 ⇒ 菜单栏要录在
-**各窗口之后**才盖得住它们。细节见 `docs/ENGINE_GUIDE.md` §18.13，脚本化验证 `--sim-menu`。
+**按钮下拉菜单**（`Dropdown`，`UiAdd::add(..)` 即可）：下拉框与菜单栏下拉**简并后**的唯一
+入口。① 选项列表模式（`Dropdown::options(id, label, &mut u32, &[&str])`）：菜单项由引擎排
+（选中行打勾 + 整行高亮，点击写回索引并收起，键盘 ↑/↓ 切换）；② 富内容模式
+（`Dropdown::new(id, label).menu(|m| ..)`）：`m` 是 `MenuCtx`（`Deref` 到 `Window`）⇒
+**菜单内又可以 `UiAdd::add`**（文本输入 / 分割线 / 菜单项 / 横向排版 / 再嵌一个下拉当子菜单，
+`.side(PopupSide::Right)`）。展开状态 = `UiState::combo_open()`（**控件绝对 ID**；面板窗口 id
+= 它 + `::popup`），单槽 ⇒ 同一时刻只有一个下拉开着。
+
+**菜单栏**（`Ui::menu_bar`）：横向一排触发器 + 同一套下拉面板（`MenuCtx` 提供
+`item` / `item_checked` / `caption` / `separator`，并 `Deref` 到 `Window`）。展开状态 =
+`UiState::menu_open`（同一时刻只有一个菜单开着），点菜单项 / 点栏外（点**另一个触发器** =
+切换，不算点外）/ Esc 收起；下拉的**录制 / 样式 / 宽度 / 关闭规则**与 `Dropdown` 共用
+`widgets::menu::popup_show`（含"点在任意 `WIN_TOPMOST` 浮层上不收起"——子菜单用）。
+下拉是 `Level::Normal` + `WIN_TOPMOST` 哨兵浮层 ⇒ 菜单栏录在哪里都盖得住别人。
+细节见 `docs/ENGINE_GUIDE.md` §18.13 / §18.15，脚本化验证 `--sim-menu` / `--sim-dropdown`。
 
 ### 8. 文本编辑（`edit.rs` 纯逻辑，可单测）
 - 编辑状态机 `apply_frame_edits`：剪贴板（Ctrl+C/V/X/A）→ 选择替换 → IME 上屏 →

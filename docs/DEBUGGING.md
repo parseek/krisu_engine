@@ -233,7 +233,7 @@ fn update(&mut self, ctx: &mut Ctx) {
   ```
   cargo run -p eg260818UI -- --sim-menu --frames 62
   sim-menu: menu_open=None · 主题调节窗口=关 [OK] 点触发器开菜单 + 点菜单项执行并自动收起
-  sim-menu: 面板原点=Some(Vec2(1017.0, 59.0)) · 期望=Some(Vec2(1017.0, 59.0)) · 菜单仍开=true · 拖拽后没跑位=true [OK] 菜单面板不会被拖动
+  sim-menu: 面板原点=Some(Vec2(105.0, 59.0)) · 期望=Some(Vec2(105.0, 59.0)) · 菜单仍开=true · 拖拽后没跑位=true [OK] 菜单面板不会被拖动
   ```
 
   判定同时看**引擎状态**（`UiState::menu_open` 必须已收起）与**应用状态**
@@ -243,10 +243,29 @@ fn update(&mut self, ctx: &mut Ctx) {
   | 症状 | 成因 |
   |---|---|
   | 触发器点不着 | 坐标错（栏位置 / 触发器宽 = 文字宽 + `button.padding.x`）；`RJ_HIT_TRACE=1` 看这个像素命中谁（`menubar::视图` / `menubar::视图/item::…`） |
-  | 菜单开着但点菜单项后不收 | `MenuCtx` 的 `close` 标志没被 `MenuBar` 读回（`item_clicked`）⇒ `finish()` 不会写 `menu_open = None` |
+  | 菜单开着但点菜单项后不收 | `MenuCtx` 的 `close` 标志没被读回（`popup_show` → `PopupResult::item_clicked`）⇒ `MenuBar::finish()` 不会写 `menu_open = None` |
   | 阶段 2 `[FAIL] 面板被拖走了` | 下拉面板漏了 `WindowClamp::Locked`（**A/B 实测**：去掉后原点被拖到 x=1682）⇒ 面板与触发器脱节，命中按窗口走、视觉跑别处（"控件严重错位"） |
-  | **分割线又短又偏 / 标题与菜单项错列** | 面板左内边距没算勾选列（应 = `item_pad_x + 勾选列宽`）；或分割线用了 `Divider`（它的宽 = `avail_w()`，**自动宽**窗口里是 `None` ⇒ 退回固定 120）。`RJ_MENU_TRACE=1` 一跑就知道：正确时 `item` / `separator` / `caption` 三者**同 `x` 同 `w`**（实测 `x=47 w=234`） |
+  | **分割线又短又偏 / 标题与菜单项错列** | 面板内边距与菜单项起排不一致（内边距 = `menu::popup_padding(theme)` = `item_pad_x`；勾选**框**在项**内容里**）；或分割线用了 `Divider`（它的宽 = `avail_w()`，**自动宽**窗口里是 `None` ⇒ 退回固定 120）。`RJ_MENU_TRACE=1` 一跑就知道：正确时 `item` / `separator` / `caption` 三者**同 `x` 同 `w`**（实测 `x=8 w=224`，DPI 1.5） |
   | 下拉被别的窗口压住 | 面板 z 没走 `WIN_TOPMOST` 哨兵（走哨兵后与录制顺序无关） |
+  | 面板宽度每帧都在变 / 变成一百万宽 | 首帧就请求了"极宽"（1e6）。必须**首帧自然宽**、第 2 帧起用 `prev` 定宽：`RJ_MENU_TRACE=1` 看 `prev=None → Some(226) → Some(240)`（最后应稳定） |
+  | 菜单里再嵌的下拉一点就把外层菜单关了 | "点外"判定没排除**任意 `WIN_TOPMOST` 浮层**（`Ui::window_under_mouse()` 的 z） |
+
+- **"下拉菜单点不开 / 选项点了不选中 / 菜单里的文本输入拿不到焦点"**：用 `--sim-dropdown`
+  （五段，全 `[OK]` 即通路正常）。坐标**运行时解算**：触发器按常量位置 + `Dropdown::width` +
+  主题尺寸；面板内行按**面板窗口原点** + **公开助手** `popup_padding` / `item_h`：
+
+  ```
+  cargo run -p eg260818UI -- --sim-dropdown --frames 90
+  sim-dropdown: ① combo_open=Some("dd_opt")（期望 dd_opt）面板原点=Some(Vec2(990.0, 59.0)) 期望=Some(Vec2(990.0, 59.0)) [OK] 点触发器开下拉（面板在触发器正下方）
+  sim-dropdown: ② 选中索引=0（期望 0）combo_open=None 面板消失=true [OK] 点选项 ⇒ 选中 + 自动收起
+  sim-dropdown: ③ 富内容下拉 combo_open=Some("dd_file")（期望 dd_file）面板原点=Some(Vec2(1290.0, 59.0)) 期望=Some(Vec2(1290.0, 59.0)) [OK] 同一个控件也能开富内容菜单
+  sim-dropdown: ④ text_focus=Some("dd_file::popup/dd_filter") [OK] 菜单里的文本输入真的可聚焦（菜单内又是 UiAdd）
+  sim-dropdown: ⑤ 菜单项点击次数=1（期望 1）combo_open=None 面板消失=true [OK] 点菜单项 ⇒ 执行 + 自动收起
+  ```
+
+  ⚠ 两个易踩点：`UiState::combo_open()` 记的是**控件（触发器）的绝对 ID**（不是面板窗口 id——
+  面板是它加 `::popup`）；面板里点不动时先看**这个像素命中的是谁**（`RJ_HIT_TRACE=1`）——
+  win=0 内容会被任何窗口盖住（脚本因此先把自己的窗口收起来）。
 
   `RJ_MENU_TRACE=1`（引擎侧）打印下拉面板每一行的矩形与"宽度是否已固定"：
 

@@ -304,8 +304,11 @@ mod button;
 mod checkbox;
 mod colorpicker;
 mod divider;
+/// **按钮下拉菜单**（`Widget`：`UiAdd::add(Dropdown::…)`；菜单内又是 `UiAdd`）。
+pub mod dropdown;
 mod fontmodal;
 mod label;
+pub mod menu;
 mod numberinput;
 mod slider;
 pub(crate) mod title_button;
@@ -321,8 +324,10 @@ pub use colorpicker::{
     ink_on, luma, parse_color, parse_hex,
 };
 pub use divider::Divider;
+pub use dropdown::Dropdown;
 pub use fontmodal::{FONT_WEIGHT_CHOICES, FontModal, weight_label};
-pub use menubar::{MenuBar, MenuCtx};
+pub use menu::{MenuContent, MenuCtx, MenuFn, PopupSide, item_h, popup_origin, popup_padding};
+pub use menubar::MenuBar;
 pub use segmented::Segmented;
 pub use label::Label;
 pub use numberinput::{GRIP_W, NumberInput};

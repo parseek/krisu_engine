@@ -75,16 +75,20 @@ ISSUE:
 * ✅ 阴影颜色（主题调节窗口「投影」滑杆后跟 `ColorPicker`（可拖 alpha），`ShadowStyle { color, .. }`；顶点 RGB 原样带出，`--sim-shadow` 实测主题值 0,0,0/0.47 → 0.9,0.15,0.1/0.55）
 * ✅ 主题调节窗口：每根滑杆后跟 `NumberInput`（Slider 后 NumberInput；`--sim-tuner` 实测拖数字条手柄 radius 8→18、拖滑杆 →0，主题圆角同步）
 * ✅ 数字条手柄宽度公开为 `rjw_ui::GRIP_W`（脚本算坐标不再写死 20；`RJ_NUM_TRACE=1` 打印矩形切分 + 拖拽状态机）
-* ✅ 菜单栏（`Ui::menu_bar` 横向触发器 + **闭包下拉面板**：`MenuCtx` 提供 `item` / `item_checked` / `caption` / `separator` 并 `Deref` 到 `Window` ⇒ 文本输入 / 分割线 / 按钮 / 横向排版都能放；展开状态 `UiState::menu_open`，点项 / 点栏外 / Esc 收起；下拉面板 `WindowClamp::Locked` + `WIN_TOPMOST`（**拖不动、恒在最上**）、内容与菜单项文字列对齐；示例三菜单「文件/视图/帮助」，**左侧竖排主菜单保留**；`--sim-menu` 两阶段实测）
+* ✅ 菜单栏（`Ui::menu_bar` 横向触发器 + **闭包下拉面板**：`MenuCtx` 提供 `item` / `item_checked` / `caption` / `separator` 并 `Deref` 到 `Window` ⇒ 文本输入 / 分割线 / 按钮 / 横向排版都能放；展开状态 `UiState::menu_open`，点项 / 点栏外 / Esc 收起；下拉面板 `WindowClamp::Locked` + `WIN_TOPMOST`（**拖不动、恒在最上**）、内容与菜单项文字列对齐；示例三菜单「文件/视图/帮助」，**左侧竖排主菜单保留**；`--sim-menu` 两阶段实测；**面板实现与 `Dropdown` 共用**——见下条）
 * ✅ 分段按钮组 `Segmented`（互斥选项**拼在一起**：相邻段共享边、只有外侧角圆、选中段高亮；段间分隔线与 `border_w` 解耦，边框归零也分得开；`--sim-tuner` 阶段 3 点段实测 `preset=2` + 角点单测）
 * ✅ `border_w = 0` 的可见性兜底（未勾选 `Checkbox` 改画实心底——否则勾选框整个消失、看起来"控件严重错位"）
 * ✅ 修：`FontModal` 一帧被录两次（面板 + 文本画两遍 = "文本输入重复"；现在有 `modal_recorded` 帧内断言守着）
 * ✅ 修：`GripShape::Bars` 三条横杠改用实心矩形（图标羽化在小尺寸下糊成一坨 = "三横是斜的"）
-* ✅ 菜单栏视觉：左内边距含勾选列（菜单项 / 标题 / 分割线天然同列）、面板宽取上一帧结算宽（高亮与分割线**铺满面板**）、分割线自绘（`Divider` 在自动宽容器里退回 120 ⇒ "Menu 分割线错位"）、`caption` 小字号 + `text_muted` 做分组标题、勾选标记只在勾选时画；`RJ_MENU_TRACE=1` 打印行矩形（实测 `item/separator/caption` 全 `x=47 w=234`）
+* ✅ 菜单栏视觉：内边距 = `ComboStyle::item_pad_x`（菜单项 / 标题 / 分割线天然同列；勾选**方框**画在项内容里、不占内边距）、面板宽取上一帧结算宽（高亮与分割线**铺满面板**）、分割线自绘（`Divider` 在自动宽容器里退回 120 ⇒ "Menu 分割线错位"）、`caption` 小字号 + `text_muted` 做分组标题；`RJ_MENU_TRACE=1` 打印行矩形（实测 `item/separator/caption` 全 `x=8 w=224`，DPI 1.5；关键是三者相同）
 * ✅ 修：combo 下拉**勾选列恒留位**（未选中项文字不再比选中项凸出一个图标宽 —— "一列像素突兀"）
 * ✅ 字体弹窗预览不再重复显示输入框里的字体名（"文本输入重复"）
 * ✅ 主题调节窗口去掉尾部"当前值一览"两行标签（每行都有滑杆 + 数字条，就近可读）
 * ✅ 缩放柄「斜线」档：三条 45° 斜线（**首端点在水平线等距 / 末端点在竖直线等距** ⇒ 互相平行、垂直间距相等），单测钉住几何；柄方框 1.5× 免得羽化糊成一片；`GripShape::{Squares, Bars, Diagonal, Hidden}`，demo 默认斜线
-* ✅ 窗口拖拽缩放：`.resize(allow: bool, axes: Resize)`（显式 bool + 轴向）+ **Y 轴缩放**（高度持久于 `UiState::window_heights`）；`allow = false` ⇒ 不画柄也不响应拖拽（菜单下拉用它，去掉 resizable）；判定抽成 `resolve_window_resize` 单测；`--sim-resize` 实测 `328×97 → 388×137`（正好等于注入位移 +60/+40）
+* ✅ 窗口拖拽缩放：`.resize(allow: bool, axes: Resize)`（显式 bool + 轴向）+ **Y 轴缩放**（高度持久于 `UiState::window_heights`）；`allow = false` ⇒ 不画柄也不响应拖拽（菜单下拉用它，去掉 resizable）；判定抽成 `resolve_window_resize` 单测；`--sim-resize` 实测 `328×145 → 388×185`（正好等于注入位移 +60/+40）
 * ✅ 修：**高度被用户固定后内容不裁剪**（TTT 窗口缩小后标签画到面板外）⇒ `window_content_clipped(strict, fixed_h)`（固定高 ⇒ 视口裁剪；固定宽不触发）+ 单测
 * ✅ 菜单下拉：勾选标记改成**方框 CheckBox**（画在菜单项内容里、方框列恒留位）、行高收紧（`item_h` 里固定 6px → 2px）、左内边距只留 `item_pad_x`（用户改的），并 `.resize(false, Resize::None)`（**不再 resizable / 不画柄**）
+* ✅ **按钮下拉菜单 `Dropdown`（图一 + 图二简并）**：`Dropdown` 是普通 `Widget` ⇒ `UiAdd::add` 加进任何容器；① `Dropdown::options(id, label, &mut u32, &[&str])` = 选项列表模式（选中行打勾 + 整行高亮 + 点击写回 + ↑/↓ 切换），② `Dropdown::new(id, label).menu(|m| ..)` = 富内容模式（`m: MenuCtx`，`Deref` 到 `Window`）⇒ **菜单内又可以 `UiAdd::add`**（文本输入 / 分割线 / 菜单项 / 横向排版 / 再嵌 `Dropdown::side(Right)` 当子菜单）
+* ✅ **下拉面板只有一套实现**（`widgets::menu::popup_show`）：菜单栏与 `Dropdown` 共用（哨兵 z + 锁定位置 + 无缩放柄 + 面板样式 + 宽度收敛 + 点外/Esc/点项收起）；`Ui::combo_at` 退化成糖（签名 / 行为不变，`FontModal` 照旧用）；`UiState::combo_open()` 与 `menu_open()` 对称可读
+* ✅ 新增"点在任意 `WIN_TOPMOST` 浮层上不收起"（**子菜单**不被外层菜单误关）；公开几何助手 `item_h` / `popup_padding` / `popup_origin`（脚本算坐标与引擎同源）
+* ✅ `--sim-dropdown` 五段实测全 `[OK]`：① 点触发器开下拉且面板原点 = `popup_origin(触发器, Below)`（实测 `(990,59)`）；② 点选项 ⇒ `dd_opt_idx=0` + 自动收起 + 面板消失；③ 富内容下拉同样开（`(1290,59)`）；④ `text_focus=dd_file::popup/dd_filter` ⇒ **菜单里的文本输入真可聚焦**；⑤ 点菜单项 ⇒ 计数 =1 + 自动收起

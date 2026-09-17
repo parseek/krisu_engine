@@ -406,7 +406,11 @@ pub struct UiState {
     pub(crate) debug_submit: HashMap<u32, Vec2>,
     /// **滚动容器状态**：`scroll_at` 的 **绝对 ID** → (偏移, 内容高)，跨帧持久。
     pub(crate) scrolls: HashMap<IdAbsolute<'static>, ScrollState>,
-    /// **下拉框展开状态**：当前展开的 `combo` 的 **绝对 ID**（`None` = 全部收起）。
+    /// **下拉菜单展开状态**：当前展开的 [`Dropdown`](crate::Dropdown)（或
+    /// [`Ui::combo_at`](crate::Ui::combo_at) 糖）的 **绝对 ID**（`None` = 全部收起）。
+    ///
+    /// 单槽 ⇒ **同一时刻只可能有一个下拉开着**：点另一个下拉 = 旧的关新的开。
+    /// 清除时机：点菜单项 / 点面板外 / `Esc` / 再点触发器（切换）。
     pub(crate) combo_open: Option<IdAbsolute<'static>>,
     /// **菜单栏展开状态**：当前展开的菜单（[`crate::Ui::menu_bar`] 的**触发器绝对 ID**；
     /// `None` = 全部收起）。点菜单项 / 点栏外 / Esc 都会清空。
@@ -606,6 +610,16 @@ impl UiState {
             .map(|(id, z)| (id.as_str(), *z))
     }
 
+    /// 当前**展开的下拉菜单**（[`Dropdown`](crate::Dropdown) 的绝对 ID；`None` = 全部收起）。
+    ///
+    /// 与 [`Self::menu_open`] 对称（菜单栏是"应用级 UI"、下拉属于某个控件，故两个槽分开
+    /// 存——混用会在"菜单开着时点下拉"上打架）。应用侧用法同 `menu_open`：决定自己的
+    /// `Esc` / 快捷键要不要让位。
+    #[inline]
+    pub fn combo_open(&self) -> Option<&str> {
+        self.combo_open.as_ref().map(|s| s.as_str())
+    }
+
     /// 当前**展开的菜单栏菜单**（触发器绝对 ID；`None` = 全部收起）。
     ///
     /// 应用侧的用法：别和菜单抢 `Esc`——
@@ -721,6 +735,18 @@ mod tests {
         assert_eq!(st.menu_open(), Some("menubar::文件"), "读到触发器绝对 ID");
         st.reset();
         assert_eq!(st.menu_open(), None, "reset 清空菜单展开状态");
+    }
+
+    #[test]
+    fn combo_open_is_readable_and_cleared_by_reset() {
+        // 与 `menu_open()` 对称：下拉菜单的展开状态同样**应用可见**（`Dropdown` 是普通
+        // 控件，应用要据此让出 Esc / 快捷键），且 `reset()` 必须清掉（否则"看起来还开着"）。
+        let mut st = UiState::new();
+        assert_eq!(st.combo_open(), None, "初始收起");
+        st.combo_open = Some(IdAbsolute::owned("diff_dd::popup".to_owned()));
+        assert_eq!(st.combo_open(), Some("diff_dd::popup"), "读到下拉的绝对 ID");
+        st.reset();
+        assert_eq!(st.combo_open(), None, "reset 清空下拉展开状态");
     }
 
     /// **帧级暂存**：一帧开场一次、收尾关场；`UiState::clone` 不带帧内暂存。

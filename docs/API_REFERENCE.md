@@ -776,6 +776,7 @@ f.text(|t| {
 | `UiState::begin_frame()` / `frame_open()` | 运行时内部 / 诊断 | 每帧开场一次（帧号 / 命中区翻页 / 帧级暂存清零）；`frame_open()` 判断本帧是否录过 UI |
 | `UiState::reset()` / `remove(id)` | 示例"R 重开" | 清空全部 / 移除单个控件状态 |
 | `UiState::text_focus() -> Option<TextFocus>` | `if ui.state().text_focus().is_none() { /* 快捷键 */ }` | **文本焦点**（只有输入框/多行框持焦点才为 `Some`）；取代旧 `capturing_text()` —— 按钮/滑块的 Tab 焦点不再吞应用快捷键 |
+| `UiState::combo_open() -> Option<&str>` | `if ui.state().combo_open().is_none() && esc { /* 自己的 Esc */ }` | **当前展开的下拉菜单**（[`Dropdown`](crate::Dropdown) 的**控件绝对 ID**；面板窗口 id = 它 + `::popup`）。与 `menu_open()` 对称（两个槽分开存：栏是应用级 UI，下拉属于某个控件）；`reset()` 清空 |
 | `Ui::debug_dump() -> UiDebugDump` | `eprintln!("{}", ui.debug_dump())` | 引擎侧状态快照（每窗口 `id/z/origin/submit/size/drag/press/stored`），单行可 grep；任一段都能调用，帧级暂存跨段共享 ⇒ 后一段能看到前一段录的窗口。见 [DEBUGGING.md](DEBUGGING.md) §1 |
 
 ### UI 绘制后端（`rjw_ui::backend`，v0.3 新增）
@@ -863,7 +864,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.menu_bar(id, pos, \|bar\| ..)` | `bar.menu(label, \|m\| ..)` → `MenuCtx::{item, item_checked, caption, separator}` | 返回栏尺寸；`pos` = 栏左上角（顶层 = 屏幕坐标）。展开状态跨帧持久于 `UiState::menu_open`（触发器绝对 ID）；**同一时刻只有一个菜单开着**，点菜单项 / 点栏外 / Esc 都收起。`MenuCtx` **`Deref` 到 `Window`** ⇒ 菜单里同样能放 `label` / `button` / `divider` / `row`（横向排版）/ `text_input` / `add(..)`。下拉面板是 `Level::Normal` + **`WindowClamp::Locked`**（点它不置顶、**拖不动**）且 z 被强制成 `WIN_TOPMOST` 哨兵 —— 所以菜单栏录在哪里都盖得住别人。面板排版由引擎保证：左内边距 = `item_pad_x + 勾选列`（菜单项 / `caption` / `separator` 天然同列）、面板宽取上一帧结算宽（子项高亮 / 分割线**铺满面板**）、`caption` 用 `text_muted` + 小字号做分组标题。细节见 `docs/ENGINE_GUIDE.md` §18.13；几何可 `RJ_MENU_TRACE=1` 打印 |
+| `ui.menu_bar(id, pos, \|bar\| ..)` | `bar.menu(label, \|m\| ..)` → `MenuCtx::{item, item_checked, caption, separator}` | 返回栏尺寸；`pos` = 栏左上角（顶层 = 屏幕坐标）。展开状态跨帧持久于 `UiState::menu_open`（触发器绝对 ID）；**同一时刻只有一个菜单开着**，点菜单项 / 点栏外 / Esc 都收起（点**另一个触发器** = 切换，不算点外）。`MenuCtx` **`Deref` 到 `Window`** ⇒ 菜单里同样能放 `label` / `button` / `divider` / `row`（横向排版）/ `text_input` / `add(..)`（含再嵌一个 `Dropdown`）。**下拉面板与 [`Dropdown`](crate::Dropdown) 共用同一实现**（`crate::widgets::menu::popup_show`）：`Level::Normal` + **`WindowClamp::Locked`**（点它不置顶、**拖不动**）+ **不画缩放柄** + z 强制 `WIN_TOPMOST` 哨兵 —— 所以菜单栏录在哪里都盖得住别人。面板排版由引擎保证：内边距 = `ComboStyle::item_pad_x`（菜单项 / `caption` / `separator` 天然同列）、面板宽取上一帧结算宽（子项高亮 / 分割线**铺满面板**）、勾选是**方框**且画在项内容里、`caption` 用 `text_muted` + 小字号做分组标题。细节见 `docs/ENGINE_GUIDE.md` §18.13/§18.15；几何可 `RJ_MENU_TRACE=1` 打印 |
 
 **窗口外框（标题栏 / 关闭 / 收起）**：三个选项各自独立、**都不调就完全没有外框**
 （逐像素等于旧行为）；任一开启都在窗口内容**第一行**录一条标题栏（底色
@@ -907,6 +908,8 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 | `text_input` | `p.text_input(id, &mut String)` | 单行输入框：点击聚焦/定位光标、打字/退格/删除/方向键、Enter/Esc 失焦、光标闪烁；**超长文本滚动跟随光标**（光标始终可见）、**拖选文本 + Ctrl+C/V/X 复制/粘贴/剪切**（选择优先于窗口拖拽）；**支持中文 IME**（组合候选浮动提示框 + 候选框定位到光标） |
 | `text_area` | `p.text_area(id, &mut String)` / `p.text_area_at(id, rect, &mut String)` | **多行文本输入框**：Enter 换行、↑/↓ 跨行（保持列）、Home/End 行首尾、按宽度自动换行、超出高度垂直滚动（滚轮 + 光标跟随）、跨行选择 + Ctrl+C/V/X、IME 支持；光标按逻辑行（`\n`）定位（超宽长行换行后近似） |
 | `NumberInput` | `p.add(NumberInput::new(id, &mut f32).range(min, max).step(s))` | **数字条**：右侧 `GRIP_W`（公开常量 **20px**）宽那条手柄**水平拖动**调值（向右 = 增；Shift ×10 / Ctrl ×0.1；拖到窗口边缘自动 warp），**文本框**点击 = 进入编辑（只收数字 / 负号 / 小数点）；显示精度跟 `step` 走（`0.25` → `2` 位小数、`≥1` → 整数）。常见组合：**滑杆后跟数字条**（拖滑杆粗调、数字条精确输入，两者绑同一个 `&mut f32`）——`eg260818UI` 的主题调节窗口整列都是这个形态，脚本化验证见 `--sim-tuner` |
+| `Dropdown` | `p.add(Dropdown::options(id, label, &mut u32, &[&str]))` / `p.add(Dropdown::new(id, label).menu(\|m\| ..))` | **按钮下拉菜单**（下拉框与菜单栏下拉**简并后**的唯一入口；`Widget` ⇒ 任意容器 `add`）：`options` = **选项列表模式**（菜单项由引擎排：选中行打勾 + 整行高亮，点击写回 `&mut u32` 并收起，键盘 ↑/↓ 切换）；`menu(..)` = **富内容模式**，闭包参数是 `MenuCtx`（`Deref` 到 `Window`）⇒ **菜单内又可以 `UiAdd::add`**（文本输入 / 分割线 / 菜单项 / 横向排版 / 再嵌一个 `Dropdown` 当子菜单）。`.side(PopupSide::Below\|Right)`（默认下方 2px）/ `.width(..)` / `.font_size(..)`。展开状态 = `UiState::combo_open()`（**控件绝对 ID**）；点触发器切换、点项执行+收起、点面板外 / Esc 收起、点**任意 `WIN_TOPMOST` 浮层**不收起（子菜单用）。面板 = 锁定位置 + 不画缩放柄 + `WIN_TOPMOST`。几何助手（公开，脚本算坐标用）：`item_h(font_size)` / `popup_padding(theme)` / `popup_origin(trigger, side)`。见 `docs/ENGINE_GUIDE.md` §18.15，仿真 `--sim-dropdown` |
+| `combo` / `combo_at` | `p.combo(id, current, &[String], Option<u32>) -> Option<u32>` | **旧入口（糖）**：= `Dropdown` 的选项列表模式 + 固定布局宽，签名 / 返回值 / 行为与旧版一致（`None` = 无选择 / 未展开；`Some(i)` = 本帧新选中）。新代码请用 `Dropdown`；`FontModal` 的字重下拉仍走它（老代码不必改） |
 | `Segmented` | `p.add(Segmented::new(id, &["紧凑","标准","宽松"], &mut idx))` | **分段按钮组**（互斥选项**拼在一起**）：相邻段共享边、只有整组外侧角是圆角、选中段高亮；点击把新索引写进 `&mut usize`。**段间分隔线与 `ButtonStyle::border_w` 解耦**（边框关掉时退化成 `Palette::surface_dim`，否则三段连成一条）。`.font_size(..)` 可覆盖字号。见 `docs/ENGINE_GUIDE.md` §18.14 |
 
 ### 状态视图

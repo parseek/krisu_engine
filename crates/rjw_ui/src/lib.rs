@@ -185,10 +185,11 @@ pub use view::{ViewCtx, ViewMode};
 /// 应用侧用 [`Theme::with_font_weight`] / [`Weight`] 时不必自己引 `rjw_text`。
 pub use rjw_text::{Stretch, Style, Weight};
 pub use widgets::{
-    Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, FONT_WEIGHT_CHOICES,
-    FontModal, GRIP_W, Label, MenuBar, MenuCtx, NumberInput, Response, Segmented, Slider,
-    SliderValue, Widget, WidgetId, color_hex, format_color, format_f, format_u8, ink_on, luma,
-    parse_color, parse_hex, weight_label,
+    Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, Dropdown,
+    FONT_WEIGHT_CHOICES, FontModal, GRIP_W, Label, MenuBar, MenuContent, MenuCtx, MenuFn,
+    NumberInput, PopupSide, Response, Segmented, Slider, SliderValue, Widget, WidgetId, color_hex,
+    format_color, format_f, format_u8, ink_on, item_h, luma, parse_color, parse_hex, popup_origin,
+    popup_padding, weight_label,
 };
 
 /// **UI 文本模块**（公开）：`rjw_ui` 里与文字渲染相关的全部公开面。

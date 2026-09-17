@@ -1698,7 +1698,11 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {      // 位置 = 栏左上角�
 | 点菜单项 | **执行 + 自动收起**（`item` / `item_checked` 内部把 `close` 标志交给栏） |
 | 点栏外 | 收起（栏外 = 既不在触发器上、也不在下拉面板矩形内） |
 | **Esc** | 收起。应用自己的 Esc 语义先看 `UiState::menu_open()`（菜单开着那一帧别抢） |
-| 下拉面板 | 一个 [`Level::Normal`] + **`WindowClamp::Locked`** 的浮层窗口（点它不置顶、**拖不动**），且 z 被强制成 `WIN_TOPMOST` 哨兵 |
+| 下拉面板 | 一个 [`Level::Normal`] + **`WindowClamp::Locked`** + **`.resize(false, Resize::None)`** 的浮层窗口（点它不置顶、**拖不动、也没有缩放柄**），且 z 被强制成 `WIN_TOPMOST` 哨兵 |
+
+> 面板的**录制 / 样式 / 宽度 / 关闭规则**全在 [`crate::widgets::menu`]（`menu::popup_show`）——
+> 与 [`Dropdown`](crate::Dropdown) **同一套实现**，本模块只负责"横向一排触发器 + 栏的判定"。
+> 下面那些排版 / 锁位约定因此对**两者同时成立**（改动只在 `menu.rs` 一处）。
 
 > ⚠ **下拉面板必须锁位置**（`WindowClamp::Locked`）：它是个窗口，默认可拖——拖走之后
 > 面板与触发器脱节，而**命中判定按窗口走**，视觉却跑别处（"控件严重错位"）。
@@ -1707,12 +1711,15 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {      // 位置 = 栏左上角�
 >
 > ⚠ **下拉面板的排版**（三条一起才对齐，缺一条就"看着有点怪"）：
 >
-> 1. **左内边距 = `item_pad_x + 勾选列宽`**：勾选列落在内边距里，于是菜单项文字 /
->    `caption` / `separator` / `row` 全部从**同一个内容原点**起排 ⇒ 天然同列。
+> 1. **内边距 = `popup_padding(theme)` = `ComboStyle::item_pad_x`**（`PanelStyle::padding` 是
+>    **标量**，四边同值）：菜单项 / `caption` / `separator` / `row` 全部从**同一个内容原点**
+>    起排 ⇒ 天然同列。勾选**框**画在菜单项**内容里**（不占内边距 —— 用户要的"小边距"）。
 >    （别用"给下一子项缩进"的花招：垂直栈里子项 `x` **恒等于内容原点**，缩进宽度无效。）
-> 2. **面板宽 = 上一帧的结算宽**（`window_sizes`，首帧自然宽、次帧起精确）：
+> 2. **面板宽 = 上一帧的结算宽**（`UiState::window_sizes`，首帧自然宽、次帧起精确）：
 >    `fill = 固定宽已知` ⇒ 子项请求"极宽"由窗口 clamp 到内容宽 ⇒ **高亮/分割线铺满面板**；
 >    首帧必须请求**自然宽**，否则 1e6 的请求会把自然尺寸撑成一百万、面板宽度再也收不回来。
+>    内容宽 = `max(上一帧面板宽, 最小面板宽) − 2 × (内边距 + 边框)`（第 2 帧即收敛；
+>    `RJ_MENU_TRACE=1` 可看到 `prev=None → Some(226) → Some(240)` 这条收敛轨迹）。
 > 3. **分割线自己画**，不用 [`Divider`](crate::Divider)：`Divider` 的宽 = `avail_w()`，
 >    而**自动宽**窗口里那是 `None` ⇒ 退回固定 120 ⇒ 线又短又不在该在的位置
 >    （用户实测："Menu 分割线错位"）。自己画时请求"极宽"由窗口 clamp ⇒ 恒等于内容宽。
@@ -1725,7 +1732,8 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {      // 位置 = 栏左上角�
 >
 > 面板 z 用了哨兵，所以**菜单栏录在哪里都盖得住别人**（不必强求录在各窗口之后）。
 > 排查通道：`RJ_MENU_TRACE=1` 打印每个下拉内容的行矩形（`x/y/w/h`）——
-> 正确时三者必须同 `x`、同 `w`（实测：`item/separator/caption` 全 `x=47 w=234`）。
+> 正确时三者必须同 `x`、同 `w`（实测：`item/separator/caption` 全 `x=8 w=224`，
+> DPI 1.5；**关键是三者相同，不是具体数值**）。
 
 **验证**：`--sim-menu`（点「视图」触发器 → 菜单打开；再点第一个菜单项 → 勾选翻转 +
 菜单自动收起，打印引擎状态与应用状态），引擎侧不变量由
@@ -1765,10 +1773,82 @@ ui.row(|r| {
 **验证**：`--sim-tuner` 阶段 3（点预设行第 3 段 ⇒ `preset == 2`，
 `[OK] 分段按钮组可点`）+ `Segmented` 的角点单测。
 
-### 18.15 维护约定（对 AI）
+### 18.15 按钮下拉菜单（`Dropdown`）——**统一的下拉面板**
+
+图一（`难度 ▾` → `简单/普通/困难`）与图二（菜单栏下拉里的文本输入 / 分割线 / 菜单项）
+**简并成同一个控件**：`Dropdown` 是普通 [`Widget`](crate::Widget)，用 `UiAdd::add` 加进
+任何容器；菜单体是一个 [`MenuCtx`](crate::MenuCtx)（`Deref` 到 `Window`）⇒
+**菜单内又可以 `UiAdd::add`**（文本输入 / 分割线 / 菜单项 / 横向排版 / 再嵌一个下拉当子菜单）。
+
+```rust
+use rjw_ui::{Dropdown, PopupSide, Ui, UiAdd};
+
+// ① 选项列表模式：菜单项由引擎排（选中行打勾 + 整行高亮），点击写回 `&mut u32` 并收起。
+ui.add(Dropdown::options("diff", "普通", &mut idx, &["简单", "普通", "困难"]));
+
+// ② 富内容模式：菜单内容自己写（`m` 是 MenuCtx ⇒ 全部 UiAdd 方法 + 菜单语义）。
+ui.add(Dropdown::new("file", "文件名过滤").width(160.0).menu(|m| {
+    m.text_input("filter", &mut filter);        // ← 菜单里的文本输入
+    m.separator();                              // ← 分割线（自绘，满内容宽）
+    if m.item("导入图片…") { /* 点完自动收起 */ }
+    m.add(Dropdown::options("enc", "UTF-8", &mut enc, &["ASCII", "UTF-8"])  // ← 菜单里再 add
+            .side(PopupSide::Right));                                       //   子菜单开在右侧
+}));
+```
+
+| API | 语义 |
+|---|---|
+| `Dropdown::options(id, label, &mut u32, &[&str])` | 选项列表模式（图一）：`label` 一般是"当前选项"文字 |
+| `Dropdown::new(id, label).menu(\|m\| ..)` | 富内容模式（图二）：菜单体是闭包，参数 [`MenuCtx`](crate::MenuCtx) |
+| `.side(PopupSide::{Below,Right})` | 面板方位：`Below`（默认，正下方 2px）/ `Right`（子菜单） |
+| `.width(..)` / `.font_size(..)` | 触发器固定宽（默认按文字自动）/ 字号 |
+| `Ui::combo_at` / `UiAdd::combo` | **糖**（旧的"下拉框"入口，签名 / 行为不变）：= 选项列表模式 + 固定布局宽。`FontModal` 的字重下拉仍走它 |
+
+**状态与语义**：展开状态跨帧持久于 [`UiState::combo_open`](crate::UiState::combo_open)
+（**控件（触发器）的绝对 ID**，与 `menu_open` 记触发器一致；面板窗口 id = `<控件 id>::popup`）。
+单槽 ⇒ 同一时刻只有一个下拉开着。点触发器切换；点菜单项 → 执行 + 收起；点面板外 / `Esc` → 收起；
+键盘 Tab 可到、Enter/Space 展开、**↑/↓ 循环切换选项**（选中即收起）。
+
+**点外收起的四条**（一条都不许丢，见 `menu::popup_show`）：
+
+| 事件 | 行为 |
+|---|---|
+| 点了菜单项（`MenuCtx::item*` 上报） | 收起 |
+| `Esc` | 收起 |
+| 左键按下在**面板外** | 收起 |
+| 左键按下在**面板内 / 触发器上 / 任意 `WIN_TOPMOST` 浮层上** | **不**收起 |
+
+最后那条是给**子菜单**留的：菜单里再 `add` 一个 `Dropdown` 时，点子菜单不该被外层菜单
+当成"点面板外"而把外层一起关掉（实现 = `Ui::window_under_mouse()` 的 z 是否
+`WIN_TOPMOST`）。菜单栏那边还多一条"栏"的判定：按下落在**另一个触发器**上 = 切换菜单
+（不是收起）——所以 `MenuBar::finish` 用**本栏**的 `on_trigger` 收口。
+
+**公开几何助手**（示例 / 脚本算坐标用，避免在脚本里抄魔数）：
+`menu::item_h(font_size)`（行高）、`menu::popup_padding(theme)`（内边距）、
+`menu::popup_origin(trigger, side)`（面板原点）。它们与引擎**同源**：
+`--sim-dropdown` 就是用它们算点击点、并用 `popup_origin` 反查"面板该在哪"。
+
+**验证**：`--sim-dropdown`（5 段，全 `[OK]`）——
+① 点触发器开下拉且**面板原点 = `popup_origin(触发器, Below)`**；
+② 点选项 ⇒ 选中索引变 + 自动收起 + 面板消失；
+③ 富内容下拉同样开得起来（同一个控件、同一套浮层）；
+④ `text_focus()` 落在 `<下拉 id>::popup/...` ⇒ **菜单里的文本输入真可聚焦**；
+⑤ 点菜单项 ⇒ 执行 + 自动收起。引擎侧不变量由纯函数单测守着（`menu.rs` /
+`dropdown.rs`：行高公式、方位、宽度收敛、关闭真值表、行底色优先级、勾选判定；`state.rs`：
+`combo_open()` 可读 + `reset` 清空）。
+
+### 18.16 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。
+- **新增控件优先做成 `Widget`**（`impl Widget for Xxx`）：那样 `UiAdd::add` / `add_at` 天然可用
+  （`Dropdown` / `Segmented` / `NumberInput` 都是这条路）。**别为同一种控件开两个入口**
+  （`Ui::xxx_at` 只作为"显式 rect / 容器内占光标"的内部或糖入口，见 `Ui::combo_at`）。
+- **下拉 / 菜单类浮层一律走 `widgets::menu::popup_show`**（唯一实现）：哨兵 z、锁定位置、
+  `.resize(false, Resize::None)`、面板样式、宽度收敛、点外 / Esc / 点项的收起判定都在那里。
+  复制一份浮层录制代码 = 迟早出现"两套菜单观感不一致"（本轮就是来消除这个的）。
+- 浮层的**几何**要能被脚本算出来：新增/改动行高或内边距时，同步改 `menu::item_h` /
+  `menu::popup_padding`（公开助手），别让脚本自己抄一遍公式。
 - 新增**交互**控件时必须调用 `register_focus(&id_for, rect, FocusKind::X)`（键盘导航 / 焦点描边；`id_for = ui.id_for(id)` 为**绝对 ID**）；需要 Enter/Space 激活的控件用 `key_click(&id_for, kind)` 合成点击。持久状态一律经 `state_mut().widget(&id_for)` 读写（绝对 ID）。
 - 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
 - **半透明与元素序**（两条都会静默毁掉画面）：
