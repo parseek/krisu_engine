@@ -1351,9 +1351,16 @@ impl UiApp {
         let frame = ctx.frames();
         match frame {
             30 => {
-                let theme = self
+                let mut theme = self
                     .theme_tuner
                     .theme(self.top.font_name(), self.top.font_weight());
+                // **故意塞一个渐变刷**：这就是用户踩的那个坑——serde 默认的"外部标签枚举"
+                // 在 TOML 里变成数组表，读回来报 "wanted exactly 1 element, more than 1
+                // element in `button.bg`"。刷子现在有显式表示 `{kind, colors}`，必须往返。
+                theme.button.bg = rjw_krusie::ui::Brush::Vertical(
+                    rjw_krusie::color::Color::rgba_u8(20, 40, 60, 255),
+                    rjw_krusie::color::Color::rgba_u8(200, 210, 220, 255),
+                );
                 let text = match theme.to_toml() {
                     Ok(t) => t,
                     Err(e) => {
@@ -1376,18 +1383,21 @@ impl UiApp {
                     }
                 };
                 let again = back.to_toml().unwrap_or_default();
-                let ok = again == text;
+                let ok = again == text
+                    && back.button.bg == theme.button.bg
+                    && back.button.bg != rjw_krusie::ui::Brush::Solid(rjw_krusie::color::Color::WHITE);
                 eprintln!(
-                    "sim-theme: ① {} 字节 · row_h={} gap={} 字重={} · 再导出逐字相同={} {}",
+                    "sim-theme: ① {} 字节 · row_h={} gap={} 字重={} · 渐变刷往返={:?} 再导出逐字相同={} {}",
                     text.len(),
                     theme.row_h,
                     theme.gap,
                     theme.font_weight.0,
-                    ok,
+                    back.button.bg,
+                    again == text,
                     if ok {
-                        "[OK] 主题导出 → 文件 → 导入：字段级往返一致"
+                        "[OK] 主题导出 → 文件 → 导入：字段级往返一致（含渐变刷）"
                     } else {
-                        "[FAIL] 往返后字段变了"
+                        "[FAIL] 往返后字段变了（渐变刷丢了？）"
                     }
                 );
             }

@@ -934,7 +934,10 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 | `THEME_FORMAT_VERSION`（`rjw_ui::theme_toml`） | 格式版本；加载时**比本引擎新**⇒报错拒载。加字段不用改它，**改名 / 删字段要改** |
 
 `Weight` 存 `u16`（`weight = 700`）、`Align` 存小写名、`CornerRadius` 反序列化**两种写法都收**
-（`radius = 6.0` 或 `radius = { tl = .. }`）。示例侧入口：顶栏「导出主题…」「导入主题…」（`rfd`）
+（`radius = 6.0` 或 `radius = { tl = .. }`）、`Brush`（背景刷）用显式
+`{ kind = "solid|vertical|horizontal", colors = [..] }`（**不要**用 serde 默认的外部标签枚举
+`{ Vertical = [..] }`——那在 TOML 里是数组表，读回来报 `wanted exactly 1 element`；加载侧兼容旧写法）。
+示例侧入口：顶栏「导出主题…」「导入主题…」（`rfd`）
 + **`--theme <路径>`**（启动载入；与导入同一条通路）+ `--sim-theme <路径>`（脚本化验证）。
 见 `docs/ENGINE_GUIDE.md` §18.16。
 `LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**/**shadow**/**grip**）、`ButtonStyle`（三态 bg + padding + **radius**）、

@@ -1902,8 +1902,16 @@ line_spacing = 1.2
 [theme.panel]
 padding = 6.0
 radius = { tl = 6.0, tr = 6.0, br = 6.0, bl = 6.0 }   # 也可以写 `radius = 6.0`（四角同值）
+bg = { kind = "vertical", colors = [ { r = 0.98, g = 0.98, b = 0.98, a = 1.0 }, { r = 0.94, g = 0.94, b = 0.94, a = 1.0 } ] }
 shadow = { blur = 8.0, offset = { x = 0.0, y = 2.0 }, color = { r = 0.0, g = 0.0, b = 0.0, a = 0.47 } }
 ```
+
+> **刷子（`Brush`）有显式表示 `{ kind = "solid"|"vertical"|"horizontal", colors = [..] }`**
+> （`solid` 1 个颜色、`vertical`/`horizontal` 2 个）——**不要**用 serde 默认的"外部标签枚举"
+> 表示（`{ Vertical = [色, 色] }`）：TOML 会把它写成**数组表** `[[…bg.Vertical]]`，读回来时
+> `toml` 的枚举反序列化报 `wanted exactly 1 element, more than 1 element in 'button.bg'`
+> （用户实测）。加载侧**兼容**旧写法（形状翻译，见 `theme_toml::translate_legacy_brushes`），
+> 形状不对时给**带字段路径**的错误。
 
 **三条语义**（`crate::theme_toml` 模块文档里有完整说明）：
 
@@ -1918,7 +1926,8 @@ shadow = { blur = 8.0, offset = { x = 0.0, y = 2.0 }, color = { r = 0.0, g = 0.0
 
 > **特性开关**：`rjw_ui` 的 `serde`（= `toml`，默认开）——`Color` 的 serde 由
 > `rjw_color/serde` 带进；`Weight` / `Align` 用**代理模块**（数值 / 小写名字）；
-> `CornerRadius` 反序列化**同时接受标量与表**（`radius = 3.0` 或四角表）。
+> `CornerRadius` 反序列化**同时接受标量与表**（`radius = 3.0` 或四角表）；
+> `Brush` 用显式 `{kind, colors}`（见上，含旧写法兼容）。
 >
 > **示例侧**（`eg260818UI`，`rfd` 文件选择器）：顶栏多了「导出主题…」「导入主题…」——
 > 导出 = `to_toml` 落盘（另存为对话框），导入 = `load_theme_onto`（在**当前**主题上

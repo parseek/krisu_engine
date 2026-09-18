@@ -65,6 +65,63 @@ mod align_serde {
     }
 }
 
+/// **[`Brush`] 的 TOML 表示**（手写友好 + 无歧义）：
+///
+/// ```toml
+/// [theme.panel]
+/// bg = { kind = "vertical", colors = [{ r = .., g = .., b = .., a = .. }, { .. }] }
+/// ```
+///
+/// ⚠ **为什么不用 `derive` 的默认枚举表示**：serde 对外部标签枚举的默认写法是
+/// `bg = { Vertical = [颜色, 颜色] }`，TOML 会把它写成**数组表** `[[…bg.Vertical]]`
+/// —— 读回来时 `toml` 的枚举反序列化会报
+/// "wanted exactly 1 element, more than 1 element"（用户实测的
+/// "主题导入失败：主题字段不合法 … in `button.bg`"）。
+/// 显式 `{ kind, colors }` 既躲开这个坑，也让人一眼看懂/手改。
+#[cfg(feature = "serde")]
+#[derive(Serialize, Deserialize)]
+struct BrushRepr {
+    /// `"solid"` / `"vertical"` / `"horizontal"`。
+    kind: String,
+    /// 颜色：`solid` 要 1 个；`vertical`（上→下）/ `horizontal`（左→右）要 2 个。
+    colors: Vec<Color>,
+}
+
+#[cfg(feature = "serde")]
+impl From<Brush> for BrushRepr {
+    fn from(b: Brush) -> Self {
+        let (kind, colors) = match b {
+            Brush::Solid(c) => ("solid", vec![c]),
+            Brush::Vertical(t, b) => ("vertical", vec![t, b]),
+            Brush::Horizontal(l, r) => ("horizontal", vec![l, r]),
+        };
+        BrushRepr { kind: kind.to_owned(), colors }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<BrushRepr> for Brush {
+    type Error = String;
+
+    /// 校验"种类名 + 颜色个数"（错误消息里列出可选值，用户能自己改对）。
+    fn try_from(r: BrushRepr) -> Result<Self, Self::Error> {
+        match (r.kind.as_str(), r.colors.as_slice()) {
+            ("solid", [c]) => Ok(Brush::Solid(*c)),
+            ("vertical", [t, b]) => Ok(Brush::Vertical(*t, *b)),
+            ("horizontal", [l, r]) => Ok(Brush::Horizontal(*l, *r)),
+            ("solid", _) => Err(format!("solid 需要 1 个颜色，收到 {} 个", r.colors.len())),
+            ("vertical" | "horizontal", _) => Err(format!(
+                "{} 需要 2 个颜色（起 / 止），收到 {} 个",
+                r.kind,
+                r.colors.len()
+            )),
+            (other, _) => Err(format!(
+                "不认识的刷子种类 {other:?}（可选：solid / vertical / horizontal）"
+            )),
+        }
+    }
+}
+
 /// "胶囊"哨兵半径：交给 [`CornerRadius::fit`] 夹成 `min(w, h) / 2`（半圆端 / 正圆）。
 ///
 /// 用一个大而有限的值而不是 `INFINITY`——`fit` 里有 `len / sum`，`INFINITY` 会算出 NaN。
@@ -89,6 +146,7 @@ pub const PILL_RADIUS: f32 = 1.0e3;
 /// 不在主题里表达。
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(into = "BrushRepr", try_from = "BrushRepr"))]
 pub enum Brush {
     /// 纯色（直角时只产生 4 个顶点，最省）。
     Solid(Color),

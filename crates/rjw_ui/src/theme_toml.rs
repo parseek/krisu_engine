@@ -80,6 +80,63 @@ fn merge(base: &mut toml::Value, over: toml::Value) {
     }
 }
 
+/// **旧写法兼容**（v1 早期导出的文件）：把 serde 默认的"外部标签枚举"刷子
+/// （`bg = { Vertical = [色, 色] }` / `{ Solid = 色 }`）就地改写成新形式
+/// `{ kind = "vertical", colors = [色, 色] }`。
+///
+/// 为什么需要它：那种写法在 TOML 里会变成**数组表** `[[…bg.Vertical]]`，读回来时
+/// `toml` 的枚举反序列化报 "wanted exactly 1 element, more than 1 element"
+/// （用户实测："主题导入失败：主题字段不合法 … in `button.bg`"）。
+/// 这里做一次**形状翻译**，于是旧文件（以及手写的等价写法）也能直接导入。
+///
+/// `path` 只用于错误定位（形如 `theme.button.bg`）。
+fn translate_legacy_brushes(v: &mut toml::Value, path: &str) -> Result<(), String> {
+    match v {
+        toml::Value::Table(t) => {
+            // 本表是不是"旧式刷子"？恰好一个键，且键名是三种刷子之一。
+            let legacy = t.len() == 1
+                && t.keys()
+                    .next()
+                    .is_some_and(|k| matches!(k.as_str(), "Solid" | "Vertical" | "Horizontal"));
+            if legacy {
+                let (variant, value) = t.iter().next().map(|(k, v)| (k.clone(), v.clone())).unwrap();
+                let (kind, colors) = match (variant.as_str(), &value) {
+                    ("Solid", toml::Value::Table(_)) => ("solid", vec![value.clone()]),
+                    ("Vertical", toml::Value::Array(a)) => ("vertical", a.clone()),
+                    ("Horizontal", toml::Value::Array(a)) => ("horizontal", a.clone()),
+                    _ => {
+                        return Err(format!(
+                            "{path}：旧式刷子写法 {variant:?} 的值形状不对；\
+                             本版请写 {{ kind = \"solid|vertical|horizontal\", colors = [..] }}"
+                        ));
+                    }
+                };
+                let mut new = toml::value::Table::new();
+                new.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
+                new.insert("colors".to_owned(), toml::Value::Array(colors));
+                *v = toml::Value::Table(new);
+                return Ok(());
+            }
+            for (k, child) in t.iter_mut() {
+                let child_path = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                translate_legacy_brushes(child, &child_path)?;
+            }
+            Ok(())
+        }
+        toml::Value::Array(a) => {
+            for (i, child) in a.iter_mut().enumerate() {
+                translate_legacy_brushes(child, &format!("{path}[{i}]"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 impl Theme {
     /// **导出为 TOML 文本**（全量：所有样式字段 + `format_version` 头）。
     ///
@@ -121,8 +178,20 @@ impl Theme {
                 .cloned()
                 .ok_or_else(|| "主题文件有 format_version 但缺少 [theme] 表".to_owned())?
         } else {
-            doc
+            // 没有版本头：**裸主题表**（`gap = 12`）直接就是字段树；
+            // 但若顶层**只有一个 `theme` 表**，那多半是"写了 `[theme.x]` 却漏了版本头"
+            // —— 也认它，否则整份文件会被静默忽略（最难查的一类问题）。
+            let wrapped = doc
+                .as_table()
+                .is_some_and(|t| t.len() == 1 && t.get("theme").is_some());
+            match doc.get("theme") {
+                Some(t) if wrapped => t.clone(),
+                _ => doc,
+            }
         };
+        // 旧式刷子写法（`{ Vertical = [..] }`）先翻译成新形式，再走合并 + 反序列化。
+        let mut over = over;
+        translate_legacy_brushes(&mut over, "theme")?;
         // 当前主题 → TOML 值 → 递归合并 → 反序列化回来（这就是"合并覆盖"的实现）。
         let mut base =
             toml::Value::try_from(&*self).map_err(|e| format!("当前主题无法序列化：{e}"))?;
@@ -138,7 +207,8 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::style::{GripShape, Palette};
+    use crate::style::{Brush, GripShape, Palette};
+    use rjw_color::Color;
     use rjw_text::Weight;
 
     /// 造一个"每个角落都改过"的主题：字段改动越分散，round-trip 越能发现问题。
@@ -206,6 +276,66 @@ mod tests {
         // 有版本头但缺 `[theme]` 表 ⇒ 明确报错（而不是静默加载一个默认主题）。
         let e = Theme::from_toml("format_version = 1").unwrap_err();
         assert!(e.contains("[theme]"), "{e}");
+    }
+
+    #[test]
+    fn every_brush_kind_round_trips() {
+        // ⚠ 这是上一版漏掉的：纯色 `Brush::Solid` 往返没问题，但**渐变刷**（`Vertical` /
+        // `Horizontal`，微渐变强度 > 0 时按钮 / 面板就是它）在 TOML 里丢失/报错
+        // ——用户实测："主题导入失败：主题字段不合法：Wanted exactly 1 element … in `button.bg`"。
+        for (name, bg) in [
+            ("solid", Brush::Solid(Color::rgba_u8(20, 40, 60, 255))),
+            ("vertical", Brush::Vertical(Color::rgba_u8(10, 20, 30, 255), Color::rgba_u8(200, 210, 220, 255))),
+            ("horizontal", Brush::Horizontal(Color::WHITE, Color::BLACK)),
+        ] {
+            let mut t = Theme::default();
+            t.button.bg = bg;
+            let text = t.to_toml().unwrap_or_else(|e| panic!("{name}: 序列化失败 {e}"));
+            eprintln!("--- {name} ---\n{text}");
+            let back = Theme::from_toml(&text).unwrap_or_else(|e| panic!("{name}: 反序列化失败 {e}"));
+            assert_eq!(back.button.bg, bg, "{name}: 往返后 Brush 变了");
+            assert_eq!(back.to_toml().unwrap(), text, "{name}: 再导出必须逐字相同");
+        }
+    }
+
+    #[test]
+    fn legacy_externally_tagged_brushes_still_load() {
+        // v1 早期导出的**真实写法**（serde 默认外部标签枚举 ⇒ TOML 数组表）：
+        // 这里直接用手写等价的两种形状：数组表 + 内联表。
+        let array_tables = r#"
+format_version = 1
+[theme]
+[theme.button]
+[[theme.button.bg.Vertical]]
+r = 1.0
+g = 0.0
+b = 0.0
+a = 1.0
+[[theme.button.bg.Vertical]]
+r = 0.0
+g = 0.0
+b = 1.0
+a = 1.0
+"#;
+        let t = Theme::from_toml(array_tables).expect("旧式的数组表刷子应能加载");
+        assert_eq!(
+            t.button.bg,
+            Brush::Vertical(Color::rgba(1.0, 0.0, 0.0, 1.0), Color::rgba(0.0, 0.0, 1.0, 1.0))
+        );
+        // 内联表写法（`{ Solid = { r = … } }`）。
+        let inline = r#"
+[theme.button]
+bg = { Solid = { r = 0.25, g = 0.5, b = 0.75, a = 1.0 } }
+"#;
+        let t = Theme::from_toml(inline).expect("旧式的内联表刷子应能加载");
+        assert_eq!(t.button.bg, Brush::Solid(Color::rgba(0.25, 0.5, 0.75, 1.0)));
+        // 形状不对的旧写法要给**能定位**的错误（而不是沉默或底层信息）。
+        let bad = r#"
+[theme.button]
+bg = { Vertical = { r = 1.0, g = 0.0, b = 0.0, a = 1.0 } }
+"#;
+        let e = Theme::from_toml(bad).unwrap_err();
+        assert!(e.contains("theme.button.bg") && e.contains("kind"), "{e}");
     }
 
     #[test]

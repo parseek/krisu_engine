@@ -245,6 +245,7 @@ fn update(&mut self, ctx: &mut Ctx) {
 
   | 症状 | 成因 |
   |---|---|
+  | `主题字段不合法：wanted exactly 1 element, more than 1 element in 'button.bg'` | **渐变刷**（`Brush::Vertical` / `Horizontal`）曾被 serde 的默认"外部标签枚举"写成 TOML 数组表 `[[…bg.Vertical]]`，读回来必失败（纯色 `Solid` 因为只有 1 个元素反而没事）。现在刷子是显式 `{ kind = "vertical", colors = [色, 色] }`，且加载时**形状翻译**旧写法 ⇒ 旧文件直接能导入。自检：`--sim-theme` ① 会故意塞一个渐变刷进导出主题（"渐变刷往返=…"） |
   | 导入后**什么都没变** | 文件写成了别的表名（`[Theme]` / 顶层平铺字段名拼错）⇒ 逐键忽略是**故意**的（向前兼容）。先看 `--sim-theme` ① 的"再导出逐字相同"，再对着 `to_toml` 的输出改文件 |
   | `主题格式版本 N 不受支持` | 文件比本引擎新。**加字段**不需要抬版本（缺字段回落默认）；**改名 / 删字段**才需要，并同时抬 `THEME_FORMAT_VERSION` |
   | `主题字段不合法：invalid type …` | 字段类型写错（如 `radius = {tl = "6"}`）。`CornerRadius` 收标量也收表；`Weight` 是**数值**（`font_weight = 700`） |
