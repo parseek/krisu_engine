@@ -114,6 +114,10 @@ impl Widget for NumberInput<'_> {
     fn ui(mut self, ui: &mut Ui) -> Response {
         // ① 申请（尺寸 = 主题固定值；手柄与文本框的切分见下）
         let rect = ui.allocate(Vec2::new(ui.theme.input.min_w, ui.theme.input.height));
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
+        if ui.culled(rect) {
+            return Response { rect, culled: true, ..Default::default() };
+        }
         let id_for = ui.id_for(self.id);
         let focused = ui
             .state()

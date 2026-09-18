@@ -105,6 +105,10 @@ impl Widget for HitProbe<'_> {
         // ① 申请 + 收交互（`Sense::CLICK`：命中 / 跨帧状态机一句话；探针不认领按下，
         //    所以不用 `Sense::DRAG`——外层窗口仍可拖）。
         let (rect, resp) = ui.allocate_sense(self.id, probe_size(), Sense::CLICK);
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段）。
+        if resp.culled {
+            return resp;
+        }
         // 排障开关（`RJ_OVERLAP_TRACE=1`）：打印两个探针每帧的矩形 / 鼠标 / 命中 /
         // 本帧被控件级遮挡拦下的次数——"为什么这个控件不响应"最快的一条线索。
         if std::env::var_os("RJ_OVERLAP_TRACE").is_some() {

@@ -56,6 +56,10 @@ impl Widget for Divider {
         // 分隔线"宽 = 可用宽"本身就是父级宽度的一部分；改成 `DisableAutoExpansion` 会让
         // 固定宽窗口的尺寸整块变掉（实测：所有窗口尺寸 +50%）。
         let rect = ui.allocate(Vec2::new(w, t + m * 2.0));
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
+        if ui.culled(rect) {
+            return Response { rect, culled: true, ..Default::default() };
+        }
         let y = rect.y + (rect.h - t) * 0.5; // 垂直居中（行高被 clamp 时仍居中）
         ui.painter().solid(Rect::new(rect.x, y, rect.w, t), c);
         Response { rect, ..Default::default() }

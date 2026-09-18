@@ -142,6 +142,10 @@ impl<T: SliderValue> Widget for Slider<'_, T> {
     fn ui(self, ui: &mut Ui) -> Response {
         // ① 申请（尺寸 = 主题，不需要测量）
         let rect = ui.allocate(Vec2::new(ui.theme.slider.min_w.max(40.0), ui.theme.slider.height));
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
+        if ui.culled(rect) {
+            return Response { rect, culled: true, ..Default::default() };
+        }
         // 拖拽灵敏度 = 每像素数值倍率 × 修饰键速度（Shift 快 / Ctrl 慢）。
         let speed = self.resolve_speed(ui);
         // 进出各换算一次：类型只在 API 边界出现，交互 / 绘制全程 `f32`。

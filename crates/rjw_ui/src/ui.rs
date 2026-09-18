@@ -48,8 +48,8 @@ use crate::draw::{
 };// 顶点收集 / 合批机制（原在此文件，见 `gpu_batch` 模块文档）。
 use crate::gpu_batch::{
     CacheStats, CachedQuad, Geom, QuadCollector, clip_key, clip_rect, cmd_sig_hash,
-    debug_layout_outline, line_row_at_y, resample_gradient_local, safe_line_slice, segment_runs,
-    vertex_p3u2c4,
+    debug_layout_outline, fully_outside, line_row_at_y, resample_gradient_local, safe_line_slice,
+    segment_runs, vertex_p3u2c4,
 };
 use crate::edit::{
     byte_to_char, caret_at_visual_click, caret_index_by_width, char_to_byte, insert_char_at,
@@ -2006,6 +2006,27 @@ impl<'a> Ui<'a> {
         self.child_rect(size.x, size.y, child)
     }
 
+    /// **本矩形是否被裁剪层完全剔除**（分配 → 判一次 → 直接 return 的判据）。
+    ///
+    /// 语义 = "在当前**强制裁剪层**（Clip 沙箱 / ScrollView 可视区 / 文本框盒；不含
+    /// 窗口结算后才知道的严格裁剪）里，这个矩形**一个像素都看不见**"。
+    /// `rect` 传**当前容器局部**矩形（就是 `allocate*` 给的那个）。
+    ///
+    /// ⚠ 与 batch scissor 分工：scissor 裁**像素**（部分重叠时保住圆角/投影原形），
+    /// 本判据裁**整条命令**（省镶嵌 + 顶点 + 段）。两者互补，都要有。
+    #[inline]
+    pub fn culled(&self, rect: Rect) -> bool {
+        // 命令是先按容器局部录制、弹出时统一平移成绝对坐标；裁剪层是**绝对**坐标 ⇒
+        // 比较前先把矩形抬到绝对空间（`abs_base` 就是当前容器的绝对原点）。
+        let abs = Rect::new(
+            rect.x + self.abs_base.x,
+            rect.y + self.abs_base.y,
+            rect.w,
+            rect.h,
+        );
+        fully_outside(abs, self.painter.q.clip)
+    }
+
     /// **收交互**（控件作者用；[`Self::allocate_sense`] 的底层）：按 [`crate::widgets::Sense`]
     /// 把"命中 → 焦点 → 按下认领 → 跨帧状态机"一次做完，返回本帧 [`crate::widgets::Response`]。
     ///
@@ -2062,6 +2083,8 @@ impl<'a> Ui<'a> {
         let held = self.state().widgets.get(id.as_str()).is_some_and(|ws| ws.pressed);
         Response {
             rect,
+            // 分配处剔除：完全看不见的控件直接把信号交给控件（它应立刻 return）。
+            culled: self.culled(rect),
             hovered: hit,
             pressed: held,
             clicked: ev.clicked,
@@ -4211,6 +4234,8 @@ impl<'a> Ui<'a> {
         for d in cmds.iter().flatten() {
             // 当前元素序：push 方法按其分组（控件级提交顺序——见 QuadCollector）。
             quads.cur_elem = d.elem;
+            // **当前裁剪层的绝对矩形**（`d.clip` 已是绝对坐标）：**剔除**用它。
+            let clip_abs = d.clip.map(|c| snap_rect(&c));
             // **环境裁剪层**（**窗口局部**；内容已随容器平移成绝对坐标后减本窗原点）。
             //
             // ⚠ 这里**不再切割几何**（旧实现逐命令 `clipped(..)`）：环境裁剪改由 batch
@@ -4221,7 +4246,33 @@ impl<'a> Ui<'a> {
             // ⚠ **必须存局部坐标**：它与缓存里的顶点同空间 ⇒ 窗口移动时缓存键与裁剪
             // 一起"跟着走"（存绝对值会让"窗口移动"污染分组键，并在缓存命中时拿到
             // 过期矩形——实测拖动窗口后 scissor 偏了一个位移量）。
-            quads.cur_clip = d.clip.map(|c| local_of(snap_rect(&c), anchor_px));
+            quads.cur_clip = clip_abs.map(|c| local_of(c, anchor_px));
+            // **兜底剔除**：完全在裁剪层之外的命令**不镶嵌、不入段**。
+            //
+            // 主剔除在**分配处**（`Ui::culled` / `Response::culled`：控件自己直接 return
+            // ——省的是它内部的全部命令）；这里兜住两类"分配处看不见的情况"：
+            // ① 自绘装饰溢出到裁剪层外（控件本体可见、装饰不可见）；
+            // ② 没检查 `culled` 的控件（含第三方）。
+            // ⚠ **只剔"全外"**：**部分**重叠照整条画，越界像素交给 batch scissor。
+            // ⚠ **空间**：`d.rect` 此刻已是**绝对**坐标（容器弹出时平移过），所以要与
+            // **绝对**的 `clip_abs` 比——`quads.cur_clip` 是窗口**局部**的（缓存键用），
+            // 拿它比会把内容整块误剔（实测：严格窗口内容全没了、子菜单面板不见了）。
+            let cull_rect = match &d.kind {
+                // 投影向外溢出本体：按**外沿**判可见性（否则贴边窗口的投影被误剔）。
+                DrawKind::Shadow { blur, offset, .. } => {
+                    let p = snap_rect(&d.rect);
+                    Rect::new(
+                        p.x - *blur + offset.x,
+                        p.y - *blur + offset.y,
+                        p.w + (*blur + offset.x.abs()) * 2.0,
+                        p.h + (*blur + offset.y.abs()) * 2.0,
+                    )
+                }
+                _ => snap_rect(&d.rect),
+            };
+            if fully_outside(cull_rect, clip_abs) {
+                continue;
+            }
             match &d.kind {
                 DrawKind::Solid(color) => {
                     if d.rect.w > 0.0 && d.rect.h > 0.0 {

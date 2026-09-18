@@ -85,6 +85,10 @@ impl Widget for Segmented<'_> {
         };
         // ② 申请（占光标；`add_at` 的绝对定位由 `place_once` 覆盖）
         let rect = ui.allocate(size);
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
+        if ui.culled(rect) {
+            return Response { rect, culled: true, ..Default::default() };
+        }
         if n == 0 || rect.w <= 0.0 || rect.h <= 0.0 {
             return Response { rect, ..Default::default() };
         }

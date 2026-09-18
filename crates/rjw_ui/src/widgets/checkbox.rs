@@ -93,10 +93,15 @@ impl Widget for Checkbox<'_> {
         );
         // ② 申请（占光标）
         let rect = ui.allocate(size);
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
+        if ui.culled(rect) {
+            return Response { rect, culled: true, ..Default::default() };
+        }
         // ③ 交互 + 绘制（显式 rect 入口负责键盘激活 / 勾选态配色）
         let s = ui.checkbox_at_styled(self.id, rect, self.label, self.checked, &style);
         Response {
             rect,
+            culled: false,
             hovered: s.hovered,
             pressed: s.pressed,
             clicked: s.clicked,

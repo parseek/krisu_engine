@@ -349,6 +349,31 @@ pub struct Response {
     pub released: bool,
     /// 勾选 / 单选类控件：本帧是否切换（其余控件恒 `false`）。
     pub toggled: bool,
+    /// **本控件本帧被裁剪层完全剔除**：分配到的矩形在**强制裁剪层之外**（一个像素都
+    /// 看不见）⇒ 控件应**直接 `return resp`**，不做绘制与交互：
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{Sense, Ui, Widget, Response};
+    /// # struct Tag<'a> { id: &'a str }
+    /// impl Widget for Tag<'_> {
+    ///     fn ui(self, ui: &mut Ui) -> Response {
+    ///         let (rect, resp) =
+    ///             ui.allocate_sense(self.id, glam::Vec2::new(20.0, 20.0), Sense::CLICK);
+    ///         if resp.culled {
+    ///             return resp;            // ← 分配 → 被裁掉 → 直接 return
+    ///         }
+    ///         ui.painter().solid(rect, rjw_color::Color::WHITE);
+    ///         resp
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// **为什么 scissor 之外还要这层**：scissor 只省**片元**；看不见的控件照样要镶嵌
+    /// 顶点、进段、发 draw。分配处剔除省的是 **CPU 镶嵌 + 顶点 + 段（draw call）**。
+    /// 只用 [`Ui::allocate`](crate::Ui::allocate)（只要矩形）的控件用
+    /// [`Ui::culled`](crate::Ui::culled) 自己判一次即可。判定是**纯几何**
+    /// （`rect` 与裁剪层无交集），与鼠标/交互无关。
+    pub culled: bool,
 }
 
 /// 手写 `Default`：`Rect` 没有 `Default`（它是几何值，没有"零矩形"的自然含义，
@@ -362,6 +387,7 @@ impl Default for Response {
             clicked: false,
             released: false,
             toggled: false,
+            culled: false,
         }
     }
 }

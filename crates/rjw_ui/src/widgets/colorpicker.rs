@@ -153,6 +153,10 @@ impl Widget for ColorPicker<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
         // 申请：内联只占**一行**（面板弹出，不参与这里的尺寸结算）。
         let rect = ui.allocate(Vec2::new(ui.theme.input.min_w, SWATCH_H));
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
+        if ui.culled(rect) {
+            return Response { rect, culled: true, ..Default::default() };
+        }
         // 先解构：`color`（&mut Color）与 `hex`（Option<&mut String>）是**互不相干**的
         // 借用，颜色值在外面读写成 `Copy` 的 `Color`，两边不打架。
         let ColorPicker { id, color, alpha, hex, popup_w } = self;

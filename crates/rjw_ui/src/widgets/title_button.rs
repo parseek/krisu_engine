@@ -35,6 +35,10 @@ impl Widget for TitleIconButton<'_> {
         // 申请 + 收交互：`Sense::DRAG` 让按下即 `claim_press()`——标题栏按钮上的按下
         // **不会**被当成"拖窗口"的基准（与滚动条同一机制）。
         let (rect, resp) = ui.allocate_sense(self.id, Vec2::new(h - 2.0, h), Sense::DRAG);
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段）。
+        if resp.culled {
+            return resp;
+        }
         let st = ui.theme().button.clone();
         let bg = st.pick_bg(resp.pressed, resp.hovered);
         let fg = if resp.hovered { st.fg } else { ui.theme().palette.text_muted };

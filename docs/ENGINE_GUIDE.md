@@ -2093,8 +2093,50 @@ UiDraw.clip（绝对屏幕坐标）
 | ④ | **签名瘦身**：环境裁剪以量化 `i32` 四元组入签名（4 次整型写入）；文本只哈希**自身软裁剪**（环境层已上移到 batch scissor） | `sig_us` 未见增长（57–60µs，与改动前同档） |
 | ⑤ | **`[perf]` 计数**：`UiStats` 增 `clip_batches / seg_count / vert_count / tri_count`，示例 `[perf]` 打印 `clip_batches= segs= verts= tris=` | `segs` = "scissor 让 draw 变多"的直接度量；`verts/tris` = 这一帧镶嵌了多少 |
 
-> 现场看 `[perf]` 稳态：`cmds=380 wins=7 cache_hit=13 cache_miss=0 clip_batches=11
-> segs=39 verts=30186 tris=41235`。
+> 现场看 `[perf]` 稳态：`cmds=381 wins=7 cache_hit=13 cache_miss=0 clip_batches=11
+> segs=40 verts=23736 tris=31621`。
+
+### 18.22 剔除（culling）：分配 → 被裁掉 → 直接 return
+
+**scissor 不是剔除**。scissor 只省**片元**：完全看不见的控件照样要镶嵌顶点、进段、发
+draw。所以两层都要有：
+
+| 层 | 粒度 | 省什么 | 在哪 |
+|---|---|---|---|
+| **剔除** | 整条命令（或整个控件） | CPU 镶嵌 + 顶点/索引 + 段（draw call） | 分配处（主）+ `collect_cmds`（兜底） |
+| **裁剪** | 像素 | 片元 | GPU `set_scissor_rect`（`UiBatch.clip`） |
+
+**主剔除（分配处）**：`allocate_sense*` 返回的 [`Response::culled`](crate::widgets::Response)
+（以及 `Ui::culled(rect)`，给只用 `allocate` 的控件）在**强制裁剪层**里判"这个矩形一个
+像素都看不见"，控件据此**直接 `return`**：
+
+```rust
+let (rect, resp) = ui.allocate_sense(self.id, size, Sense::CLICK);
+if resp.culled { return resp; }        // 分配 → 被裁掉 → 直接 return
+let p = ui.painter(); p.panel(..); p.text(..);
+resp
+```
+
+判据是**纯几何**（`rect` 与裁剪层无交集），与鼠标/交互无关；`Ui::culled` 把
+`rect + abs_base`（绝对）与裁剪层（绝对）比——**空间必须一致**（见下）。
+
+**兜底剔除（`collect_cmds`）**：命令层再判一次"整条在裁剪层之外 ⇒ 不镶嵌、不入段"，
+兜住两种分配处看不见的情况：① 自绘装饰溢出到裁剪层外（本体可见、装饰不可见）；
+② 没检查 `culled` 的控件（含第三方）。投影按**外沿**判（否则贴边窗口的投影被误剔）。
+
+两个**踩过的坑**（都被 sim 当场抓住，写进注释）：
+
+1. **空间**：`d.rect` 在 `collect_cmds` 里已是**绝对**坐标，而缓存键用的 `cur_clip` 是
+   **窗口局部**的。拿局部裁剪层去比绝对矩形 = 把内容**整块误剔** —— 实测"严格窗口内容
+   全没了 / 子菜单面板不见了"（用户报的"控件消失"）。正确做法：剔除用 **绝对**
+   `clip_abs`，进缓存键用 **局部**。
+2. **分配处剔除只覆盖"当前已知的强制层"**：窗口结算后才知道的严格裁剪
+   （`Placement::Clip` / 固定高）在录制期**还没有** `Ui::clip`，分配处剔不掉它——
+   那条路径靠 `collect_cmds` 的兜底剔除（`finish` 里 retro-clip 已把 `d.clip` 补上）。
+
+**实测收益**（演示稳态，`[perf]` 前后对照）：`verts 30186 → 23736（−21%）`、
+`tris 41235 → 31621（−23%）`、`segs 39 → 40`（段数不变，因为省掉的是"本来也要合进
+同段"的顶点）。全部 14 个 `--sim-*` 判定不变。
 
 ### 18.19 Widget 协议：**尺寸在 `ui()` 里就地申请**（v0.3）
 

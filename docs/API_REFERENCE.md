@@ -996,8 +996,12 @@ impl Sense {
   + `update_drag`；拖拽基准与数值映射仍由控件维护（`WidgetState::{press_mouse,press_panel}`）。
 - `interact` 一次做完：命中（含窗口 / 控件级遮挡 / 裁剪过滤）→ 焦点 → 按下认领 →
   `update_interact`（hover / pressed / clicked / released）→ `note_press_handled` → `update_drag`。
-- `Response` 增 `rect: Rect`（本帧最终矩形；`UiAdd::label` 就靠它返回尺寸）；
+- `Response` 增 `rect: Rect`（本帧最终矩形；`UiAdd::label` 就靠它返回尺寸）与
+  `culled: bool`（**被裁剪层完全剔除** ⇒ 控件应立刻 `return resp`，不镶嵌不入段）；
   `pressed` = **持续按住**（与 `ButtonState::pressed` 同义），`clicked` = 本帧完成点击。
+- `Ui::culled(rect) -> bool`：只用 `allocate`（只要矩形）的控件自己判一次可见性，
+  等价于 `Response::culled`。**scissor 只省片元**，剔除才省镶嵌/顶点/draw——
+  见 `docs/ENGINE_GUIDE.md` §18.22。
 - 膨胀语义是**申请方式**：`Expansion::{UnlimitedExpansion(默认), LimitedInParent(压到 avail_w), DisableAutoExpansion(不撑大父级)}`；
   min/max 用 `apply_constraints(desired, c)` 自己应用。
 - `add_at(pos, w)`：给 `Ui` 打**一次性放置覆盖**，控件的第一次申请消费它（**只在第一次**；

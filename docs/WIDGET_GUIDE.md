@@ -136,6 +136,11 @@ impl Widget for TagButton<'_> {
         let desired = Vec2::new(tsize.x + 24.0, tsize.y + 10.0);
         // ② 申请 + 收交互（一句话：id_for / 命中 / 焦点 / 按下认领 / update_interact）
         let (rect, resp) = ui.allocate_sense(self.id, desired, Sense::CLICK.focus(FocusKind::Button));
+        // ②' **被裁剪层完全剔除 ⇒ 直接 return**（scissor 只省片元，这里省镶嵌/顶点/段）。
+        //     只用 allocate（只要矩形）时用 `ui.culled(rect)` 自己判一次。
+        if resp.culled {
+            return resp;
+        }
         // ③ 画（一个绘制块一个 painter）
         let p = ui.painter();
         // 悬停 / 按下三态：`Brush` 支持逐控件覆盖（`bg`），这里给"有覆盖就用覆盖"的最简式

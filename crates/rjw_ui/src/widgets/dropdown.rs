@@ -404,6 +404,10 @@ impl<F: MenuContent> Widget for Dropdown<'_, F> {
         // ② 申请：**触发器在窄容器里被截断**（文字走省略号），不把父级撑破 ⇒
         //    `LimitedInParent`（旧 `Widget::expansion()` 的等价物）。
         let rect = ui.allocate_mode(size, crate::widgets::Expansion::LimitedInParent);
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
+        if ui.culled(rect) {
+            return Response { rect, culled: true, ..Default::default() };
+        }
         // ③ 交互 + 绘制 + 面板（与 `Ui::combo_at` 共用 `show_in`）
         self.show_in(ui, rect)
     }

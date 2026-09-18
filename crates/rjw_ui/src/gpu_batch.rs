@@ -169,6 +169,23 @@ pub(crate) fn segment_runs(
     runs
 }
 
+/// **命令是否完全落在裁剪层之外**（⇒ 不必镶嵌、不必入段、不必提交）。
+///
+/// ⚠ 与"几何切割"是**两件事**（阶段 3 之后尤其要分清）：
+/// - **剔除（本函数）**：整条命令的矩形与裁剪层**无交集** ⇒ 一个像素都看不见 ⇒ 直接跳过。
+///   省的是 **CPU 镶嵌 + 顶点/索引 + 段（draw call）**；半开相交（边沿接触 = 零面积可见）；
+/// - **裁剪（batch scissor）**：**部分**重叠 ⇒ 整条照画，越界像素交给 GPU scissor
+///   （圆角 / 环带 / 投影因此保持原形——不能用几何求交，那会把圆角切平）。
+///
+/// 所以这里**只判"全外"**，绝不做部分求交。`clip = None`（无强制层）恒不剔。
+#[inline]
+pub(crate) fn fully_outside(rect: Rect, clip: Option<Rect>) -> bool {
+    match clip {
+        None => false,
+        Some(c) => !c.intersects(&rect),
+    }
+}
+
 /// `finish` 顶点缓存各阶段**累计**（µs / 计数）：拆出的缓存/提交子函数共享一个
 /// `&mut CacheStats` 累加，`finish` 末尾统一写入 `UiStats`（示例/诊断读取）。
 #[derive(Default)]

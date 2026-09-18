@@ -179,6 +179,10 @@ impl Widget for Label<'_> {
         };
         // ② 申请（占光标）
         let rect = ui.allocate(natural);
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
+        if ui.culled(rect) {
+            return Response { rect, culled: true, ..Default::default() };
+        }
         // ③ 画（省略 / 换行两条路径各自负责自洽内容）
         if self.ellipsis {
             self.draw_ellipsis(ui, rect, color, size, align, family);

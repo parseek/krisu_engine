@@ -136,6 +136,10 @@ impl Widget for Button<'_> {
         };
         // ② 申请（占光标；`add_at` 的绝对定位由 `place_once` 覆盖）
         let rect = ui.allocate(size);
+        // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
+        if ui.culled(rect) {
+            return Response { rect, culled: true, ..Default::default() };
+        }
         // ③ 交互 + 绘制交给显式 rect 入口（键盘激活 / 省略号 / 三态配色都在那里）
         let s = ui.button_at_styled(self.id, rect, self.label, &style);
         Response { rect, ..s.into() }
