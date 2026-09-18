@@ -1191,3 +1191,163 @@ fn title_bar_hugs_the_top_and_does_not_clip_content() {
     let btn = 45.0 - 2.0;
     assert!(btn < title_bar_h(45.0) + 1.0, "按钮可以接近/超过条高");
 }
+
+// ─── 顶层放置序（`z0_place_for_seq`）与提交排序键 ─────────────────────
+//
+// 这一组把用户报告的两个**闪烁**变成断言。症状：可拖动玩家名面板的底色被更早录制的
+// win=0 内容（FPS / 点击次数标签）穿透；`scroll_at` 的滚动条被列表项盖住（只在条目
+// 间隙里忽隐忽现）。根因：绘制序只有 `(win, elem, ...)`，而**所有非窗口内容共享
+// `win = 0`**，于是"容器装饰用 `elem = 0`（画在本容器元素之下）"退化成
+// "画在整个 win=0 空间的最底"。修法：在 `win` 之后插入**顶层放置序** `place`。
+
+#[test]
+fn place_is_zero_before_the_first_placement() {
+    // 开头的散装顶层命令（`label_at` 等）不属于任何放置 ⇒ 序 0。
+    let starts = [5u32, 20, 40];
+    assert_eq!(z0_place_for_seq(&starts, 0), 0);
+    assert_eq!(z0_place_for_seq(&starts, 4), 0);
+    // 放置 1 从 seq=5 开始 ⇒ seq=5 已属于它。
+    assert_eq!(z0_place_for_seq(&starts, 5), 1);
+}
+
+#[test]
+fn place_is_constant_inside_a_placement_and_grows_after_it() {
+    // 放置 1 = seq 5..19，放置 2 = seq 20..39，放置 3 = seq 40..。
+    let starts = [5u32, 20, 40];
+    for seq in 5..20 {
+        assert_eq!(z0_place_for_seq(&starts, seq), 1, "放置内恒定（seq={seq}）");
+    }
+    for seq in 20..40 {
+        assert_eq!(z0_place_for_seq(&starts, seq), 2);
+    }
+    for seq in 40..60 {
+        assert_eq!(z0_place_for_seq(&starts, seq), 3);
+    }
+    // 单调不减（提前 break 的正确性前提就是 starts 递增）。
+    let mut prev = 0;
+    for seq in 0..80 {
+        let p = z0_place_for_seq(&starts, seq);
+        assert!(p >= prev, "place 必须单调不减（seq={seq}）");
+        prev = p;
+    }
+}
+
+#[test]
+fn place_splits_a_run_of_loose_commands_around_placements() {
+    // ⚠ 这一条是本次修复的**核心**：散装命令与放置交错时，
+    // "放置 A → 散装 → 放置 B" 必须得到 1 / 1 / 2（散装跟随"上一个放置"），
+    // 于是后续放置的 `place` 严格更大 ⇒ 它的装饰（elem=0）不会被前面的内容穿透。
+    let starts = [10u32, 30];
+    assert_eq!(z0_place_for_seq(&starts, 0), 0, "放置 A 之前的散装");
+    assert_eq!(z0_place_for_seq(&starts, 10), 1, "放置 A");
+    assert_eq!(z0_place_for_seq(&starts, 25), 1, "A 与 B 之间的散装跟随 A");
+    assert_eq!(z0_place_for_seq(&starts, 30), 2, "放置 B 严格更大");
+}
+
+#[test]
+fn place_boundary_is_the_first_command_not_the_container_entry() {
+    // ⚠ 回归：`begin_top_placement` 必须记"**本放置第一条命令**的 seq"
+    // （`queue.seq + 1`），而不是容器入口时的 `queue.seq`。
+    //
+    // 现场（实测）：`scroll_at` 的滚动条由 `next_seq()` 取号（seq = N），紧接着
+    // 后面的 `flex_at` 容器在同一 `seq = N` 上开新放置。若记 `N`，滚动条那条命令
+    // （seq = N）就被 `≤` 命中到**新**放置里 ⇒ 滚动条与它自己的列表项分属两个
+    // 排序空间（`place` 差 1），序随录制细节漂移。记 `N + 1` 后滚动条留在原放置。
+    let starts = [1u32, 83]; // 第 2 个放置的第一条命令是 seq=83
+    assert_eq!(z0_place_for_seq(&starts, 82), 1, "seq=82 属于上一个放置（滚动条）");
+    assert_eq!(z0_place_for_seq(&starts, 83), 2, "seq=83 才是新放置的第一条");
+    // 反例：若把起点记成"容器入口 seq"（82），seq=82 会被算进新放置。
+    let wrong = [1u32, 82];
+    assert_eq!(z0_place_for_seq(&wrong, 82), 2, "这就是踩过的 off-by-one");
+}
+
+#[test]
+fn empty_placements_still_consume_a_place() {
+    // 空闭包的 `pack_at` 会"开了放置但一条命令都没录"。它不产生几何，但计数照加——
+    // 后面的放置因此拿到更大的 place（序仍然正确）。
+    let starts = [7u32, 7, 9];
+    assert_eq!(z0_place_for_seq(&starts, 7), 2, "同一起点的两个放置都算");
+    assert_eq!(z0_place_for_seq(&starts, 8), 2);
+    assert_eq!(z0_place_for_seq(&starts, 9), 3);
+}
+
+/// 构造一条合成几何段（`place` / `elem` 之外都取最小可用值）。
+fn cq(win: u32, place: u32, elem: u32) -> crate::gpu_batch::CachedQuad {
+    (
+        win,
+        place,
+        elem,
+        0,
+        1,
+        None,
+        crate::gpu_batch::Geom::default(),
+        Vec::new(),
+    )
+}
+
+#[test]
+fn submit_order_puts_a_placement_above_earlier_content_and_below_its_own_children() {
+    // 现场 = `--sim-zorder` 的那个：顶部两个散装标签（place 0，elem 1/2）→
+    // 按钮行（place 1）→ **可拖动面板（place 2）**，面板的投影 / 底色是 `elem = 0`、
+    // 面板自己的 label / 输入框是 elem 15/16。
+    let mut v = [
+        cq(0, 2, 15), // 面板自己的内容
+        cq(0, 0, 2),  // 散装标签 2
+        cq(0, 1, 3),  // 按钮行（place 1）
+        cq(0, 2, 0),  // **面板底色 / 投影（elem = 0）**
+        cq(0, 0, 1),  // 散装标签 1
+    ];
+    v.sort_unstable_by_key(crate::gpu_batch::submit_sort_key);
+    let order: Vec<(u32, u32)> = v.iter().map(|q| (q.1, q.2)).collect();
+    assert_eq!(
+        order,
+        vec![(0, 1), (0, 2), (1, 3), (2, 0), (2, 15)],
+        "散装标签(0,1/0,2) → 按钮行(1,3) → **面板底色(2,0)** → 面板内容(2,15)"
+    );
+    // 关键不变量：面板的 elem=0 装饰**必须排在按钮行之后**（否则被按钮穿透），
+    // 且**必须排在自己的内容之前**（否则底色盖住自家文字）。
+    let idx = |pl: u32, el: u32| order.iter().position(|&x| x == (pl, el)).unwrap();
+    assert!(idx(2, 0) > idx(1, 3), "面板底色不得被更早录制的放置穿透");
+    assert!(idx(2, 0) < idx(2, 15), "面板底色仍必须在自家内容之下");
+}
+
+#[test]
+fn submit_order_puts_a_scrollbar_above_its_own_items() {
+    // 现场 = `scroll_at`：列表项（place 1，elem ≥ 1，各自裁剪）与滚动条轨道 / 滑块。
+    // 修法后滚动条用 `elem_hint()`（在内容**之后**录制）⇒ 排在自家内容**之上**。
+    // 修法前滚动条用 `elem = 0` ⇒ 排在 (place 1, elem 0) ⇒ 被列表项盖住（闪烁）。
+    let mut fixed = [
+        cq(0, 1, 0),  // 滚动条轨道（elem_hint 之后 → 实际不会是 0，见下）
+        cq(0, 1, 1),  // 列表项 0
+        cq(0, 1, 2),  // 列表项 1
+    ];
+    // 修复后的键：滚动条 elem 取"内容之后的下一个元素序"（这里以 3 代表）。
+    fixed[0].2 = 3;
+    fixed.sort_unstable_by_key(crate::gpu_batch::submit_sort_key);
+    let order: Vec<u32> = fixed.iter().map(|q| q.2).collect();
+    assert_eq!(order, vec![1, 2, 3], "列表项 → 滚动条（滑块最后画 = 在最上）");
+
+    // 反例（修复前的形态）：滚动条 elem = 0 ⇒ 排到列表项之前（被盖住）。
+    let mut broken = [cq(0, 1, 0), cq(0, 1, 1), cq(0, 1, 2)];
+    broken.sort_unstable_by_key(crate::gpu_batch::submit_sort_key);
+    let broken_order: Vec<u32> = broken.iter().map(|q| q.2).collect();
+    assert_eq!(
+        broken_order,
+        vec![0, 1, 2],
+        "elem=0 的滚动条排在列表项之前 = 被列表项盖住（正是要修掉的现象）"
+    );
+}
+
+#[test]
+fn submit_order_still_keeps_windows_above_non_window_content() {
+    // `win` 仍是第一位：非窗口内容（0）恒在窗口（≥1）之下——本修复不得动摇这条
+    // （窗口 z 序 / 遮挡语义都建立在它上面）。
+    let mut v = [cq(3, 0, 0), cq(0, 9, 0), cq(1, 0, 5), cq(0, 0, 1)];
+    v.sort_unstable_by_key(crate::gpu_batch::submit_sort_key);
+    let order: Vec<(u32, u32, u32)> = v.iter().map(|q| (q.0, q.1, q.2)).collect();
+    assert_eq!(
+        order,
+        vec![(0, 0, 1), (0, 9, 0), (1, 0, 5), (3, 0, 0)],
+        "win 升序优先，place 只在同 win 内比较"
+    );
+}

@@ -195,15 +195,14 @@ pub(crate) struct UiFrameState {
     pub size_chain: Vec<(i32, crate::ui::SizeLink)>,
     /// UI 帧起点（开场时刻；`ui_frame_us` = 收尾 − 起点）。
     pub frame_t0: std::time::Instant,
-    /// win=0 放置子槽组号（跨段**连续**递增：组号即缓存槽 key，各段从 1 重开会互相踩）。
-    pub cur_z0_group: u32,
     /// 各段累加的统计（帧尾写回 `UiState::stats`）。
     pub stats: UiStats,
-    /// **本段段号**（帧内第几段，从 `1` 起；帧首重置）。用于给 win=0 放置子槽编号
-    /// 加**段前缀**——组号本身是"段内第几个顶层放置"，各段都从 0 起（兜底组恒为 0），
-    /// 只用组号做缓存键会让不同段的同号槽互相覆盖（见 `UiState::z0_quads`）。
+    /// **本段段号**（帧内第几段，从 `1` 起；帧首重置）。用于给 win=0 放置槽键
+    /// 加**段前缀**——放置序 `place` 是段内派生的计数（各段都从 0 起、且第 0 个放置
+    /// 恒是"开头的散装顶层命令"），只用 `place` 做缓存键会让不同段的同号槽互相覆盖
+    /// （见 `UiState::z0_quads`）。
     pub segment: u32,
-    /// **本帧已见到的 win=0 槽**（`(段号, 组号)`；各段累加，帧首/帧末用于清陈旧槽）。
+    /// **本帧已见到的 win=0 槽**（`(段号, 放置序)`；各段累加，帧首/帧末用于清陈旧槽）。
     ///
     /// 必须**按帧**汇总：`cache_z0_window` 每段各跑一次，段只见到自己那部分槽——按段清
     /// 会把同帧其它段刚写好的缓存删掉，那些槽于是每帧都 miss、每帧重镶嵌整个 win=0 几何。
@@ -252,7 +251,6 @@ impl Default for UiFrameState {
             pos_chain: vec![(0, crate::ui::PosLink::Drag)],
             size_chain: vec![(0, crate::ui::SizeLink::Drag)],
             frame_t0: std::time::Instant::now(),
-            cur_z0_group: 0,
             stats: UiStats::default(),
             segment: 0,
             z0_seen: Vec::new(),
@@ -283,7 +281,6 @@ impl std::fmt::Debug for UiFrameState {
             .field("focusables", &self.focusables.len())
             .field("pos_chain", &self.pos_chain.len())
             .field("size_chain", &self.size_chain.len())
-            .field("cur_z0_group", &self.cur_z0_group)
             .finish()
     }
 }
@@ -397,17 +394,22 @@ pub struct UiState {
     /// 见 [`crate::ui::geom_cache_sig`](crate::ui) 与 `crate::Ui` 的 `hash_cmds`。
     pub(crate) window_quads:
         HashMap<IdAbsolute<'static>, (u64, Vec<(u32, u8, u64, Option<Rect>, crate::gpu_batch::Geom)>)>,
-    /// **非窗口（win=0）内容的按放置子槽几何缓存**：放置子槽组号 → (内容签名, 局部几何)。
+    /// **非窗口（win=0）内容的按放置几何缓存**：`(段号, 放置序)` → (内容签名, 局部几何)。
     /// 分组与缓存机制同 `window_quads`（**全量签名** → 命中复用 / 未命中重建），但针对
-    /// **顶层非窗口放置**（pack / flex / scroll / list / drag_panel / container 等，
-    /// 分组见 [`crate::ui::Ui::z0_ranges`]）。值/交互变化只重建对应子槽，其余 win=0
+    /// **顶层非窗口放置**（pack / flex / scroll / list / drag_panel / container，以及
+    /// 两段放置之间的散装顶层命令各成一段）。值/交互变化只重建对应放置，其余 win=0
     /// 放置仍命中复用（缓解"任何 win=0 变化 → 整区重建"）。
     ///
-    /// **键 = `(段号, 组号)`**（[`crate::UiState::frame_state`] 的 `segment`）：组号是
-    /// "段内第几个顶层放置"，**各段都从 0 起且兜底组恒为 0** —— 只用组号会让不同段的
-    /// 同号槽互相覆盖：本帧段 1 写入 → 段 2 查同一个键、判 miss、覆盖 → 下帧段 1 再
-    /// 判 miss…… 两个槽**永远命中不了**，每帧各自重镶嵌一遍（实测 7 个 win=0 槽每帧
-    /// 全量重建 ≈ 0.6ms，`cache_miss` 恒等于槽数）。加段前缀后同帧各段互不干扰。
+    /// **键 = `(段号, 放置序)`**（[`crate::UiState::frame_state`] 的 `segment`；
+    /// 放置序见 [`crate::ui::Ui::z0_ranges`]）：放置序是**段内派生的计数**（各段都从 0
+    /// 起），只用它会让不同段的同号槽互相覆盖：本帧段 1 写入 → 段 2 查同一个键、判 miss、
+    /// 覆盖 → 下帧段 1 再判 miss…… 两个槽**永远命中不了**，每帧各自重镶嵌一遍（实测
+    /// 7 个 win=0 槽每帧全量重建 ≈ 0.6ms，`cache_miss` 恒等于槽数）。加段前缀后同帧各段
+    /// 互不干扰。
+    ///
+    /// ⚠ 放置序**逐帧重算**、绝不从缓存里读：放置增删会让后面的 `place` 整体平移，
+    /// 键跟着变 ⇒ 直接判 miss 重建。反过来若把 `place` 当成缓存条目里的陈旧字段，
+    /// 就会出现"命中一个序已过期的条目"⇒ **绘制序错一帧**（闪烁）。
     pub(crate) z0_quads:
         HashMap<(u32, u32), (u64, Vec<(u32, u8, u64, Option<Rect>, crate::gpu_batch::Geom)>)>,
     /// **圆角镶嵌缓存**：单位四分之一圆弧表（一张表服务所有半径）。
@@ -829,19 +831,19 @@ mod tests {
         assert!(state.frame_open(), "原 state 不受克隆影响");
     }
 
-    /// **win=0 放置子槽缓存：按帧清理，且同帧各段的槽都要留下**。
+    /// **win=0 放置缓存：按帧清理，且同帧各段的槽都要留下**。
     ///
     /// 回归防线（实测过的一次真实性能事故）：`cache_z0_window` **每段各跑一次**，一段只
     /// 见到自己录制的槽。若在段收尾按"本段见到的集合"清理：
     /// ① 段 1 的槽被段 2 的清理删掉、段 2 的槽又被下帧段 1 删掉 ⇒ 每个槽永远命中不了、
     ///    每帧重镶嵌整个 win=0 几何（实测 `cache_miss` 恒 = 槽数、`collect` ≈ 0.6ms，
     ///    UI 帧时间翻倍）；
-    /// ② 兜底组 0 在每段都存在，只用组号做键还会让两段的同号槽**互相覆盖**。
+    /// ② 放置序 `place` 在每段都从 0 起，只用它做键还会让两段的同号槽**互相覆盖**。
     /// 故：键带段前缀 + 清理按帧（[`UiState::begin_frame`] 用上一帧的完整集合）。
     #[test]
     fn z0_slots_are_segment_scoped_and_pruned_once_per_frame() {
         let mut st = UiState::new();
-        // 上一帧两个段各自的兜底组（以及一个已经消失的陈旧槽）。
+        // 上一帧两个段各自的第 0 个放置（以及一个已经消失的陈旧槽）。
         st.z0_quads.insert((1, 0), (0x11, Vec::new()));
         st.z0_quads.insert((2, 0), (0x22, Vec::new()));
         st.z0_quads.insert((1, 9), (0x99, Vec::new()));
@@ -854,7 +856,7 @@ mod tests {
             "同帧各段的槽都必须留下——按段清会删掉其中一段 ⇒ 那些槽每帧 miss"
         );
         assert!(!st.z0_quads.contains_key(&(1, 9)), "上一帧未出现的槽被清掉（防跨帧误复用）");
-        // 键带段前缀：两段的同号组是**不同槽**（否则互相覆盖、永远 miss）。
+        // 键带段前缀：两段的同号放置是**不同槽**（否则互相覆盖、永远 miss）。
         assert_ne!((1u32, 0u32), (2u32, 0u32));
     }
 }

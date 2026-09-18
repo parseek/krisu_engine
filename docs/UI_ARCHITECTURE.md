@@ -44,10 +44,12 @@ rjw_krusie::Render2dUiBackend（唯一的桥）→ rjw_2d_render::Render2D → w
 ① 录制    Ui::begin → 控件 push   → DrawQueue.queue: Vec<UiDraw>（384 条）
                                   记录（win, elem, depth, seq, rect, clip, kind）
 ② 分桶    bucket_cmds              → per-win → per-depth 桶（顺序保持 = 免全量排序）
-③ 签名    hash_cmds(全量, anchor)   → 逐窗 / 逐 win=0 子槽内容签名（含图集世代 + 行距/字重）
+③ 派生    z0_place_for_seq          → win=0 的**顶层放置序 place**（排序空间，见 §5.6）
+③′ 签名   hash_cmds(全量, anchor)   → 逐窗 / 逐置放内容签名（含图集世代 + 行距/字重）
 ④ 命中    geom.clone()  ────────► cached: Vec<CachedQuad>      【拷贝 C1】864KB
    未命中  collect_cmds → 镶嵌（圆角/羽化/阴影/字形）→ 写回缓存（只在变化时）
-⑤ 装配    ordered.extend(cached)（move）；sort；segment_runs；跨条 append  【拷贝 C2】≤864KB
+⑤ 装配    ordered.extend(cached)（move）；按 (win, place, elem, g, tex, clip) 排序；
+          segment_runs 切段；跨条 append                          【拷贝 C2】≤864KB
 ⑥ 交后端  flush_seg → UiBackend::submit(UiBatch)               （move，无拷贝）
 ⑦ 桥接    Render2dUiBackend → mesh_indexed → MeshStorage.extend 【拷贝 C3】864KB
 ⑧ 渲染器  Render2D::build → buf_all_verts.extend_from_slice     【拷贝 C4】864KB
@@ -64,6 +66,10 @@ rjw_krusie::Render2dUiBackend（唯一的桥）→ rjw_2d_render::Render2D → w
 ---
 
 ## 3. 成本模型（实测）
+
+> ⚠ **下面的绝对值是"某一次测量"的现场**：同一台机器的整机速度会漂 ±30%
+> （同一份代码不同时段测出的 `finish` 能从 0.50ms 到 0.77ms）。**跨天比较无效**，
+> 任何结论都要**同机交错 A/B**（`ENGINE_GUIDE.md` §18.21 的表就是这么测的）。
 
 稳态（520 帧，后 3 个 120 帧滑窗一致）：
 
@@ -164,6 +170,21 @@ debug_submit / debug_clip / widget_strs` 共 **20 张以 ID 或 z 为键的表**
 `debug_draw::thick_line_quad`。所以**"UI 不依赖渲染器"只在调用方向上成立**，
 在数据格式上是耦合的——这正是 §6 里 L1 方案的门槛所在。
 
+### 5.6 win=0 曾**没有自己的排序空间**（已在阶段 8 修掉，但教训值得留着）
+提交序原为 `(win, elem, group, tex, clip)`，而 `elem = 0` 的语义是"画在**本容器**元素
+之下"——**只有"每个容器一个排序空间"才成立**。窗口天然满足（一扇窗 = 一个 `win` 桶），
+但**所有非窗口内容共享 `win = 0`**：`panel_impl` 的投影/底色与 `scroll_at` 的滚动条
+（全仓仅这两处 win=0 装饰用 `elem = 0`）于是落进**整个 win=0 的最底**，被任何别的
+win=0 内容穿透 ⇒ 用户看到的"可拖动面板闪烁 / ScrollBar 闪烁"。
+
+修法是在 `win` 之后插入**顶层放置序** `place`（`z0_place_for_seq`），排序键变为
+`(win, place, elem, group, tex, clip)`。**这条改造同时是 §6.2 的前提**：只有当"一个放置
+= 一个有序单元"时，合并结果才能作为单元整体缓存。
+
+教训（写进 `DEBUGGING.md` §8.3）：**排序键少一维时，症状是"闪烁"而不是"顺序乱"**，
+而且只有内容在动的地方才看得见——所以先看**引擎自己的提交序**（`RJ_ORDER_TRACE`），
+不要靠截图猜。
+
 ---
 
 ## 6. 决策
@@ -179,29 +200,38 @@ debug_submit / debug_clip / widget_strs` 共 **20 张以 ID 或 z 为键的表**
 
 ### 6.2 采纳：**缓存"提交计划"而不是"几何碎片"**（唯一剩余的结构性收益）
 
-现在的缓存粒度是 `(win, elem, group, tex, clip) → Geom`，于是**每帧都要重新合并一次**：
+> **前置已落地（阶段 8）**：`place`（顶层放置序）作为排序维度。没有它，一个 **win=0
+> 放置** 的几何就无法用**单元级 key** 表达序——`elem` 在 win=0 里跨放置交错，
+> 合并成"计划"之后序就丢了。见 §5.6。
+
+现在的缓存粒度是 `(win, place, elem, group, tex, clip) → Geom`，于是**每帧都要重新合并一次**：
 命中 → 逐条克隆（C1）→ 组装 `ordered` → 排序 → `segment_runs` → 跨条 `append`（C2）→ 再交后端。
 
-但合并结果只取决于**帧内稳定的排序键** `(elem, group, tex, clip)` 与 `MAX_UI_SEG_VERTS`，
-而段永远不跨窗口 ⇒ **合并结果本身可以缓存**：
+但合并结果只取决于**帧内稳定的排序键** `(place, elem, group, tex, clip)` 与 `MAX_UI_SEG_VERTS`，
+而段永远不跨 `(win, place)` ⇒ **合并结果本身可以缓存**：
 
 ```text
-window_quads[id] : (sig, Vec<UiBatchGeom>)
-UiBatchGeom { texture, clip, geom: Geom, elements: Vec<u32> }
+window_quads[id]        : (sig, Vec<BatchPlan>)      // 窗口 = 一个 place
+z0_quads[(segment, place)] : (sig, Vec<BatchPlan>)   // win=0 的一个放置
+BatchPlan { texture, clip, geom: Geom, elements: Vec<u32> }
 ```
 
-命中路径变成：`HashMap::remove(&id)`（**move 一个 Vec 指针，O(1)、零顶点拷贝**）→
-按序 `flush_seg(&entry)` → 再 `insert` 回去。于是：
+命中路径变成：`HashMap::remove(&key)`（**move 一个 Vec 指针，O(1)、零顶点拷贝**）→
+按 `(win, place)` 排一遍**单元**（~15 个）→ 逐个 `flush_seg(&plan)` → 再 `insert` 回去。于是：
 
-- C1（`clone` 169µs）**消失**；
+- C1（`clone` ~140µs）**消失**；
 - C2 的 `append` 与 `ordered`/排序/切段**消失**（只在 miss 时做一次）；
 - `sort`（分桶）与 `sig` 保留（那是索引，不是几何）；
 - 上一轮担心的"零拷贝两阶段读取导致整窗不提交闪烁"**不再适用**：数据是 `remove`
   出来的**所有权值**，z→id 映射只解一次，不存在"按旧 z 读新表"。
 
-预期：`finish 570µs → ≈240µs`，`ui 0.83ms → ≈0.5ms`，**渲染结果逐像素不变**
+代价：`UiBatch` 的顶点/索引必须改**借用**（`&[VertexP3U2C4]` / `&[Tri]`），否则命中路径
+又要在后端边界复制一份；`segs`（批次候选数）会小幅上升，但**真实 draw call 不变**
+（`Render2D` 会把相邻同 `(rstates, texture, transform, scissor)` 的 `Mesh` 合成一个动态段）。
+
+预期：`finish` 砍掉 C1+C2 ≈ **−300µs**，**渲染结果逐像素不变**
 （同一套几何、同一套切段规则、同一套 scissor）。风险集中在缓存生命周期，
-而本项目有 14 个 `--sim-*` + 283 个单测 + `--sim-clip` 的移动窗口断言可以钉住它。
+而本项目有 16 个 `--sim-*` + 291 个单测 + `--sim-clip` / `--sim-zorder` 可以钉住它。
 
 ### 6.3 记账不实施：**SDF / 实例化圆角**（L1）
 

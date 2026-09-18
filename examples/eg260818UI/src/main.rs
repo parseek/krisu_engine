@@ -58,6 +58,15 @@ use overlap::OverlapDemo;
 /// —— 挪栏不用改脚本（写死像素的脚本一挪就点空）。
 const MENUBAR_POS: Vec2 = Vec2::new(90.0, 12.0);
 
+/// **「玩家名」可拖动面板的初始位置**（逻辑像素，左上角）：录制与 `--sim-zorder`
+/// 的坐标解算共用同一常量（同理：脚本不写死像素）。
+const NAME_PANEL_POS: Vec2 = Vec2::new(430.0, 12.0);
+
+/// `--sim-zorder` 把 `name_panel` 拖到的**目标左上角**（物理像素）：压在顶部
+/// "FPS / 点击次数"两个标签上——那正是"面板底色被更早录制的 win=0 内容穿透"的现场。
+/// 值按**物理像素**给（注入与面板命中都在物理空间），脚本不做二次 DPI 换算。
+const ZORDER_PANEL_DST: Vec2 = Vec2::new(30.0, 18.0);
+
 /// **统一后的「按钮下拉菜单」演示位置**（逻辑像素，左上角；与菜单栏同一行、在其右侧）：
 /// 录制与 `--sim-dropdown` 的坐标解算**共用同一常量**（同理：脚本不写死像素）。
 const DROPDOWN_OPT_POS: Vec2 = Vec2::new(660.0, 12.0);
@@ -185,7 +194,7 @@ impl TopBar {
             });
         });
         // 玩家名可拖动面板（右移：上面那行按钮随字体名变长，别压到它）。
-        ui.drag_panel_at("name_panel", Vec2::new(430.0, 12.0), |p| {
+        ui.drag_panel_at("name_panel", NAME_PANEL_POS, |p| {
             p.label("玩家名（可拖动）");
             p.text_input("name", &mut self.player_name);
         });
@@ -1157,6 +1166,22 @@ struct UiApp {
     sim_clip: bool,
     /// --sim-clip：第 30 帧记录的严格窗口原点（第 90 帧比较"确实被拖动了"）。
     clip_probe: Option<Vec2>,
+    /// --sim-zorder：**脚本化验证 win=0 的绘制序**（不是命中序）。
+    ///
+    /// 两段：
+    /// 1. 把 `name_panel` 拖到顶部 FPS / 点击次数标签**上面**（按下点在面板**内边距**里，
+    ///    避开内部 label / 输入框 ⇒ 不会被 `press_claimed` 撤销拖拽基准）。拖动本身与
+    ///    绘制序无关，只是把"重叠现场"摆出来；
+    /// 2. 点 `list_demo` 的滚动条条带**翻页**，再点列表里的同一屏幕点 ⇒ 选中项号必须变大
+    ///    （证明滚动条命中通路真的被脚本摸到了，现场画面确实含"滑块 + 列表项"重叠）。
+    ///
+    /// 绘制序本身由 `RJ_ORDER_TRACE=1` 的 `order[...]` 行核对（引擎侧证据，
+    /// 应用侧读不到"谁画在谁上面"）。
+    sim_zorder: bool,
+    /// --sim-zorder：第 100 帧读到的 `name_panel` 位置（判定"真的拖动了"）。
+    zorder_panel: Option<Vec2>,
+    /// --sim-zorder：翻页**之前**点列表得到的选中项号（判定"同一屏幕点选了更后面的条目"）。
+    zorder_sel_before: Option<u32>,
     /// --sim-shadow：第 20 帧的主题投影色（第 40 帧对比用）。
     shadow_probe: Option<Color>,
     /// --sim-tuner：脚本化鼠标的两个目标点（**录制时运行时解算**）：
@@ -1520,6 +1545,9 @@ impl UiApp {
             font_file: None,
             theme_file: None,
             sim_theme: None,
+            sim_zorder: false,
+            zorder_panel: None,
+            zorder_sel_before: None,
             perf: PerfAgg::new(),
             top: TopBar::new(),
             menu: Menu::new(),
@@ -1999,6 +2027,50 @@ impl App for UiApp {
                     let dx = (n - 20) as f32 * 6.0;
                     f.debug_inject_mouse(Vec2::new(start.x + dx, start.y + dx * 0.5), true)
                 }
+                _ => {}
+            }
+        }
+
+        // ── 调试：脚本化鼠标（`--sim-zorder`）─────────────────────
+        // 摆出两个"必须靠绘制序判断"的重叠现场（**不看命中**：命中由 `hit_regions` 管，
+        // 与画在谁上面无关）：
+        //   ① 把 `name_panel` 拖到顶部「FPS / 点击次数」标签上（面板底色原本被更早录制的
+        //      win=0 内容穿透 ⇒ 标签从面板里透出来）；
+        //   ② 点 `list_demo` 的滚动条**条带**翻页（滑块原本画在列表项之下 ⇒ 只在条目
+        //      间隙里闪），再点同一屏幕点 ⇒ 选中项号必须变大。
+        // 按下点取在面板**内边距**里（`pad * 0.5`，避开内部 label / 输入框），否则输入框会
+        // `press_claimed` 撤销拖拽基准 ⇒ 拖不动（见 `panel_impl` 的按下裁决）。
+        if self.sim_zorder {
+            let n = f.frames();
+            // 面板原点（物理）+ 内边距的一半：内边距 = (panel.padding + border_w) × scale。
+            // `Theme` 在 `Ui` 内才按 DPI 预乘 ⇒ 这里手动乘 `scale`（同 `--sim-chrome`）。
+            let th = self.theme_tuner.theme(self.top.font_name(), self.top.font_weight());
+            let pad = (th.panel.padding + th.panel.border_w) * scale;
+            let from = NAME_PANEL_POS * scale + Vec2::splat(pad * 0.5);
+            let to = ZORDER_PANEL_DST + Vec2::splat(pad * 0.5);
+            // 列表滚动条**条带**中心（物理）：可视区 = (880,130) 逻辑 + 240×300 逻辑；
+            // 条带 = 右缘 SCROLLBAR_W(14) 物理像素。取 y 在 win_b 下缘之下（不被窗口遮挡）。
+            let strip = Vec2::new((880.0 + 240.0) * scale - 7.0, 620.0);
+            // 列表里的一个固定屏幕点（同一物理点，翻页前后各点一次）。
+            let row = Vec2::new(890.0 * scale, 600.0);
+            match n {
+                // ① 拖动玩家名面板（按下帧先无条件建立基准，位移 ≥ 3px 才激活）。
+                20 => f.debug_inject_mouse(from, true),
+                21..=70 => {
+                    let k = (n - 20) as f32 / 50.0;
+                    f.debug_inject_mouse(from + (to - from) * k, true)
+                }
+                71..=120 => f.debug_inject_mouse(to, true),
+                121 => f.debug_inject_mouse(to, false),
+                // ② 翻页前先点一次列表里的固定点（作为"翻页后必须更大"的基线）。
+                126 => f.debug_inject_mouse(row, true),
+                127 => f.debug_inject_mouse(row, false),
+                // ③ 点条带（滑块在下 ⇒ 走翻页路径），内容下移一格可视区。
+                134 => f.debug_inject_mouse(strip, true),
+                135 => f.debug_inject_mouse(strip, false),
+                // ④ 再点**同一个屏幕点**：内容已滚过 ⇒ 命中的条目号必须更大。
+                142 => f.debug_inject_mouse(row, true),
+                143 => f.debug_inject_mouse(row, false),
                 _ => {}
             }
         }
@@ -2513,6 +2585,13 @@ impl App for UiApp {
                         "[FAIL] 裁剪没进 scissor / 矩形不对 / 拖动时 scissor 没跟着走"
                     }
                 );
+            }
+            // `--sim-zorder`：记下 `name_panel` **实际结算位置**（判定"脚本真的拖动了
+            // 面板"——否则这条现场是空跑的，同 `--sim-clip` 拖动段的教训）。
+            // **绘制序本身应用侧读不到**：谁画在谁上面只能靠 `RJ_ORDER_TRACE=1`
+            // 的 `order[...]` 行核对（引擎侧证据）。
+            if self.sim_zorder && sim_frame == 100 {
+                self.zorder_panel = ui.state().panel_pos.get("name_panel").copied();
             }
             // 段收尾：提交本段到 UI 层自己的 `Render2D`；`f` 的借用到此结束。
             ui.finish();
@@ -3246,6 +3325,29 @@ impl App for UiApp {
         if self.sim_picker && f.frames() == 90 {
             eprintln!("sim-picker: demo_color = {:?}", self.top.demo_color);
         }
+        // --sim-zorder：先记"翻页前同一屏幕点选中的条目号"（翻页后必须更大）。
+        if self.sim_zorder && f.frames() == 132 {
+            self.zorder_sel_before = self.right.list_sel;
+        }
+        // --sim-zorder 判定：两段现场都必须**真的发生**，否则 `RJ_ORDER_TRACE` 的那几行
+        // `order[...]` 只是纸上谈兵（同 `--sim-clip` 的教训：断言空跑比没有断言更糟）。
+        if self.sim_zorder && f.frames() == 150 {
+            let moved = self
+                .zorder_panel
+                .is_some_and(|p| (p - ZORDER_PANEL_DST).length() <= 4.0);
+            let before = self.zorder_sel_before;
+            let after = self.right.list_sel;
+            let scrolled = before.zip(after).is_some_and(|(b, a)| a > b);
+            eprintln!(
+                "sim-zorder: 面板拖动后={:?}（目标={ZORDER_PANEL_DST:?}）列表选中 {before:?} → {after:?} {}",
+                self.zorder_panel,
+                if moved && scrolled {
+                    "[OK] 面板压到标签上 + 滚动条翻页后同一屏幕点选到更后面的条目"
+                } else {
+                    "[FAIL] 面板没拖到位 / 滚动条翻页没生效（脚本坐标打空）"
+                }
+            );
+        }
         // --sim-click：打印"这一像素的归属"证据（点中了几个控件 + 谁被遮挡拦下）。
         // 背包格子（`inventory`）相邻格的**共享边**是最典型的用例：修复前点在边上会
         // **两个格子一起切换**，修复后只有画在后面的那个生效。
@@ -3407,6 +3509,7 @@ fn main() -> Result<(), RunError> {
     app.sim_weight = args.iter().any(|a| a == "--sim-weight");
     app.sim_shadow = args.iter().any(|a| a == "--sim-shadow");
     app.sim_clip = args.iter().any(|a| a == "--sim-clip");
+    app.sim_zorder = args.iter().any(|a| a == "--sim-zorder");
     app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
     app.sim_import = parse_str_arg(&args, "--sim-import");
     app.theme_file = parse_str_arg(&args, "--theme");

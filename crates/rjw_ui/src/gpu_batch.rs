@@ -75,24 +75,41 @@ impl Geom {
 
 // ─── 可提交顶点段 ─────────────────────────────────────────────
 
-/// 按 `(窗口 z, 元素序, 图形/文字组, 纹理 uid)` 分组的四边形顶点段的来源。
+/// 按 `(窗口 z, 放置序, 元素序, 图形/文字组, 纹理 uid, 裁剪)` 分组的四边形顶点段的来源。
 ///
-/// **控件级提交顺序**：`(win, elem, g, tex)`——同窗内按**元素序**（后录控件覆盖
-/// 先录控件），元素内"背景/图形 → 文字"（`g`）。与队列排序键一致；白纹理与字形
-/// 同页时，控件背景+文字相邻同纹理 → 后端合批（单窗口一次 DrawCall）。
+/// **提交顺序**：`(win, place, elem, g, tex, clip)`——
+/// 1. `win` 升序：非窗口（0）最底，窗口按 z 从下到上；
+/// 2. `place`（**顶层放置序**）升序：win=0 内"后录制者在上"（见 [`crate::Ui`] 的
+///    `z0_ranges`）；窗口内恒为同一个 `place`，不影响窗口序；
+/// 3. `elem`（元素序）升序：同放置内后录控件覆盖先录控件，`elem = 0` 的容器装饰最先；
+/// 4. `g`：元素内"背景/图形 → 文字"；`tex`：白纹理与字形同页时相邻合批；
+/// 5. `clip`：不同 scissor 不能同批（一次 draw 只能一个 scissor）。
 ///
-/// 一条**可提交的几何段**：`(窗口 win, 元素序 elem, 图形/文字组 g, 纹理 uid, 几何)`。
-/// 由窗口 / win=0 子槽的**顶点缓存命中**或**本帧重建**产生；提交时按 `(win, elem, g, tex)`
-/// 排序后合批。`win` 决定窗口原点（局部顶点 → 世界变换）与 layer。
+/// 一条**可提交的几何段**：`(win, place, elem, g, tex, clip, geom, 元素序列表)`。
+/// 由窗口 / win=0 放置的**顶点缓存命中**或**本帧重建**产生。`win` 决定窗口原点
+/// （局部顶点 → 世界变换）与 layer。
 ///
 /// 末位是**本片段覆盖的元素序列表**（[`crate::UiBatchSource::elements`] 的来源；
 /// 缓存命中路径在采集期已统计）。
-/// **可提交的几何段**：`(win, elem, group, tex, clip, geom, 元素序列表)`。
 ///
 /// `clip` = 本段的环境裁剪层（绝对逻辑坐标；`None` = 不裁剪）——提交时按它算
 /// [`crate::UiBatch::clip`]（batch scissor），几何本身**不再被切割**。
-pub(crate) type CachedQuad = (u32, u32, u8, u64, Option<Rect>, Geom, Vec<u32>);
+pub(crate) type CachedQuad = (u32, u32, u32, u8, u64, Option<Rect>, Geom, Vec<u32>);
 
+
+/// **提交排序键**（纯函数）：`(win, place, elem, group, tex, clip)`。
+///
+/// 抽出来是为了让"谁画在谁上面"这条规则能在**没有 `Ui` / 没有 GPU** 的情况下断言
+/// （见 `gpu_batch::batch_contract_tests`）：`place` 在任何 `elem` 之前比较，
+/// 才使"每个顶层放置一个排序空间"成立——没有它，一个放置的 `elem = 0` 装饰会被
+/// **更早录制**的另一个放置的内容穿透（实测：可拖动面板底色被 FPS 标签穿透、
+/// `scroll_at` 的滚动条被列表项盖住，两者都表现为闪烁）。
+///
+/// `clip` 用量化整数键比较（[`ClipKey`]；`Rect` 是 `f32`，不能直接做 `Ord` 键）。
+#[inline]
+pub(crate) fn submit_sort_key(q: &CachedQuad) -> (u32, u32, u32, u8, u64, Option<ClipKey>) {
+    (q.0, q.1, q.2, q.3, q.4, clip_key(q.5))
+}
 
 /// 一个合批段（= 一个 [`crate::UiBatch`] = 一次 draw call 的候选）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -203,13 +220,18 @@ pub(crate) struct CacheStats {
 
 // ─── 四边形收集器 ─────────────────────────────────────────────
 
-/// **四边形分组键**：`(win, elem, group, tex, clip)`。
+/// **四边形分组键**：`(win, place, elem, group, tex, clip)`。
 ///
+/// `place` = 顶层放置序（见 [`crate::Ui::z0_ranges`](crate::ui::Ui)）：win=0 的排序空间。
 /// 末位是**环境裁剪层**（绝对逻辑坐标的量化键，见 [`ClipKey`]）——裁剪不同的几何
 /// **不能合进同一段**（一次 draw 只能一个 scissor，见 [`crate::UiBatch::clip`]）。
-pub(crate) type QuadKey = (u32, u32, u8, u64, Option<ClipKey>);
+pub(crate) type QuadKey = (u32, u32, u32, u8, u64, Option<ClipKey>);
 
-/// 按 `(win, elem, group, tex, clip)` 分组的几何收集器（`finish` 提交用）。
+/// 按 `(win, place, elem, group, tex, clip)` 分组的几何收集器（`finish` 提交用）。
+///
+/// ⚠ `place`（顶层放置序）在**键的第 2 位**：win=0 里所有非窗口内容共享 `win = 0`，
+/// 没有它就没有独立排序空间，`elem = 0` 的装饰（面板底色 / 滚动条）会被**别的**
+/// win=0 放置的内容穿透（历史 bug，见 [`crate::Ui::z0_ranges`](crate::ui::Ui)）。
 ///
 /// `debug` 是**屏幕调试叠加**（DebugDraw 图元 + debug_layout 布局描边）——
 /// 按 `win` 分组、恒用白纹理，在全部 UI 内容**之后**提交。
@@ -221,10 +243,12 @@ pub(crate) struct QuadCollector {
     /// WHITE 纹理区域 UV（字形图集页白纹理 region；兜底为整纹理 [0,1)）。
     white_uv_tl: Vec2,
     white_uv_wh: Vec2,
+    /// **当前放置序**（`collect_cmds` 每处理一个命令设置；`win > 0` 恒 0）。
+    pub(crate) cur_place: u32,
     /// **当前元素序**（`collect_cmds` 每处理一个命令设置；push 方法按其分组）。
     pub(crate) cur_elem: u32,
     /// **当前环境裁剪层**（绝对逻辑坐标；`collect_cmds` 每处理一个命令设置）——
-    /// 与 `cur_elem` 一起进入分组键。
+    /// 与 `cur_place` / `cur_elem` 一起进入分组键。
     pub(crate) cur_clip: Option<Rect>,
     /// **每条几何所属的元素序**（键与 `quads` 同构，供提交期统计
     /// 「一个批次覆盖了多少个元素」——即 [`crate::UiBatchSource::elements`]）。
@@ -239,21 +263,22 @@ impl QuadCollector {
             white_uid,
             white_uv_tl,
             white_uv_wh,
+            cur_place: 0,
             cur_elem: 0,
             cur_clip: None,
             elems: std::collections::HashMap::new(),
         }
     }
 
-    /// **本帧当前分组键**（`win` + 当前元素序 + 组 + 纹理 + 当前裁剪层）。
+    /// **本帧当前分组键**（`win` + 当前放置序 + 当前元素序 + 组 + 纹理 + 当前裁剪层）。
     #[inline]
     pub(crate) fn key(&self, win: u32, group: u8, tex: u64) -> QuadKey {
-        (win, self.cur_elem, group, tex, clip_key(self.cur_clip))
+        (win, self.cur_place, self.cur_elem, group, tex, clip_key(self.cur_clip))
     }
 
     /// 取（或建）某分组键的几何段，并登记本段所属的元素序。
     fn geom(&mut self, key: QuadKey) -> &mut Geom {
-        let elem = key.1;
+        let elem = key.2;
         self.elems.entry(key).or_default().push(elem);
         self.quads.entry(key).or_default()
     }

@@ -280,7 +280,6 @@ impl<'a> UiInit<'a> {
             cur_win_id: None,
             win_hit_bounds: None,
             z0_ranges: Vec::new(),
-            cur_z0_group: 0,
             segment,
             // 鼠标屏幕坐标：物理（拖拽 / IME 基准与命中测试统一物理像素，无逻辑之分）
             mouse_screen,
@@ -453,16 +452,27 @@ pub struct Ui<'a> {
     /// 记录子控件命中区（而不是所有绘制命令）是**有意为之**：装饰（阴影 / 描边）
     /// 不该扩大交互范围。窗口进入时保存、退出时恢复（浮层是嵌套窗口）。
     win_hit_bounds: Option<Rect>,
-    /// **本帧 win=0（非窗口）放置子槽分组**：`(组号, 起始seq, 结束seq)`。
-    /// 由顶层放置入口在 `depth == 0` 时记录（[`Self::begin_top_placement`]）；
-    /// `finish` 按 `seq` 把 win=0 命令归入对应子槽，逐槽做**全量签名**顶点缓存，
-    /// 使值/交互变化只重建对应放置，其余 win=0 内容复用。未分组的独立顶层命令 → 组 0。
+    /// **本帧 win=0（非窗口）各顶层放置的起始 `seq`**（按录制序）。由顶层放置入口在
+    /// `depth == 0` 时记录（[`Self::begin_top_placement`]）。
     ///
-    /// ⚠ `z0_ranges` 是**段内**的（`Ui` 视图每段新建）：组号因此只在段内唯一——
+    /// 这份表同时供**两个**用途，二者都必须有它：
+    ///
+    /// 1. **绘制序**（[`Self::z0_place_for_seq`]）：给每条 win=0 命令一个"放置序"
+    ///    `place`，提交排序键是 `(win, place, elem, group, tex, clip)`。
+    ///    ⚠ **没有它 win=0 就没有独立排序空间**：所有非窗口内容共享 `win = 0`，
+    ///    而 `elem = 0` 的语义是"画在本容器元素之下"——只有"每个放置一个排序空间"
+    ///    才成立。历史 bug 就是踩了这条：可拖动面板的底色（`elem = 0`）被**更早录制**的
+    ///    win=0 内容（FPS 标签）穿透、`scroll_at` 的滚动条（`elem = 0`）被列表项盖住，
+    ///    两者都表现为**闪烁**；
+    /// 2. **缓存槽键**：`finish` 按 `place` 把 win=0 命令归槽，逐槽做**全量签名**顶点
+    ///    缓存，使值/交互变化只重建对应放置，其余 win=0 内容复用。
+    ///
+    /// ⚠ `z0_ranges` 是**段内**的（`Ui` 视图每段新建）：`place` 只在段内唯一——
     /// 缓存键必须带上 [`Self::segment`]（见 `UiState::z0_quads`）。
-    z0_ranges: Vec<(u32, u32, u32)>,
-    /// 下一个 win=0 放置子槽组号（每段从 1 递增；0 = 未分组 / 独立顶层内容）。
-    cur_z0_group: u32,
+    ///
+    /// 不需要"结束 `seq`"：放置之间不可能嵌套（本入口只在 `depth == 0` 记录，
+    /// 嵌套调用什么也不做），所以"下一条命令属于哪个放置"只由 `start` 决定。
+    z0_ranges: Vec<u32>,
     /// **本段段号**（帧内第几段，从 1 起）——win=0 放置子槽缓存键的段前缀。
     segment: u32,
     /// 鼠标屏幕坐标（**物理像素**；命中测试用——内部坐标全物理）。
@@ -563,7 +573,6 @@ impl<'a> Ui<'a> {
         self.cursor_window_drag = fs.cursor_window_drag;
         self.cursor_custom = fs.cursor_custom;
         self.frame_t0 = fs.frame_t0;
-        self.cur_z0_group = fs.cur_z0_group;
         self.segment = fs.segment;
         // 集合 / `Option` 用 take（`save_frame_state` 会原样换回去）：段与帧之间**搬移**
         // 而不是克隆——窗口原点表 / 焦点链在大 UI 下可不小。
@@ -590,7 +599,6 @@ impl<'a> Ui<'a> {
         fs.cursor_grabbing = self.cursor_grabbing;
         fs.cursor_window_drag = self.cursor_window_drag;
         fs.cursor_custom = self.cursor_custom;
-        fs.cur_z0_group = fs.cur_z0_group.max(self.cur_z0_group);
         fs.drag_panel = self.drag_panel.take();
         fs.win_press_top = self.win_press_top.take();
         std::mem::swap(&mut fs.win_origins, &mut self.win_origins);
@@ -605,41 +613,53 @@ impl<'a> Ui<'a> {
         self.painter.next_seq()
     }
 
-    /// **顶层放置分组入口**：`depth == 0` 时开一个新 win=0 放置子槽并记录起始 `seq`；
-    /// 嵌套（`depth > 0`，即当前放置的子容器）返回 `None`（并入外层放置组）。
+    /// **顶层放置分组入口**：`depth == 0` 时开一个新 win=0 放置（记录它**第一条命令的
+    /// `seq`**）；嵌套（`depth > 0`，即当前放置的子容器）不记录（并入外层放置）。
     ///
-    /// 返回值须与 [`Self::end_top_placement`] 配对。仅影响**缓存分组**，不影响绘制
-    /// 内容 / 顺序；未调用的放置（独立顶层 `label_at` 等）落入兜底组 0（全量签名缓存）。
+    /// ⚠ **记的是 `seq + 1`（下一条命令的序号），不是当前 `seq`**：`begin_top_placement`
+    /// 在容器入口调用，此时队列里最后一条命令属于**上一个**放置（例如 `scroll_at` 的滚动条
+    /// 由 `next_seq()` 取号，紧挨着后面的容器的起点）。若记当前的 `seq`，那条命令会被算进
+    /// **新**放置（`place(seq) = #{start ≤ seq}` 会用 `≤` 命中），同一个容器的命令被拆进
+    /// 两个排序空间 ⇒ 序不稳、又变成闪烁。记 `seq + 1` 后语义是"本放置第一条命令的序号"。
+    ///
+    /// 记录的东西只有一个用途：给每条 win=0 命令算出它的**放置序**
+    /// （[`Self::z0_place_for_seq`]），进而决定绘制序与缓存槽键
+    /// （见 [`Self::z0_ranges`]）。不记录也不会漏——未调用的放置（独立顶层
+    /// `label_at` 等）落在"上一个放置"里，见 [`Self::z0_place_for_seq`]。
     #[inline]
-    fn begin_top_placement(&mut self) -> Option<u32> {
+    fn begin_top_placement(&mut self) {
         if self.painter.q.depth == 0 {
-            self.cur_z0_group += 1;
-            let g = self.cur_z0_group;
-            self.z0_ranges.push((g, self.painter.q.seq, 0));
-            Some(g)
-        } else {
-            None
+            // 不变量：队列播放头 = 已分配的最大序号。少数"直接写队列"的入口若一条命令
+            // 之后没再取号（历史 bug：滚动条两条命令共用一次 `next_seq()`），下一条命令会
+            // 拿到**重复序号** ⇒ 以 `seq` 归一化的放置序会把同一容器拆成两个排序空间。
+            // 这里把它变成显式失败，而不是"序偶尔错一帧"。
+            debug_assert!(
+                self.painter.q
+                    .queue
+                    .last()
+                    .is_none_or(|d| d.seq <= self.painter.q.seq),
+                "seq 播放头落后于已入队命令（直接写队列的入口必须每条命令各取一次 next_seq）"
+            );
+            self.z0_ranges.push(self.painter.q.seq + 1);
         }
     }
 
-    /// 与 [`Self::begin_top_placement`] 配对：记录该放置子槽的结束 `seq`（须在该放置
-    /// **全部命令录制之后**调用，如滚动容器的滚动条）。
+    /// **放置序**（`place`）：到 `seq` 这条命令为止**已经开始了几个顶层放置**。
+    ///
+    /// 这是 win=0 的**唯一**排序维度（见 [`Self::z0_ranges`] 为什么必须有它）：
+    ///
+    /// - 同一放置内的全部命令（含**最后录制**的投影 / 底色、以及 `scroll_at` 的滚动条）
+    ///   得到同一个 `place` ⇒ 放置内仍由 `elem` 排序 ⇒ `elem = 0` 的装饰正好排到
+    ///   "本放置自己的子内容之下"（这才是 `elem = 0` 的本意）；
+    /// - 相邻放置由 `place` 分开 ⇒ **后录制者在上**（与窗口的 z 序同构）；
+    /// - **散装顶层命令**（未开放置的 `label_at` / `add_at`）按计数落进"上一个放置"
+    ///   的 `place`：它录制更晚 ⇒ `elem` 更大 ⇒ 画在那个放置之上（正确）。
+    ///
+    /// `z0_ranges` 按录制序压栈 ⇒ `start` 单调 ⇒ 数一下即可（且可提前 `break`）。
+    /// 判定逻辑抽成自由函数 [`z0_place_for_seq`]，使语义能在**没有 `Ui` 实例**时单测。
     #[inline]
-    fn end_top_placement(&mut self, g: Option<u32>) {
-        if let Some(g) = g
-            && let Some(r) = self.z0_ranges.iter_mut().rev().find(|r| r.0 == g) {
-                r.2 = self.painter.q.seq;
-            }
-    }
-
-    /// 把一条 win=0 命令按其 `seq` 归入放置子槽组号；不在任何放置区间 → 兜底组 `0`。
-    fn z0_group_for_seq(&self, seq: u32) -> u32 {
-        for &(g, start, end) in &self.z0_ranges {
-            if seq >= start && (end == 0 || seq <= end) {
-                return g;
-            }
-        }
-        0
+    fn z0_place_for_seq(&self, seq: u32) -> u32 {
+        z0_place_for_seq(&self.z0_ranges, seq)
     }
 
     // ── 控件作者公开 API（跨 crate 自定义控件用） ─────────────
@@ -2099,7 +2119,7 @@ impl<'a> Ui<'a> {
         F: FnOnce(&mut ContainerCtx<'_, '_>),
     {
         let start = self.painter.q.queue.len();
-        let g = self.begin_top_placement();
+        self.begin_top_placement();
         let saved_base = self.abs_base;
         self.abs_base = saved_base + pos;
         self.frames.push(frame);
@@ -2122,7 +2142,6 @@ impl<'a> Ui<'a> {
                 parent.note_content(Rect::new(ib.x + pos.x, ib.y + pos.y, ib.w, ib.h));
             }
         }
-        self.end_top_placement(g);
         (size, max_child)
     }
 
@@ -2160,7 +2179,7 @@ impl<'a> Ui<'a> {
         // 可用宽度栈：沙箱内 avail_w() = 沙箱宽。
         self.avail_stack.push(Some(view_rel.w));
         let start = self.painter.q.queue.len();
-        let g = self.begin_top_placement();
+        self.begin_top_placement();
         self.abs_base = saved_base + pos;
         self.frames.push(Frame::new_stack(PackSide::Top, self.theme.gap, 0.0));
         self.painter.q.depth += 1;
@@ -2174,7 +2193,6 @@ impl<'a> Ui<'a> {
         for d in &mut self.painter.q.queue[start..] {
             d.translate(pos);
         }
-        self.end_top_placement(g);
         content
     }
 
@@ -2260,7 +2278,7 @@ impl<'a> Ui<'a> {
         self.avail_stack.push(Some(view_rel.w));
         // 内容 pack 堆叠（手动管理帧栈：平移 = pos - offset_px/scale，而非 container 的 pos）。
         let start = self.painter.q.queue.len();
-        let g = self.begin_top_placement();
+        self.begin_top_placement();
         // abs_base = 内容**渲染**原点（已含 -offset 滚动偏移）——`hit_abs`（点击
         // 命中）/ `register_focus`（焦点描边）/ IME 光标定位都经 abs_base 换算，
         // 必须与平移后的绘制位置一致，否则点击位置跟不上滚动视图（offset ≠ 0 时
@@ -2296,6 +2314,14 @@ impl<'a> Ui<'a> {
         // 滚动条（内容超出可视区时显示；拖 thumb / 点轨道翻页）——在**当前容器局部
         // 坐标**绘制，**不参与**上面的内容平移；随外层容器弹出统一平移成绝对坐标。
         if content_size.y > view_size.y + 1.0 && view_size.y > 0.0 {
+            // `elem` = **本放置的下一个元素序**（`elem_hint()`）：滚动条在**内容之后**录制，
+            // 于是它排在本容器子内容**之上**——与 `scrollbar` 的文档 / 它注册的控件级遮挡
+            // （"点滚动条不该连带触发被压住的列表项"）一致。
+            //
+            // ⚠ 这里**曾经传 `0`**（当成"容器装饰"）。但 `elem = 0` 的语义是"画在本容器
+            // 元素**之下**"，于是列表项（`elem ≥ 1`）把滑块整块盖住 —— 用户报的
+            // "ScrollBar 闪烁"（滑块只在条目间隙里露一条，滚动时忽隐忽现）。
+            // 容器**底色 / 投影**用 `elem = 0` 是对的（它们确实该在最底），滚动条不是。
             offset_px = self.scrollbar(
                 &abs,
                 &view_rel,
@@ -2304,7 +2330,7 @@ impl<'a> Ui<'a> {
                 offset_px,
                 max_off_px,
                 saved_clip,
-                0,
+                self.painter.q.seq + 1,
             );
         }
         // 写回滚动状态（`f` 借用已结束；offset 为物理像素）。
@@ -2312,7 +2338,6 @@ impl<'a> Ui<'a> {
         st.offset = offset_px;
         st.content_h = content_size.y;
         self.painter.q.clip = saved_clip;
-        self.end_top_placement(g);
         view_size
     }
 
@@ -2358,8 +2383,9 @@ impl<'a> Ui<'a> {
     /// abs_base`），遮挡判定仍用绝对鼠标。滑块几何在物理像素里取整（
     /// [`scroll_thumb`]），拖拽按 **整物理像素 1:1** 步进——内容与滑块刚性移动
     /// （非整数 DPI 不抖）。
-    /// `elem`：所属元素序（`scroll_at` 传 `0` 装饰层；文本编辑框传 `seq+1` 使
-    /// 滚动条覆盖在文本之上）。
+    /// `elem`：所属元素序（`scroll_at` 传 `elem_hint()` ⇒ 覆盖在本容器内容之上；
+    /// 文本编辑框传自己的 `elem`，同样在文本之上——**不要传 `0`**：那是"画在内容之下"，
+    /// 会被自家内容盖住，见 `scroll_at` 里的说明）。
     #[allow(clippy::too_many_arguments)]
     fn scrollbar(
         &mut self,
@@ -2435,7 +2461,15 @@ impl<'a> Ui<'a> {
             (dragging, ws.press_panel.unwrap_or(Vec2::ZERO))
         };
         // 绘制：轨道 + 滑块（白纹理图形，`elem` 所属元素）。胶囊 = 半径取半宽。
-        let seq = self.next_seq();
+        //
+        // ⚠ **每条命令各取一次 `next_seq()`**：这里是少数"直接写队列"的入口之一，
+        // 队列播放头 `DrawQueue::seq` 必须恒等于已分配的最大序号——否则下一条命令会
+        // 拿到**重复序号**，而"放置序"（`z0_place_for_seq`）是按 `seq` 归一化的
+        // ⇒ 重复序号跨越放置边界时会把同一容器的命令拆进两个排序空间（实测：滚动条的
+        // 轨道与滑块被拆成 place=1 / place=2，滑块被列表项盖住 = 又变成闪烁）。
+        // （旧写法 `let seq = next_seq(); push(seq); push(seq + 1)` 就是这样漏掉一次的。）
+        let track_seq = self.next_seq();
+        let thumb_seq = self.next_seq();
         let radius = CornerRadius::all(SCROLLBAR_BAR_W * 0.5);
         let pal = self.theme.palette;
         let thumb_col = if bar_hit || grab.0 {
@@ -2445,7 +2479,7 @@ impl<'a> Ui<'a> {
         };
         self.painter.q.queue.push(UiDraw {
             depth,
-            seq,
+            seq: track_seq,
             win,
             elem,
             rect: track,
@@ -2467,7 +2501,7 @@ impl<'a> Ui<'a> {
         });
         self.painter.q.queue.push(UiDraw {
             depth,
-            seq: seq + 1,
+            seq: thumb_seq,
             win,
             elem,
             rect: thumb,
@@ -2686,7 +2720,7 @@ impl<'a> Ui<'a> {
             None => pos,
         };
         let start = self.painter.q.queue.len();
-        let g = self.begin_top_placement();
+        self.begin_top_placement();
         let style = style
             .cloned()
             .unwrap_or_else(|| self.theme.panel.clone());
@@ -2772,7 +2806,6 @@ impl<'a> Ui<'a> {
         for d in &mut self.painter.q.queue[start..] {
             d.translate(display_pos);
         }
-        self.end_top_placement(g);
         size
     }
 
@@ -3410,7 +3443,7 @@ impl<'a> Ui<'a> {
         let total_h = total_h.into().to_physical(self.scale);
         let gap = self.theme.gap;
         let start = self.painter.q.queue.len();
-        let g = self.begin_top_placement();
+        self.begin_top_placement();
         let saved_base = self.abs_base;
         self.abs_base = saved_base + pos;
         let mut frame = Frame::new_stack(PackSide::Top, gap, 0.0);
@@ -3442,7 +3475,6 @@ impl<'a> Ui<'a> {
                 parent.note_content(Rect::new(ib.x + pos.x, ib.y + pos.y, ib.w, ib.h));
             }
         }
-        self.end_top_placement(g);
         size
     }
 
@@ -3753,11 +3785,11 @@ impl<'a> Ui<'a> {
         }
     }
 
-    /// **非窗口（win=0）内容按放置子槽缓存**：按 `seq` 把命令归入放置子槽
-    /// （[`Self::z0_group_for_seq`]），逐槽做**全量签名**（[`Self::hash_cmds`]）→ 命中
-    /// 复用缓存顶点 / 未命中重建该槽；值/交互变化只重建对应子槽，其余 win=0 放置复用。
-    /// 组 0 = 未分组的独立顶层命令（`label_at` 等），同样全量签名缓存。最后只保留
-    /// 本帧录制过的子槽（放置消失/条件渲染时清陈旧，防跨帧误复用）。
+    /// **非窗口（win=0）内容按放置缓存**：按 `seq` 把命令归入其**放置**
+    /// （[`Self::z0_place_for_seq`]），逐放置做**全量签名**（[`Self::hash_cmds`]）→ 命中
+    /// 复用缓存顶点 / 未命中重建该放置；值/交互变化只重建对应放置，其余 win=0 放置复用。
+    /// 未开放置的独立顶层命令（`label_at` 等）自成一段放置（同样全量签名缓存）。
+    /// 最后只保留本帧录制过的放置（放置消失/条件渲染时清陈旧，防跨帧误复用）。
     fn cache_z0_window(
         &mut self,
         cmds: &[Vec<UiDraw>],
@@ -3767,18 +3799,40 @@ impl<'a> Ui<'a> {
         white_uv_wh: Vec2,
         stats: &mut CacheStats,
     ) {
-        let mut by_group: Vec<(u32, Vec<&UiDraw>)> = Vec::new();
+        let mut by_place: Vec<(u32, Vec<&UiDraw>)> = Vec::new();
         for d in cmds.iter().flatten() {
-            let g = self.z0_group_for_seq(d.seq);
-            match by_group.iter_mut().find(|(gg, _)| *gg == g) {
+            let place = self.z0_place_for_seq(d.seq);
+            match by_place.iter_mut().find(|(pp, _)| *pp == place) {
                 Some((_, v)) => v.push(d),
-                None => by_group.push((g, vec![d])),
+                None => by_place.push((place, vec![d])),
             }
         }
-        for (g, refs) in by_group {
-            // **槽 = (段号, 组号)**：组号只在段内唯一（每段兜底组都是 0），故必须带段前缀，
-            // 否则不同段的同号槽共用一个缓存条目、每帧交替覆盖 → 永远 miss。
-            let slot = (self.segment, g);
+        // **放置槽布局**（诊断，`RJ_ORDER_TRACE=slot`）：逐帧打印每个放置槽的 `seq` 区间。
+        // 用来回答"同一个容器是不是被拆进了两个排序空间"——那正是本次修的两个闪烁的
+        // 形态（面板底被邻居穿透 / 滚动条与自己的列表项分属两个 `place`）。
+        if std::env::var("RJ_ORDER_TRACE").is_ok_and(|v| v == "slot") {
+            for (place, refs) in &by_place {
+                let lo = refs.iter().map(|d| d.seq).min().unwrap_or(0);
+                let hi = refs.iter().map(|d| d.seq).max().unwrap_or(0);
+                eprintln!(
+                    "z0slot[frame {}] seg={} place={place} n={} seq={lo}..{hi}",
+                    self.state.frame,
+                    self.segment,
+                    refs.len()
+                );
+            }
+            eprintln!(
+                "z0starts[frame {}] seg={} starts={:?}",
+                self.state.frame, self.segment, self.z0_ranges
+            );
+        }
+        for (place, refs) in by_place {
+            // **槽 = (段号, 放置序)**：`place` 是段内派生的计数（各段从 0 起），
+            // 故必须带段前缀，否则不同段的同号槽共用一个缓存条目、每帧交替覆盖 → 永远 miss。
+            // ⚠ `place` **逐帧重算**（不存进 `UiDraw`）：放置增删会让后面的 `place` 整体
+            // 平移，键跟着变 ⇒ 直接判 miss 重建，绝不会"命中一个 `place` 已过期的条目"
+            // 而把绘制序搞错一帧（那正是本次修复的闪烁形态）。
+            let slot = (self.segment, place);
             if !self.state.frame_state.z0_seen.contains(&slot) {
                 self.state.frame_state.z0_seen.push(slot);
             }
@@ -3791,7 +3845,8 @@ impl<'a> Ui<'a> {
                 stats.cache_hits += 1;
                 let t_clone = Instant::now();
                 for (elem, gg, tex, clip, geom) in &entry.1 {
-                    cached.push((0, *elem, *gg, *tex, *clip, geom.clone(), vec![*elem]));
+                    // `place` 来自**槽键**（本帧重算的那个），不是缓存里的陈旧值。
+                    cached.push((0, place, *elem, *gg, *tex, *clip, geom.clone(), vec![*elem]));
                 }
                 stats.clone_us += t_clone.elapsed().as_secs_f64() * 1e6;
                 continue;
@@ -3799,23 +3854,23 @@ impl<'a> Ui<'a> {
             stats.cache_misses += 1;
             let t_collect = Instant::now();
             let mut q = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh);
-            // 该子槽重建（克隆命令为 owned 单桶传入 collect_cmds）。
+            // 该放置重建（克隆命令为 owned 单桶传入 collect_cmds）。
             let owned: Vec<UiDraw> = refs.iter().map(|d| (*d).clone()).collect();
             self.collect_cmds(&mut q, 0, std::slice::from_ref(&owned));
             stats.collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
-            self.trace_cache_miss(&format!("z0 group {g}"), refs.len(), t_collect);
+            self.trace_cache_miss(&format!("z0 place {place}"), refs.len(), t_collect);
             let mut grp: Vec<(u32, u8, u64, Option<Rect>, Geom)> = Vec::new();
-            for ((_, elem, gg, tex, clip), geom) in q.quads {
+            for ((_, _, elem, gg, tex, clip), geom) in q.quads {
                 // 缓存存克隆、本帧提交原几何（各一份）——重建帧照常绘制，不"消失 1 帧"。
                 let clip = clip.map(clip_rect);
                 grp.push((elem, gg, tex, clip, geom.clone()));
-                cached.push((0, elem, gg, tex, clip, geom, vec![elem]));
+                cached.push((0, place, elem, gg, tex, clip, geom, vec![elem]));
             }
-            // 缓存组顺序与提交顺序一致：控件序 → 元素内图形 → 文字 → 纹理 → 裁剪——跨帧稳定。
+            // 缓存组顺序与提交顺序一致：元素序 → 元素内图形 → 文字 → 纹理 → 裁剪——跨帧稳定。
             grp.sort_by_key(|&(elem, gg, tex, clip, _)| (elem, gg, tex, clip_key(clip)));
             self.state.z0_quads.insert(slot, (sig, grp));
         }
-        // 陈旧子槽的清理**不在这里**：本函数每段跑一次、只见到本段的槽，按段清会把同帧
+        // 陈旧放置的清理**不在这里**：本函数每段跑一次、只见到本段的槽，按段清会把同帧
         // 其它段刚写好的缓存删掉（那些槽于是每帧 miss）。这里只把本段见到的槽记进帧级
         // 暂存（`z0_seen`），由 `UiState::begin_frame` 在**下一帧开场**按完整集合清一次。
     }
@@ -3848,7 +3903,9 @@ impl<'a> Ui<'a> {
                 stats.cache_hits += 1;
                 let t_clone = Instant::now();
                 for (elem, g, tex, clip, geom) in &entry.1 {
-                    cached.push((win, *elem, *g, *tex, *clip, geom.clone(), vec![*elem]));
+                    // `place = 0`：窗口自带独立排序空间（`win`），`elem = 0` 的装饰
+                    // 只在本窗内"画在最底"，不会漏到别处（见 `Self::z0_ranges`）。
+                    cached.push((win, 0, *elem, *g, *tex, *clip, geom.clone(), vec![*elem]));
                 }
                 stats.clone_us += t_clone.elapsed().as_secs_f64() * 1e6;
                 return;
@@ -3862,7 +3919,7 @@ impl<'a> Ui<'a> {
         stats.collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
         self.trace_cache_miss(&format!("win {win} id={}", id.as_str()), cmds.iter().map(|v| v.len()).sum(), t_collect);
         let mut grp: Vec<(u32, u8, u64, Option<Rect>, Geom)> = Vec::new();
-        for ((_, elem, g, tex, clip), geom) in q.quads {
+        for ((_, _, elem, g, tex, clip), geom) in q.quads {
             // 缓存存克隆、本帧提交原几何（各一份）——**重建帧窗口照常绘制**：
             // 否则窗口内容一变就"消失 1 帧"（缓存冷启动 / 拖动中 hover、光标
             // 闪烁、滚动等逐帧变化 → 窗口每帧重建、每帧消失 → "消失与显示
@@ -3870,7 +3927,7 @@ impl<'a> Ui<'a> {
             // 量化键 → 实际矩形（1px 精度；最终 scissor 本来就按整数像素取整）。
             let clip = clip.map(clip_rect);
             grp.push((elem, g, tex, clip, geom.clone()));
-            cached.push((win, elem, g, tex, clip, geom, vec![elem]));
+            cached.push((win, 0, elem, g, tex, clip, geom, vec![elem]));
         }
         // 缓存组顺序与提交顺序一致：控件序 → 元素内图形 → 文字 → 纹理 → 裁剪——跨帧稳定。
         grp.sort_by_key(|&(elem, g, tex, clip, _)| (elem, g, tex, clip_key(clip)));
@@ -3952,23 +4009,62 @@ impl<'a> Ui<'a> {
         let mut seg_elems: std::collections::BTreeSet<u32> =
             std::mem::take(&mut self.state.scratch_elems);
         // mem::take：只移走内容几何，`quads.debug`（调试叠加）留待最后提交。
-        for ((win, elem, g, tex_uid, clip), geom) in std::mem::take(&mut quads.quads) {
+        for ((win, place, elem, g, tex_uid, clip), geom) in std::mem::take(&mut quads.quads) {
             let elems = quads
                 .elems
-                .remove(&(win, elem, g, tex_uid, clip))
+                .remove(&(win, place, elem, g, tex_uid, clip))
                 .unwrap_or_default();
-            ordered.push((win, elem, g, tex_uid, clip.map(clip_rect), geom, elems));
+            ordered.push((win, place, elem, g, tex_uid, clip.map(clip_rect), geom, elems));
         }
-        // 缓存命中路径（`cached`）来自 `cache_window`，其元素数已在采集期统计。
+        // 缓存命中路径（`cached`）来自 `cache_window` / `cache_z0_window`，
+        // 其元素数已在采集期统计。
         ordered.extend(cached);
-        // 提交序：`(win, elem, group, tex, clip)`（`clip` 用整数像素键比较）。
+        // 提交序：`(win, place, elem, group, tex, clip)`（`clip` 用整数像素键比较）。
+        // `place` = 顶层放置序（win=0 的排序空间，见 `Self::z0_ranges`）——必须在
+        // `elem` **之前**：否则一个放置的底装饰（`elem = 0`）会排到别的放置的内容之下。
         // `sort_unstable`：键相同的条目之间**顺序无关**（同键必然合进同一段）。
-        ordered.sort_unstable_by_key(|q| (q.0, q.1, q.2, q.3, clip_key(q.4)));
+        ordered.sort_unstable_by_key(crate::gpu_batch::submit_sort_key);
+        // **绘制序追踪**（诊断，`RJ_ORDER_TRACE`）：逐条打印实际提交顺序。
+        //
+        // 为什么需要它：绘制序只由 `(win, place, elem, group, tex, clip)` 决定，而
+        // `elem = 0` 的语义是"画在本容器元素之下"——**只有"每个顶层放置一个排序空间"
+        // 才成立**。"某个 win=0 控件被别的 win=0 内容穿透 / 看错层级"这类现象只能靠
+        // 这份序核对。未命中 / 命中两条路径都汇进同一个 `ordered`，所以这里看到的就是真相。
+        //
+        // 取值：`RJ_ORDER_TRACE=<帧号>` 只打印那一帧（**推荐**）；`all` 打印每一帧。
+        // ⚠ 一帧 ≈ 200 行，且 `eprintln!` 是**无缓冲**的（每行一次 write）——
+        // `all` + 经管道重定向（如 PowerShell 的 `RedirectStandardError`）会顶满管道
+        // 缓冲，把应用压到 **~1fps**（实测踩过，与引擎无关）。要 `all` 就重定向到**真文件**
+        // （`cmd /c "app 2> log.txt"`）；按帧打印则完全没有这个问题。关闭时零开销。
+        let trace = match std::env::var("RJ_ORDER_TRACE") {
+            Ok(v) if v == "all" => true,
+            Ok(v) => v.parse::<u64>().map(|f| f == self.state.frame).unwrap_or(false),
+            Err(_) => false,
+        };
+        if trace {
+            for (i, q) in ordered.iter().enumerate() {
+                // 首顶点坐标：用来在 trace 里**认出**这是谁——比如"面板底色那条"与
+                // "FPS 标签那条"各在什么位置（缓存里存的是窗口/放置局部坐标）。
+                let v0 = q.6.verts.first().map(|v| (v.pos[0], v.pos[1]));
+                eprintln!(
+                    "order[frame {}] i={i} win={} place={} elem={} g={} tex={} clip={} verts={} v0={:?}",
+                    self.state.frame,
+                    q.0,
+                    q.1,
+                    q.2,
+                    q.3,
+                    q.4,
+                    if q.5.is_some() { 1 } else { 0 },
+                    q.6.verts.len(),
+                    v0.map(|(x, y)| (x.round(), y.round()))
+                );
+            }
+        }
         // 连续运行合批：同 (win, tex, clip) 顶点合并成一段；窗口/纹理/**裁剪**切换或
         // 超段顶点上限时切段。切段规则抽成纯函数 [`segment_runs`]，使「一次交互产生
         // 几次 draw call」可在**无 GPU** 的情况下断言（见 `gpu_batch::batch_contract_tests`）。
         let runs = segment_runs(
-            ordered.iter().map(|q| (q.0, q.3, q.4, q.5.verts.len())),
+            ordered.iter().map(|q| (q.0, q.4, q.5, q.6.verts.len())),
             MAX_UI_SEG_VERTS,
         );
         // 「装配」= 到切段为止（组装 + 排序 + 切段）——纯 UI 自己的账。
@@ -3987,20 +4083,20 @@ impl<'a> Ui<'a> {
             let seg = if run.quads == 1 {
                 // 单组：直接 move（省一次 `append` 全量拷贝）——只影响本帧这一份 `ordered`
                 // 条目（`ordered` 是本帧的 scratch，move 走即空）。
-                Geom { verts: std::mem::take(&mut ordered[next].5.verts), tris: std::mem::take(&mut ordered[next].5.tris) }
+                Geom { verts: std::mem::take(&mut ordered[next].6.verts), tris: std::mem::take(&mut ordered[next].6.tris) }
             } else {
                 scratch_seg.verts.clear();
                 scratch_seg.tris.clear();
                 scratch_seg.verts.reserve(run.verts);
                 for q in &ordered[next..next + run.quads] {
                     // 索引按已累计顶点数平移（`Geom::append`）——不同段的索引各自从 0 起。
-                    scratch_seg.append(&q.5);
+                    scratch_seg.append(&q.6);
                 }
                 Geom { verts: std::mem::take(&mut scratch_seg.verts), tris: std::mem::take(&mut scratch_seg.tris) }
             };
             seg_elems.clear();
             for q in &ordered[next..next + run.quads] {
-                seg_elems.extend(q.6.iter().copied());
+                seg_elems.extend(q.7.iter().copied());
             }
             next += run.quads;
             let n = seg_elems.len() as u32;
@@ -4256,6 +4352,9 @@ impl<'a> Ui<'a> {
         };
         // depth 桶展平（桶序 = depth 升序，桶内录制序）：免排序下仍满足提交序。
         for d in cmds.iter().flatten() {
+            // **当前放置序**：win=0 的排序空间（窗口内恒 0——窗口本身就是一个排序空间）。
+            // 见 `Self::z0_ranges`：没有它，`elem = 0` 的容器装饰会被别的 win=0 放置穿透。
+            quads.cur_place = if win == 0 { self.z0_place_for_seq(d.seq) } else { 0 };
             // 当前元素序：push 方法按其分组（控件级提交顺序——见 QuadCollector）。
             quads.cur_elem = d.elem;
             // **当前裁剪层的绝对矩形**（`d.clip` 已是绝对坐标）：**剔除**用它。
@@ -7476,6 +7575,31 @@ fn clamp_window_pos(abs: Vec2, size: Vec2, sw: f32, sh: f32) -> Vec2 {
 #[inline]
 pub(crate) fn local_of(pr: Rect, anchor_px: Vec2) -> Rect {
     Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h)
+}
+
+/// **顶层放置序**（纯函数，见 [`Ui`] 的 `z0_ranges` 字段文档）：到 `seq` 这条命令为止
+/// 已经开始过的顶层放置个数。
+///
+/// `starts` = 各顶层放置**第一条命令的 `seq`**（**按录制序**，因此单调不减）；
+/// 提前 `break` 依赖这个单调性。散装顶层命令（不属于任何放置）得到"上一个放置"的序
+/// —— 它们录制更晚、`elem` 更大，于是仍画在那个放置之上。
+///
+/// ⚠ 记的是"**第一条命令**的序号"（`begin_top_placement` 传 `queue.seq + 1`），
+/// 不是容器入口时的 `seq`——否则紧靠在容器之前录制的那条命令（如 `scroll_at` 的滚动条，
+/// 由 `next_seq()` 取号）会被算进新放置，同一容器被拆进两个排序空间。
+///
+/// 抽成自由函数是为了让这条语义能在**没有 `Ui` 实例**的情况下单测（`Ui` 需要字形图集
+/// 与 winit 窗口，构造不出来；见 `ui/tests.rs`）。
+pub(crate) fn z0_place_for_seq(starts: &[u32], seq: u32) -> u32 {
+    let mut n = 0;
+    for &start in starts {
+        if start <= seq {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n
 }
 
 /// `ui` 模块的单元测试（独立文件，见该目录下的 `tests.rs`）。

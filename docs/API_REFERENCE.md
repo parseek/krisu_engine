@@ -834,7 +834,7 @@ impl Painter {
 |---|---|
 | **一段绘制一个 painter** | `ui.painter()` 借 `&mut self`；painter 存活期内 `ui.text_size` / `ui.hit_abs` / `ui.*_at` 都借不到 `ui`。顺序 = 先量 → 画 → 再量 |
 | **`elem` 默认逐条取** | 原语各自取"录制时的 `seq + 1`"，与旧 `Ui::push_*` 逐位一致。装饰要压在自家内容之上时**重新取一次 `ui.painter()`**（此时 `elem_hint` 已更大）；**不要**把一个 painter 的 elem 想成冻结值 |
-| **容器装饰用 `elem = 0`** | 窗口背景 / 边框 / 阴影：`panel_elem(.., 0)` / `panel_img_elem(.., 0)` / `shadow(..)` |
+| **容器装饰用 `elem = 0`** | **本容器**的背景 / 边框 / 阴影：`panel_elem(.., 0)` / `panel_img_elem(.., 0)` / `shadow(..)`。⚠ 语义是"画在本容器元素**之下**"——**只有窗口（`win > 0`）才天然成立**（一扇窗 = 一个排序空间）；**win=0 的容器**靠"顶层放置序 `place`"获得自己的排序空间（见 `ENGINE_GUIDE.md` §18.23），所以 `drag_panel_at` 的底色不会被别的 win=0 内容穿透。**滚动条 / 手柄这类"要盖在自家内容之上"的装饰不要传 0，用 `elem_hint()`** |
 | **裁剪就在 painter 上** | Clip 沙箱 / ScrollView 可视区 / 严格窗口内容裁剪 = `Painter::clip()` 的**当前层**，命令自带它 ⇒ **沙箱里的控件什么都不用做**。只有"要一层与当前**不同**的裁剪"才用 `painter.clipped(Some(rect), \|p\| ..)` / `ui.painter_clipped(rect, ..)`（更窄，或 `None` 主动不裁），块外自动恢复 |
 | **独立可用** | `Painter::new(1.0)` + `commands()` ⇒ 无字体图集也能断言"画出了哪几条命令"（`rjw_ui` 的 painter 单测就是这么写的） |
 
