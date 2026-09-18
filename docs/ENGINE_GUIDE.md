@@ -1978,9 +1978,55 @@ sim-theme: ② 导入前 row_h=26 → 引擎侧 row_h=27（期望 27）[OK] 导�
 - 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
 - **半透明与元素序**（两条都会静默毁掉画面）：
   - `tess::push_rounded_rect` / `push_rounded_ring` / `push_convex` 的硬体 alpha **就是调用方给的颜色 alpha**（羽化环从它降到 0）——**不要写死 `alpha = 1`**：曾导致所有半透明圆角矩形 / 图标渲染成不透明（取色器 `#6EA8FF0A` 色块实测像素 = 纯色）。
-  - 组合控件里"画在自家背景之上"的装饰（手柄 / 箭头 / 分隔线）必须传 `ui.elem_hint()` 作为 `elem`（`push_panel_like` 的 `elem` 参数、`push_draw` 的第 3 个参数）：**元素序小的先画**，写死 `0`/`1` 会被本控件自己的背景或文本框整块盖住（`NumberInput` 的拖拽手柄、`ColorPicker` 的展开箭头都曾因此消失）。
+  - 组合控件里"画在自家背景之上"的装饰（手柄 / 箭头 / 分隔线）必须传 `ui.elem_hint()` 作为 `elem`（`push_panel_like` 的 `elem` 参数、`push_draw` 的第 3 个参数）：**元素序小的先画**，写死 `0`/`1` 会被本控件自己的背景或文本框整块盖住（`NumberInput` 的拖拽手柄、`ColorPicker` 的展开箭头都曾因此消失）。用绘制器（`ui.painter()`）时这条是**默认正确**的——原语各自取当时的 `elem_hint()`，要"压住自家已有内容"就**再取一次** painter（见 §18.18）。
   - 相邻矩形拼成的"多段渐变"（如色相条）要用**纯四边形**（`DrawKind::Rect`）而不是多个带羽化的圆角矩形：两侧羽化的 alpha 斜坡会在共享边都降到 0，透出一条缝。
   - 四角渐变在一整块几何里只做**逐三角形线性**插值：颜色场含交叉项（如 SV 平面 `V·lerp(白, 色相, S)`）时会出现折痕 ⇒ 切成网格（`colorpicker::hsv::sv_plane_cells`）。
 - **可拖拽容器**（窗口 / 面板）另有一条硬约定：`abs_base` 必须等于本帧实际平移量（`display_pos`），且**交互（命中 / 拖拽基准 / clamp）先于内容录制求解**——命中矩形取**上一帧结算尺寸**（`UiState::window_sizes` / `panel_sizes`，鼠标事件正是针对屏幕上那个矩形产生的）。若像早期实现那样"`abs_base` 用上一帧位置、几何用本帧位置"，拖拽期间一切走 `abs_base` 的绝对空间量（文本 `box_clip`、IME 光标、滑块基准）都会落后一帧（快速拖动时文字被裁 / 点击偏移）。位置求解复用 `ui::resolve_drag`（纯函数，可单测）。
 - 网格 cell 缓存（`UiState::grid_cells`）保证跨帧布局稳定；无缓存首帧渐进扩展，次帧起稳定。
 - **缓存了 UV / 图集区域的跨帧缓存，键里必须并入 `DynamicAtlas::revision()`**（`rjw_ui` 的窗口顶点缓存、`rjw_ui` 的 win=0 子槽缓存即如此）：`generation()` 只覆盖"重排搬动"，漏掉"逐出 + 空闲槽位被复用"——此时旧 UV 采样到别的字形像素（"陈旧文字 / 背景消失"），而内容签名不变 ⇒ 缓存永不失效。校验区域用 `region_peek()`（**不刷新寿命**，别用 `region()`——那会保活被校验的条目）。
+
+### 18.18 绘制器（`Painter` / `DrawQueue`）：录制状态从 `Ui` 里抽出来
+
+**动机**：绘制命令的"写出"本来散在 `Ui` 的几十个 `push_*` 方法里，每个方法各自读
+`self.queue` / `self.seq` / `self.depth` / `self.cur_win` / `self.clip` 五个字段，于是
+"画一条命令"这件事**无法脱离 `Ui` 存在**——而 `Ui` 需要字形图集（GPU）才能构造，所以本仓
+历史上所有绘制 bug（圆角丢失、背景图在直角面板上消失、拖拽柄被自家背景盖住）都只能靠
+示例截图发现，**写不出单测**。
+
+现在录制状态自成一个组件：
+
+```
+painter.rs          // 门面：Painter / DrawQueue / Ui::painter / Ui::painter_clipped
+painter/queue.rs    // DrawQueue：命令队列 + 播放头（seq / depth / cur_win / clip）
+painter/prim.rs     // 原语：solid / border / panel(_elem) / panel_img(_elem) / shadow / rounded_at / icon_at / image_at / gradient_at
+painter/text.rs     // text / text_noclip（环境裁剪进 UiDraw.clip，软裁剪进 DrawKind::Text.clip）
+painter/debug.rs    // debug_line / debug_rect_outline / … （进 debug_queue）
+```
+
+- `Painter` **按值拥有** `DrawQueue`；`Ui` 只有字段 `painter: Painter`（`Ui::painter()` 借出）。
+- `painter.rs` **不 `use crate::ui::Ui`**，`DrawQueue` 可 `Default` 独立构造 ⇒ `Painter::new(1.0)`
+  就能录命令并 `commands()` 读回（`painter/*` 的单测即如此：`rjw_ui` 第一次能在无字体图集 /
+  无 GPU 的情况下断言"画出来的是哪几条命令"）。
+- `Ui::push_*` / `*_at` 全部保留为**薄包装**（公开 API 不破坏），实现改成一行
+  `self.painter.<原语>(..)`；`PanelCmdCtx` / `push_panel_img_cmds`（面板三层命令的纯函数）从
+  `ui.rs` 移到了 `draw.rs`——它只依赖 `UiDraw` / `DrawKind`，绘制器与单测共用。
+
+**两条硬约定（都是踩过的坑）**：
+1. **`elem` 默认逐条取 `elem_hint()`**（= 当前 `seq + 1`），与原 `push_*` 逐位一致：同一元素内
+   按 `seq` 排序、**图形先于文字**（`group`）。所以"装饰压住自家已有内容"靠的是**重新取一次
+   `ui.painter()`**（那时 `elem_hint()` 已经更大），**不是**把 painter 的 elem 冻结成一个值——
+   冻结会让后画的图形（拖拽柄）排到自家文字之前，被整块盖住（`NumberInput` 手柄 /
+   `ColorPicker` 箭头的历史 bug）。
+2. **绘制与 `ui.*` 不能交错**：`ui.painter()` 借 `&mut self`，painter 存活期内 `ui.text_size` /
+   `ui.hit_abs` / `ui.*_at` 都借不到 `ui`（egui 那种"随便交错"靠 `Painter` 持 `Context` 克隆 +
+   内部可变性；本引擎不用 `Arc<Mutex<_>>` 换它，保持零堆分配 / 无锁）。顺序是「先量 → 画 → 再量」。
+
+**裁剪就在 painter 上**：`Clip` 沙箱 / ScrollView 可视区 / 严格窗口内容裁剪是 `view_at` /
+`scroll_at` 写进 `DrawQueue::clip` 的**当前强制层**——沙箱内取到的 painter 的 `clip()` 就是它，
+录出的每条命令自带该裁剪（`UiDraw.clip`）⇒ **沙箱里的控件不需要 `painter_clipped`**。
+`clipped(..)` / `painter_clipped(..)` 只用于"要一层与当前**不同**的裁剪"：临时更窄（本控件自己
+再裁一刀，且不改全局层——改全局层会连带子控件 / 兄弟控件），或传 `None` 主动不裁。
+
+**等价性怎么验**：迁移前后同一场景 `[perf] cmds=` / `wins=` / `cache_hit=` 逐项相同（实测
+`cmds=380 wins=7 cache_hit=13 cache_miss=0`，与迁移前的 HEAD 构建逐位一致），外加全部
+`--sim-*` 判定行不变、`cargo test -p rjw_ui` 全绿。

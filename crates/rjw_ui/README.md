@@ -200,6 +200,25 @@ ui.window("w").style(ui.theme().panel.clone().with_bg_image(bg)); // 窗口/面�
 - [`ImageBg`] 的 `Stretch` / `Fill` / `Center` 走**仿射 UV 映射**，因此能与圆角遮罩
   共存；`Tile` 用 1:1 图块四边形（不支持圆角，见 `ImageFit::Tile` 文档）。
 
+## 绘制器（`Painter`，独立于 `Ui` 的组件）
+
+上面那些 `ui.xxx_at(..)` 只是糖：录制机制住在 [`Painter`] / [`DrawQueue`]（`rjw_ui::painter`）。
+一个**绘制块**取一次 painter，块内所有原语不再逐参数传 `elem` / 环境裁剪：
+
+```rust
+let mut p = ui.painter();
+p.panel(rect, theme.button.bg, theme.button.border, 1.0, theme.button.radius); // elem 自动 = elem_hint
+p.text(rect, label, 14.0, Color::WHITE, None, TextAlign::Center, TextVAlign::Center, None, None);
+p.panel_elem(shadow_rect, bg, border, 1.0, 0.0, 0);   // elem = 0 = 容器装饰层（画在所有元素之下）
+```
+
+- **独立**：`Painter` 只拥有录制状态（队列 + 播放头）与 DPI 换算，**不引用 `Ui`、不需要
+  字体图集 / GPU** ⇒ `Painter::new(1.0)` + `commands()` 就能在单测里断言"画出了哪几条命令"；
+- **一段绘制一个 painter**：`ui.painter()` 借 `&mut self`，所以顺序是「先量 → 画 → 再量」
+  （不是一个 painter 画到底，也不能边画边跑子控件）；
+- **装饰压住自家内容** = 重新取一次 `ui.painter()`（不是冻结 elem）；容器装饰传 `elem = 0`；
+- **局部裁剪**：`ui.painter_clipped(Some(rect), |p| { … })`（块外自动恢复，不动 `Ui` 的强制裁剪层）。
+
 ## 依赖
 
 `rjw_2d_render`（绘制）/ `rjw_text`（测量与渲染）/ `rjw_transform`（屏幕固定变换）/ `rjw_color` / `rjw_mouse`（鼠标）/ `rjw_keyboard`（字符输入）/ `glam`

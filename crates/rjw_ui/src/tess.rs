@@ -2231,7 +2231,7 @@ mod tests {
             TEST_UV,
         );
         let segs = CornerTable::segs_of(t.stride_for(12.0 + DEFAULT_FEATHER * 0.5)) as usize;
-        // 外羽化 + 外/内轮廓 + 内羽化 ⇒ 4 圈（内羽化在 i - f/2 有效时才画）
+        // 外羽化 + 外/内轮廓 + 内羽化 ⇒ 4 圈（内羽化在 i - f/2 有效时才画）
         assert!(v.len() <= 4 * 4 * (segs + 1), "环带顶点数 {} 超界", v.len());
     }
 

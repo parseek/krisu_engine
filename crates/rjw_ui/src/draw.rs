@@ -1665,3 +1665,86 @@ mod gradient_tests {
         assert!((mid[3] - 1.0).abs() <= 1e-6, "alpha 1→1 应保持 1.0，实际 {}", mid[3]);
     }
 }
+
+// ─── 面板命令（纯函数：绘制器 `panel*` 与单测共用） ──────────────
+
+/// 一条面板命令的公共字段（[`push_panel_img_cmds`] 的入参；`seq` = 背景刷那条命令的序号）。
+pub(crate) struct PanelCmdCtx {
+    pub depth: u32,
+    pub win: u32,
+    pub elem: u32,
+    pub rect: Rect,
+    pub clip: Option<Rect>,
+    pub seq: u32,
+}
+
+/// **面板的三层命令**（背景刷 → 背景图 → 边框）——从面板绘制原语里提出来的**纯函数**：
+/// 不碰 `Ui` / 绘制器，因此可以直接单测"直角面板到底推了哪几条命令"。
+///
+/// 为什么值得单独成函数：**背景图曾在 `radius == 0`（直角）分支里被静默丢掉**
+/// （"Tile（1:1 平铺，直角）"那个窗口就是因为这条而空白）。当时的方法体把"背景刷
+/// 形状"和"要不要画图 / 边框"混在同一个 `if radius` 里，看代码很难一眼发现。现在：
+/// 背景刷按 `(是否直角, 是否纯色)` 一次 `match` 定形，**图与边框移出分支、无条件执行**。
+pub(crate) fn push_panel_img_cmds(
+    out: &mut Vec<UiDraw>,
+    ctx: PanelCmdCtx,
+    bg: &crate::style::Brush,
+    img: Option<ImageBg>,
+    border: Color,
+    border_w: f32,
+    radius: CornerRadius,
+) {
+    let PanelCmdCtx { depth, win, elem, rect, clip, seq } = ctx;
+    // 背景图的 seq 夹在"背景刷"与"边框"之间（同 elem 内按 seq 排序 ⇒ 层次正确）。
+    let img_seq = seq + 1;
+    let border_seq = if img.is_some() { seq + 2 } else { seq + 1 };
+    // 渐变锚定在 `rect` 上（`resample_gradient_local` 保证裁剪不改变颜色锚定）。
+    let grad = Gradient::corners(
+        bg.corners()[0],
+        bg.corners()[1],
+        bg.corners()[2],
+        bg.corners()[3],
+    );
+    // **背景刷**：圆角 = 一整块 `RoundedRect`（渐变四角色直接给它，无需内缩重采样）；
+    // 直角 = `Solid` / `Rect`（少一次镶嵌）。
+    //
+    // 圆角分支的历史：旧实现是"外圈 border 色实心圆角 + 内圈 bg 色实心圆角"，两块
+    // 的抗锯齿边缘会在圆角处各混合一次（看起来发灰、边缘偏粗）；现在边框是**环带**，
+    // 只画一次边界。
+    let kind = match (radius.is_zero(), bg.as_solid()) {
+        (false, Some(c)) => DrawKind::RoundedRect { corners: [c; 4], radius },
+        (false, None) => DrawKind::RoundedRect {
+            corners: [grad.tl, grad.tr, grad.bl, grad.br],
+            radius,
+        },
+        (true, Some(c)) => DrawKind::Solid(c),
+        (true, None) => DrawKind::Rect(grad),
+    };
+    out.push(UiDraw { depth, seq, win, elem, rect, clip, kind });
+    // **背景图**（背景刷之上、边框之下）：圆角遮罩用面板 radius（直角时半径 0 ⇒ 不裁）。
+    // ⚠ 与半径**无关**：直角面板同样要画图（历史 bug 就在这里）。
+    if let Some(mut img) = img {
+        img.radius = radius;
+        out.push(UiDraw {
+            depth,
+            seq: img_seq,
+            win,
+            elem,
+            rect,
+            clip,
+            kind: DrawKind::Image(img),
+        });
+    }
+    // **边框**（最上层）：直角时 `radius` 本身就是 0，无需另写 `CornerRadius::default()`。
+    if border_w > 0.0 {
+        out.push(UiDraw {
+            depth,
+            seq: border_seq,
+            win,
+            elem,
+            rect,
+            clip,
+            kind: DrawKind::Border { color: border, width: border_w, radius },
+        });
+    }
+}

@@ -159,6 +159,7 @@ pub mod id;
 pub mod hit;
 pub mod input;
 pub mod layout;
+pub mod painter;
 pub mod state;
 pub mod style;
 pub(crate) mod tess;
@@ -176,6 +177,7 @@ pub use focus::FocusKind;
 pub use id::{IdAbsolute, IdRelative, IdStack};
 pub use hit::{hit_test, InteractEvents};
 pub use layout::{Child, PackSide};
+pub use painter::{DrawQueue, Painter};
 pub use state::{ButtonState, CheckboxState, TextFocus, UiState, UiStats, WidgetState};
 pub use style::{
     Brush, ButtonStyle, CheckboxStyle, ComboStyle, DEFAULT_LINE_SPACING, Density, DividerStyle,

@@ -5,6 +5,7 @@
 //! 窗口限位与拖拽 / 命中与焦点 / 字符边界安全等——全部不需要 GPU。
 
 use super::*;
+use crate::draw::{PanelCmdCtx, push_panel_img_cmds};
 use crate::gpu_batch::{GROUP_GRAPHIC, GROUP_TEXT};
 use crate::edit::{remove_at, remove_before};
 

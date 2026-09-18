@@ -25,6 +25,7 @@
 - [9. Text（文本渲染）](#9-text文本渲染)
 - [10. 其他常用小类型速查](#10-其他常用小类型速查)
 - [11. UI（rjw_ui）](#11-uirjw_ui)
+  - [11.1 绘制器（Painter / DrawQueue）](#绘制器painter--drawqueuev03-新增)
 
 ---
 
@@ -778,6 +779,54 @@ f.text(|t| {
 | `UiState::text_focus() -> Option<TextFocus>` | `if ui.state().text_focus().is_none() { /* 快捷键 */ }` | **文本焦点**（只有输入框/多行框持焦点才为 `Some`）；取代旧 `capturing_text()` —— 按钮/滑块的 Tab 焦点不再吞应用快捷键 |
 | `UiState::combo_open() -> Option<&str>` | `if ui.state().combo_open().is_none() && esc { /* 自己的 Esc */ }` | **当前展开的下拉菜单**（[`Dropdown`](crate::Dropdown) 的**控件绝对 ID**；面板窗口 id = 它 + `::popup`）。与 `menu_open()` 对称（两个槽分开存：栏是应用级 UI，下拉属于某个控件）；`reset()` 清空 |
 | `Ui::debug_dump() -> UiDebugDump` | `eprintln!("{}", ui.debug_dump())` | 引擎侧状态快照（每窗口 `id/z/origin/submit/size/drag/press/stored`），单行可 grep；任一段都能调用，帧级暂存跨段共享 ⇒ 后一段能看到前一段录的窗口。⚠ 按**本帧录制过的窗口 ID** 列（不是按 z）：浮层 z = `WIN_TOPMOST` 基址 + **嵌套层数**（子菜单比父面板 +1，`ui::overlay_z`），按 id 列才不会漏掉嵌套浮层；`origin` 是**相对直接容器**的原点（顶层窗口 = 屏幕坐标，**嵌套浮层要叠加外层窗口原点**）。见 [DEBUGGING.md](DEBUGGING.md) §1 |
+
+### 绘制器（`Painter` / `DrawQueue`，v0.3 新增）
+
+**绘制器是独立于 `Ui` 的组件**（`rjw_ui::painter`）：它只拥有**录制状态**（命令队列 +
+播放头）与 API 边界的 DPI 换算，**不引用 `Ui`、不需要字体图集 / GPU**。
+
+```rust
+pub struct Painter { /* 私有：DrawQueue + scale */ }
+pub struct DrawQueue { /* 私有：内容队列 / 调试队列 / seq / depth / cur_win / clip */ }
+
+impl Ui {
+    fn painter(&mut self) -> &mut Painter;                        // 一个绘制块取一次
+    fn painter_clipped<R>(&mut self, clip: Option<Rect>, f: impl FnOnce(&mut Painter) -> R) -> R;
+    fn elem_hint(&self) -> u32;                                    // = painter().elem_hint()
+}
+impl Painter {
+    fn new(scale: f32) -> Painter;                                 // 独立构造（单测 / 离屏）
+    fn commands(&self) -> &[UiDraw];   fn debug_commands(&self) -> &[UiDraw];
+    fn clip(&self) -> Option<Rect>;    fn scale(&self) -> f32;     fn elem_hint(&self) -> u32;
+    fn clipped<R>(&mut self, clip: Option<Rect>, f: impl FnOnce(&mut Painter) -> R) -> R;
+    // 原语（默认 elem = elem_hint()）
+    fn solid(&mut self, rect, color);                     fn border(&mut self, rect, color, width);
+    fn panel(&mut self, rect, bg, border, border_w, radius);
+    fn panel_elem(&mut self, rect, bg, border, border_w, radius, elem);      // elem = 0 容器装饰
+    fn panel_img(&mut self, rect, bg, img, border, border_w, radius);
+    fn panel_img_elem(&mut self, rect, bg, img, border, border_w, radius, elem);
+    fn shadow(&mut self, rect, &ShadowStyle, radius);      // elem = 0
+    fn rounded_at(&mut self, pos, size, radius, color);    fn gradient_at(&mut self, pos, size, gradient);
+    fn icon_at(&mut self, pos, size, icon, color);         fn image_at(&mut self, pos, size, bg);
+    fn text(&mut self, rect, text, size, color, family, align, valign, soft_clip, buf);
+    fn text_noclip(&mut self, rect, text, size, color, family, align, valign, buf);
+    fn draw(&mut self, kind: DrawKind, rect, elem);        // 底层（显式 elem）
+    // 调试图元（进 debug 队列）
+    fn debug_line / debug_rect_outline / debug_circle_outline / debug_cross / debug_grid
+}
+```
+
+| 约定 | 说明 |
+|---|---|
+| **一段绘制一个 painter** | `ui.painter()` 借 `&mut self`；painter 存活期内 `ui.text_size` / `ui.hit_abs` / `ui.*_at` 都借不到 `ui`。顺序 = 先量 → 画 → 再量 |
+| **`elem` 默认逐条取** | 原语各自取"录制时的 `seq + 1`"，与旧 `Ui::push_*` 逐位一致。装饰要压在自家内容之上时**重新取一次 `ui.painter()`**（此时 `elem_hint` 已更大）；**不要**把一个 painter 的 elem 想成冻结值 |
+| **容器装饰用 `elem = 0`** | 窗口背景 / 边框 / 阴影：`panel_elem(.., 0)` / `panel_img_elem(.., 0)` / `shadow(..)` |
+| **裁剪就在 painter 上** | Clip 沙箱 / ScrollView 可视区 / 严格窗口内容裁剪 = `Painter::clip()` 的**当前层**，命令自带它 ⇒ **沙箱里的控件什么都不用做**。只有"要一层与当前**不同**的裁剪"才用 `painter.clipped(Some(rect), \|p\| ..)` / `ui.painter_clipped(rect, ..)`（更窄，或 `None` 主动不裁），块外自动恢复 |
+| **独立可用** | `Painter::new(1.0)` + `commands()` ⇒ 无字体图集也能断言"画出了哪几条命令"（`rjw_ui` 的 painter 单测就是这么写的） |
+
+> 旧 `Ui::push_solid_rect` / `push_border_rect` / `push_panel_like(_img)` / `push_panel_shadow` /
+> `push_text_rect(_noclip)` / `rounded_rect_at` / `gradient_rect_at` / `icon_at` / `image_at`
+> **全部保留**，实现为绘制器的薄包装（既有调用点无需改动）。
 
 ### UI 绘制后端（`rjw_ui::backend`，v0.3 新增）
 

@@ -62,6 +62,7 @@ use crate::hit::{
 use crate::id::{IdAbsolute, IdRelative, IdStack};
 use crate::input::{KeyboardSnapshot, MouseSnapshot};
 use crate::layout::{Child, Frame, PackSide};
+use crate::painter::Painter;
 use crate::state::{ButtonState, CheckboxState, TEXT_BUFFER_CACHE_CAP, UiState, WidgetState};
 use crate::style::{ButtonStyle, CheckboxStyle, GripShape, GripStyle, PanelStyle, Theme};
 use crate::view::{clip_for_view, ViewCtx, ViewMode};
@@ -272,14 +273,9 @@ impl<'a> UiInit<'a> {
             scale,
             debug_layout,
             frames: Vec::new(),
-            queue: Vec::new(),
-            debug_queue: Vec::new(),
-            clip: None,
+            painter: Painter::new(scale),
             avail_stack: Vec::new(),
             abs_base: Vec2::ZERO,
-            depth: 0,
-            seq: 0,
-            cur_win: 0,
             cur_win_id: None,
             win_hit_bounds: None,
             z0_ranges: Vec::new(),
@@ -424,30 +420,17 @@ pub struct Ui<'a> {
     scale: f32,
     /// 容器帧栈（当前容器在栈顶）。
     frames: Vec<Frame>,
-    /// 录制命令（坐标 = 相对当前容器 origin 的局部坐标，**逻辑像素**）。
-    queue: Vec<UiDraw>,
-    /// **调试命令队列**（[`Self::debug_line`] 等；坐标 = **绝对逻辑屏幕像素**）。
-    /// 不进窗口缓存、不参与内容排序——`finish` 时在 UI 内容**之后**提交（恒覆盖在最上）。
-    debug_queue: Vec<UiDraw>,
+    /// **绘制器**（独立组件，见 [`crate::painter`]）：拥有录制状态（命令队列 + 播放头）
+    /// 与 API 边界的 DPI 换算。`Ui` 只持有一个，绘制经 [`Ui::painter`] 借出。
+    painter: Painter,
     /// **调试 UI 布局开关**（[`UiInit::debug_layout`] / [`Self::debug_layout`]）：
     /// 开启后每个录制命令的矩形都会画青色描边（布局 / 命中区域可视化）。
     debug_layout: bool,
-    /// **当前裁剪区**（**绝对逻辑屏幕坐标**；滚动容器 [`Self::scroll_at`] 等设置）。
-    /// 录制命令时存入 `UiDraw.clip`，收集期与内容求交（越界剔除）。
-    /// 语义 = **强制裁剪层**（ScrollView 可视区 / Clip 沙箱）：所有绘制命令
-    /// （含 `push_*_noclip` 变体）都服从；普通容器（Expand）不产生强制层。
-    clip: Option<Rect>,
     /// **可用宽度栈**（逻辑像素）：`view_at` 沙箱进入时压入沙箱宽，弹出恢复。
     /// [`Self::avail_w`] 的唯一沙箱来源（容器固定宽经 `Frame::fixed_avail_w` 兜底）。
     avail_stack: Vec<Option<f32>>,
     /// 当前容器绝对原点（命中测试用，逻辑像素）。
     abs_base: Vec2,
-    /// 当前录制深度（容器嵌套层数）。
-    depth: u32,
-    /// 全局递增序号（同深度内排序）。
-    seq: u32,
-    /// 当前窗口 z 序（[`Self::window`]；非窗口内容 = 0）。
-    cur_win: u32,
     /// **当前窗口的绝对 ID**（非窗口内容 = `None`；嵌套窗口进出时保存/恢复）。
     ///
     /// 用途：`hit_impl` 记下"这次按下认领属于哪扇窗"时**必须存 ID 而不是 z**——z 会在帧末
@@ -614,8 +597,7 @@ impl<'a> Ui<'a> {
 
     #[inline]
     fn next_seq(&mut self) -> u32 {
-        self.seq += 1;
-        self.seq
+        self.painter.next_seq()
     }
 
     /// **顶层放置分组入口**：`depth == 0` 时开一个新 win=0 放置子槽并记录起始 `seq`；
@@ -625,10 +607,10 @@ impl<'a> Ui<'a> {
     /// 内容 / 顺序；未调用的放置（独立顶层 `label_at` 等）落入兜底组 0（全量签名缓存）。
     #[inline]
     fn begin_top_placement(&mut self) -> Option<u32> {
-        if self.depth == 0 {
+        if self.painter.q.depth == 0 {
             self.cur_z0_group += 1;
             let g = self.cur_z0_group;
-            self.z0_ranges.push((g, self.seq, 0));
+            self.z0_ranges.push((g, self.painter.q.seq, 0));
             Some(g)
         } else {
             None
@@ -641,7 +623,7 @@ impl<'a> Ui<'a> {
     fn end_top_placement(&mut self, g: Option<u32>) {
         if let Some(g) = g
             && let Some(r) = self.z0_ranges.iter_mut().rev().find(|r| r.0 == g) {
-                r.2 = self.seq;
+                r.2 = self.painter.q.seq;
             }
     }
 
@@ -957,11 +939,11 @@ impl<'a> Ui<'a> {
         }
         self.focusables.push(FocusEntry {
             id: id.to_static(),
-            win: self.cur_win,
+            win: self.painter.q.cur_win,
             kind,
-            depth: self.depth,
+            depth: self.painter.q.depth,
             rect: abs,
-            clip: self.clip,
+            clip: self.painter.q.clip,
         });
     }
 
@@ -1064,19 +1046,7 @@ impl<'a> Ui<'a> {
 
     /// 录制一条屏幕空间调试图元（进 `debug_queue`，坐标 = 绝对逻辑像素）。
     fn push_debug(&mut self, shape: DebugShape, color: Color) {
-        let seq = self.next_seq();
-        let depth = self.depth;
-        let win = self.cur_win;
-        self.debug_queue.push(UiDraw {
-            depth,
-            seq,
-            win,
-            elem: 0,
-            // 调试形状自带几何（DebugShape），rect 字段未用。
-            rect: Rect::new(0.0, 0.0, 0.0, 0.0),
-            clip: None,
-            kind: DrawKind::Debug { color, shape },
-        });
+        self.painter.debug(shape, color);
     }
 
     /// **圆角矩形**（背景填充原语；绝对定位，`radius` 带单位）。
@@ -1108,14 +1078,7 @@ impl<'a> Ui<'a> {
         radius: impl Into<Size<CornerRadius>>,
         color: Color,
     ) {
-        let pos = pos.into().to_physical(self.scale);
-        let size = size.into().to_physical(self.scale);
-        let radius = radius.into().to_physical(self.scale);
-        self.push_draw(
-            DrawKind::RoundedRect { corners: [color; 4], radius },
-            Rect::new(pos.x, pos.y, size.x, size.y),
-            self.elem_hint(),
-        );
+        self.painter.rounded_at(pos, size, radius, color);
     }
 
     /// **矢量图标**（绝对定位；`size` 为图标方框）。
@@ -1139,13 +1102,7 @@ impl<'a> Ui<'a> {
         icon: Icon,
         color: Color,
     ) {
-        let pos = pos.into().to_physical(self.scale);
-        let size = size.into().to_physical(self.scale);
-        self.push_draw(
-            DrawKind::Icon { icon, color },
-            Rect::new(pos.x, pos.y, size.x, size.y),
-            self.elem_hint(),
-        );
+        self.painter.icon_at(pos, size, icon, color);
     }
 
     /// **矢量图标**（随布局流排布；与 [`Self::icon_at`] 同语义，位置来自当前容器游标）。
@@ -1162,7 +1119,7 @@ impl<'a> Ui<'a> {
     pub fn icon(&mut self, size: impl Into<Size<Vec2>>, icon: Icon, color: Color) {
         let size = size.into().to_physical(self.scale);
         let pos = self.child_rect(size.x, size.y, Child::Expand).min();
-        self.push_draw(DrawKind::Icon { icon, color }, Rect::new(pos.x, pos.y, size.x, size.y), self.elem_hint());
+        self.painter.icon_at(Position::Physical(pos), Size::Physical(size), icon, color);
     }
 
     /// **背景图**（绝对定位；`ImageBg` 决定铺排 / 染色 / 圆角遮罩）。
@@ -1185,16 +1142,14 @@ impl<'a> Ui<'a> {
         size: impl Into<Size<Vec2>>,
         bg: ImageBg,
     ) {
-        let pos = pos.into().to_physical(self.scale);
-        let size = size.into().to_physical(self.scale);
-        self.push_draw(DrawKind::Image(bg), Rect::new(pos.x, pos.y, size.x, size.y), self.elem_hint());
+        self.painter.image_at(pos, size, bg);
     }
 
     /// **背景图**（随布局流排布；与 [`Self::image_at`] 同语义，位置来自当前容器游标）。
     pub fn image(&mut self, size: impl Into<Size<Vec2>>, bg: ImageBg) {
         let size = size.into().to_physical(self.scale);
         let pos = self.child_rect(size.x, size.y, Child::Expand).min();
-        self.push_draw(DrawKind::Image(bg), Rect::new(pos.x, pos.y, size.x, size.y), self.elem_hint());
+        self.painter.image_at(Position::Physical(pos), Size::Physical(size), bg);
     }
 
     /// **矩形渐变**（绝对定位；背景填充原语）。
@@ -1216,13 +1171,7 @@ impl<'a> Ui<'a> {
         size: impl Into<Size<Vec2>>,
         gradient: impl Into<Gradient>,
     ) {
-        let pos = pos.into().to_physical(self.scale);
-        let size = size.into().to_physical(self.scale);
-        self.push_draw(
-            DrawKind::Rect(gradient.into()),
-            Rect::new(pos.x, pos.y, size.x, size.y),
-            self.elem_hint(),
-        );
+        self.painter.gradient_at(pos, size, gradient);
     }
 
     /// **矩形渐变**（随布局流排布；与 [`Self::gradient_rect_at`] 同语义，位置来自当前容器游标）。
@@ -1233,11 +1182,7 @@ impl<'a> Ui<'a> {
     ) {
         let size = size.into().to_physical(self.scale);
         let pos = self.child_rect(size.x, size.y, Child::Expand).min();
-        self.push_draw(
-            DrawKind::Rect(gradient.into()),
-            Rect::new(pos.x, pos.y, size.x, size.y),
-            self.elem_hint(),
-        );
+        self.painter.gradient_at(Position::Physical(pos), Size::Physical(size), gradient);
     }
 
     /// **元素序提示**（控件作者用）：取"当前录制位置"的元素序（`seq + 1`）。
@@ -1250,19 +1195,60 @@ impl<'a> Ui<'a> {
     /// **组合控件里"后画的装饰"必须用本方法**：展开箭头、拖拽手柄、分隔线若写死
     /// `0` / `1`，就会被本控件自己的背景 / 文本框盖住（历史 bug：`NumberInput` 的
     /// 拖拽手柄与分隔线、`ColorPicker` 的展开箭头整块看不见——元素序小的先画）。
+    ///
+    /// 等价于 `ui.painter().elem_hint()`（[`crate::Painter`] 的默认 elem 就是它）。
     #[inline]
     pub fn elem_hint(&self) -> u32 {
-        self.seq + 1
+        self.painter.elem_hint()
+    }
+
+    /// **借出绘制器**（[`crate::Painter`]）：一个**绘制块**取一次，块内所有原语
+    /// 不再逐参数传 `elem` / 环境裁剪。
+    ///
+    /// ```no_run
+    /// # use rjw_transform::Rect;
+    /// # use rjw_ui::Ui;
+    /// # fn demo(ui: &mut Ui, rect: Rect) {
+    /// let mut p = ui.painter();
+    /// p.panel(rect, rjw_color::Color::BLACK, rjw_color::Color::WHITE, 1.0, 4.0);
+    /// # }
+    /// ```
+    ///
+    /// **沙箱内直接可用**：Clip 沙箱 / ScrollView 可视区 / 严格窗口内容裁剪就是
+    /// [`Painter::clip`] 上的**当前强制层**（`view_at` / `scroll_at` 进入时写入），
+    /// 录出的命令自带它 ⇒ 沙箱里的控件**不需要**任何额外动作。只有"要一层与当前
+    /// **不同**的裁剪"时才用 [`Self::painter_clipped`]（更窄，或 `None` 主动不裁）。
+    ///
+    /// ⚠ **绘制与 `ui.*` 不能交错**：本方法借 `&mut self`，painter 存活期内
+    /// `ui.text_size` / `ui.hit_abs` / `ui.allocate*` 都借不到 `ui`。
+    /// 顺序是「先量 → 画 → 再量」，不是一个 painter 画到底。
+    #[inline]
+    pub fn painter(&mut self) -> &mut Painter {
+        &mut self.painter
+    }
+
+    /// **借出绘制器并覆盖环境裁剪层**（只影响闭包内录的命令，块外自动恢复）。
+    ///
+    /// 等价于 `ui.painter().clipped(clip, |p| …)`；`clip = None` = 不裁剪。
+    /// 用于"本控件内容裁到自己框内、但**不改** `Ui` 的强制裁剪层"——改那一层会连带
+    /// 影响子控件 / 兄弟控件（`view_at` / `scroll_at` 就是这么用的）。
+    ///
+    /// ⚠ **已经在 Clip 沙箱里时不需要它**：沙箱裁剪已经是 painter 的当前层，
+    /// 见 [`Self::painter`]。
+    #[inline]
+    pub fn painter_clipped<R>(
+        &mut self,
+        clip: Option<Rect>,
+        f: impl FnOnce(&mut Painter) -> R,
+    ) -> R {
+        self.painter.clipped(clip, f)
     }
 
     /// 录制一条绘制命令（`elem` 由调用方给：`0` = 容器装饰层，画在本容器元素之下）。
     ///
     /// ⚠ 组合控件内"画在自家背景之上"的装饰传 [`Self::elem_hint`]，**不要**写死 `0`。
     pub(crate) fn push_draw(&mut self, kind: DrawKind, rect: Rect, elem: u32) {
-        let seq = self.next_seq();
-        let depth = self.depth;
-        let win = self.cur_win;
-        self.queue.push(UiDraw { depth, seq, win, elem, rect, clip: self.clip, kind });
+        self.painter.draw(kind, rect, elem);
     }
 
     /// 按样式 push **背景 + 边框**。
@@ -1275,7 +1261,7 @@ impl<'a> Ui<'a> {
     /// 内圈即使内缩 `border_w`，颜色按其在 `rect` 中的相对位置重采样，
     /// 不会整体平移（`resample_gradient`）。
     ///
-    /// `elem`：元素序（装饰背景传 0；控件背景传 `self.seq + 1`）。
+    /// `elem`：元素序（装饰背景传 0；控件背景传 `self.painter.q.seq + 1`）。
     /// **控件作者绘制原语**（逻辑坐标，内部 ×scale 取整到物理像素）。
     #[allow(clippy::too_many_arguments)]
     pub fn push_panel_like(
@@ -1306,19 +1292,7 @@ impl<'a> Ui<'a> {
         shadow: &crate::style::ShadowStyle,
         radius: impl Into<CornerRadius>,
     ) {
-        if !shadow.is_visible() {
-            return;
-        }
-        self.push_draw(
-            DrawKind::Shadow {
-                color: shadow.color,
-                blur: shadow.blur,
-                offset: shadow.offset,
-                radius: radius.into(),
-            },
-            rect,
-            0,
-        );
+        self.painter.shadow(rect, shadow, radius);
     }
 
     /// **右下角缩放柄图案**（窗口/面板局部坐标；`size` = 本体尺寸）。
@@ -1399,16 +1373,7 @@ impl<'a> Ui<'a> {
         radius: impl Into<CornerRadius>,
         elem: u32,
     ) {
-        let seq = self.next_seq();
-        push_panel_img_cmds(
-            &mut self.queue,
-            PanelCmdCtx { depth: self.depth, win: self.cur_win, elem, rect, clip: self.clip, seq },
-            &bg.into(),
-            img,
-            border,
-            border_w,
-            radius.into(),
-        );
+        self.painter.panel_img_elem(rect, bg, img, border, border_w, radius, elem);
     }
 
     /// 取（或创建）文本排版缓冲，并测量其自然尺寸（**逻辑像素**，宽 = 内容宽，高 = 内容高）。
@@ -1631,45 +1596,23 @@ impl<'a> Ui<'a> {
     }
 
     /// **控件作者绘制原语**：实心矩形（逻辑坐标；`w/h <= 0` 跳过）。
+    ///
+    /// 等价于 `ui.painter().solid(rect, color)`；保留为方法是为了不改既有调用点。
+    #[inline]
     pub fn push_solid_rect(&mut self, rect: Rect, color: Color) {
-        if rect.w > 0.0 && rect.h > 0.0 {
-            let elem = self.seq + 1;
-            let seq = self.next_seq();
-            let depth = self.depth;
-            let win = self.cur_win;
-            self.queue.push(UiDraw {
-                depth,
-                seq,
-                win,
-                elem,
-                rect,
-                clip: self.clip,
-                kind: DrawKind::Solid(color),
-            });
-        }
+        self.painter.solid(rect, color);
     }
 
     /// **控件作者绘制原语**：矩形边框（逻辑坐标；画在矩形内边缘，宽度取整到物理像素）。
+    ///
+    /// 等价于 `ui.painter().border(rect, color, width)`。
+    #[inline]
     pub fn push_border_rect(&mut self, rect: Rect, color: Color, width: f32) {
-        if rect.w > 0.0 && rect.h > 0.0 {
-            let elem = self.seq + 1;
-            let seq = self.next_seq();
-            let depth = self.depth;
-            let win = self.cur_win;
-            self.queue.push(UiDraw {
-                depth,
-                seq,
-                win,
-                elem,
-                rect,
-                clip: self.clip,
-                kind: DrawKind::Border { color, width, radius: CornerRadius::default() },
-            });
-        }
+        self.painter.border(rect, color, width);
     }
 
     /// 推送一条文本绘制命令（供 widget 层与 `*_at` 方法共用；`clip` 为文本局部裁剪，
-    /// 外层裁剪自动取当前容器 `self.clip`；`buf = Some` 时直接用预排版缓冲）。
+    /// 外层裁剪自动取当前容器 `self.painter.q.clip`；`buf = Some` 时直接用预排版缓冲）。
     /// **控件作者绘制原语**（逻辑坐标；`family` 传 `None` = 系统默认字体）。
     pub fn push_text_rect(
         &mut self,
@@ -1683,25 +1626,7 @@ impl<'a> Ui<'a> {
         clip: Option<Rect>,
         buf: Option<Arc<Buffer>>,
     ) {
-        let elem = self.seq + 1;
-        let seq = self.next_seq();
-        let depth = self.depth;
-        self.queue.push(text_cmd(
-            depth,
-            seq,
-            self.cur_win,
-            elem,
-            rect,
-            Arc::from(text),
-            size,
-            color,
-            align,
-            valign,
-            family,
-            clip,
-            self.clip,
-            buf,
-        ));
+        self.painter.text(rect, text, size, color, family, align, valign, clip, buf);
     }
 
     /// **不服从内容裁剪的文本绘制**（控件作者原语）：
@@ -1709,7 +1634,7 @@ impl<'a> Ui<'a> {
     /// 语义 = [`Self::push_text_rect`] 且**不附加任何软层（内容裁剪）**——调用方
     /// 承诺文本**内容自洽**（自动换行后高 = 自然高、"…"省略后宽 = 分配宽、滚动
     /// 内容受限），无需按控件边界裁剪。**仍服从强制层**（ScrollView 可视区 /
-    /// Clip 沙箱，即 `self.clip`）：父级如 ScrollView 强制裁切时躲不掉；无 Scroll
+    /// Clip 沙箱，即 `self.painter.q.clip`）：父级如 ScrollView 强制裁切时躲不掉；无 Scroll
     /// 的普通容器本来就没有强制层 → 自洽内容画出界（自洽内容本就不会出界）。
     pub fn push_text_rect_noclip(
         &mut self,
@@ -1820,14 +1745,14 @@ impl<'a> Ui<'a> {
             return false;
         }
         // 强制裁剪层（Clip 沙箱 / ScrollView 可视区）：层外命中失效。
-        if let Some(c) = self.clip
+        if let Some(c) = self.painter.q.clip
             && !c.contains_point(self.mouse_logical) {
                 return false;
             }
         // **窗口遮挡**（点击穿透修复）：鼠标下若有更高 z 的窗口（`win=0` 内容被任意
         // 窗口）覆盖本控件所在窗口 → 本窗口不得响应——重叠区域只让最上层窗口交互，
         // 背后窗口的控件不会误触发。窗口矩形来自 [`UiState::window_rects`]（跨帧缓存）。
-        if window_occluded(self.cur_win, self.mouse_logical, self.window_rects_iter()) {
+        if window_occluded(self.painter.q.cur_win, self.mouse_logical, self.window_rects_iter()) {
             // 命中但被遮挡 → 记录诊断计数（未响应）。
             self.state.occluded_hits += 1;
             return false;
@@ -1846,7 +1771,7 @@ impl<'a> Ui<'a> {
         // 更上层的别的控件覆盖此处。登记只在"几何命中"之后发生——遮挡判定只关心
         // 鼠标下那一处，鼠标不在自己矩形内时无需登记。
         let me = id_hash(owner);
-        let key = self.seq;
+        let key = self.painter.q.seq;
         let blocked = widget_occluded(
             me,
             key,
@@ -1857,7 +1782,7 @@ impl<'a> Ui<'a> {
             owner: me,
             key,
             rect: abs,
-            clip: self.clip,
+            clip: self.painter.q.clip,
         });
         let traced = std::env::var_os("RJ_HIT_TRACE").is_some();
         if blocked {
@@ -2001,20 +1926,20 @@ impl<'a> Ui<'a> {
     where
         F: FnOnce(&mut ContainerCtx<'_, '_>),
     {
-        let start = self.queue.len();
+        let start = self.painter.q.queue.len();
         let g = self.begin_top_placement();
         let saved_base = self.abs_base;
         self.abs_base = saved_base + pos;
         self.frames.push(frame);
-        self.depth += 1;
+        self.painter.q.depth += 1;
         f(&mut ContainerCtx { ui: self });
         let frame = self.frames.pop().expect("container frame");
         let size = frame.settle_size();
         let max_child = frame.max_child;
         let inner_bounds = frame.content_bounds();
-        self.depth -= 1;
+        self.painter.q.depth -= 1;
         self.abs_base = saved_base;
-        for d in &mut self.queue[start..] {
+        for d in &mut self.painter.q.queue[start..] {
             d.translate(pos);
         }
         // 绝对放置的容器整体也要算进**父级**尺寸（否则父容器/窗口仍会"只有标题那么高"）；
@@ -2049,7 +1974,7 @@ impl<'a> Ui<'a> {
     ) -> Vec2 {
         let pos = pos.into().to_physical(self.scale);
         let size = size.into().to_physical(self.scale);
-        let saved_clip = self.clip;
+        let saved_clip = self.painter.q.clip;
         let saved_base = self.abs_base;
         let view_rel = Rect::new(pos.x, pos.y, size.x.max(0.0), size.y.max(0.0));
         let view_abs = Rect::new(
@@ -2059,22 +1984,22 @@ impl<'a> Ui<'a> {
             view_rel.h,
         );
         // 强制裁剪层（Clip 模式：外层 ∩ 可视区；Expand：原样传递）。
-        self.clip = clip_for_view(saved_clip, view_abs, mode);
+        self.painter.q.clip = clip_for_view(saved_clip, view_abs, mode);
         // 可用宽度栈：沙箱内 avail_w() = 沙箱宽。
         self.avail_stack.push(Some(view_rel.w));
-        let start = self.queue.len();
+        let start = self.painter.q.queue.len();
         let g = self.begin_top_placement();
         self.abs_base = saved_base + pos;
         self.frames.push(Frame::new_stack(PackSide::Top, self.theme.gap, 0.0));
-        self.depth += 1;
+        self.painter.q.depth += 1;
         f(&mut ViewCtx { ui: self });
         let frame = self.frames.pop().expect("view frame");
         let content = frame.settle_size();
-        self.depth -= 1;
+        self.painter.q.depth -= 1;
         self.abs_base = saved_base;
         self.avail_stack.pop();
-        self.clip = saved_clip;
-        for d in &mut self.queue[start..] {
+        self.painter.q.clip = saved_clip;
+        for d in &mut self.painter.q.queue[start..] {
             d.translate(pos);
         }
         self.end_top_placement(g);
@@ -2137,7 +2062,7 @@ impl<'a> Ui<'a> {
         let view_size = view_size.into().to_physical(self.scale);
         // 滚动容器自身也是命名空间边界：内部子控件 ID 自动带 `id` 前缀。
         let abs = self.id_for(id);
-        let saved_clip = self.clip;
+        let saved_clip = self.painter.q.clip;
         let saved_base = self.abs_base;
         // 可视区（**相对**当前容器 origin：内容 / 滚动条命令都录在容器局部坐标，
         // 随外层容器弹出统一平移成绝对坐标）。
@@ -2150,7 +2075,7 @@ impl<'a> Ui<'a> {
             view_size.y.max(0.0),
         );
         // 强制裁剪层 = 外层裁剪 ∩ 本可视区（View 沙箱 Clip 语义）。
-        self.clip = clip_for_view(saved_clip, view_abs, ViewMode::Clip);
+        self.painter.q.clip = clip_for_view(saved_clip, view_abs, ViewMode::Clip);
         // 滚动偏移（**物理像素**，跨帧状态；先 Copy 读出，`f` 结束再写回——避免
         // 借用冲突）。以整物理像素步进（滚轮 / 拖 thumb 均取整）。
         let mut offset_px = self
@@ -2162,7 +2087,7 @@ impl<'a> Ui<'a> {
         // 可用宽度栈：滚动容器内 avail_w() = 可视区宽（LimitedInParent 控件自洽）。
         self.avail_stack.push(Some(view_rel.w));
         // 内容 pack 堆叠（手动管理帧栈：平移 = pos - offset_px/scale，而非 container 的 pos）。
-        let start = self.queue.len();
+        let start = self.painter.q.queue.len();
         let g = self.begin_top_placement();
         // abs_base = 内容**渲染**原点（已含 -offset 滚动偏移）——`hit_abs`（点击
         // 命中）/ `register_focus`（焦点描边）/ IME 光标定位都经 abs_base 换算，
@@ -2170,12 +2095,12 @@ impl<'a> Ui<'a> {
         // 命中落在未滚动坐标上）。
         self.abs_base = saved_base + pos - Vec2::new(0.0, offset_px);
         self.frames.push(Frame::new_stack(PackSide::Top, self.theme.gap, 0.0));
-        self.depth += 1;
+        self.painter.q.depth += 1;
         // ID 命名空间：滚动容器进入压栈、退出弹栈（闭包作用域保证配对）。
         self.with_id(id, |ui| f(&mut Scroll { ui }));
         let frame = self.frames.pop().expect("scroll frame");
         let content_size = frame.settle_size();
-        self.depth -= 1;
+        self.painter.q.depth -= 1;
         self.abs_base = saved_base;
         self.avail_stack.pop();
         let max_off_px = (content_size.y - view_size.y).max(0.0).round();
@@ -2184,7 +2109,7 @@ impl<'a> Ui<'a> {
         // 每格 40 物理像素取整（trackpad 连续增量同样按格取整步进）。
         let hit = hit_test(&view_abs, self.mouse_logical)
             && self.mouse_in_window
-            && !window_occluded(self.cur_win, self.mouse_logical, self.window_rects_iter());
+            && !window_occluded(self.painter.q.cur_win, self.mouse_logical, self.window_rects_iter());
         if hit {
             let (_, wy) = self.mouse.wheel();
             if wy != 0.0 {
@@ -2193,7 +2118,7 @@ impl<'a> Ui<'a> {
         }
         // 平移内容子命令：局部坐标 → 绝对（`UiDraw::clip` 已是绝对，不随平移——见其
         // 文档）。offset 为物理像素 → 刚性平移。
-        for d in &mut self.queue[start..] {
+        for d in &mut self.painter.q.queue[start..] {
             d.translate(pos - Vec2::new(0.0, offset_px));
         }
         // 滚动条（内容超出可视区时显示；拖 thumb / 点轨道翻页）——在**当前容器局部
@@ -2214,7 +2139,7 @@ impl<'a> Ui<'a> {
         let st = self.state.scrolls.entry(abs.to_static()).or_default();
         st.offset = offset_px;
         st.content_h = content_size.y;
-        self.clip = saved_clip;
+        self.painter.q.clip = saved_clip;
         self.end_top_placement(g);
         view_size
     }
@@ -2286,8 +2211,8 @@ impl<'a> Ui<'a> {
         let thumb = Rect::new(track.x, track.y + thumb_y_px, track.w, thumb_h_px);
         // 交互判定必须在**绘制前**求出（滑块颜色取决于悬停 / 拖拽状态）。
         // 局部坐标鼠标 = 绝对鼠标 − 当前容器绝对原点（abs_base 已恢复为外层值）。
-        let depth = self.depth;
-        let win = self.cur_win;
+        let depth = self.painter.q.depth;
+        let win = self.painter.q.cur_win;
         let mouse_rel = self.mouse_logical - self.abs_base;
         let bar_id = IdAbsolute::owned(format!("{}::bar", id.as_str()));
         let on_top = self.mouse_in_window
@@ -2298,7 +2223,7 @@ impl<'a> Ui<'a> {
         // - 同时也要能被**更晚录制**的控件挡住（对称处理，不搞特例）。
         // 登记用**条带**（滑块 + 两侧留白 + 上下留白）：热区即占位区。
         let me = id_hash(&bar_id);
-        let key = self.seq;
+        let key = self.painter.q.seq;
         let strip_abs = Rect::new(
             self.abs_base.x + strip.x,
             self.abs_base.y + strip.y,
@@ -2310,7 +2235,7 @@ impl<'a> Ui<'a> {
                 owner: me,
                 key,
                 rect: strip_abs,
-                clip: self.clip,
+                clip: self.painter.q.clip,
             });
         }
         let on_top = on_top
@@ -2346,7 +2271,7 @@ impl<'a> Ui<'a> {
         } else {
             pal.text_dim
         };
-        self.queue.push(UiDraw {
+        self.painter.q.queue.push(UiDraw {
             depth,
             seq,
             win,
@@ -2368,7 +2293,7 @@ impl<'a> Ui<'a> {
                 )),
             },
         });
-        self.queue.push(UiDraw {
+        self.painter.q.queue.push(UiDraw {
             depth,
             seq: seq + 1,
             win,
@@ -2411,16 +2336,16 @@ impl<'a> Ui<'a> {
     /// 绝对定位标签（`pos` 相对当前容器内容原点；顶层即屏幕原点）。
     pub fn label_at(&mut self, pos: impl Into<Position>, text: &str) -> Vec2 {
         let pos = pos.into().to_physical(self.scale);
-        let elem = self.seq + 1;
+        let elem = self.painter.q.seq + 1;
         let seq = self.next_seq();
         let style = self.theme.label.clone();
         let size = self.text_size(text, style.font_size, style.font_family.as_deref());
         let rect = Rect::new(pos.x, pos.y, size.x, size.y);
         self.note_placed(rect);
-        self.queue.push(text_cmd(
-            self.depth,
+        self.painter.q.queue.push(text_cmd(
+            self.painter.q.depth,
             seq,
-            self.cur_win,
+            self.painter.q.cur_win,
             elem,
             rect,
             Arc::from(text),
@@ -2430,7 +2355,7 @@ impl<'a> Ui<'a> {
             TextVAlign::Center,
             style.font_family.clone(),
             None,
-            self.clip,
+            self.painter.q.clip,
         None,
         ));
         size
@@ -2443,7 +2368,7 @@ impl<'a> Ui<'a> {
     pub fn label_wrap_at(&mut self, pos: impl Into<Position>, max_w: impl Into<Size<f32>>, text: &str) -> Vec2 {
         let pos = pos.into().to_physical(self.scale);
         let max_w = max_w.into().to_physical(self.scale);
-        let elem = self.seq + 1;
+        let elem = self.painter.q.seq + 1;
         let seq = self.next_seq();
         let style = self.theme.label.clone();
         let size = self.text_size_wrap(text, style.font_size, style.font_family.as_deref(), max_w);
@@ -2456,10 +2381,10 @@ impl<'a> Ui<'a> {
         } else {
             None
         };
-        self.queue.push(text_cmd(
-            self.depth,
+        self.painter.q.queue.push(text_cmd(
+            self.painter.q.depth,
             seq,
-            self.cur_win,
+            self.painter.q.cur_win,
             elem,
             rect,
             Arc::from(text),
@@ -2469,7 +2394,7 @@ impl<'a> Ui<'a> {
             TextVAlign::Center,
             style.font_family.clone(),
             None,
-            self.clip,
+            self.painter.q.clip,
             buf,
         ));
         size
@@ -2588,7 +2513,7 @@ impl<'a> Ui<'a> {
             Some(a) => self.resolve_pos(a, pos),
             None => pos,
         };
-        let start = self.queue.len();
+        let start = self.painter.q.queue.len();
         let g = self.begin_top_placement();
         let style = style
             .cloned()
@@ -2626,12 +2551,12 @@ impl<'a> Ui<'a> {
         // 内容基准 = **本帧显示基准**（`display_pos`）——录制期的绝对空间量与几何一致。
         self.abs_base = saved_base + display_pos;
         self.frames.push(Frame::new_stack(PackSide::Top, gap, pad_total));
-        self.depth += 1;
+        self.painter.q.depth += 1;
         let mut panel = Panel { ui: self };
         f(&mut panel);
         let frame = self.frames.pop().expect("panel frame");
         let size = frame.settle_size();
-        self.depth -= 1;
+        self.painter.q.depth -= 1;
         self.abs_base = saved_base;
         // ─── ② 内容录完后：按下裁决 + 位置持久 ──────────────────────────
         if let Some(a) = abs.as_ref() {
@@ -2672,7 +2597,7 @@ impl<'a> Ui<'a> {
         self.push_panel_like_img(bg_rect, style.bg, style.bg_image, style.border, style.border_w, style.radius, 0);
         // 平移全部（子命令 + 背景/边框）：
         // 用 `display_pos`（拖拽中 = 本帧新位置）→ 文字/矩形**当帧生效**。
-        for d in &mut self.queue[start..] {
+        for d in &mut self.painter.q.queue[start..] {
             d.translate(display_pos);
         }
         self.end_top_placement(g);
@@ -2754,17 +2679,17 @@ impl<'a> Ui<'a> {
                 .unwrap_or(0);
             *self.state.window_z.entry(id_for.to_static()).or_insert(max_z + 1)
         };
-        let saved_win = std::mem::replace(&mut self.cur_win, z);
+        let saved_win = std::mem::replace(&mut self.painter.q.cur_win, z);
         // 当前窗口 ID（嵌套窗口 = 下拉浮层进出时保存/恢复）：`hit_impl` 记按下归属要用它，
         // 因为 z 会在帧末被"点击置顶"改，而复核要用**当前** z（见 `resolve_widget_press`）。
         let saved_win_id = self.cur_win_id.replace(id_for.to_static());
         // 当前窗口的"可交互内容范围"并集：进入时从零开始，退出时并进遮挡矩形
         // （浮层是嵌套窗口 ⇒ 保存/恢复，浮层的内容不该算进外层窗口）。
         let saved_hit_bounds = self.win_hit_bounds.take();
-        let saved_clip = self.clip;
+        let saved_clip = self.painter.q.clip;
         // 位置经**责任链**解析（脚本处理器 → 用户拖拽状态 → 传入 pos，见 pos_handler）
         let origin = self.resolve_pos(&id_for, pos);
-        let start = self.queue.len();
+        let start = self.painter.q.queue.len();
         let style = style
             .cloned()
             .unwrap_or_else(|| self.theme.panel.clone());
@@ -2915,7 +2840,7 @@ impl<'a> Ui<'a> {
             frame.set_fixed_h(h);
         }
         self.frames.push(frame);
-        self.depth += 1;
+        self.painter.q.depth += 1;
 
         // ID 命名空间：窗口进入压栈、退出弹栈（闭包作用域保证配对——取代手动
         // push_id/pop_id，杜绝漏配对/多弹出）。窗口内子控件 ID 自动带窗口前缀。
@@ -2939,7 +2864,7 @@ impl<'a> Ui<'a> {
 
         let frame = self.frames.pop().expect("window frame");
         let size = frame.settle_size();
-        self.depth -= 1;
+        self.painter.q.depth -= 1;
         self.abs_base = saved_base;
         // 记录窗口尺寸（按 id 持久；点击置顶 z 变化后下帧 prev_size 仍可取）。
         self.state.window_sizes.insert(id_for.to_static(), size);
@@ -2968,9 +2893,9 @@ impl<'a> Ui<'a> {
             && self
                 .win_press_top
                 .as_ref()
-                .is_none_or(|(_, top_z)| self.cur_win > *top_z)
+                .is_none_or(|(_, top_z)| self.painter.q.cur_win > *top_z)
         {
-            self.win_press_top = Some((id_for.to_static(), self.cur_win));
+            self.win_press_top = Some((id_for.to_static(), self.painter.q.cur_win));
         }
         if active {
             self.drag_panel = Some(id_for.to_static());
@@ -3049,7 +2974,7 @@ impl<'a> Ui<'a> {
                 size.x,
                 size.y,
             );
-            for d in &mut self.queue[start..] {
+            for d in &mut self.painter.q.queue[start..] {
                 d.clip = clip_for_view(saved_clip, win_abs, ViewMode::Clip);
             }
         }
@@ -3088,10 +3013,10 @@ impl<'a> Ui<'a> {
                 0,
             );
         }
-        for d in &mut self.queue[start..] {
+        for d in &mut self.painter.q.queue[start..] {
             d.translate(display_pos);
         }
-        self.cur_win = saved_win;
+        self.painter.q.cur_win = saved_win;
         self.cur_win_id = saved_win_id;
         // 恢复外层窗口的"可交互内容范围"（本窗口已并进自己的遮挡矩形）。
         self.win_hit_bounds = saved_hit_bounds;
@@ -3175,16 +3100,16 @@ impl<'a> Ui<'a> {
         };
         let dim_rect = Rect::new(0.0, 0.0, mw, mh);
         // 遮罩录制（win = z_dim；按顶层使用，局部 == 绝对）。
-        let saved_win = std::mem::replace(&mut self.cur_win, z_dim);
+        let saved_win = std::mem::replace(&mut self.painter.q.cur_win, z_dim);
         let seq = self.next_seq();
-        let depth = self.depth;
-        self.queue.push(UiDraw {
+        let depth = self.painter.q.depth;
+        self.painter.q.queue.push(UiDraw {
             depth,
             seq,
             win: z_dim,
             elem: 0,
             rect: dim_rect,
-            clip: self.clip,
+            clip: self.painter.q.clip,
             kind: DrawKind::Solid(self.theme.modal.dim),
         });
         // 遮罩窗口矩形（遮挡判定用；绝对）。键按**遮罩的绝对 ID**（同 `window_impl`）。
@@ -3195,7 +3120,7 @@ impl<'a> Ui<'a> {
         }
         self.win_ids.insert(z_dim, dim_abs.to_static());
         self.win_origins.insert(z_dim, Vec2::ZERO);
-        self.cur_win = saved_win;
+        self.painter.q.cur_win = saved_win;
         // 对话框窗口（window_impl 按 max+1 分配 → z = z_dim + 1，浮于遮罩之上；
         // **不主动置顶**——点击对话框/背景不触发 z 提升）。
         self.window_impl(
@@ -3312,14 +3237,14 @@ impl<'a> Ui<'a> {
         let pos = pos.into().to_physical(self.scale);
         let total_h = total_h.into().to_physical(self.scale);
         let gap = self.theme.gap;
-        let start = self.queue.len();
+        let start = self.painter.q.queue.len();
         let g = self.begin_top_placement();
         let saved_base = self.abs_base;
         self.abs_base = saved_base + pos;
         let mut frame = Frame::new_stack(PackSide::Top, gap, 0.0);
         frame.set_fixed_h(total_h);
         self.frames.push(frame);
-        self.depth += 1;
+        self.painter.q.depth += 1;
         let sum: u32 = weights.iter().sum();
         let gaps = gap * weights.len().saturating_sub(1) as f32;
         let usable = (total_h - gaps).max(0.0);
@@ -3334,9 +3259,9 @@ impl<'a> Ui<'a> {
         let frame = self.frames.pop().expect("flex frame");
         let size = frame.settle_size();
         let inner_bounds = frame.content_bounds();
-        self.depth -= 1;
+        self.painter.q.depth -= 1;
         self.abs_base = saved_base;
-        for d in &mut self.queue[start..] {
+        for d in &mut self.painter.q.queue[start..] {
             d.translate(pos);
         }
         if let Some(parent) = self.frames.last_mut() {
@@ -3427,8 +3352,8 @@ impl<'a> Ui<'a> {
         // 分桶、桶内保持录制序，与 `sort_by_key((win, depth, elem, group, seq))`
         // **完全等价**（O(n + 桶数)，免每帧 O(n log n)）。
         let t_sort = Instant::now();
-        let cmd_count = self.queue.len() as u32;
-        let queue = std::mem::take(&mut self.queue);
+        let cmd_count = self.painter.q.queue.len() as u32;
+        let queue = std::mem::take(&mut self.painter.q.queue);
         // **WHITE 基础纹理优先取字形图集页**（`Text::white_region`，1×1 clamp_margin）：
         // 实心填充（Solid / 边框 / 光标）与字形**同页同纹理** → 同窗口内"图形组 → 文字组"
         // 相邻且同纹理，后端的连续段合批合成单次 draw call，省去图形↔文字的纹理状态切换。
@@ -3935,7 +3860,7 @@ impl<'a> Ui<'a> {
         // 1. 收集 debug_queue（[`Self::debug_line`] 等屏幕空间调试图元），与布局描边合并。
         let mut debug_groups: std::collections::HashMap<u32, Vec<UiDraw>> =
             std::collections::HashMap::new();
-        for d in self.debug_queue.drain(..) {
+        for d in self.painter.q.debug_queue.drain(..) {
             debug_groups.entry(d.win).or_default().push(d);
         }
         let mut dwins: Vec<u32> = debug_groups.keys().copied().collect();
@@ -4020,9 +3945,9 @@ impl<'a> Ui<'a> {
         self.state
             .window_rects
             .retain(|id, _| seen_wins.iter().any(|w| w == id));
-        self.depth = 0;
-        self.seq = 0;
-        self.cur_win = 0;
+        self.painter.q.depth = 0;
+        self.painter.q.seq = 0;
+        self.painter.q.cur_win = 0;
         self.any_pressed = false;
         self.drag_panel = None;
         self.win_press_top = None;
@@ -4410,9 +4335,9 @@ impl<'a> Ui<'a> {
             // 先拷贝字段，结束对 chain 的借用（随后需要 &mut self）。
             let (win, depth, rect, clip) = (entry.win, entry.depth, entry.rect, entry.clip);
             let focus = self.theme.focus.clone();
-            let elem = self.seq + 1;
+            let elem = self.painter.q.seq + 1;
             let seq = self.next_seq();
-            self.debug_queue.push(UiDraw {
+            self.painter.q.debug_queue.push(UiDraw {
                 depth,
                 seq,
                 win,
@@ -4804,25 +4729,17 @@ pub trait UiAdd<'a> {
         let style = ui.theme.label.clone();
         let size = ui.text_size_wrap(text, style.font_size, style.font_family.as_deref(), max_w);
         let rect = ui.child_rect(size.x, size.y, Child::Expand);
-        let elem = ui.seq + 1;
-        let seq = ui.next_seq();
-        let depth = ui.depth;
-        ui.queue.push(text_cmd(
-            depth,
-            seq,
-            ui.cur_win,
-            elem,
+        ui.painter().text(
             rect,
-            Arc::from(text),
+            text,
             style.font_size,
             style.color,
+            style.font_family.clone(),
             TextAlign::from(style.align),
             TextVAlign::Center,
-            style.font_family.clone(),
             None,
-            ui.clip,
             None,
-        ));
+        );
         size
     }
 
@@ -5554,9 +5471,9 @@ impl Ui<'_> {
             let (pressed, hovered) = (ws.pressed, ws.hovered);
             // 记录绘制（ws 借用已结束）
             let bg = style.pick_bg(pressed, hovered);
-            let depth = self.depth;
-            let win = self.cur_win;
-            let elem = self.seq + 1;
+            let depth = self.painter.q.depth;
+            let win = self.painter.q.cur_win;
+            let elem = self.painter.q.seq + 1;
             // 背景 + 边框（radius > 0 走圆角双层矩形）。
             self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
             // 按钮文本自动省略（Resizable 窗口缩窄 / max 约束下不溢出）：
@@ -5569,7 +5486,7 @@ impl Ui<'_> {
             );
             let draw_label: &str = label_owned.as_deref().unwrap_or(label);
             let text_seq = self.next_seq();
-            self.queue.push(text_cmd(
+            self.painter.q.queue.push(text_cmd(
                 depth,
                 text_seq,
                 win,
@@ -5582,7 +5499,7 @@ impl Ui<'_> {
                 TextVAlign::Center,
                 style.font_family.clone(),
                 None,
-                self.clip,
+                self.painter.q.clip,
             None,
             ));
             ButtonState {
@@ -5720,7 +5637,7 @@ impl Ui<'_> {
         } else {
             0.0
         };
-        let elem = self.seq + 1;
+        let elem = self.painter.q.seq + 1;
         let track_rect =
             Rect::new(rect.x, rect.y + (rect.h - style.track_h) * 0.5, rect.w, style.track_h);
         // 手柄**中心**夹在轨道两端之内（t=0/1 时手柄不伸出轨道/控件外）；
@@ -5900,9 +5817,9 @@ impl Ui<'_> {
         hovered: bool,
         style: &CheckboxStyle,
     ) {
-        let depth = self.depth;
-        let win = self.cur_win;
-        let elem = self.seq + 1;
+        let depth = self.painter.q.depth;
+        let win = self.painter.q.cur_win;
+        let elem = self.painter.q.seq + 1;
         let box_rect = Rect::new(
             rect.x,
             rect.y + (rect.h - style.box_size) * 0.5,
@@ -5922,23 +5839,23 @@ impl Ui<'_> {
                 self.theme.palette.surface_sunken
             };
             let seq = self.next_seq();
-            self.queue.push(UiDraw {
+            self.painter.q.queue.push(UiDraw {
                 depth,
                 seq,
                 win,
                 elem,
                 rect: box_rect,
-                clip: self.clip,
+                clip: self.painter.q.clip,
                 kind: DrawKind::RoundedRect { corners: [bg; 4], radius: style.radius },
             });
         } else {
-            self.queue.push(UiDraw {
+            self.painter.q.queue.push(UiDraw {
                 depth,
                 seq,
                 win,
                 elem,
                 rect: box_rect,
-                clip: self.clip,
+                clip: self.painter.q.clip,
                 kind: DrawKind::Border {
                     // 悬停时方框描边转向强调色——与按钮 / 下拉框的悬停反馈一致
                     // （此前勾选框 hover 毫无变化，鼠标移上去看不出"可以点"）。
@@ -5959,13 +5876,13 @@ impl Ui<'_> {
                 // 填充与外框同心的内圆角（`radius - inset`，clamp 到 0）——
                 // 与外框环带的内侧半径取同一套规则，两者贴合不留缝。
                 let fill_radius = style.radius.map(|r| (r - inset_px).max(0.0));
-                self.queue.push(UiDraw {
+                self.painter.q.queue.push(UiDraw {
                     depth,
                     seq,
                     win,
                     elem,
                     rect: inner,
-                    clip: self.clip,
+                    clip: self.painter.q.clip,
                     kind: DrawKind::RoundedRect {
                         corners: [style.checked_fill; 4],
                         radius: fill_radius,
@@ -5983,7 +5900,7 @@ impl Ui<'_> {
         let label_owned = self.ellipsized(label, style.font_size, style.font_family.as_deref(), text_rect.w);
         let draw_label: &str = label_owned.as_deref().unwrap_or(label);
         let seq = self.next_seq();
-        self.queue.push(text_cmd(
+        self.painter.q.queue.push(text_cmd(
             depth,
             seq,
             win,
@@ -5996,7 +5913,7 @@ impl Ui<'_> {
             TextVAlign::Center,
             style.font_family.clone(),
             None,
-            self.clip,
+            self.painter.q.clip,
         None,
         ));
     }
@@ -6279,16 +6196,16 @@ impl Ui<'_> {
         let (focused, caret) = caret_est;
         // 绘制
         let style = self.theme.input.clone();
-        let depth = self.depth;
-        let win = self.cur_win;
-        let elem = self.seq + 1;
+        let depth = self.painter.q.depth;
+        let win = self.painter.q.cur_win;
+        let elem = self.painter.q.seq + 1;
         let border = if focused { style.border_focus } else { style.border };
         // 视觉框绝对矩形（Clip 沙箱用）：**整个输入框**——高亮/光标/文本命令
         // 受其强制裁剪（滚出视图不画出框，且外层 ScrollView 裁切一并生效）。
         let box_clip = Rect::new(self.abs_base.x + rect.x, self.abs_base.y + rect.y, rect.w, rect.h);
         // **Clip 子沙箱**（控件内）：强制裁剪层 = 外层强制 ∩ 输入框矩形。
-        let saved_clip = self.clip;
-        self.clip = clip_for_view(saved_clip, box_clip, ViewMode::Clip);
+        let saved_clip = self.painter.q.clip;
+        self.painter.q.clip = clip_for_view(saved_clip, box_clip, ViewMode::Clip);
         // 背景 + 边框（radius > 0 走圆角双层矩形）。
         // 圆角可以被**一次性**覆盖（[`Self::text_input_corners`]）——`NumberInput` 靠它让
         // 文本框只圆左侧两角，从而与右侧拖拽手柄拼成一条直边。
@@ -6383,14 +6300,14 @@ impl Ui<'_> {
             );
             if sel_rect.w > 0.0 && sel_rect.h > 0.0 {
                 let seq = self.next_seq();
-                self.queue.push(UiDraw {
+                self.painter.q.queue.push(UiDraw {
                     depth,
                     seq,
                     win,
                     elem,
                     rect: sel_rect,
                     // 选择高亮受输入框强制裁剪（不溢出输入框 / 外层滚动容器）。
-                    clip: self.clip,
+                    clip: self.painter.q.clip,
                     // **圆角 + 上下留白**：原来是整块无圆角实心（上下各只缩 1px），
                     // 在圆角输入框里看起来就是一个"方框顶着边框"。现在贴近文字行高，
                     // 小圆角（顺带吃到羽化抗锯齿）。
@@ -6431,7 +6348,7 @@ impl Ui<'_> {
             }
         };
         let seq = self.next_seq();
-        self.queue.push(text_cmd(
+        self.painter.q.queue.push(text_cmd(
             depth,
             seq,
             win,
@@ -6444,7 +6361,7 @@ impl Ui<'_> {
             TextVAlign::Center,
             style.font_family.clone(),
             Some(clip),
-            self.clip,
+            self.painter.q.clip,
             Some(buf),
         ));
         // **组合下划线**：覆盖组合文本段（显示串 `[span]`），受内容区裁剪。
@@ -6461,13 +6378,13 @@ impl Ui<'_> {
             );
             if ul.w > 0.0 && ul.h > 0.0 {
                 let useq = self.next_seq();
-                self.queue.push(UiDraw {
+                self.painter.q.queue.push(UiDraw {
                     depth,
                     seq: useq,
                     win,
                     elem,
                     rect: ul,
-                    clip: self.clip,
+                    clip: self.painter.q.clip,
                     kind: DrawKind::Solid(style.preedit),
                 });
             }
@@ -6492,13 +6409,13 @@ impl Ui<'_> {
                 (content_rect.h - 4.0).max(1.0),
             );
             let seq = self.next_seq();
-            self.queue.push(UiDraw {
+            self.painter.q.queue.push(UiDraw {
                 depth,
                 seq,
                 win,
                 elem,
                 rect: caret_rect,
-                clip: self.clip,
+                clip: self.painter.q.clip,
                 kind: DrawKind::Caret {
                     color: style.caret,
                     width: 1.0,
@@ -6506,7 +6423,7 @@ impl Ui<'_> {
             });
         }
         // 退出 Clip 子沙箱（恢复外层强制裁剪层）。
-        self.clip = saved_clip;
+        self.painter.q.clip = saved_clip;
     }
 
     /// 多行文本输入框（显式 rect，**TextArea**）。
@@ -6929,14 +6846,14 @@ impl Ui<'_> {
             ws.scroll_y
         };
         // 绘制
-        let depth = self.depth;
-        let win = self.cur_win;
-        let elem = self.seq + 1;
+        let depth = self.painter.q.depth;
+        let win = self.painter.q.cur_win;
+        let elem = self.painter.q.seq + 1;
         let border = if focused { style.border_focus } else { style.border };
         // **Clip 子沙箱**（控件内）：强制裁剪层 = 外层强制 ∩ 输入框矩形。
         // 光标 / 高亮 / 文本命令自动受其裁剪（滚出视图不画出框）。
-        let saved_clip = self.clip;
-        self.clip = clip_for_view(saved_clip, box_clip, ViewMode::Clip);
+        let saved_clip = self.painter.q.clip;
+        self.painter.q.clip = clip_for_view(saved_clip, box_clip, ViewMode::Clip);
         self.push_panel_like(rect, style.bg, border, style.border_w, style.radius, elem);
         // 选择高亮（逐**视觉行**；x = 行内前缀宽度，y = 视觉行序号 × 行高——与显示一致）
         if let Some((lo, hi)) = sel_range(
@@ -6980,13 +6897,13 @@ impl Ui<'_> {
                 );
                 if sel_rect.w > 0.0 {
                     let seq = self.next_seq();
-                    self.queue.push(UiDraw {
+                    self.painter.q.queue.push(UiDraw {
                         depth,
                         seq,
                         win,
                         elem,
                         rect: sel_rect,
-                        clip: self.clip,
+                        clip: self.painter.q.clip,
                         // 与单行输入框一致：圆角高亮（不是硬边实心块）。
                         kind: DrawKind::RoundedRect {
                             corners: [style.sel_bg; 4],
@@ -6999,7 +6916,7 @@ impl Ui<'_> {
         // 文本（换行 + 垂直滚动；clip 相对文本块：上缘 = scroll/scale，高 = 可视区；
         // 缓冲控件自持——组合时用显示串缓冲，否则复用 `vbuf`）。
         let seq = self.next_seq();
-        self.queue.push(text_cmd(
+        self.painter.q.queue.push(text_cmd(
             depth,
             seq,
             win,
@@ -7024,7 +6941,7 @@ impl Ui<'_> {
                 rect.w,
                 rect.h,
             )),
-            self.clip,
+            self.painter.q.clip,
             Some(draw_buf),
         ));
         // **组合下划线**：覆盖组合文本段（显示串 `[span]`，可能跨视觉行），
@@ -7055,13 +6972,13 @@ impl Ui<'_> {
                 );
                 if ul.w > 0.0 && ul.h > 0.0 {
                     let useq = self.next_seq();
-                    self.queue.push(UiDraw {
+                    self.painter.q.queue.push(UiDraw {
                         depth,
                         seq: useq,
                         win,
                         elem,
                         rect: ul,
-                        clip: self.clip,
+                        clip: self.painter.q.clip,
                         kind: DrawKind::Solid(style.preedit),
                     });
                 }
@@ -7087,13 +7004,13 @@ impl Ui<'_> {
                 line_h,
             );
             let seq = self.next_seq();
-            self.queue.push(UiDraw {
+            self.painter.q.queue.push(UiDraw {
                 depth,
                 seq,
                 win,
                 elem,
                 rect: caret_rect,
-                clip: self.clip,
+                clip: self.painter.q.clip,
                 kind: DrawKind::Caret {
                     color: style.caret,
                     width: 1.0,
@@ -7111,14 +7028,14 @@ impl Ui<'_> {
                 content_h,
                 scroll,
                 max_scroll_px,
-                self.clip,
+                self.painter.q.clip,
                 elem,
             );
             let ws = self.state.widgets.entry(id_for.to_static()).or_default();
             ws.scroll_y = new_px;
         }
         // 退出 Clip 子沙箱（恢复外层强制裁剪层）。
-        self.clip = saved_clip;
+        self.painter.q.clip = saved_clip;
     }
 }
 
@@ -7265,88 +7182,10 @@ fn trace_title_bar(
     }
 }
 
-// ─── 面板命令（纯函数：`push_panel_like_img` 与单测共用） ─────────
-
-/// 一条面板命令的公共字段（[`push_panel_img_cmds`] 的入参；`seq` = 背景刷那条命令的序号）。
-pub(crate) struct PanelCmdCtx {
-    pub depth: u32,
-    pub win: u32,
-    pub elem: u32,
-    pub rect: Rect,
-    pub clip: Option<Rect>,
-    pub seq: u32,
-}
-
-/// **面板的三层命令**（背景刷 → 背景图 → 边框）——从 `Ui::push_panel_like_img` 提出来
-/// 的**纯函数**：不碰 `Ui`，因此可以直接单测"直角面板到底推了哪几条命令"。
-///
-/// 为什么值得单独成函数：**背景图曾在 `radius == 0`（直角）分支里被静默丢掉**
-/// （"Tile（1:1 平铺，直角）"那个窗口就是因为这条而空白）。当时的方法体把"背景刷
-/// 形状"和"要不要画图 / 边框"混在同一个 `if radius` 里，看代码很难一眼发现。现在：
-/// 背景刷按 `(是否直角, 是否纯色)` 一次 `match` 定形，**图与边框移出分支、无条件执行**。
-pub(crate) fn push_panel_img_cmds(
-    out: &mut Vec<UiDraw>,
-    ctx: PanelCmdCtx,
-    bg: &crate::style::Brush,
-    img: Option<ImageBg>,
-    border: Color,
-    border_w: f32,
-    radius: CornerRadius,
-) {
-    let PanelCmdCtx { depth, win, elem, rect, clip, seq } = ctx;
-    // 背景图的 seq 夹在"背景刷"与"边框"之间（同 elem 内按 seq 排序 ⇒ 层次正确）。
-    let img_seq = seq + 1;
-    let border_seq = if img.is_some() { seq + 2 } else { seq + 1 };
-    // 渐变锚定在 `rect` 上（`resample_gradient_local` 保证裁剪不改变颜色锚定）。
-    let grad = Gradient::corners(
-        bg.corners()[0],
-        bg.corners()[1],
-        bg.corners()[2],
-        bg.corners()[3],
-    );
-    // **背景刷**：圆角 = 一整块 `RoundedRect`（渐变四角色直接给它，无需内缩重采样）；
-    // 直角 = `Solid` / `Rect`（少一次镶嵌）。
-    //
-    // 圆角分支的历史：旧实现是"外圈 border 色实心圆角 + 内圈 bg 色实心圆角"，两块
-    // 的抗锯齿边缘会在圆角处各混合一次（看起来发灰、边缘偏粗）；现在边框是**环带**，
-    // 只画一次边界。
-    let kind = match (radius.is_zero(), bg.as_solid()) {
-        (false, Some(c)) => DrawKind::RoundedRect { corners: [c; 4], radius },
-        (false, None) => DrawKind::RoundedRect {
-            corners: [grad.tl, grad.tr, grad.bl, grad.br],
-            radius,
-        },
-        (true, Some(c)) => DrawKind::Solid(c),
-        (true, None) => DrawKind::Rect(grad),
-    };
-    out.push(UiDraw { depth, seq, win, elem, rect, clip, kind });
-    // **背景图**（背景刷之上、边框之下）：圆角遮罩用面板 radius（直角时半径 0 ⇒ 不裁）。
-    // ⚠ 与半径**无关**：直角面板同样要画图（历史 bug 就在这里）。
-    if let Some(mut img) = img {
-        img.radius = radius;
-        out.push(UiDraw {
-            depth,
-            seq: img_seq,
-            win,
-            elem,
-            rect,
-            clip,
-            kind: DrawKind::Image(img),
-        });
-    }
-    // **边框**（最上层）：直角时 `radius` 本身就是 0，无需另写 `CornerRadius::default()`。
-    if border_w > 0.0 {
-        out.push(UiDraw {
-            depth,
-            seq: border_seq,
-            win,
-            elem,
-            rect,
-            clip,
-            kind: DrawKind::Border { color: border, width: border_w, radius },
-        });
-    }
-}
+// ─── 面板命令（纯函数） ─────────────────────────────────────────
+//
+// 实现已移到 `draw.rs`（`PanelCmdCtx` / `push_panel_img_cmds`）：它们只依赖
+// [`UiDraw`] / [`DrawKind`]，绘制器 [`crate::Painter`] 与单测共用。
 
 // ─── 单元测试（无 GPU） ─────────────────────────────────────────
 
