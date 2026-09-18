@@ -2071,10 +2071,30 @@ UiDraw.clip（绝对屏幕坐标）
 | `--sim-clip` | 严格窗口的 scissor == 它的内容区（`origin` + `size`）且 `clip_batches > 0` |
 | 渲染器单测 | `scissor_px`（取整/钳制/全外 ⇒ 跳过）、`rect_intersect`（命令级 ∩ 画面级） |
 
+**裁剪层必须与缓存同空间**（用户实测 bug："被裁窗口的 scissor 和内容不会一起移动"）：
+`QuadCollector.cur_clip` / `CachedQuad` / `SegRun.clip` 里存的是**窗口局部**裁剪层
+（`d.clip` 已随容器平移成绝对坐标后再减 `anchor_px`）。存绝对值会怎样：① 分组键被
+"窗口位置"污染；② 更糟的是 §18.21 的签名去绝对化之后，**拖动窗口会命中缓存** ⇒ 提交时
+拿到的裁剪层是**上一帧的绝对矩形** ⇒ scissor 留在旧位置（实测偏一个位移量，`--sim-clip`
+的拖动段当场抓住）。改成局部后：`batch_scissor(clip_local, tf)` = 局部裁剪 × 批次变换，
+纯平移下就是"裁剪层 + 窗口原点"，窗口怎么动 scissor 就怎么跟。
+
 ⚠ **代价**：裁剪区越多，draw call 越多（每个不同 scissor 至少要一段）。演示场景实测
-`clip_batches=11`（1 个严格窗口 + 若干文本框盒 + 滚动可视区），`cmds/wins/cache_*` 与
-改动前逐位一致——即"裁剪改道"没有带来额外几何重建。若某天 `clip_batches` 暴涨，先看
-是不是每个控件都给自己套了一层裁剪（`painter_clipped` 用得太碎）。
+`clip_batches=11`、`segs=39`（1 个严格窗口 + 若干文本框盒 + 滚动可视区），
+`cmds/wins/cache_*` 与改动前逐位一致——即"裁剪改道"没有带来额外几何重建。
+
+### 18.21 提交期优化（①–⑤；⑥ GPU 持久缓冲不做）
+
+| # | 做法 | 效果（实测） |
+|---|---|---|
+| ① | **签名去绝对化**：`cmd_sig_hash` 哈希 `rect − anchor` / `clip − anchor`（与"缓存里存的是窗口局部顶点"同口径） | 拖动窗口从"**每帧 1 次整窗 MISS**"（`RJ_CACHE_TRACE`：f22…f61 每帧一条 `MISS win`）变成**稳态 0 MISS**（只剩 f1 冷启动 7 条）。`--sim-drag` 实测 |
+| ② | **scratch 复用**：`submit_quads` 的 `ordered`（待提交段列表）与 `seg_elems`（段内元素序集合）住 `UiState`，每帧 `clear()` 复用 | 去掉每帧 1 个 `Vec` + 每段 1 个 `BTreeSet` 的分配（演示 `segs=39`/帧） |
+| ③ | ~~单组段直接 move 几何~~ **已撤销** | 省一次 `append` 拷贝，但会让单组段的几何在某些路径上凭空少一份（实测把 `--sim-dropdown` 的子菜单面板整块弄丢）⇒ 收益不值风险，保留 append 版本 |
+| ④ | **签名瘦身**：环境裁剪以量化 `i32` 四元组入签名（4 次整型写入）；文本只哈希**自身软裁剪**（环境层已上移到 batch scissor） | `sig_us` 未见增长（57–60µs，与改动前同档） |
+| ⑤ | **`[perf]` 计数**：`UiStats` 增 `clip_batches / seg_count / vert_count / tri_count`，示例 `[perf]` 打印 `clip_batches= segs= verts= tris=` | `segs` = "scissor 让 draw 变多"的直接度量；`verts/tris` = 这一帧镶嵌了多少 |
+
+> 现场看 `[perf]` 稳态：`cmds=380 wins=7 cache_hit=13 cache_miss=0 clip_batches=11
+> segs=39 verts=30186 tris=41235`。
 
 ### 18.19 Widget 协议：**尺寸在 `ui()` 里就地申请**（v0.3）
 

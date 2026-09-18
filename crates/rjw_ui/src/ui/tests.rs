@@ -70,7 +70,7 @@ fn cmd_sig_invalidates_on_content_change() {
     };
     fn sig(d: &UiDraw) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        cmd_sig_hash(&mut h, d);
+        cmd_sig_hash(&mut h, d, Vec2::ZERO);
         h.finish()
     }
     // 同一命令哈希确定（命中复用前提）
@@ -152,7 +152,7 @@ fn cmd_sig_covers_image_fields() {
     use std::hash::Hasher;
     fn sig(d: &UiDraw) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        cmd_sig_hash(&mut h, d);
+        cmd_sig_hash(&mut h, d, Vec2::ZERO);
         h.finish()
     }
     let mk = |bg: ImageBg| UiDraw {

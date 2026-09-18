@@ -3756,7 +3756,8 @@ impl<'a> Ui<'a> {
                 self.state.frame_state.z0_seen.push(slot);
             }
             let t_sig = Instant::now();
-            let sig = self.hash_cmds(refs.iter().copied());
+            // 非窗口内容的 anchor = 0（其坐标本就是绝对屏幕坐标）。
+            let sig = self.hash_cmds(refs.iter().copied(), Vec2::ZERO);
             stats.sig_us += t_sig.elapsed().as_secs_f64() * 1e6;
             let entry = self.state.z0_quads.entry(slot).or_insert((0, Vec::new()));
             if entry.0 == sig {
@@ -3808,7 +3809,10 @@ impl<'a> Ui<'a> {
         stats: &mut CacheStats,
     ) {
         let t_sig = Instant::now();
-        let sig = self.hash_cmds(cmds.iter().flatten());
+        // **anchor = 本窗原点**：缓存里存的是窗口局部顶点，签名也必须按局部坐标算，
+        // 否则"窗口移动 = 内容变化"⇒ 拖动/滚动每帧整窗重镶嵌。
+        let anchor = self.win_origins.get(&win).copied().unwrap_or(Vec2::ZERO);
+        let sig = self.hash_cmds(cmds.iter().flatten(), anchor);
         stats.sig_us += t_sig.elapsed().as_secs_f64() * 1e6;
         // 命中缓存：直接用缓存的局部顶点（分组复制到提交列表），跳过重建
         {
@@ -3878,13 +3882,20 @@ impl<'a> Ui<'a> {
     /// 文本的实际行高 / 整体高度取决于行距、字形与步进宽度取决于字重 ⇒ 不并入就会被
     /// "改了行距 / 字重但窗口几何仍命中旧缓存"卡住（固定矩形里的居中文本尤其明显）。
     /// 两者都是主题令牌、只在主题变更时改，代价可忽略。
-    fn hash_cmds<'c>(&self, cmds: impl IntoIterator<Item = &'c UiDraw>) -> u64 {
+    ///
+    /// `anchor` = 该窗口 / 子槽的原点（物理像素）：见 [`cmd_sig_hash`]——按局部坐标入签名，
+    /// 于是**窗口移动 / 滚动不会让签名变化**（拖动窗口不再每帧整窗重镶嵌）。
+    fn hash_cmds<'c>(
+        &self,
+        cmds: impl IntoIterator<Item = &'c UiDraw>,
+        anchor: Vec2,
+    ) -> u64 {
         use std::hash::Hasher;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         h.write_u32(self.theme.line_spacing.to_bits());
         h.write_u16(self.theme.font_weight.0);
         for d in cmds {
-            self.cmd_sig(&mut h, d);
+            self.cmd_sig(&mut h, d, anchor);
         }
         geom_cache_sig(h.finish(), self.text.atlas_revision())
     }
@@ -3902,7 +3913,12 @@ impl<'a> Ui<'a> {
         layer_base: f64,
     ) -> f64 {
         let t_submit = Instant::now();
-        let mut ordered: Vec<CachedQuad> = Vec::with_capacity(cached.len() + quads.quads.len());
+        // ② **复用 scratch 缓冲**（住 `UiState`，跨帧保留容量）：本帧的"待提交段"列表与
+        // "段内元素序集合"都不再每帧新建（`segs` 段 × 每段一个 `BTreeSet` 的分配）。
+        let mut ordered: Vec<CachedQuad> = std::mem::take(&mut self.state.scratch_ordered);
+        ordered.clear();
+        let mut seg_elems: std::collections::BTreeSet<u32> =
+            std::mem::take(&mut self.state.scratch_elems);
         // mem::take：只移走内容几何，`quads.debug`（调试叠加）留待最后提交。
         for ((win, elem, g, tex_uid, clip), geom) in std::mem::take(&mut quads.quads) {
             let elems = quads
@@ -3924,16 +3940,30 @@ impl<'a> Ui<'a> {
         );
         let mut next = 0usize;
         for run in runs {
-            let mut seg = Geom::default();
-            seg.verts.reserve(run.verts);
-            let mut seg_elems: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            // ③ **已被撤销（保留说明）**：曾让 `run.quads == 1` 的段直接 `mem::take` 掉
+            // 那份几何（省一次 `append` 全量拷贝）。但单组段的几何**同时**被
+            // `debug`/缓存路径以外的读者按引用持有过一次的场景下会凭空少一份顶点
+            // （实测：`--sim-dropdown` 的子菜单面板整块不再录制 → ⑤/⑥ 失败）。
+            // 收益（一次拷贝）不值得这个风险：这里保留 append 版本。
+            let seg = {
+                let mut seg = Geom::default();
+                seg.verts.reserve(run.verts);
+                for q in &ordered[next..next + run.quads] {
+                    // 索引按已累计顶点数平移（`Geom::append`）——不同段的索引各自从 0 起。
+                    seg.append(&q.5);
+                }
+                seg
+            };
+            seg_elems.clear();
             for q in &ordered[next..next + run.quads] {
-                // 索引按已累计顶点数平移（`Geom::append`）——不同段的索引各自从 0 起。
-                seg.append(&q.5);
                 seg_elems.extend(q.6.iter().copied());
             }
             next += run.quads;
             let n = seg_elems.len() as u32;
+            // 段统计（`[perf] segs=/verts=/tris=`）：**段数 = draw call 候选数**，
+            // 顶点/三角数是"这一帧到底镶嵌了多少"的直接度量。
+            let (sv, st) = (seg.verts.len() as u32, seg.tris.len() as u32);
+            let emitted = !seg.is_empty();
             self.flush_seg(
                 backend,
                 layer_base,
@@ -3943,7 +3973,16 @@ impl<'a> Ui<'a> {
                 run.clip,
                 n,
             );
+            if emitted {
+                let acc = &mut self.state.frame_state.stats;
+                acc.seg_count = acc.seg_count.saturating_add(1);
+                acc.vert_count = acc.vert_count.saturating_add(sv);
+                acc.tri_count = acc.tri_count.saturating_add(st);
+            }
         }
+        // ② 归还 scratch（容量留到下一帧；元素里的 `Geom` 已 move/丢弃，不影响复用）。
+        self.state.scratch_ordered = ordered;
+        self.state.scratch_elems = seg_elems;
         t_submit.elapsed().as_secs_f64() * 1e6
     }
 
@@ -4005,10 +4044,12 @@ impl<'a> Ui<'a> {
         // 诊断：记录本窗口**实际提交用的平移量**（`debug_dump` 的 `submit` 字段）——
         // 与 `origin` 比对即可判定"引擎状态 vs 视觉"是否一致。
         self.state.debug_submit.insert(win, tf.pos);
-        // **batch scissor**：环境裁剪层（绝对逻辑坐标）→ 本批次的屏幕像素矩形。
-        // `tf` 通常只是"平移到窗口原点"，此时结果就是原矩形；窗口 FX（缩放/旋转）下
-        // 走保守 AABB（宁可多画一点，绝不误裁），见 [`crate::view::batch_scissor`]。
-        let clip = clip.map(|c| crate::view::batch_scissor(c, anchor_px, &tf));
+        // **batch scissor**：窗口**局部**裁剪层 → 本批次的屏幕像素矩形（见
+        // [`crate::view::batch_scissor`]）。`tf` 通常只是"平移到窗口原点"⇒ 结果 = 局部
+        // 裁剪 + 窗口原点；窗口 FX（缩放/旋转）下走保守 AABB（宁可多画一点，绝不误裁）。
+        // ⚠ 裁剪层必须与**缓存里的顶点同空间**（局部）：否则窗口一动，命中的旧缓存会把
+        // scissor 留在旧位置（"scissor 不跟内容一起移动"，用户实测）。
+        let clip = clip.map(|c| crate::view::batch_scissor(c, &tf));
         if let Some(c) = clip {
             // 诊断 + 计数：本帧带 scissor 的批次数（`[perf] clip_batches`）。
             self.state.debug_clip.insert(win, c);
@@ -4170,13 +4211,17 @@ impl<'a> Ui<'a> {
         for d in cmds.iter().flatten() {
             // 当前元素序：push 方法按其分组（控件级提交顺序——见 QuadCollector）。
             quads.cur_elem = d.elem;
-            // **环境裁剪层**（绝对物理；内容已随容器平移成绝对坐标）：进分组键。
+            // **环境裁剪层**（**窗口局部**；内容已随容器平移成绝对坐标后减本窗原点）。
             //
             // ⚠ 这里**不再切割几何**（旧实现逐命令 `clipped(..)`）：环境裁剪改由 batch
-            // scissor 在 GPU 侧执行（见 `UiBatch::clip` / `batch_scissor`）。收益：
+            // scissor 在 GPU 侧执行（见 `UiBatch::clip` / `view::batch_scissor`）。收益：
             // ① 圆角 / 环带不再被切平；② 省掉每命令的矩形求交与渐变重采样；
             // ③ 投影不再需要"部分可见就整块跳过"的特例（像素级裁边更干净）。
-            quads.cur_clip = d.clip.map(|c| snap_rect(&c));
+            //
+            // ⚠ **必须存局部坐标**：它与缓存里的顶点同空间 ⇒ 窗口移动时缓存键与裁剪
+            // 一起"跟着走"（存绝对值会让"窗口移动"污染分组键，并在缓存命中时拿到
+            // 过期矩形——实测拖动窗口后 scissor 偏了一个位移量）。
+            quads.cur_clip = d.clip.map(|c| local_of(snap_rect(&c), anchor_px));
             match &d.kind {
                 DrawKind::Solid(color) => {
                     if d.rect.w > 0.0 && d.rect.h > 0.0 {
@@ -4363,8 +4408,8 @@ impl<'a> Ui<'a> {
     /// ⚠ **必须覆盖一切渲染相关字段**（颜色 / 边框宽 / 圆角 / 对齐 / 光标 / 选择 /
     /// 文本内容）——曾用"轻量摘要"跳过它，漏掉颜色位导致 hover/click 变色时
     /// 缓存不失效、窗口内交互效果不刷新（见 [`crate::state::UiState::window_quads`] 文档）。
-    fn cmd_sig(&self, h: &mut std::collections::hash_map::DefaultHasher, d: &UiDraw) {
-        cmd_sig_hash(h, d);
+    fn cmd_sig(&self, h: &mut std::collections::hash_map::DefaultHasher, d: &UiDraw, anchor: Vec2) {
+        cmd_sig_hash(h, d, anchor);
     }
 
     /// 窗口按下裁决：本帧若有窗口被按下（重叠区域点击），**只保留最上层窗口**

@@ -626,24 +626,39 @@ pub(crate) fn resample_gradient_local(
 
 /// **窗口/放置内容签名哈希**（提取为自由函数，便于无 `Ui` 实例的单元测试）。
 ///
-/// 逐命令哈希**一切渲染相关字段**（颜色 / 边框宽 / 圆角 / 对齐 / 光标 / 选择 / 文本），
-/// 忽略 `win/seq`。任何影响绘制的内容变化（含 hover/click 变色、传入值改变）都会改变
-/// 签名 → 对应窗口 / win=0 放置子槽缓存自动失效重建。⚠ 不可退回"轻量摘要"（曾漏颜色位，
-/// 导致 hover/click 变色不刷新）。
-pub(crate) fn cmd_sig_hash(h: &mut std::collections::hash_map::DefaultHasher, d: &UiDraw) {
+/// 逐命令哈希**一切渲染相关字段**（颜色 / 边框宽 / 圆角 / 对齐 / 光标 / 选择 / 文本 /
+/// 环境裁剪层），忽略 `win/seq`。任何影响绘制的内容变化（含 hover/click 变色、传入值
+/// 改变）都会改变签名 → 对应窗口 / win=0 放置子槽缓存自动失效重建。⚠ 不可退回"轻量摘要"
+/// （曾漏颜色位，导致 hover/click 变色不刷新）。
+///
+/// **`anchor` = 该窗口/子槽的原点**（物理像素）：`rect` 与 `clip` 都按
+/// `值 − anchor` 入签名。理由：顶点缓存里存的是**窗口局部坐标**
+/// （`collect_cmds` 里 `r.x - anchor_px.x`），而命令的 `rect` 是**绝对坐标**——
+/// 直接哈希绝对值会让"窗口位置变了、内容没变"（拖窗 / 滚窗）也判定为"内容变了"，
+/// 每帧整窗重镶嵌（`cache_miss` 恒等于窗数、`collect_us` 不降）。减去 anchor 后
+/// 签名只反映"内容"，与缓存里存的坐标口径一致。
+pub(crate) fn cmd_sig_hash(
+    h: &mut std::collections::hash_map::DefaultHasher,
+    d: &UiDraw,
+    anchor: Vec2,
+) {
     use std::hash::Hash;
     d.depth.hash(h);
     d.elem.hash(h);
-    d.rect.x.to_bits().hash(h);
-    d.rect.y.to_bits().hash(h);
+    // 局部坐标（与缓存里存的顶点同口径）
+    (d.rect.x - anchor.x).to_bits().hash(h);
+    (d.rect.y - anchor.y).to_bits().hash(h);
     d.rect.w.to_bits().hash(h);
     d.rect.h.to_bits().hash(h);
     // **环境裁剪层进签名**：它决定几何落到哪个缓存分组（`QuadKey` 末位），也是
     // 批次 scissor 的输入。⚠ 旧实现把 `d.clip` 当"收集期几何切割"的输入、却不哈希它
     // ——裁剪变了（严格窗口开关 / 滚动可视区变化）而命令内容相同时，窗口顶点缓存会
-    // 命中旧分组，表现为"裁剪不生效 / 圆角仍是被切平的旧几何"。量化到 1px（与分组键
-    // 同口径），代价 = 4 次整型写入。
-    match clip_key(d.clip) {
+    // 命中旧分组，表现为"裁剪不生效 / 圆角仍是被切平的旧几何"。同样按 anchor 归一到
+    // 局部空间（窗口移动不该让裁剪签名失效）。
+    let clip_local = d.clip.map(|c| {
+        rjw_transform::Rect::new(c.x - anchor.x, c.y - anchor.y, c.w, c.h)
+    });
+    match clip_key(clip_local) {
         Some(k) => k.hash(h),
         None => 0u8.hash(h),
     }

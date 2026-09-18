@@ -106,6 +106,12 @@ pub struct UiStats {
     /// 它远大于窗口数 ⇒ 裁剪区太碎（每个不同 scissor 都要单独一次 draw，见
     /// [`crate::UiBatch::clip`]）。
     pub clip_batches: u32,
+    /// 本帧提交的**段数**（每段 = 一次 draw call 候选；由 `segment_runs` 裁决）。
+    pub seg_count: u32,
+    /// 本帧提交的顶点 / 三角总数（"这一帧到底镶嵌了多少"的直接度量；
+    /// 缓存命中时它们与原顶点数相同，但 `collect_us` 会明显下降）。
+    pub vert_count: u32,
+    pub tri_count: u32,
     /// 窗口顶点缓存命中 / 未命中次数。
     pub cache_hits: u32,
     pub cache_misses: u32,
@@ -423,8 +429,16 @@ pub struct UiState {
     /// Ui 每帧由 egin 重建，帧内诊断（Ui::debug_dump）常在本帧**录制期**调用，
     /// 故放在跨帧状态里；与 win_origins 对照即可判定"引擎状态 vs 视觉"是否一致。
     pub(crate) debug_submit: HashMap<u32, Vec2>,
-    /// **诊断**：窗口 z → 最近一次提交的**批次 scissor**（[`crate::UiBatch::clip`]；
-    /// `flush_seg` 写）。与 `debug_submit` 同源，回答"这一窗的裁剪到底是多少"。
+    /// **提交期 scratch 缓冲**（②：每帧复用，免每帧新建 `Vec`/`BTreeSet`）。
+    ///
+    /// - `scratch_ordered`：`submit_quads` 的"本帧待提交几何段"列表；
+    /// - `scratch_elems`：每个段收集元素序的 `BTreeSet`（段间 `clear()` 复用）。
+    ///
+    /// 住 `UiState`（跨帧）而不是 `Ui`（每帧重建）才有意义——否则等于每帧新建。
+    pub(crate) scratch_ordered: Vec<crate::gpu_batch::CachedQuad>,
+    pub(crate) scratch_elems: std::collections::BTreeSet<u32>,
+    /// **窗口 z → 最近一次提交的批次 scissor**（[`crate::UiBatch::clip`]；`flush_seg` 写）。
+    /// 与 `debug_submit` 同源，回答"这一窗的裁剪到底是多少"。
     pub(crate) debug_clip: HashMap<u32, Rect>,
     /// **滚动容器状态**：`scroll_at` 的 **绝对 ID** → (偏移, 内容高)，跨帧持久。
     pub(crate) scrolls: HashMap<IdAbsolute<'static>, ScrollState>,

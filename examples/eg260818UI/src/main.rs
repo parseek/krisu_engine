@@ -545,6 +545,7 @@ impl Windows {
         ui.window("strict_win")
             .pos(Vec2::new(560.0, 460.0))
             .placement(Placement::Clip)
+            .resize(true, Resize::Both)
             .show(|w| {
             w.label("严格裁剪窗口（内容超出被裁）");
             w.add(Label::new(
@@ -1151,8 +1152,11 @@ struct UiApp {
     /// `panel.shadow.color` 证明"色块 → ShadowStyle → 主题"这条线是通的。
     sim_shadow: bool,
     /// --sim-clip：**环境裁剪走 batch scissor**（不是逐命令切割几何）。
-    /// 第 30 / 90 帧打印 `clip_batches` + 严格窗口 / 普通窗口的 `clip`（`--ui-dump` 同源）。
+    /// 第 30 / 90 帧打印 `clip_batches` + 严格窗口 / 普通窗口的 `clip`（`--ui-dump` 同源）；
+    /// 期间脚本拖动该窗口 ⇒ 顺带回归"scissor 与内容一起移动"。
     sim_clip: bool,
+    /// --sim-clip：第 30 帧记录的严格窗口原点（第 90 帧比较"确实被拖动了"）。
+    clip_probe: Option<Vec2>,
     /// --sim-shadow：第 20 帧的主题投影色（第 40 帧对比用）。
     shadow_probe: Option<Color>,
     /// --sim-tuner：脚本化鼠标的两个目标点（**录制时运行时解算**）：
@@ -1466,6 +1470,7 @@ impl UiApp {
             sim_weight: false,
             sim_shadow: false,
             sim_clip: false,
+            clip_probe: None,
             shadow_probe: None,
             sim_tuner_pts: None,
             tuner_probe: None,
@@ -1552,6 +1557,11 @@ struct PerfAgg {
     /// 诊断用：它 = 0 而界面里明明有 Clip 沙箱 ⇒ 裁剪没接上；远大于窗口数 ⇒ 裁剪区太碎
     /// （每个不同 scissor 单独一次 draw，见 `docs/ENGINE_GUIDE.md` §18.20）。
     clip_batches: u64,
+    /// 本帧提交段数（= draw call 候选）/ 顶点 / 三角（`[perf] segs=/verts=/tris=`）。
+    /// `segs` 是"scissor 让 draw 变多"的直接度量；`verts/tris` 是"这一帧镶嵌了多少"。
+    segs: u64,
+    verts: u64,
+    tris: u64,
 }
 
 /// 每多少帧打印一次 [perf] 统计（165Hz 下约 0.7 秒一次）。
@@ -1580,6 +1590,9 @@ impl PerfAgg {
             hits: 0,
             misses: 0,
             clip_batches: 0,
+            segs: 0,
+            verts: 0,
+            tris: 0,
         }
     }
 
@@ -1615,6 +1628,9 @@ impl PerfAgg {
         self.hits += s.cache_hits as u64;
         self.misses += s.cache_misses as u64;
         self.clip_batches += s.clip_batches as u64;
+        self.segs += s.seg_count as u64;
+        self.verts += s.vert_count as u64;
+        self.tris += s.tri_count as u64;
     }
 
     /// 打印近 N 帧均值（ms / µs）后清零。
@@ -1631,7 +1647,8 @@ impl PerfAgg {
              record={record_ms:.2} finish={finish_ms:.2}) \
              | ui: sort={:.1}us sig={:.1}us collect={:.1}us clone={:.1}us submit={:.1}us \
              | render: total={:.2}ms begin={:.1}us encode={:.1}us submit={:.1}us present={:.1}us \
-             | cmds={:.0} wins={:.0} cache_hit={:.0} cache_miss={:.0} clip_batches={:.0}",
+             | cmds={:.0} wins={:.0} cache_hit={:.0} cache_miss={:.0} clip_batches={:.0} \
+             segs={:.0} verts={:.0} tris={:.0}",
             self.frame_us / n / 1000.0,
             self.sort_us / n,
             self.sig_us / n,
@@ -1648,6 +1665,9 @@ impl PerfAgg {
             self.hits as f64 / n,
             self.misses as f64 / n,
             self.clip_batches as f64 / n,
+            self.segs as f64 / n,
+            self.verts as f64 / n,
+            self.tris as f64 / n,
         );
         *self = Self::new();
     }
@@ -1930,6 +1950,27 @@ impl App for UiApp {
                 83 => f.debug_inject_mouse(mode(2), false),
                 96 => f.debug_inject_mouse(Vec2::new(900.0, 100.0), true), // 点面板外 → 收起
                 97 => f.debug_inject_mouse(Vec2::new(900.0, 100.0), false),
+                _ => {}
+            }
+        }
+
+        // ── 调试：脚本化鼠标（`--sim-clip`）──────────────────────────
+        // **用户报告的 bug**：拖动"被裁窗口"时，**scissor 不跟着内容走**（缓存的裁剪层
+        // 一度存了绝对坐标 ⇒ 拖动中缓存命中后拿到过期矩形，裁到旧位置）。这里在
+        // `strict_win` 标题栏上按住右移——第 30 / 90 帧的断言会同时检查"窗口确实移动了"
+        // 与"scissor 仍等于窗口内容区（即跟着一起走）"。
+        if self.sim_clip {
+            let n = f.frames();
+            let start = Vec2::new(760.0, 700.0); // strict_win 标题栏（origin ≈ 711,690）
+            match n {
+                35 => f.debug_inject_mouse(start, true),
+                36..=80 => {
+                    // ⚠ **往左拖**：该窗口被 `WindowClamp::Screen` 夹在屏幕右缘
+                    // （560 → 474 逻辑），往右拖不动 —— 那样这条断言会"看起来通过"
+                    // 却什么都没验证（实测踩过）。
+                    let dx = (n - 35) as f32 * 5.0;
+                    f.debug_inject_mouse(Vec2::new(start.x - dx, start.y), true)
+                }
                 _ => {}
             }
         }
@@ -2432,6 +2473,7 @@ impl App for UiApp {
                 let strict = dump.windows.iter().find(|w| w.id.ends_with("strict_win"));
                 let strict_clip = strict.and_then(|w| w.clip);
                 let clip_batches = ui.state().stats.clip_batches;
+                // ① scissor == 该窗内容区（原点 + 结算尺寸）；
                 let ok_rect = strict.map(|w| (w.origin, w.size)).is_some_and(|(o, s)| {
                     strict_clip.is_some_and(|c| {
                         (c.x - o.x).abs() <= 1.0
@@ -2439,14 +2481,24 @@ impl App for UiApp {
                             && (c.w - s.x).abs() <= 2.0
                     })
                 });
-                let ok = clip_batches > 0 && ok_rect;
+                // ② **跟着窗口一起走**：第 90 帧时窗口已被脚本拖动过（origin 变了），
+                //    scissor 必须仍然贴着它（上面那条已含此意，这里额外打印位移量）。
+                if sim_frame == 30 {
+                    self.clip_probe = strict.map(|w| w.origin);
+                }
+                let moved = match self.clip_probe {
+                    Some(o0) => strict.map(|w| w.origin).is_some_and(|o| (o - o0).length() > 5.0),
+                    None => false,
+                };
+                // 第 30 帧尚未拖动 ⇒ 不要求 moved；第 90 帧必须已移动且 scissor 仍贴合。
+                let ok = clip_batches > 0 && ok_rect && (sim_frame == 30 || moved);
                 eprintln!(
-                    "sim-clip: 帧={sim_frame} clip_batches={clip_batches} 严格窗 clip={strict_clip:?}（内容区={:?}） {}",
+                    "sim-clip: 帧={sim_frame} clip_batches={clip_batches} 严格窗 clip={strict_clip:?}（内容区={:?}）移动过={moved} {}",
                     strict.map(|w| (w.origin, w.size)),
                     if ok {
-                        "[OK] 环境裁剪进了批次 scissor（严格窗口的 scissor = 其内容区）"
+                        "[OK] 环境裁剪进了批次 scissor，且拖动时 scissor 与内容一起移动"
                     } else {
-                        "[FAIL] 裁剪没进 scissor 或矩形不对"
+                        "[FAIL] 裁剪没进 scissor / 矩形不对 / 拖动时 scissor 没跟着走"
                     }
                 );
             }
