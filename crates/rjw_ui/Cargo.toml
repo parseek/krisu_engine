@@ -24,3 +24,14 @@ glam = "0.33.2"
 winit = "0.30.13"
 # 剪贴板（文本选择复制/粘贴/剪切；跨平台：Windows / macOS / Linux / Web）。
 arboard = "3"
+# 主题序列化（`Theme::to_toml` / `from_toml` / `apply_toml`）。
+# `rc`：主题里的字体族是 `Option<Arc<str>>`（serde 的 Arc 支持要这个 feature）。
+serde = { version = "1", features = ["derive", "rc"], optional = true }
+toml = { version = "0.8", optional = true }
+
+[features]
+default = ["serde", "toml"]
+# 主题序列化（TOML 文本 ↔ `Theme`）。`rjw_color/serde` 让 `Color` 可序列化。
+serde = ["dep:serde", "dep:toml", "rjw_color/serde"]
+# 与 `serde` 同义（对齐 `rjw_atlas` 的双别名写法：`toml` = 语义名）。
+toml = ["dep:toml", "dep:serde", "rjw_color/serde"]

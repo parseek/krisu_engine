@@ -2217,6 +2217,8 @@ dependencies = [
  "rjw_render",
  "rjw_text",
  "rjw_transform",
+ "serde",
+ "toml",
  "winit",
 ]
 

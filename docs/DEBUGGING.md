@@ -220,11 +220,44 @@ fn update(&mut self, ctx: &mut Ctx) {
 - **加载外部文件**（看真实素材下的布局 / 图片铺排 / 字体）：`--image <路径>` 用你自己的
   图片当 `ImageBg`（PNG / JPEG / BMP / GIF，四个窗口分别演示 Fill / Tile 等铺排），
   `--font-file <路径>` 把 ttf / otf / ttc 加载进运行时文本子系统（随后在 `字体…` 弹窗里
-  输入该字体的**族名**即可全局换字）：
+  输入该字体的**族名**即可全局换字），**`--theme <路径>` 启动时载入主题**（TOML 序列化
+  格式；文件里出现的字段**覆盖**在旋钮组装出的主题上 ⇒ 两行的手写文件也能当启动皮肤）：
 
   ```
   cargo run -p eg260818UI -- --image .\shot.png --font-file C:\Windows\Fonts\consola.ttf
+  cargo run -p eg260818UI -- --theme C:\my-theme.toml
+  theme: 启动载入 C:\my-theme.toml
   ```
+
+- **"导出的主题导入回来不一样 / 主题文件加载报错"**：主题走 TOML 序列化
+  （`Theme::to_toml` / `from_toml` / `apply_toml`）；界面上的入口是顶栏
+  「导出主题…」（另存为）与「导入主题…」（在**当前**主题上合并覆盖），命令行入口是
+  `--theme <路径>`。脚本化等价开关 **`--sim-theme <路径>`**（两段，不弹对话框；
+  ⚠ 它**会写 / 覆盖**该路径——请给一个临时文件，别指向你的真实主题）：
+
+  ```
+  cargo run -p eg260818UI -- --sim-theme C:\rust-targets\sim-theme.toml --frames 70
+  sim-theme: ① 7403 字节 · row_h=26 gap=6 字重=400 · 再导出逐字相同=true [OK] 主题导出 → 文件 → 导入：字段级往返一致
+  sim-theme: ② 导入前 row_h=26 → 引擎侧 row_h=27（期望 27）[OK] 导入的主题真的进了引擎（全量文件改一行 ⇒ 只那一项变）
+  ```
+
+  典型失败与成因：
+
+  | 症状 | 成因 |
+  |---|---|
+  | 导入后**什么都没变** | 文件写成了别的表名（`[Theme]` / 顶层平铺字段名拼错）⇒ 逐键忽略是**故意**的（向前兼容）。先看 `--sim-theme` ① 的"再导出逐字相同"，再对着 `to_toml` 的输出改文件 |
+  | `主题格式版本 N 不受支持` | 文件比本引擎新。**加字段**不需要抬版本（缺字段回落默认）；**改名 / 删字段**才需要，并同时抬 `THEME_FORMAT_VERSION` |
+  | `主题字段不合法：invalid type …` | 字段类型写错（如 `radius = {tl = "6"}`）。`CornerRadius` 收标量也收表；`Weight` 是**数值**（`font_weight = 700`） |
+  | 导出的主题**丢了窗口贴图** | `PanelStyle::bg_image` **故意不序列化**（纹理 uid 跨进程不可移植）⇒ 载入后回落 `None`，要贴图由应用自己灌 |
+  | 导入后旋钮**拖了没反应** | 导入的主题当**基底**生效（旋钮暂不生效）——主题调节窗口里点「恢复调节」即可回到旋钮 |
+
+- **"下级 popup 的阴影被上级 popup 的控件盖住"**（浮层嵌套）：所有浮层的 z 现在是
+  **基址 + 嵌套层数**（`ui::overlay_z`，进入 / 退出用 `Ui::push_overlay_z` / `pop_overlay`），
+  子浮层整段（含**阴影**）画在父浮层之后。写死同一个哨兵 z 会让两层命令落进同一个
+  `(win, elem)` 分组排序，而窗口阴影 / 背景是 `elem = 0`、控件是 `elem ≥ 1` ⇒ 阴影被盖。
+  硬断言在 `--sim-dropdown` ⑤（`z(父/子)=…/…+1 子层z更大=true`）+ 单测
+  `ui/tests.rs::overlay_z_bands_by_nesting_depth`。"是否在浮层上"用区间判定
+  `is_overlay_z(z)`，别写 `z == WIN_TOPMOST`。
 
 - **"菜单栏点了没反应 / 菜单项点了菜单不收"**：示例的 `--sim-menu` 脚本化走两阶段
   （点「视图」触发器 → 点下拉里第一个菜单项），坐标同样**运行时解算**（触发器按主题

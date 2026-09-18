@@ -30,7 +30,7 @@ use crate::hit::update_drag;
 use crate::id::IdAbsolute;
 use crate::layout::Child;
 use crate::style::{Brush, PanelStyle, SliderStyle};
-use crate::ui::{UiAdd, WIN_TOPMOST};
+use crate::ui::UiAdd;
 use crate::{TextAlign, Ui};
 
 use super::SWATCH_RADIUS;
@@ -94,10 +94,13 @@ pub(super) fn show_popup(
     let popup_pos = Vec2::new(anchor.x, anchor.y + anchor.h + 2.0);
     let popup_raw = format!("{id}::popup");
 
-    // 强制哨兵 z：`window_at` 的 `entry().or_insert()` 会保留既有值。
+    // **浮层 z（基址 + 嵌套层数）**：`window_at` 的 `entry().or_insert()` 会保留既有值。
+    // 取色面板本身可能是**嵌套浮层**（菜单 / 下拉里的取色器）⇒ 走 `push_overlay_z`，
+    // 子浮层整段画在父浮层之上（含阴影）。
+    let overlay = ui.push_overlay_z();
     ui.state_mut()
         .window_z
-        .insert(IdAbsolute::owned(format!("{}::popup", abs.as_str())), WIN_TOPMOST);
+        .insert(IdAbsolute::owned(format!("{}::popup", abs.as_str())), overlay);
 
     let panel_style = popup_panel_style(ui);
     let mut inside = false;
@@ -121,6 +124,7 @@ pub(super) fn show_popup(
             // 面板内容尺寸（自动宽 = pw，高 = ph）。
             ui.child_rect(pw, ph, Child::Expand);
         });
+    ui.pop_overlay();
     (color_out, inside)
 }
 

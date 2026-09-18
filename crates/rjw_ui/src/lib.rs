@@ -128,6 +128,8 @@
 //! - [`id`]：ID 命名空间（[`IdRelative`] 原始名字 / [`IdAbsolute`] 完整状态键 / [`IdStack`]）
 //! - [`layout`]：容器布局（Frame / PackSide）
 //! - [`style`]：`Theme` 样式系统 + [`Palette`]（配色令牌）+ [`Brush`]（背景刷）
+//! - [`theme_toml`]：**主题序列化**（TOML：`Theme::to_toml` / `from_toml` / `apply_toml`；
+//!   `serde` feature）
 //! - [`state`]：`UiState` 持久状态 + `ButtonState` / `CheckboxState`
 //! - [`hit`]：命中测试与交互状态机
 //! - [`focus`]：键盘导航（焦点链 / [`focus_step`]）
@@ -150,6 +152,8 @@ pub mod backend;
 pub mod draw;
 pub mod edit;
 pub mod focus;
+#[cfg(feature = "serde")]
+pub mod theme_toml;
 pub(crate) mod gpu_batch;
 pub mod id;
 pub mod hit;

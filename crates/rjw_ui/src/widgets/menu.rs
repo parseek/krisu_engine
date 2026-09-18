@@ -57,7 +57,7 @@ use crate::draw::{Icon, Position, Size, TextAlign, TextVAlign};
 use crate::hit::{hit_test, update_interact};
 use crate::layout::Child;
 use crate::style::{ComboStyle, PanelStyle, Theme};
-use crate::ui::{Level, Ui, UiAdd as _, WindowClamp, WIN_TOPMOST};
+use crate::ui::{Level, Ui, UiAdd as _, WindowClamp, is_overlay_z};
 use crate::Window;
 
 // ─── 公开几何助手（示例 / 仿真算坐标用，别在脚本里抄魔数） ──────
@@ -224,12 +224,15 @@ pub(crate) fn popup_show(
         ..ui.theme.panel.clone()
     };
     let pos = popup_origin(spec.trigger, spec.side);
-    // **强制哨兵 z**：下拉浮层恒在一切窗口之上，这样"菜单栏 / 下拉录在哪里"都不影响
-    // 遮挡。⚠ 键必须是**绝对 id**（`window_impl` 内部按当前栈解析出同一前缀）。
+    // **浮层 z（基址 + 嵌套层数）**：恒在一切窗口之上，且**子浮层整段画在父浮层之上**
+    // （同一 z 会让两层的命令落进同一个 `(win, elem)` 分组，子层阴影被父层控件盖住 ——
+    // 用户实测："下级 popup 阴影被绘制在了上级控件后面"）。
+    // ⚠ 键必须是**绝对 id**（`window_impl` 内部按当前栈解析出同一前缀）。
     let abs = ui.id_for(spec.id);
+    let overlay = ui.push_overlay_z();
     ui.state_mut()
         .window_z
-        .insert(abs.to_static(), WIN_TOPMOST);
+        .insert(abs.to_static(), overlay);
     // 固定宽 = **上一帧的结算宽**（首帧自然宽，次帧起精确）。
     // ⚠ `WindowBuilder::width` 收的是**内容宽**，而 `settle = fixed_w + 2*pad_total`
     // ⇒ 传 `prev - 2*pad_total` 才是"保持上一帧的面板宽"。
@@ -274,14 +277,16 @@ pub(crate) fn popup_show(
         };
         content.render(&mut m);
     });
+    ui.pop_overlay();
     let rect = Rect::new(pos.x, pos.y, size.x, size.y);
     // 点外判定：面板矩形与鼠标**同一坐标系**（都是当前容器局部），用 `mouse_local()`；
-    // "落在任意 WIN_TOPMOST 浮层上"用公开的 `window_under_mouse()`（子菜单不关外层）。
+    // "落在**任意浮层**上"（`z >= WIN_TOPMOST`，含子菜单 / 更深层）用公开的
+    // `window_under_mouse()`——子菜单不关外层。
     let mouse = ui.mouse_local();
     let on_popup = hit_test(&rect, mouse);
     let on_overlay = ui
         .window_under_mouse()
-        .is_some_and(|(_, z)| z == WIN_TOPMOST);
+        .is_some_and(|(_, z)| is_overlay_z(z));
     let down_outside = ui.mouse_left().down_edge() && !on_popup && !on_overlay;
     PopupResult {
         rect,

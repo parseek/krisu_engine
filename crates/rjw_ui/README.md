@@ -82,6 +82,16 @@ krusie 引擎的 UI 模块：**hybrid 模式**（立即外观 + ID 持久状态�
 - **标题栏贴顶**：标题行录在窗口**顶边**（`y = 0`），条高 = `title_bar_h(row_h)` = **一行**
   （纯函数）；下面的内容与窗口高度各少一个 `pad_total`。条只是**背景装饰、不裁剪内容**
   （标题 / ▲ / ✕ 允许比条高）。`eg260818UI --sim-chrome` 断言按钮命中（其 y 公式同步去掉 `pad`）。
+- **主题序列化（TOML）**：`Theme::to_toml`（全量导出 + `format_version` 头）/
+  `from_toml`（从 `Default` 加载）/ `apply_toml`（**在当前主题上合并覆盖** ⇒ 手写的
+  `gap = 12` 小文件直接可用）。`serde`/`toml` feature（默认开）；`Weight`→`u16`、
+  `Align`→小写名、`CornerRadius` 收标量或表、`bg_image` 不入文件（纹理 uid 不可移植）。
+  示例侧：顶栏「导出主题…」「导入主题…」+ **`--theme <路径>`**（启动即生效）+
+  `--sim-theme <路径>`（脚本化验证往返与"进引擎"）。
+- **浮层 z 分层**：浮层 z = `WIN_TOPMOST` 基址 + **嵌套层数**（`Ui::push_overlay_z`）；
+  子浮层（子菜单 / 菜单里的取色器）整段（含**阴影**）画在父浮层之后。
+  写死同一个哨兵 z 会让阴影被父层控件盖住（`elem 0` vs `elem ≥ 1` 的排序）。
+  "是否在浮层上"用区间 `ui::is_overlay_z`。
 - **全局字重**：`Theme::font_weight`（`Weight`，默认 `NORMAL` = 400，任意数值可用）；
   它是**排版输入**（改字形与步进宽度）⇒ 与 `line_spacing` 同样进「排版缓冲缓存键 +
   窗口 / 子槽几何签名前缀」两处，改它不会留下陈旧几何。`Density` / `scaled(DPI)` 都不碰它。

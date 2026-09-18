@@ -71,9 +71,10 @@ const DIFF_TOP: [&str; 3] = ["简单", "普通", "困难"];
 /// 演示 ②（富内容模式里嵌的子下拉）的选项。
 const ENCODINGS: [&str; 3] = ["ASCII", "UTF-8", "GBK"];
 
-/// **文件导入**（系统文件选择器 → 字节 → 引擎资源）：图片当背景纹理、字体进运行时字体库。
+/// **文件导入**（系统文件选择器 → 字节 → 引擎资源）：图片当背景纹理、字体进运行时字体库、
+/// 主题走 TOML 序列化（导入 = 在当前主题上合并覆盖，导出 = 全量落盘）。
 mod filedialog;
-use filedialog::ImportKind;
+use filedialog::{ExportKind, ImportKind};
 
 /// 「上层窗口没挡住背后窗口的控件」脚本化复现（`--sim-cover`）。
 mod cover;
@@ -104,6 +105,8 @@ struct TopBar {
     /// **待处理的导入请求**（点「导入图片…」/「导入字体…」只记请求：系统选择器是
     /// **阻塞**调用，录制期不能弹——见 `filedialog` 模块文档）。
     import_request: Option<ImportKind>,
+    /// **待处理的导出请求**（「导出主题…」→ TOML；同样帧外弹"另存为"）。
+    export_request: Option<ExportKind>,
     /// 导入结果 / 失败原因（顶栏状态标签显示）。
     import_status: String,
     /// 本帧是否已经录过字体 Modal（**一帧只允许录一次**：重复调用会把面板与文本画两遍，
@@ -122,6 +125,7 @@ impl TopBar {
             font_modal_open: false,
             demo_color: Color::rgba_u8(255, 128, 40, 255),
             import_request: None,
+            export_request: None,
             import_status: String::new(),
             modal_recorded: false,
         }
@@ -165,6 +169,14 @@ impl TopBar {
                 }
                 if r.button("import_font_btn", "导入字体…").clicked() {
                     self.import_request = Some(ImportKind::Font);
+                }
+                // **主题序列化（TOML）**：导出 = 当前主题全量落盘；导入 = 在**当前主题上
+                // 合并覆盖**（手写小文件只写要改的几行也能用）。同样只记待办（`rfd` 阻塞）。
+                if r.button("theme_export_btn", "导出主题…").clicked() {
+                    self.export_request = Some(ExportKind::Theme);
+                }
+                if r.button("theme_import_btn", "导入主题…").clicked() {
+                    self.import_request = Some(ImportKind::Theme);
                 }
                 // 导入结果 / 失败原因（空 = 不占位）。
                 if !self.import_status.is_empty() {
@@ -795,6 +807,12 @@ struct ThemeTuner {
     border: Color,
     /// 强调色；hover / active 由它派生。
     accent: Color,
+    /// **导入 / `--theme` 载入的主题**（TOML 序列化格式）。
+    ///
+    /// `Some` 时它当**基底**：旋钮（圆角 / 密度 / 投影 / 缩放柄 / 调色）**暂不生效**，
+    /// 但应用侧**运行时令牌**（字体族 / 字重）仍然照常覆盖——这样「字体…」弹窗与
+    /// `--font-file` 不会因为导入主题而失效。窗口里给一行提示 + 「恢复调节」按钮清除它。
+    override_theme: Option<Theme>,
     /// 是否显示本窗口。
     open: bool,
 }
@@ -837,6 +855,7 @@ impl ThemeTuner {
             bg: p.surface,
             border: p.border,
             accent: p.accent,
+            override_theme: None,
             // 默认打开：这是个"可调的窗口"，开着才能看见效果。
             open: false,
         }
@@ -868,6 +887,15 @@ impl ThemeTuner {
 
     /// 按当前旋钮组装主题（`frame.ui(..)` 之前调用——闭包借用 `self`，闭包内不能构造）。
     fn theme(&self, font: &str, weight: Weight) -> Theme {
+        // **导入 / `--theme` 的主题当基底**：旋钮暂不生效（窗口里有提示 + 恢复按钮），
+        // 但应用侧运行时令牌（字体族 / 字重）仍然照常覆盖。
+        if let Some(base) = &self.override_theme {
+            let mut t = base.clone();
+            if !font.is_empty() {
+                t = t.with_font_family(font);
+            }
+            return t.with_font_weight(weight);
+        }
         let mut p = preset_palette(self.preset);
         // 表面基色：按**逐通道比**缩放整条 `surface*` 阶梯 —— 既改亮度也改色相，
         // 同时保持"凹陷 / 面板 / 抬升 / 浮层 / 悬停 / 激活"之间的相对关系不塌。
@@ -942,6 +970,16 @@ impl ThemeTuner {
             .pos(vec2(280.0, 420.0))
             .show(|w| {
                 w.label("主题调节（实时）");
+                // **导入 / `--theme` 的主题**：作为基底生效时，下面的旋钮暂不生效
+                // （避免"拖了没反应"的困惑）——给一行提示 + 「恢复调节」。
+                if self.override_theme.is_some() {
+                    w.row(|w| {
+                        w.label("已导入主题文件（旋钮暂不生效）");
+                        if w.button("th_clear_override", "恢复调节").clicked() {
+                            self.override_theme = None;
+                        }
+                    });
+                }
                 w.row(|w| {
                     w.label("预设:");
                     // **分段按钮组**（`Segmented`）：互斥选项拼成一个整体——相邻段共享边、
@@ -1217,6 +1255,11 @@ struct UiApp {
     /// （`Ctx::text_mut().load_font_data`）——之后 `字体…` 弹窗里输入该字体的**族名**
     /// 即可全局换字（下一帧按族名重建主题）。
     font_file: Option<String>,
+    /// --theme <路径>：**启动时指定主题**（TOML 序列化格式；见 `filedialog::load_theme_onto`）
+    /// ——文件里出现的字段覆盖在"旋钮组装出来的主题"上，于是两行的手写文件也能当启动皮肤。
+    theme_file: Option<String>,
+    /// --sim-theme <路径>：**脚本化**验证"序列化 → 文件 → 反序列化 → 进引擎"（不弹对话框）。
+    sim_theme: Option<String>,
     /// 帧统计聚合（每 `PERF_PRINT_EVERY` 帧打印一次）。
     perf: PerfAgg,
     // 各 UI 模块
@@ -1271,12 +1314,123 @@ impl UiApp {
                 }
             }
             Some(ImportKind::Image) => self.import_image_path = Some(path),
+            Some(ImportKind::Theme) => {
+                // **主题导入 = 在当前主题上合并覆盖**（TOML）⇒ 立即当基底生效；
+                // 旋钮（圆角 / 密度 / 调色…）暂不生效直到「恢复调节」（窗口里有提示）。
+                let base = self
+                    .theme_tuner
+                    .theme(self.top.font_name(), self.top.font_weight());
+                match filedialog::load_theme_onto(&path, &base) {
+                    Ok(t) => {
+                        self.top.import_status = format!("主题：{label}");
+                        self.theme_tuner.override_theme = Some(t);
+                    }
+                    Err(e) => self.top.import_status = format!("主题导入失败：{e}"),
+                }
+            }
             None => {
-                self.top.import_status = format!("不认得的文件类型：{label}（要图片或 ttf/otf/ttc）");
+                self.top.import_status =
+                    format!("不认得的文件类型：{label}（要图片 / ttf·otf·ttc / toml）");
                 if verbose {
                     eprintln!("--font-file: 不认得的文件类型 {label}");
                 }
             }
+        }
+    }
+
+    /// **`--sim-theme <路径>`**：脚本化验证"**序列化 → 文件 → 反序列化 → 进引擎**"整条线
+    /// （`rfd` 对话框本身无法无头跑，但文件这条通路是真实的）。
+    ///
+    /// 两阶段（各打印一行 `[OK]`/`[FAIL]`）：
+    /// 1. **文件第 30 帧**：把**当前**主题 `to_toml()` 写到 `<路径>`，再读回来
+    ///    `Theme::from_toml` ⇒ 两边**再导出一次文本必须逐字相同**（字段级往返一致）；
+    /// 2. **第 60 帧**：把文件里 `[theme]` 的 `row_h` 改成一个**明显不同的值**写回，
+    ///    再走应用的真通路（`load_theme_onto` → `override_theme`）⇒
+    ///    `theme_tuner.theme(..)`（引擎真正吃的那一份）的 `row_h` 必须变成新值。
+    fn sim_theme_io(&mut self, ctx: &mut Ctx, path: std::path::PathBuf) {
+        let frame = ctx.frames();
+        match frame {
+            30 => {
+                let theme = self
+                    .theme_tuner
+                    .theme(self.top.font_name(), self.top.font_weight());
+                let text = match theme.to_toml() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("sim-theme: ① 序列化失败：{e} [FAIL]");
+                        return;
+                    }
+                };
+                if let Err(e) = std::fs::write(&path, &text) {
+                    eprintln!("sim-theme: ① 写文件失败：{e} [FAIL]");
+                    return;
+                }
+                let back = match std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| Theme::from_toml(&s))
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("sim-theme: ① 读回失败：{e} [FAIL]");
+                        return;
+                    }
+                };
+                let again = back.to_toml().unwrap_or_default();
+                let ok = again == text;
+                eprintln!(
+                    "sim-theme: ① {} 字节 · row_h={} gap={} 字重={} · 再导出逐字相同={} {}",
+                    text.len(),
+                    theme.row_h,
+                    theme.gap,
+                    theme.font_weight.0,
+                    ok,
+                    if ok {
+                        "[OK] 主题导出 → 文件 → 导入：字段级往返一致"
+                    } else {
+                        "[FAIL] 往返后字段变了"
+                    }
+                );
+            }
+            60 => {
+                // 真实用户流程：**导出全量文件 → 手改一行 → 导入**。
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    eprintln!("sim-theme: ② 文件读不到 [FAIL]");
+                    return;
+                };
+                let patched: String = text
+                    .lines()
+                    .map(|l| if l.starts_with("row_h =") { "row_h = 27.0" } else { l })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if let Err(e) = std::fs::write(&path, &patched) {
+                    eprintln!("sim-theme: ② 写文件失败：{e} [FAIL]");
+                    return;
+                }
+                let base = self
+                    .theme_tuner
+                    .theme(self.top.font_name(), self.top.font_weight());
+                let before = base.row_h;
+                match filedialog::load_theme_onto(&path, &base) {
+                    Ok(t) => {
+                        self.theme_tuner.override_theme = Some(t);
+                        let now = self
+                            .theme_tuner
+                            .theme(self.top.font_name(), self.top.font_weight())
+                            .row_h;
+                        let ok = (now - 27.0).abs() < 0.01 && (before - 27.0).abs() >= 0.01;
+                        eprintln!(
+                            "sim-theme: ② 导入前 row_h={before} → 引擎侧 row_h={now}（期望 27）{}",
+                            if ok {
+                                "[OK] 导入的主题真的进了引擎（全量文件改一行 ⇒ 只那一项变）"
+                            } else {
+                                "[FAIL] 导入的主题没进引擎 / 覆盖语义不对"
+                            }
+                        );
+                    }
+                    Err(e) => eprintln!("sim-theme: ② 导入失败：{e} [FAIL]"),
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1345,6 +1499,8 @@ impl UiApp {
             cover_starts_after_a: 0,
             image_file: None,
             font_file: None,
+            theme_file: None,
+            sim_theme: None,
             perf: PerfAgg::new(),
             top: TopBar::new(),
             menu: Menu::new(),
@@ -1572,6 +1728,56 @@ impl App for UiApp {
                 Some(path) => self.apply_import(ctx, path, false),
                 None => self.top.import_status = "导入已取消".to_owned(),
             }
+        }
+        // ── 主题**导出**（TOML）：帧外弹"另存为"，写的是**当前**主题 ─────────────
+        // `theme_tuner.theme(..)` 与渲染用的那一份**同源**（`menu/窗口/控件` 都吃它）
+        // ⇒ 导出的文件导入回来就是"现在这个样子"。
+        if let Some(kind) = self.top.export_request.take() {
+            match kind {
+                ExportKind::Theme => match filedialog::pick_save(kind) {
+                    Some(path) => {
+                        let theme = self
+                            .theme_tuner
+                            .theme(self.top.font_name(), self.top.font_weight());
+                        match filedialog::save_theme(&path, &theme) {
+                            Ok(()) => {
+                                self.top.import_status =
+                                    format!("主题已导出：{}", filedialog::file_label(&path));
+                            }
+                            Err(e) => self.top.import_status = format!("主题导出失败：{e}"),
+                        }
+                    }
+                    None => self.top.import_status = "导出已取消".to_owned(),
+                },
+            }
+        }
+        // ── `--theme <路径>`：**启动时指定主题**（TOML 序列化格式）──────────────
+        // 与「导入主题…」同一条通路（`filedialog::load_theme_onto`）：文件里出现的字段
+        // 覆盖在**当前**（旋钮组装出来的）主题上 ⇒ 一个只写两行的文件也能当"启动皮肤"。
+        // 放在帧外（不需要 `Ctx` / `Gpu`），失败只写状态行，不挡启动。
+        if let Some(path) = self.theme_file.take() {
+            let path = std::path::PathBuf::from(path);
+            let base = self
+                .theme_tuner
+                .theme(self.top.font_name(), self.top.font_weight());
+            match filedialog::load_theme_onto(&path, &base) {
+                Ok(t) => {
+                    self.top.import_status =
+                        format!("主题已载入：{}", filedialog::file_label(&path));
+                    self.theme_tuner.override_theme = Some(t);
+                    eprintln!("theme: 启动载入 {}", path.display());
+                }
+                Err(e) => {
+                    self.top.import_status = format!("主题载入失败：{e}");
+                    eprintln!("theme: 启动载入失败 {}：{e}", path.display());
+                }
+            }
+        }
+        // ── `--sim-theme <路径>`：**脚本化验证 序列化 → 文件 → 反序列化 → 进引擎** ──
+        // 与 `--sim-import` 同一套思路：`rfd` 对话框本身无法在无头环境里跑，所以脚本直接
+        // 走"文件"这条真实通路（导出 → 读回 → 改一个字段 → 再导入 → 断言引擎侧主题变了）。
+        if let Some(p) = self.sim_theme.clone() {
+            self.sim_theme_io(ctx, std::path::PathBuf::from(p));
         }
         if let Some(path) = self.font_file.take() {
             self.apply_import(ctx, std::path::PathBuf::from(path), true);
@@ -2517,6 +2723,9 @@ impl App for UiApp {
                 // 嵌套浮层的 id 带父窗口前缀（`<父面板>/item::编码::sub`）⇒ 按**后缀**匹配。
                 let seen_suffix =
                     |suffix: &str| dump.windows.iter().any(|p| p.id.ends_with(suffix));
+                let z_of = |id: &str| dump.windows.iter().find(|p| p.id == id).map(|p| p.z);
+                let z_suffix =
+                    |suffix: &str| dump.windows.iter().find(|p| p.id.ends_with(suffix)).map(|p| p.z);
                 let near = |got: Option<Vec2>, want: Option<Vec2>| match (got, want) {
                     (Some(g), Some(w)) => (g.x - w.x).abs() < 2.0 && (g.y - w.y).abs() < 2.0,
                     _ => false,
@@ -2581,15 +2790,22 @@ impl App for UiApp {
                         // 症状是"点一下整条 popup 消失"）。
                         let (got, want) = (self.dd_sub_panel, self.dd_sub_want);
                         let sub_seen = seen_suffix("item::编码::sub");
+                        // **分层 z**：子面板 z 必须 **大于** 父面板（浮层 z = 基址 + 嵌套层数）
+                        // —— 同 z 会让两层命令落进同一个 `(win, elem)` 分组排序，子层的**阴影**
+                        // （elem 0）被父层控件（elem ≥ 1）盖住（用户实测："下级 popup 阴影被绘制
+                        // 在了上级控件后面"）。
+                        let (zp, zs) = (z_of("dd_file::popup"), z_suffix("item::编码::sub"));
+                        let layered = matches!((zp, zs), (Some(a), Some(b)) if b > a);
                         let ok = sub_seen
                             && near(got, want)
+                            && layered
                             && open.as_deref() == Some("dd_file");
                         eprintln!(
-                            "sim-dropdown: ⑤ 子面板原点={got:?} 期望={want:?} 面板在 dump={sub_seen} combo_open={open:?} {}",
+                            "sim-dropdown: ⑤ 子面板原点={got:?} 期望={want:?} 面板在 dump={sub_seen} z(父/子)={zp:?}/{zs:?} 子层z更大={layered} combo_open={open:?} {}",
                             if ok {
-                                "[OK] Hover 在 item 右边展开子菜单，且父 popup 不消失"
+                                "[OK] Hover 在 item 右边展开子菜单（分层 z：阴影不再被父层控件盖住），且父 popup 不消失"
                             } else {
-                                "[FAIL] 子菜单没展开 / 位置不对 / 父 popup 被关掉"
+                                "[FAIL] 子菜单没展开 / 位置不对 / z 没分层 / 父 popup 被关掉"
                             }
                         );
                     }
@@ -3075,6 +3291,8 @@ fn main() -> Result<(), RunError> {
     app.sim_shadow = args.iter().any(|a| a == "--sim-shadow");
     app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
     app.sim_import = parse_str_arg(&args, "--sim-import");
+    app.theme_file = parse_str_arg(&args, "--theme");
+    app.sim_theme = parse_str_arg(&args, "--sim-theme");
     app.sim_menu = args.iter().any(|a| a == "--sim-menu");
     app.sim_dropdown = args.iter().any(|a| a == "--sim-dropdown");
     app.sim_weight_modal = args.iter().any(|a| a == "--sim-weight-modal");

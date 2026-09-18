@@ -101,11 +101,34 @@ pub(crate) const CHECKBOX_INNER: f32 = 1.0;
 /// 且为 4 的倍数——四边形一组）。窗口内容超限时自动切段（顺序连续，层级不变）。
 pub(crate) const MAX_UI_SEG_VERTS: usize = 65000;
 
-/// **置顶哨兵 z 值**：IME 组合候选提示框、下拉浮层等**顶层浮层**用它——
-/// 绘制（win 升序排序恒最后）与命中（`window_occluded` 无更高 z）都恒在一切窗口之上。
-/// 真实窗口的 z 分配 / 置顶运算必须**排除本值**（`filter(|&z| z < WIN_TOPMOST)`、
-/// `saturating_add`），避免普通窗口递增碰撞到哨兵。
-pub(crate) const WIN_TOPMOST: u32 = u32::MAX;
+/// **浮层 z 基址**：IME 候选框、下拉浮层、子菜单、取色面板等**顶层浮层**的 z 从它起，
+/// 按**嵌套层数**递增（见 [`overlay_z`]）——恒在一切真实窗口之上。
+/// 真实窗口的 z 分配 / 置顶运算必须**排除浮层区间**（`filter(|&z| z < WIN_TOPMOST)`、
+/// `saturating_add`），避免普通窗口递增碰撞到这个区间。
+///
+/// ⚠ **为什么不是一个单一哨兵值**：父浮层（下拉 / 菜单）里还能开**子浮层**（子菜单）。
+/// 同一个 z ⇒ 两层命令落在同一个 `(win, elem)` 分组里排序，而窗口的**阴影 / 背景 / 边框**
+/// 用的是 `elem = 0`、控件用 `elem ≥ 1` ⇒ **子层的阴影会被父层的控件盖住**
+/// （用户实测："下级 popup 阴影被绘制在了上级控件后面"）。
+/// 分层 z ⇒ 子层整段（含阴影）排在父层之后；顺带让 `win_origins` / `win_ids` 不再撞键
+/// （它们按 z 键），每个浮层用自己的提交原点。
+pub(crate) const WIN_TOPMOST: u32 = u32::MAX - OVERLAY_Z_SPAN;
+
+/// 浮层 z 可用层数（够深了；超出后 clamp 到最后一层）。
+pub(crate) const OVERLAY_Z_SPAN: u32 = 1024;
+
+/// **浮层 z** = `WIN_TOPMOST + 嵌套层数`（`depth = 0` = 最外层浮层；超出层数上限时 clamp）。
+#[inline]
+pub(crate) fn overlay_z(depth: u32) -> u32 {
+    WIN_TOPMOST + depth.min(OVERLAY_Z_SPAN - 1)
+}
+
+/// `z` 是否落在**浮层区间**（`z >= WIN_TOPMOST`）——"鼠标在任意浮层上"这类判定用它，
+/// 而不是 `z == WIN_TOPMOST`（浮层现在是一段带层数的区间）。
+#[inline]
+pub(crate) fn is_overlay_z(z: u32) -> bool {
+    z >= WIN_TOPMOST
+}
 
 // 纯文本编辑函数（字符插入/删除/剪贴板/编辑状态机）已迁入 [`crate::edit`]：
 // `insert_char_at` / `remove_before` / `remove_at` / `clipboard_shortcuts` /
@@ -267,6 +290,7 @@ impl<'a> UiInit<'a> {
             mouse_logical: mouse_screen,
             mouse_in_window,
             any_pressed: false,
+            overlay_depth: 0,
             press_claimed: false,
             next_input_corners: None,
             drag_panel: None,
@@ -460,6 +484,10 @@ pub struct Ui<'a> {
     mouse_in_window: bool,
     /// 本帧是否有控件被按下（空白点击清焦点用）。
     any_pressed: bool,
+    /// **当前正在录制的浮层层数**（0 = 不在浮层里）：浮层 z = [`overlay_z`]`(本值)`，
+    /// 进入 / 退出一层用 [`Self::push_overlay_z`] / [`Self::pop_overlay`]。
+    /// 嵌套（下拉里开子菜单）时递增 ⇒ 子层 z 更大、整段画在父层之上（含阴影）。
+    overlay_depth: u32,
     /// **本帧按下是否被文本输入控件占用**（选择拖拽优先于窗口/面板拖拽）：
     /// 输入框/TextArea 在按下响应时置位，`window_at` / `panel_impl` 据此**不建立**
     /// 拖拽基准——从输入框上拖拽 = 选择文本，而不是拖动窗口。
@@ -705,6 +733,28 @@ impl<'a> Ui<'a> {
     #[inline]
     pub(crate) fn note_press_handled(&mut self) {
         self.any_pressed = true;
+    }
+
+    /// **进入一层浮层**（控件作者用：下拉 / 菜单 / 取色面板…）：返回本层该用的 z
+    /// （[`overlay_z`]`(嵌套层数)`），并把层数 +1。配套 [`Self::pop_overlay`]。
+    ///
+    /// 用法：`let z = ui.push_overlay_z(); state.window_z.insert(id, z); …录浮层窗口… ;
+    /// ui.pop_overlay();`
+    ///
+    /// ⚠ 浮层里再开浮层（子菜单 / 菜单里的取色器）**必须**走这一对方法：同 z 会让两层的
+    /// 绘制命令落进同一个 `(win, elem)` 分组，子层的阴影 / 背景（`elem = 0`）被父层控件
+    /// （`elem ≥ 1`）盖住（用户实测："下级 popup 阴影被绘制在了上级控件后面"）。
+    #[inline]
+    pub(crate) fn push_overlay_z(&mut self) -> u32 {
+        let z = overlay_z(self.overlay_depth);
+        self.overlay_depth += 1;
+        z
+    }
+
+    /// **退出一层浮层**（与 [`Self::push_overlay_z`] 配对）。
+    #[inline]
+    pub(crate) fn pop_overlay(&mut self) {
+        self.overlay_depth = self.overlay_depth.saturating_sub(1);
     }
 
     /// **通用拖拽缩放柄**（控件作者原语）：`handle` 为**当前容器局部坐标**的柄矩形

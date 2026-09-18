@@ -777,7 +777,7 @@ f.text(|t| {
 | `UiState::reset()` / `remove(id)` | 示例"R 重开" | 清空全部 / 移除单个控件状态 |
 | `UiState::text_focus() -> Option<TextFocus>` | `if ui.state().text_focus().is_none() { /* 快捷键 */ }` | **文本焦点**（只有输入框/多行框持焦点才为 `Some`）；取代旧 `capturing_text()` —— 按钮/滑块的 Tab 焦点不再吞应用快捷键 |
 | `UiState::combo_open() -> Option<&str>` | `if ui.state().combo_open().is_none() && esc { /* 自己的 Esc */ }` | **当前展开的下拉菜单**（[`Dropdown`](crate::Dropdown) 的**控件绝对 ID**；面板窗口 id = 它 + `::popup`）。与 `menu_open()` 对称（两个槽分开存：栏是应用级 UI，下拉属于某个控件）；`reset()` 清空 |
-| `Ui::debug_dump() -> UiDebugDump` | `eprintln!("{}", ui.debug_dump())` | 引擎侧状态快照（每窗口 `id/z/origin/submit/size/drag/press/stored`），单行可 grep；任一段都能调用，帧级暂存跨段共享 ⇒ 后一段能看到前一段录的窗口。⚠ 按**本帧录制过的窗口 ID** 列（不是按 z）：同一帧的多个 `WIN_TOPMOST` 浮层（**下拉里的子菜单**）z 相同，按 z 会只剩最后一个；`origin` 是**相对直接容器**的原点（顶层窗口 = 屏幕坐标，**嵌套浮层要叠加外层窗口原点**）。见 [DEBUGGING.md](DEBUGGING.md) §1 |
+| `Ui::debug_dump() -> UiDebugDump` | `eprintln!("{}", ui.debug_dump())` | 引擎侧状态快照（每窗口 `id/z/origin/submit/size/drag/press/stored`），单行可 grep；任一段都能调用，帧级暂存跨段共享 ⇒ 后一段能看到前一段录的窗口。⚠ 按**本帧录制过的窗口 ID** 列（不是按 z）：浮层 z = `WIN_TOPMOST` 基址 + **嵌套层数**（子菜单比父面板 +1，`ui::overlay_z`），按 id 列才不会漏掉嵌套浮层；`origin` 是**相对直接容器**的原点（顶层窗口 = 屏幕坐标，**嵌套浮层要叠加外层窗口原点**）。见 [DEBUGGING.md](DEBUGGING.md) §1 |
 
 ### UI 绘制后端（`rjw_ui::backend`，v0.3 新增）
 
@@ -923,6 +923,20 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 ### 样式（`Theme`，可 clone 覆盖）
 
 `Theme { label, panel, button, slider, input, checkbox, divider, debug, focus, modal, combo, gap, row_h, feather, line_spacing, font_weight, palette }`，子样式见 `crates/rjw_ui/src/style.rs`：
+
+**主题序列化（TOML）**（`rjw_ui` 的 `serde` / `toml` feature，**默认开**）：
+
+| API | 语义 |
+|---|---|
+| `Theme::to_toml() -> Result<String, String>` | **全量导出**：`format_version` 头 + `[theme]` 字段树。⚠ `panel.bg_image` **不序列化**（纹理 uid 不可移植） |
+| `Theme::from_toml(s) -> Result<Theme, String>` | 从 TOML 加载（起点 `Theme::default()`；缺字段回落默认、多余键忽略） |
+| `Theme::apply_toml(&mut self, s) -> Result<(), String>` | **在当前主题上合并覆盖**（文件里出现的字段才改）——手写 `gap = 12` 这类小文件的语义 |
+| `THEME_FORMAT_VERSION`（`rjw_ui::theme_toml`） | 格式版本；加载时**比本引擎新**⇒报错拒载。加字段不用改它，**改名 / 删字段要改** |
+
+`Weight` 存 `u16`（`weight = 700`）、`Align` 存小写名、`CornerRadius` 反序列化**两种写法都收**
+（`radius = 6.0` 或 `radius = { tl = .. }`）。示例侧入口：顶栏「导出主题…」「导入主题…」（`rfd`）
++ **`--theme <路径>`**（启动载入；与导入同一条通路）+ `--sim-theme <路径>`（脚本化验证）。
+见 `docs/ENGINE_GUIDE.md` §18.16。
 `LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**/**shadow**/**grip**）、`ButtonStyle`（三态 bg + padding + **radius**）、
 `SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius**）、
 `CheckboxStyle`（box_size/checked_fill/gap）、`DividerStyle`、`DebugStyle`（layout_outline / layout_outline_width）、

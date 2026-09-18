@@ -137,7 +137,41 @@ impl Size<CornerRadius> {
 /// ⚠ 与 [`DrawKind::RoundedRect`] 的 `corners: [Color; 4]` **顺序不同**：颜色数组是
 /// `[TL, TR, BL, BR]`（历史约定，与四边形顶点一致），本类型是**具名字段**故无歧义。
 /// 镶嵌器内部按屏幕顺时针 TL → TR → BR → BL 遍历。
+/// **圆角半径的可反序列化表示**（手写主题文件两种写法都要能收）：
+/// `radius = 3.0`（四角同值）或 `radius = { tl = 3.0, tr = 0.0, … }`（缺角回落 `0`）。
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum CornerRadiusRepr {
+    Scalar(f32),
+    Corners {
+        #[serde(default)]
+        tl: f32,
+        #[serde(default)]
+        tr: f32,
+        #[serde(default)]
+        br: f32,
+        #[serde(default)]
+        bl: f32,
+    },
+}
+
+#[cfg(feature = "serde")]
+impl From<CornerRadiusRepr> for CornerRadius {
+    fn from(r: CornerRadiusRepr) -> Self {
+        match r {
+            CornerRadiusRepr::Scalar(v) => CornerRadius::all(v),
+            CornerRadiusRepr::Corners { tl, tr, br, bl } => CornerRadius { tl, tr, br, bl },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default, from = "CornerRadiusRepr")
+)]
 pub struct CornerRadius {
     pub tl: f32,
     pub tr: f32,

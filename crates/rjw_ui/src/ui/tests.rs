@@ -1161,6 +1161,25 @@ fn window_content_clips_when_height_is_user_fixed() {
 }
 
 #[test]
+fn overlay_z_bands_by_nesting_depth() {
+    // 浮层 z = **基址 + 嵌套层数**：子浮层 z 更大 ⇒ 整段（含**阴影**）画在父浮层之后。
+    // 同一个 z 会让两层的命令落进同一个 `(win, elem)` 分组排序，而窗口阴影/背景是
+    // `elem = 0`、控件是 `elem ≥ 1` ⇒ 子层阴影被父层控件盖住
+    // （用户实测："下级 popup 阴影被绘制在了上级控件后面"）。
+    assert_eq!(overlay_z(0), WIN_TOPMOST);
+    assert_eq!(overlay_z(1), WIN_TOPMOST + 1);
+    assert!(overlay_z(0) < overlay_z(1), "子浮层 z 必须更大");
+    // 整个浮层区间都在真实窗口 z 之上（真实 z 从 1 起按 `max+1` 递增，够不到基址）。
+    assert!(is_overlay_z(overlay_z(0)));
+    assert!(is_overlay_z(overlay_z(7)));
+    assert!(!is_overlay_z(WIN_TOPMOST - 1), "基址之下不是浮层");
+    assert!(!is_overlay_z(1), "普通窗口不是浮层");
+    // 层数超出上限时 clamp（不回绕、也不会溢出成普通窗口区间）。
+    assert!(is_overlay_z(overlay_z(u32::MAX)));
+    assert_eq!(overlay_z(u32::MAX), overlay_z(OVERLAY_Z_SPAN));
+}
+
+#[test]
 fn title_bar_hugs_the_top_and_does_not_clip_content() {
     // 标题行**贴窗口顶边**录（`window_title_bar` 把内容光标抬到 y=0）⇒ 条高 = **一行**，
     // 不再含上内边距（用户实测："可以往上抬"）。

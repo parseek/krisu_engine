@@ -1,12 +1,69 @@
 //! 主题样式：`Theme` + 各控件子样式（默认 / dark 两套预设，可 clone 覆盖）。
+//!
+//! # 序列化
+//!
+//! `serde` feature 开时全部样式类型可 `Serialize` / `Deserialize`（`Theme::to_toml` /
+//! `from_toml` / `apply_toml`，见 [`crate::theme_toml`]）：
+//! - 每个样式结构体都带 `#[serde(default)]` ⇒ **缺字段回落 `Default`**（手写小文件只写要改的节）；
+//! - `PanelStyle::bg_image` **不序列化**（纹理 uid 不可移植）；`Theme::font_weight` 用
+//!   `u16` 代理（`Weight` 在 `rjw_text`，不能在此 derive）。
 
 use std::sync::Arc;
 
 use glam::Vec2;
 use rjw_color::Color;
 use rjw_text::{Align, Weight};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use crate::draw::CornerRadius;
+
+/// `Theme::font_weight` 的 serde 代理。
+///
+/// `Weight` 定义在 `rjw_text`（本 crate 不能给它 derive）⇒ 用**数值**存（`400` 这种，
+/// 人读 TOML 也一眼认得出）；未知数值不报错（`Weight` 是任意 `u16`）。
+#[cfg(feature = "serde")]
+mod weight_serde {
+    use rjw_text::Weight;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(w: &Weight, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u16(w.0)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Weight, D::Error> {
+        Ok(Weight(u16::deserialize(d)?))
+    }
+}
+
+/// `LabelStyle::align` 的 serde 代理（`Align` 同样在 `rjw_text`）。
+///
+/// 存成小写名字（`"left"` / `"center"` / `"right"` / `"justified"`）；认不出的名字回落
+/// `Center`（"主题文件里多写了个我不认识的对齐"不该让整份主题加载失败）。
+#[cfg(feature = "serde")]
+mod align_serde {
+    use rjw_text::Align;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(a: &Align, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match a {
+            Align::Left => "left",
+            Align::Right => "right",
+            Align::Justified => "justified",
+            _ => "center",
+        })
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Align, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "left" => Align::Left,
+            "right" => Align::Right,
+            "justified" => Align::Justified,
+            _ => Align::Center,
+        })
+    }
+}
 
 /// "胶囊"哨兵半径：交给 [`CornerRadius::fit`] 夹成 `min(w, h) / 2`（半圆端 / 正圆）。
 ///
@@ -31,6 +88,7 @@ pub const PILL_RADIUS: f32 = 1.0e3;
 /// 需要四角各异（对角渐变）时用 [`crate::Gradient::corners`] 走绘制原语，
 /// 不在主题里表达。
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Brush {
     /// 纯色（直角时只产生 4 个顶点，最省）。
     Solid(Color),
@@ -110,6 +168,8 @@ pub fn hgrad(left: Color, right: Color) -> Brush {
 
 /// 全局 UI 主题：所有控件样式 + 通用间距。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct Theme {
     pub label: LabelStyle,
     pub panel: PanelStyle,
@@ -152,6 +212,7 @@ pub struct Theme {
     /// `Ui::cache_buffer_wrap` / `Ui::ensure_text_buf` 这两个出口建缓冲。
     /// 不是 DPI 量（[`Theme::scaled`] 不缩放它）。字体没有该字重时由 cosmic-text
     /// 按最接近的字面回落（`fontdb` 匹配），不会变成豆腐块。见 [`Theme::with_font_weight`]。
+    #[cfg_attr(feature = "serde", serde(with = "weight_serde"))]
     pub font_weight: Weight,
     /// **本主题的调色板**（换肤 / 回退 / 诊断用；由 [`Theme::themed`] 记录）。
     ///
@@ -164,6 +225,8 @@ pub struct Theme {
 /// 外观**——扁平列表项（无边框）、hover / 选中整行高亮、✓ 选中标记、浮层面板细边框
 /// 小圆角。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct ComboStyle {
     /// 浮层面板背景（浅色主题 = 白 / 浅灰；dark = 深灰）。
     pub menu_bg: Color,
@@ -427,6 +490,8 @@ pub fn bevel_sunken(c: Color, k: f32) -> Brush {
 /// 注意 `surface_sunken` 比 `surface` **更暗**是刻意的（"可编辑"的通用暗示，
 /// 与 VS Code / Discord / egui 一致）；`surface_raised` 及以上才是越抬越亮。
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct Palette {
     // ── 表面（暗 → 亮）──
     /// 最底：窗口之外的画布 / 模态遮罩基色。
@@ -716,6 +781,8 @@ impl ComboStyle {
 
 /// 模态对话框样式（[`Ui::modal`](crate::ui::Ui::modal) 的全屏遮罩）。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct ModalStyle {
     /// 遮罩颜色（默认半透明黑，遮住背后内容）。
     pub dim: Color,
@@ -734,12 +801,15 @@ impl Default for ModalStyle {
 
 /// 纯文本标签样式。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct LabelStyle {
     /// 字体族（`None` = 系统默认；空串同默认）。
     pub font_family: Option<Arc<str>>,
     pub font_size: f32,
     pub color: Color,
     /// 水平对齐（垂直恒居中）。
+    #[cfg_attr(feature = "serde", serde(with = "align_serde"))]
     pub align: Align,
 }
 
@@ -760,6 +830,8 @@ impl Default for LabelStyle {
 /// alpha 按二次曲线渐隐到 0。因为完全是顶点色，它**进窗口顶点缓存**——窗口内容不变时
 /// 零额外开销，也不增加 draw call（与背景同纹理同变换，合批成一段）。
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct ShadowStyle {
     /// 向外渐隐宽度（**逻辑像素**；**0 = 不画投影**）。
     pub blur: f32,
@@ -813,6 +885,7 @@ pub const DEFAULT_LINE_SPACING: f32 = 1.2;
 ///
 /// 用枚举而非裸 bool（R2）：三档语义明确，且以后加档位不改签名。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Density {
     /// **紧凑**：间距 ×0.84、字号 ×0.92、行距 ×1.10（工具面板 / 小屏 / 高信息密度表格）。
     Compact,
@@ -839,6 +912,7 @@ impl Density {
 ///
 /// 用枚举而不是多个裸 bool（R2）：形状是**互斥**的几档，且以后加档位不改签名。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum GripShape {
     /// **三条递减小方块**（默认；历史观感：沿右下对角线逐级内缩）。
     #[default]
@@ -859,6 +933,8 @@ pub enum GripShape {
 /// 只对**固定宽窗口**（`WindowBuilder::width(..)`）生效 —— 那是唯一带缩放柄的容器；
 /// 会话里的"拖拽按钮"指的就是它。
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct GripStyle {
     /// 形状（默认 [`GripShape::Squares`]）。
     pub shape: GripShape,
@@ -920,6 +996,8 @@ impl GripStyle {
 
 /// 面板（背景 + 边框）样式。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct PanelStyle {
     /// 背景刷（纯色 / 两端色渐变；与 `radius` 组合即「圆角 + 渐变」）。
     pub bg: Brush,
@@ -934,6 +1012,10 @@ pub struct PanelStyle {
     ///
     /// 典型用途：窗口 / 面板的纹理底（木纹、纸张、渐变图、平铺图案）。`bg` 仍可
     /// 作为底色（图片半透明时透出）。
+    ///
+    /// ⚠ **不参与序列化**（`serde(skip)`）：纹理 `uid` 跨进程 / 跨资源不可移植，
+    /// 加载主题后该字段回落 `None`——要贴图请应用自己在加载后 `.with_bg_image(..)`。
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub bg_image: Option<crate::draw::ImageBg>,
     /// **投影**（窗口 / 面板 / 浮层的软阴影；`blur = 0` = 不画）。
     ///
@@ -960,6 +1042,8 @@ impl Default for PanelStyle {
 
 /// 按钮样式（normal / hover / pressed 三态）。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct ButtonStyle {
     /// 常态背景刷。默认给一点纵向微渐变：纯平色在深色主题下偏死板，
     /// 一点明暗差即有体积感，且**零纹理成本**。
@@ -998,6 +1082,8 @@ impl Default for ButtonStyle {
 
 /// 滑块样式。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct SliderStyle {
     /// 轨道刷（纯色 / 两端色渐变；接受 [`Color`]）。
     ///
@@ -1041,6 +1127,8 @@ impl Default for SliderStyle {
 
 /// 文本输入框样式。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct InputStyle {
     /// 背景刷（默认略微纵向渐变的凹陷感）。
     pub bg: Brush,
@@ -1091,6 +1179,8 @@ impl Default for InputStyle {
 
 /// 分割线样式（[`Ui::divider_at`](crate::ui::Ui::divider_at) / [`crate::widgets::Divider`]）。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct DividerStyle {
     /// 线颜色。
     pub color: Color,
@@ -1112,6 +1202,8 @@ impl Default for DividerStyle {
 
 /// 勾选框 / 单选样式。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct CheckboxStyle {
     /// 方框边长。
     pub box_size: f32,
@@ -1154,6 +1246,8 @@ impl Default for CheckboxStyle {
 /// - DebugDraw 屏幕空间图元（[`crate::Ui::debug_line`] 等）的样式 = **每次调用显式传参**
 ///   （`color` + `width`，逻辑像素）——需要统一样式时，可自建常量/结构体保存后传入。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct DebugStyle {
     /// `debug_layout` 布局描边颜色（默认青色）。
     pub layout_outline: Color,
@@ -1174,6 +1268,8 @@ impl Default for DebugStyle {
 /// 宽度为**逻辑像素**（内部 × scale 后取整）；默认取调色板强调色、宽 2.0
 /// ——1.0 在深色高 DPI 下几乎看不出来，键盘导航"看不见焦点"是硬伤。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct FocusStyle {
     pub color: Color,
     pub width: f32,

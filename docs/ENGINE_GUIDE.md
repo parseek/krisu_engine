@@ -1699,7 +1699,7 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {      // 位置 = 栏左上角�
 | 点菜单项 | **执行 + 自动收起**（`item` / `item_checked` 内部把 `close` 标志交给栏） |
 | 点栏外 | 收起（栏外 = 既不在触发器上、也不在下拉面板矩形内） |
 | **Esc** | 收起。应用自己的 Esc 语义先看 `UiState::menu_open()`（菜单开着那一帧别抢） |
-| 下拉面板 | 一个 [`Level::Normal`] + **`WindowClamp::Locked`** + **`.resize(false, Resize::None)`** 的浮层窗口（点它不置顶、**拖不动、也没有缩放柄**），且 z 被强制成 `WIN_TOPMOST` 哨兵 |
+| 下拉面板 | 一个 [`Level::Normal`] + **`WindowClamp::Locked`** + **`.resize(false, Resize::None)`** 的浮层窗口（点它不置顶、**拖不动、也没有缩放柄**），且 z 落在**浮层区间**（`WIN_TOPMOST` 基址 + 嵌套层数，见 §18.15「分层 z」） |
 
 > 面板的**录制 / 样式 / 宽度 / 关闭规则**全在 [`crate::widgets::menu`]（`menu::popup_show`）——
 > 与 [`Dropdown`](crate::Dropdown) **同一套实现**，本模块只负责"横向一排触发器 + 栏的判定"。
@@ -1841,31 +1841,107 @@ ui.add(Dropdown::new("file", "文件名过滤").width(160.0).menu(|m| {
 | 点了菜单项（`MenuCtx::item*` 上报） | 收起 |
 | `Esc` | 收起 |
 | 左键按下在**面板外** | 收起 |
-| 左键按下在**面板内 / 触发器上 / 任意 `WIN_TOPMOST` 浮层上** | **不**收起 |
+| 左键按下在**面板内 / 触发器上 / 任意浮层（`z >= WIN_TOPMOST`）上** | **不**收起 |
 
-最后那条是给**子菜单**留的：菜单里再 `add` 一个 `Dropdown` 时，点子菜单不该被外层菜单
-当成"点面板外"而把外层一起关掉（实现 = `Ui::window_under_mouse()` 的 z 是否
-`WIN_TOPMOST`）。菜单栏那边还多一条"栏"的判定：按下落在**另一个触发器**上 = 切换菜单
-（不是收起）——所以 `MenuBar::finish` 用**本栏**的 `on_trigger` 收口。
+最后那条是给**子菜单**留的：菜单里再开子菜单时，点子菜单不该被外层菜单当成"点面板外"
+而把外层一起关掉（实现 = `Ui::window_under_mouse()` 的 z 是否落在**浮层区间**
+`z >= WIN_TOPMOST`）。菜单栏那边还多一条"栏"的判定：按下落在**另一个触发器**上 =
+切换菜单（不是收起）——所以 `MenuBar::finish` 用**本栏**的 `on_trigger` 收口。
+
+**分层 z（浮层 = 基址 + 嵌套层数）**：所有浮层的 z 都从 `WIN_TOPMOST`（基址）起、按
+**当前嵌套层数**递增（`Ui::push_overlay_z` / `pop_overlay`，见 `ui::overlay_z`）。
+
+| 为什么不能是同一个哨兵值 | 说明 |
+|---|---|
+| 画面上 | 同一 z ⇒ 两层命令落进同一个 `(win, elem)` 分组排序，而窗口的**阴影 / 背景 / 边框**是 `elem = 0`、控件是 `elem ≥ 1` ⇒ **子层的阴影会被父层的控件盖住**（用户实测："下级 popup 阴影被绘制在了上级控件后面"）。分层 z ⇒ 子层（含阴影）整段排在父层之后 |
+| 状态上 | `win_origins` / `win_ids` 按 z 键 ⇒ 同 z 只会留下最后一个（诊断通道漏掉嵌套浮层）；分层 z 后每个浮层有自己的提交原点 |
+| 判定上 | "落在任意浮层上"是**区间判定**（`is_overlay_z`），不是 `== WIN_TOPMOST` |
+
+普通窗口的 z 从 1 起按 `max+1` 递增并**排除浮层区间** ⇒ 浮层恒在最上（两者相差 ~2³²）。
 
 **公开几何助手**（示例 / 脚本算坐标用，避免在脚本里抄魔数）：
 `menu::item_h(font_size)`（行高）、`menu::popup_padding(theme)`（内边距）、
-`menu::popup_origin(trigger, side)`（面板原点）。它们与引擎**同源**：
-`--sim-dropdown` 就是用它们算点击点、并用 `popup_origin` 反查"面板该在哪"。
+`menu::popup_origin(trigger, side)`（面板原点）、`menu::popup_gap(scale)`（行距）。
+它们与引擎**同源**：`--sim-dropdown` 就是用它们算点击点、并用 `popup_origin` 反查"面板该在哪"。
 
 **验证**：`--sim-dropdown`（**7 段，全 `[OK]`**）——
 ① 点触发器开下拉且**面板原点 = `popup_origin(触发器, Below)`**；
 ② 点选项 ⇒ 选中索引变 + 自动收起 + 面板消失；
 ③ 富内容下拉同样开得起来（同一个控件、同一套浮层）；
 ④ `text_focus()` 落在 `<下拉 id>::popup/...` ⇒ **菜单里的文本输入真可聚焦**；
-⑤ **只悬停**子菜单行 ⇒ 子面板原点 = `popup_origin(行, Right)` 且**父 popup 未消失**；
+⑤ **只悬停**子菜单行 ⇒ 子面板原点 = `popup_origin(行, Right)`、**父 popup 未消失**、
+   且**子面板 z > 父面板 z**（分层 z 的硬断言：阴影不再被父层控件盖住）；
 ⑥ 点子菜单里的项 ⇒ 应用状态变 + **整条链**（子 + 父）收起；
 ⑦ 点 `MenuClick::Keep` 项 ⇒ 执行 + **popup 保留**。
 引擎侧不变量由纯函数单测守着（`menu.rs`：行高公式、面板方位、宽度收敛、关闭真值表、行底色
 优先级、勾选判定、**子菜单展开真值表**、**窗口子树前缀边界**、`Item` 责任链默认档；`ui/tests.rs`：
-`title_bar_h` 贴顶；`dropdown.rs`；`state.rs`：`combo_open()` 可读 + `reset` 清空）。
+`title_bar_h` 贴顶、**`overlay_z` 分层与区间**；`dropdown.rs`；`state.rs`：`combo_open()` 可读 +
+`reset` 清空）。
 
-### 18.16 维护约定（对 AI）
+### 18.16 主题序列化（TOML：导出 / 导入 / 启动参数）
+
+`Theme`（含全部子样式）可**序列化**为 TOML 文本，于是"调好的主题"能落盘、能进版本库、
+能在启动时指定：
+
+| API | 语义 |
+|---|---|
+| `Theme::to_toml() -> Result<String, String>` | **全量导出**：`format_version` 头 + `[theme]` 字段树（所有样式字段） |
+| `Theme::from_toml(s) -> Result<Theme, String>` | 从 TOML **加载**（起点 = `Theme::default()`；缺字段回落默认） |
+| `Theme::apply_toml(&mut self, s)` | **在当前主题上合并覆盖**（文件里出现的字段才改）——手写小文件最常用的语义 |
+| `THEME_FORMAT_VERSION` | 格式版本（导出写进文件；加载时**比本引擎新** ⇒ 报错拒绝） |
+
+```toml
+format_version = 1              # 认不出 ⇒ 加载报错；缺失 ⇒ 整份文档当"裸主题表"
+
+[theme]
+row_h = 26.0
+gap = 6.0
+font_weight = 700               # u16 代理（Weight 在 rjw_text，不能在此 derive）
+line_spacing = 1.2
+
+[theme.panel]
+padding = 6.0
+radius = { tl = 6.0, tr = 6.0, br = 6.0, bl = 6.0 }   # 也可以写 `radius = 6.0`（四角同值）
+shadow = { blur = 8.0, offset = { x = 0.0, y = 2.0 }, color = { r = 0.0, g = 0.0, b = 0.0, a = 0.47 } }
+```
+
+**三条语义**（`crate::theme_toml` 模块文档里有完整说明）：
+
+1. **`to_toml` 是全量**：导出的文件导入回来逐字段一致（单测的强断言 = "再导出一次文本
+   完全相同"）。唯一例外：`PanelStyle::bg_image` **不序列化**（纹理 `uid` 跨进程不可移植，
+   `serde(skip)` ⇒ 加载后回落 `None`，要贴图由应用自己灌）。
+2. **`apply_toml` 是合并**：先把当前主题序列化成 TOML 值，再把文件里的值**递归**合并上去
+   ⇒ `gap = 12` 两行的手写文件就只改间距；`from_toml` = 在 `Default` 上合并。
+3. **宽容**：缺字段回落默认（每个样式结构体 `serde(default)`）、多余键忽略（向前兼容）；
+   只有**版本比本引擎新** / TOML 语法 / 字段类型不合法才 `Err(String)`（消息带原文，直接
+   显示给用户）。
+
+> **特性开关**：`rjw_ui` 的 `serde`（= `toml`，默认开）——`Color` 的 serde 由
+> `rjw_color/serde` 带进；`Weight` / `Align` 用**代理模块**（数值 / 小写名字）；
+> `CornerRadius` 反序列化**同时接受标量与表**（`radius = 3.0` 或四角表）。
+>
+> **示例侧**（`eg260818UI`，`rfd` 文件选择器）：顶栏多了「导出主题…」「导入主题…」——
+> 导出 = `to_toml` 落盘（另存为对话框），导入 = `load_theme_onto`（在**当前**主题上
+> `apply_toml`）后当作**基底**生效（旋钮暂不生效，窗口里有「恢复调节」）；
+> **`--theme <路径>`** 就是同一条通路在**启动时**跑一次：
+
+```
+cargo run -p eg260818UI -- --theme C:\my-theme.toml
+theme: 启动载入 C:\my-theme.toml
+```
+
+**验证**（`rfd` 对话框无法无头跑，但"文件"这条通路是真实的）：
+
+```
+cargo run -p eg260818UI -- --sim-theme C:\rust-targets\sim-theme.toml --frames 70
+sim-theme: ① 7403 字节 · row_h=26 gap=6 字重=400 · 再导出逐字相同=true [OK] 主题导出 → 文件 → 导入：字段级往返一致
+sim-theme: ② 导入前 row_h=26 → 引擎侧 row_h=27（期望 27）[OK] 导入的主题真的进了引擎（全量文件改一行 ⇒ 只那一项变）
+```
+
+引擎侧不变量由单测守着（`theme_toml.rs`：round-trip 文本逐字相同、merge 只在文件写到的
+字段上生效、版本过高 / 语法错误 / 缺 `[theme]` 的可读报错、`bg_image` 不入文件）。
+
+### 18.17 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
 - 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。
@@ -1882,6 +1958,13 @@ ui.add(Dropdown::new("file", "文件名过滤").width(160.0).menu(|m| {
   （[`Ui::debug_dump`](crate::Ui::debug_dump) 走 `frame_state.window_ids_seen` +
   `UiState::window_origins`）。渲染不受影响：采集时减、提交时加用的是同一个 z 键值。
   跨帧状态槽位同理：**子菜单状态挂行自己（`WidgetState`），不要挤 `UiState::combo_open`**。
+- **浮层 z 一律走 `Ui::push_overlay_z` / `pop_overlay`**（`ui::overlay_z` = 基址 + 嵌套层数）：
+  写死同一个哨兵会让子浮层的**阴影**被父浮层控件盖住（见 §18.15「分层 z」）。
+  "是否在浮层上"用区间判定 `ui::is_overlay_z`，不要写 `== WIN_TOPMOST`。
+- **主题加字段**：样式结构体都已 `derive(Serialize, Deserialize)` + `serde(default)` ⇒
+  加字段（带 `Default`）**不需要**动格式版本；但**改字段名 / 删字段** = 破坏文件兼容 ⇒
+  视为格式变更并抬 `THEME_FORMAT_VERSION`。新字段若类型没有 serde（外部 crate 的类型）
+  就加**代理模块**（`weight_serde` / `align_serde`）或 `serde(skip)`（不可移植的值）。
 - 新增**交互**控件时必须调用 `register_focus(&id_for, rect, FocusKind::X)`（键盘导航 / 焦点描边；`id_for = ui.id_for(id)` 为**绝对 ID**）；需要 Enter/Space 激活的控件用 `key_click(&id_for, kind)` 合成点击。持久状态一律经 `state_mut().widget(&id_for)` 读写（绝对 ID）。
 - 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
 - **半透明与元素序**（两条都会静默毁掉画面）：
