@@ -942,6 +942,46 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 | `flex_at` | `ui.flex_at(pos, total_h, &[w1,w2,..], \|f, i\| ...) -> Vec2` | **flex 容器**：固定总高 `total_h` 按 `weights` **权重等分**子项高度（扣 gap；回调按索引布局，同帧精确）；内容超高溢出可见（需滚动时内嵌 `scroll_at`） |
 | 容器内 `*_at(offset)` | `p.panel_at(offset, \|inner\| ...)` | 嵌套容器（相对当前容器内容原点，不占光标） |
 
+### 控件协议（`Widget` / `Sense` / 申请 API，v0.3 起）
+
+**`Widget` 只有一个方法**（尺寸在 `ui()` 里就地申请，参考 egui）：
+
+```rust
+pub trait Widget {
+    fn ui(self, ui: &mut Ui) -> Response;     // 申请 → 画 → 收交互 → 返回响应
+}
+
+impl Ui {
+    // 申请（尺寸 = 物理像素 Vec2；要逻辑单位先 to_physical(scale)）
+    fn allocate(&mut self, size: Vec2) -> Rect;
+    fn allocate_mode(&mut self, size: Vec2, mode: Expansion) -> Rect;
+    fn allocate_at(&mut self, pos: impl Into<Position>, size: Vec2) -> Rect;
+    fn allocate_sense(&mut self, id: &str, size: Vec2, sense: Sense) -> (Rect, Response);
+    fn allocate_sense_mode(&mut self, id: &str, size: Vec2, mode: Expansion, sense: Sense) -> (Rect, Response);
+    fn allocate_sense_at(&mut self, pos: impl Into<Position>, id: &str, size: Vec2, sense: Sense) -> (Rect, Response);
+    // 交互（申请与交互分开时用；`allocate_sense*` 已含这一步）
+    fn interact(&mut self, id: &IdAbsolute<'_>, rect: Rect, sense: Sense) -> Response;
+}
+
+pub struct Sense { pub hover: bool, pub click: bool, pub drag: bool, pub focus: Option<FocusKind> }
+impl Sense {
+    pub const NONE / HOVER / CLICK / DRAG: Self;
+    pub fn focus(self, kind: FocusKind) -> Self;    // 进焦点链（Tab + 焦点描边）
+}
+```
+
+- `Sense::drag` = **按下即 `claim_press()`**（外层窗口 / 面板不把这次按下当作拖动基准）
+  + `update_drag`；拖拽基准与数值映射仍由控件维护（`WidgetState::{press_mouse,press_panel}`）。
+- `interact` 一次做完：命中（含窗口 / 控件级遮挡 / 裁剪过滤）→ 焦点 → 按下认领 →
+  `update_interact`（hover / pressed / clicked / released）→ `note_press_handled` → `update_drag`。
+- `Response` 增 `rect: Rect`（本帧最终矩形；`UiAdd::label` 就靠它返回尺寸）；
+  `pressed` = **持续按住**（与 `ButtonState::pressed` 同义），`clicked` = 本帧完成点击。
+- 膨胀语义是**申请方式**：`Expansion::{UnlimitedExpansion(默认), LimitedInParent(压到 avail_w), DisableAutoExpansion(不撑大父级)}`；
+  min/max 用 `apply_constraints(desired, c)` 自己应用。
+- `add_at(pos, w)`：给 `Ui` 打**一次性放置覆盖**，控件的第一次申请消费它（**只在第一次**；
+  控件要摆多块用 `allocate_at`）。
+- ⚠ **顺序**：先量（`text_size` / `avail_w`）→ 再申请 → 再画（`ui.painter()`，一个绘制块一个）。
+
 ### 控件（容器内：`p.xxx(...)` 占光标；`*_at` 变体显式 `Rect`）
 
 | 控件 | 签名 | 返回值 / 行为 |

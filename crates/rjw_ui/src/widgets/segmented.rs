@@ -30,11 +30,10 @@ use glam::Vec2;
 use rjw_color::Color;
 use rjw_transform::Rect;
 
-use crate::draw::{CornerRadius, Size, TextAlign, TextVAlign};
-use crate::hit::update_interact;
+use crate::draw::{CornerRadius, Position, Size, TextAlign, TextVAlign};
 use crate::style::{ButtonStyle, Theme};
 use crate::ui::Ui;
-use crate::widgets::{Response, Widget};
+use crate::widgets::{Response, Sense, Widget};
 
 /// 分段按钮组（互斥选项拼在一起；选中项写入 `&mut usize`）。
 pub struct Segmented<'a> {
@@ -69,26 +68,25 @@ impl<'a> Segmented<'a> {
 }
 
 impl Widget for Segmented<'_> {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
-        let (st, fam, fs) = self.resolve(&ui.theme, ui.scale());
-        let n = self.labels.len().max(1);
-        let mut w = 0.0;
-        let mut h: f32 = 0.0;
-        for l in self.labels {
-            let t = ui.text_size(l, fs, fam.as_deref());
-            w += t.x + st.padding.x * 2.0;
-            h = h.max(t.y);
-        }
-        let h = h + st.padding.y * 2.0;
-        // 极窄时也要有可点的宽度（每段至少 `font_size` 宽）。
-        Vec2::new(w.max(fs * n as f32), h)
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+    fn ui(self, ui: &mut Ui) -> Response {
         let (st, fam, fs) = self.resolve(&ui.theme, ui.scale());
         let n = self.labels.len();
+        // ① 先量（与旧 `size()` 同式：每段文字宽 + 内边距，再保证每段至少 `font_size` 宽）
+        let size = {
+            let nn = n.max(1);
+            let mut w = 0.0;
+            let mut h: f32 = 0.0;
+            for l in self.labels {
+                let t = ui.text_size(l, fs, fam.as_deref());
+                w += t.x + st.padding.x * 2.0;
+                h = h.max(t.y);
+            }
+            Vec2::new(w.max(fs * nn as f32), h + st.padding.y * 2.0)
+        };
+        // ② 申请（占光标；`add_at` 的绝对定位由 `place_once` 覆盖）
+        let rect = ui.allocate(size);
         if n == 0 || rect.w <= 0.0 || rect.h <= 0.0 {
-            return Response::default();
+            return Response { rect, ..Default::default() };
         }
         // 各段宽度：按文字实测，再整体缩放到 `rect.w`（两次测量必然同值，缩放只为消缝）。
         let mut widths: Vec<f32> = Vec::with_capacity(n);
@@ -98,71 +96,73 @@ impl Widget for Segmented<'_> {
         let total: f32 = widths.iter().sum();
         let k = if total > 0.0 { rect.w / total } else { 1.0 };
         let r = st.radius;
-        // 组的整体底色 + 外框（一个圆角矩形 ⇒ 只有**外侧角**是圆的）。
-        let mut elem = ui.elem_hint();
-        ui.push_panel_like(rect, st.bg, st.border, st.border_w, r, elem);
-        // 段间隔线：边框开了用边框色；边框被关掉（`border_w = 0`）退化成下沉色——
-        // 否则三段同底色连成一条长条，看不出是三个选项。
-        let sep = if st.border_w > 0.0 { st.border } else { ui.theme.palette.surface_dim };
+        // ③ 逐段收交互（`Sense::DRAG`：段自己消费按下，别让外层容器当成"拖窗口/拖面板"）。
+        //    先收完交互再画：绘制要用一个 painter 一把画完（painter 存活期内借不到 `ui`）。
+        let mut segs: Vec<(Rect, Response)> = Vec::with_capacity(n);
+        let mut x = rect.x;
         let mut clicked = false;
         let mut hovered_any = false;
         let mut pressed_any = false;
-        let mut x = rect.x;
-        elem = ui.elem_hint();
         for (i, w0) in widths.iter().enumerate() {
             let w = w0 * k;
             let seg = Rect::new(x, rect.y, w, rect.h);
             let seg_id = format!("{}::seg{i}", self.id);
-            let abs = ui.id_for(seg_id.as_str());
-            let hit = ui.hit_abs(&abs, &seg);
-            let btn = ui.mouse_left();
-            if btn.down_edge() && hit {
-                // 段自己消费按下：别让外层容器把这次按下当成"拖窗口 / 拖面板"。
-                ui.claim_press();
+            let (seg, resp) = ui.allocate_sense_at(
+                Position::Physical(Vec2::new(seg.x, seg.y)),
+                seg_id.as_str(),
+                Vec2::new(seg.w, seg.h),
+                Sense::DRAG,
+            );            hovered_any |= resp.hovered;
+            pressed_any |= resp.pressed;
+            if resp.clicked {
+                clicked = true;
+                *self.selected = i;
             }
-            let ev = {
-                let ws = ui.state_mut().widget(&abs);
-                update_interact(ws, hit, btn)
-            };
-            hovered_any |= hit;
-            pressed_any |= ev.pressed;
+            segs.push((seg, resp));
+            x += w;
+        }
+        // ④ 画（一个绘制块一个 painter；组底 / 高亮段 / 分隔线 / 文字都在这里）
+        let sep = if st.border_w > 0.0 { st.border } else { ui.theme.palette.surface_dim };
+        let fg = st.fg;
+        let labels = self.labels;
+        let selected = *self.selected;
+        let p = ui.painter();
+        // 组的整体底色 + 外框（一个圆角矩形 ⇒ 只有**外侧角**是圆的）。
+        p.panel(rect, st.bg, st.border, st.border_w, r);
+        for (i, (seg, resp)) in segs.iter().enumerate() {
             // 选中 / 悬停段高亮：圆角只取组的**外侧**两角（内侧直角，拼缝处不露底）。
-            if *self.selected == i || hit || ev.pressed {
-                let bg = if *self.selected == i { st.bg_pressed } else { st.bg_hover };
+            if selected == i || resp.hovered || resp.pressed {
+                let bg = if selected == i { st.bg_pressed } else { st.bg_hover };
                 let cr = CornerRadius {
                     tl: if i == 0 { r.tl } else { 0.0 },
                     bl: if i == 0 { r.bl } else { 0.0 },
                     tr: if i == n - 1 { r.tr } else { 0.0 },
                     br: if i == n - 1 { r.br } else { 0.0 },
                 };
-                ui.push_panel_like(seg, bg, Color::TRANSPARENT, 0.0, cr, elem);
+                p.panel(*seg, bg, Color::TRANSPARENT, 0.0, cr);
             }
             // 段间隔线（居中 1px；避开外框的宽度，短一截更像分隔而不是边框）。
             if i > 0 {
                 let inset = st.border_w.max(0.0);
-                ui.push_solid_rect(
-                    Rect::new(x - 0.5, rect.y + inset, 1.0, (rect.h - inset * 2.0).max(1.0)),
+                p.solid(
+                    Rect::new(seg.x - 0.5, rect.y + inset, 1.0, (rect.h - inset * 2.0).max(1.0)),
                     sep,
                 );
             }
-            ui.push_text_rect(
-                seg,
-                self.labels[i],
+            p.text(
+                *seg,
+                labels[i],
                 fs,
-                st.fg,
+                fg,
                 fam.clone(),
                 TextAlign::Center,
                 TextVAlign::Center,
                 None,
                 None,
             );
-            if ev.clicked {
-                clicked = true;
-                *self.selected = i;
-            }
-            x += w;
         }
         Response {
+            rect,
             hovered: hovered_any,
             pressed: pressed_any,
             clicked,

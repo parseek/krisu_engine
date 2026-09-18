@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use glam::Vec2;
 use rjw_color::Color;
-use rjw_transform::Rect;
 use crate::draw::Size;
 use crate::style::{CheckboxStyle, Theme};
 use crate::ui::Ui;
@@ -84,25 +83,20 @@ impl<'a> Checkbox<'a> {
 }
 
 impl Widget for Checkbox<'_> {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
-        let box_size = ui.theme.checkbox.box_size;
-        let gap = ui.theme.checkbox.gap;
-        let size = self
-            .font_size
-            .map(|s| s.to_physical(ui.scale()))
-            .unwrap_or(ui.theme.checkbox.font_size);
-        let family = match self.font_family {
-            Some(f) => Some(Arc::from(f)),
-            None => ui.theme.checkbox.font_family.clone(),
-        };
-        let tsize = ui.text_size(self.label, size, family.as_deref());
-        Vec2::new(box_size + gap + tsize.x, box_size.max(tsize.y))
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+    fn ui(self, ui: &mut Ui) -> Response {
         let style = self.resolve(&ui.theme, ui.scale());
+        // ① 先量：方框 + 间距 + 文本宽
+        let tsize = ui.text_size(self.label, style.font_size, style.font_family.as_deref());
+        let size = Vec2::new(
+            style.box_size + style.gap + tsize.x,
+            style.box_size.max(tsize.y),
+        );
+        // ② 申请（占光标）
+        let rect = ui.allocate(size);
+        // ③ 交互 + 绘制（显式 rect 入口负责键盘激活 / 勾选态配色）
         let s = ui.checkbox_at_styled(self.id, rect, self.label, self.checked, &style);
         Response {
+            rect,
             hovered: s.hovered,
             pressed: s.pressed,
             clicked: s.clicked,

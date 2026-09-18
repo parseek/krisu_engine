@@ -20,8 +20,8 @@
 
 ```rust
 pub trait Widget {
-    fn size(&self, ui: &mut Ui) -> Vec2;          // 期望尺寸（内容测量）
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response; // 在矩形内渲染 + 交互
+    /// 就地申请空间（`ui.allocate*`）→ 绘制（`ui.painter()`）→ 收交互（`ui.interact`）。
+    fn ui(self, ui: &mut Ui) -> Response;
 }
 
 // 容器 API（crate::ui::UiAdd）：唯一必需方法 ui_mut()，
@@ -78,18 +78,22 @@ ui.add_at(Vec2::new(400.0, 40.0), Label::new("HUD"));
 `.ellipsis()` 切换为单行"…"省略。Button / 勾选 / 下拉的文本超出分配矩形时
 **自动省略**（内容自洽，noclip 绘制）。
 
-### Widget 尺寸契约（`Widget` trait 默认方法，现有 impl 零破坏）
+### Widget 尺寸契约（**就地申请**，v0.3 起）
 
-```rust
-fn constraints(&self) -> SizeConstraints { SizeConstraints::default() }  // min_w/max_w/min_h/max_h 全 Option<f32>
-fn expansion(&self) -> Expansion { Expansion::UnlimitedExpansion }
-fn resizable(&self) -> Option<(Vec2, Vec2)> { None }   // 可选拖拽缩放范围
-```
+`Widget` 只有**一个方法**（`fn ui(self, ui) -> Response`）——**尺寸不再单独声明**，
+而是在 `ui()` 里就地申请（参考 egui 的 `allocate_exact_size`）：
 
-- `UnlimitedExpansion`（默认）：内容自然尺寸（clamp min/max），撑大父级（DOM 语义）；
-- `LimitedInParent`：取 min(内容, 父级可用宽 `Ui::avail_w()`)，超出由控件自处理
-  （Label 换行 / 省略、Button 省略、TextArea 滚动）；
-- `DisableAutoExpansion`：不撑大父级（内容溢出由控件用 noclip 自洽）。
+| 申请方式 | 语义 | 旧 `Expansion` 对应 |
+|---|---|---|
+| `ui.allocate(size)` | 占光标，**撑大父级** | `UnlimitedExpansion`（默认） |
+| `ui.allocate_mode(size, Expansion::DisableAutoExpansion)` | 不撑大父级（装饰件） | `DisableAutoExpansion` |
+| `ui.allocate_mode(size, Expansion::LimitedInParent)` | 宽度压到父级 `avail_w()` | `LimitedInParent` |
+| `ui.allocate_at(pos, size)` | 绝对定位（不占光标） | — |
+| `ui.allocate_sense(id, size, sense)` | 申请 + **一次收交互** | — |
+
+- 尺寸一律是**物理像素 `Vec2`**（与"`Theme` 已预乘、内部全物理像素"一致）；要写逻辑
+  单位先 `Size::Logical(x).to_physical(ui.scale())`；
+- **min/max 尺寸**：`apply_constraints(desired, c)` 后交给 `allocate`（不再有 trait 钩子）；
 - 拖拽缩放：`Ui::resize_handle(id, handle, current, min, cursor)` 通用原语 +
   `UiState::sizes` 持久尺寸（`ui.window(id).width(w)` 宽度缩放即基于它）。
 
@@ -118,30 +122,36 @@ impl<'a> TagButton<'a> {
 }
 ```
 
-### 3.2 实现 `Widget`
+### 3.2 实现 `Widget`（**只写一个方法**）
 
 ```rust
 impl Widget for TagButton<'_> {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
-        // 主题回落值先拷出（owned），再调用 &mut ui 测量，避免借用冲突
-        let size = self.font_size.unwrap_or(ui.theme.button.font_size);
-        let family = ui.theme.button.font_family.clone();
-        let tsize = ui.text_size(self.label, size, family.as_deref());
-        Vec2::new(tsize.x + 24.0, tsize.y + 10.0)
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-        // 1) 交互：复用现成原语（推荐）或自写（hit_abs / mouse_left / register_focus /
-        //    key_click / hit::update_interact 均为**公开**，可跨 crate）
-        //    自写命中时务必传自己的绝对 ID：`ui.hit_abs(&ui.id_for(self.id), &rect)` ——
-        //    引擎按它做**控件级遮挡**（同窗口内重叠控件只有最上层响应）。
-        let st = ui.button_at_styled(self.id, rect, self.label, &ui.theme.button);
-        // 2) 覆盖属性：你可以在 button_at_styled 前后追加自己的绘制命令
-        //    （如 push_panel_like / push_text_rect / push_solid_rect 公开原语）
-        Response::from(st)
+    fn ui(self, ui: &mut Ui) -> Response {
+        // ① 先量（文本测量 / 读主题）——必须在 allocate 之前（申请会推进光标）
+        let st = ui.theme.button.clone();          // 主题回落值先拷出（owned），避免借用冲突
+        let size = self.font_size
+            .map(|s| Size::Logical(s).to_physical(ui.scale()))
+            .unwrap_or(st.font_size);
+        let tsize = ui.text_size(self.label, size, st.font_family.as_deref());
+        let desired = Vec2::new(tsize.x + 24.0, tsize.y + 10.0);
+        // ② 申请 + 收交互（一句话：id_for / 命中 / 焦点 / 按下认领 / update_interact）
+        let (rect, resp) = ui.allocate_sense(self.id, desired, Sense::CLICK.focus(FocusKind::Button));
+        // ③ 画（一个绘制块一个 painter）
+        let p = ui.painter();
+        // 悬停 / 按下三态：`Brush` 支持逐控件覆盖（`bg`），这里给"有覆盖就用覆盖"的最简式
+        let bg = self.bg.unwrap_or_else(|| st.pick_bg(resp.pressed, resp.hovered));
+        p.panel(rect, bg, st.border, st.border_w, st.radius);
+        p.text(rect, self.label, size, st.fg, st.font_family.clone(),
+               TextAlign::Center, TextVAlign::Center, None, None);
+        resp
     }
 }
 ```
+
+- 想要"复用现成控件的交互 + 自绘"就调 `ui.button_at_styled(id, rect, label, &style)` /
+  `ui.checkbox_at_styled(..)`（**显式 rect** 入口）——它们的 `*State` 可 `Response::from(..)`；
+- 想自写命中：`ui.hit_abs(&ui.id_for(self.id), &rect)` 的绝对 ID 决定**控件级遮挡**
+  （同窗口内重叠控件只有最上层响应）；`Sense` 的 `drag` 就是"按下即 `claim_press()`"。
 
 ### 3.3 放置即用
 
@@ -156,19 +166,22 @@ if ui.add(TagButton::new("t1", "标签").bg(Color::ORANGE)).clicked() { … }
 
 | 分类 | 公开原语（`Ui` 方法） | 用途 |
 |---|---|---|
-| 主题 | `ui.theme`（字段，可读可改） | 样式取值 / 逐控件覆盖合并 |
-| 测量 | `text_size` / `text_size_wrap` | `Widget::size` 里内容测量（逻辑像素） |
-| 布局 | `child_rect` | 自写"占光标"容器时分配子矩形 |
-| 命中 | `hit_abs(&绝对ID, &Rect)` / `hit_body_abs(&Rect)` / `mouse_left()` / `mouse_logical()` | 点中判定（含窗口遮挡 + **控件级遮挡** + 裁剪过滤）/ 窗口·面板本体 / 左键状态 / 拖拽基准 |
-| 按下归属 | `claim_press()` | **自身有拖拽语义的控件**在按下时调用——阻止外层窗口把本次按下当窗口拖拽基准 |
+| 主题 | `theme()` / `theme_mut()`（crate 内为字段） | 样式取值 / 逐控件覆盖合并 |
+| 测量 | `text_size` / `text_size_wrap` / `wrap_buffer` | 内容测量（**物理像素**；在 `allocate` **之前**调用） |
+| 申请 | `allocate` / `allocate_mode` / `allocate_at` / `allocate_sense` / `allocate_sense_at` | 就地在 `ui()` 里申请矩形（物理像素；`Response::rect` = 最终矩形） |
+| 交互 | `interact(&绝对ID, rect, Sense)` | 命中 / 焦点 / 按下认领 / `update_interact` / `update_drag` 一次做完（返回 `Response`） |
+| 布局 | `child_rect` / `avail_w` / `mouse_local` | 自写"占光标"容器 / 父级可用宽 / 局部鼠标 |
+| 命中 | `hit_abs(&绝对ID, &Rect)` / `mouse_left()` / `mouse_logical()` | 点中判定（含窗口遮挡 + **控件级遮挡** + 裁剪过滤）/ 左键状态 / 拖拽基准 |
+| 按下归属 | `claim_press()`（或 `Sense::drag`） | **自身有拖拽语义的控件**在按下时调用——阻止外层窗口把本次按下当窗口拖拽基准 |
 | 焦点 | `register_focus(&id_for, rect, FocusKind)` / `key_click(&id_for, kind)`（`id_for = ui.id_for(id)` 为**绝对 ID**） | 键盘导航（Tab/Enter/方向键）接入 |
-| 状态 | `state_mut().widget(&id_for)` → `WidgetState` + `hit::update_drag` / `update_interact` | 跨帧交互状态机（hover/按下/拖拽基准）；**收绝对 ID** |
-| 绘制 | `push_panel_like` / `push_text_rect` / `push_solid_rect` / `push_border_rect` | 背景边框 / 文本 / 实心 / 描边（逻辑坐标） |
+| 状态 | `state_mut().widget(&id_for)` → `WidgetState` + [`hit::update_drag`](crate::hit::update_drag) / [`hit::update_interact`](crate::hit::update_interact) | 跨帧交互状态机（hover/按下/拖拽基准）；**收绝对 ID** |
+| 绘制 | `painter()` → `panel / panel_elem / panel_img / solid / border / rounded_at / gradient_at / icon_at / image_at / text`（`push_panel_like` 等旧方法保留为薄包装） | 背景边框 / 文本 / 实心 / 描边（逻辑坐标） |
 | 复用 | `button_at_styled` / `checkbox_at_styled` / `slider_at` / `text_input_at` / `text_area_at` / `radio_at` / `combo_at`（= `Dropdown` 的糖） | 委托现有控件（**内置控件同路径**） |
 | 浮层 | `widgets::menu::popup_show`（`pub(crate)`）+ `MenuCtx` | **下拉 / 菜单类浮层一律走这里**（哨兵 z / 锁定位置 / 无缩放柄 / 面板样式 / 宽度收敛 / 点外·Esc·点项收起都在里面）；`MenuCtx` 是给应用写菜单内容的上下文（`Deref` 到 `Window` ⇒ 全部 `UiAdd`） |
 
-约定：`rect` 均为**相对当前容器 origin 的局部坐标**；`push_*` 内部 ×scale 取整到
-物理像素；交互前先拷出主题值（Copy / owned）避免借用冲突。
+约定：`rect` 均为**相对当前容器 origin 的局部坐标**；`Theme` 已预乘 DPI ⇒ 内部一律
+**物理像素**（`Size` / `Position` 只在公开 API 边界做换算）；交互前先拷出主题值
+（Copy / owned）避免借用冲突；**一个绘制块一个 painter**（`ui.painter()` 借 `&mut self`）。
 
 ### 3.5 复用现有控件时的建议
 

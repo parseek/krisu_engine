@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use glam::Vec2;
 use rjw_color::Color;
-use rjw_transform::Rect;
 use crate::draw::Size;
 use crate::draw::CornerRadius;
 use crate::style::{Brush, ButtonStyle, Theme};
@@ -125,32 +124,20 @@ impl<'a> Button<'a> {
 }
 
 impl Widget for Button<'_> {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
-        let size = self
-            .font_size
-            .map(|s| s.to_physical(ui.scale()))
-            .unwrap_or(ui.theme.button.font_size);
-        let family = match self.font_family {
-            Some(f) => Some(Arc::from(f)),
-            None => ui.theme.button.font_family.clone(),
-        };
-        let tsize = ui.text_size(self.label, size, family.as_deref());
-        let pad = self
-            .padding
-            .map(|p| p.to_physical(ui.scale()))
-            .unwrap_or(ui.theme.button.padding);
-        Vec2::new(tsize.x + pad.x * 2.0, tsize.y + pad.y * 2.0)
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+    fn ui(self, ui: &mut Ui) -> Response {
         let style = self.resolve(&ui.theme, ui.scale());
+        // ① 先量（文本测量必须在申请之前——申请会推进容器光标）
+        let size = {
+            let tsize = ui.text_size(self.label, style.font_size, style.font_family.as_deref());
+            Vec2::new(
+                tsize.x + style.padding.x * 2.0,
+                tsize.y + style.padding.y * 2.0,
+            )
+        };
+        // ② 申请（占光标；`add_at` 的绝对定位由 `place_once` 覆盖）
+        let rect = ui.allocate(size);
+        // ③ 交互 + 绘制交给显式 rect 入口（键盘激活 / 省略号 / 三态配色都在那里）
         let s = ui.button_at_styled(self.id, rect, self.label, &style);
-        Response {
-            hovered: s.hovered,
-            pressed: s.pressed,
-            clicked: s.clicked,
-            released: s.released,
-            toggled: false,
-        }
+        Response { rect, ..s.into() }
     }
 }

@@ -33,9 +33,12 @@
 //! 1. `struct MyWidget<'a> { id: &'a str, /* 属性用 Option 存差异 */ }`
 //!    —— **builder 约定**：没设的属性回落 [`Theme`](crate::style::Theme)，于是主题一改
 //!    所有控件一起变（内置控件全是这个形状）；
-//! 2. `impl Widget for MyWidget`，只需要两个方法：
-//!    - `fn size(&self, ui) -> Vec2`：量尺寸（文字用 `ui.text_size`，其它读主题常量）；
-//!    - `fn ui(self, ui, rect) -> Response`：在 `rect` 里画 + 收交互。
+//! 2. `impl Widget for MyWidget`，**只写一个方法** `fn ui(self, ui) -> Response`：
+//!    - **先量**：`ui.text_size(..)` / 读主题（必须在申请之前——申请会推进容器光标）；
+//!    - **申请**：`let (rect, resp) = ui.allocate_sense(id, size, Sense::CLICK);`
+//!      （只要矩形不要交互就用 [`Ui::allocate`](crate::Ui::allocate)）；
+//!    - **画**：`let p = ui.painter(); p.panel(..); p.text(..);`
+//!    - **返回 `resp`**（`Response::rect` 就是最终矩形）。
 //! 3. 放进去：`ui.add(w)`（容器内占光标）/ `ui.add_at(pos, w)`（绝对定位）；
 //!    容器包装（`Pack` / `Panel` / `Grid` / `Window` / `Scroll`）经
 //!    [`crate::ui::UiAdd`] 提供同样的 `add` / `add_at`。
@@ -49,9 +52,8 @@
 //! ```no_run
 //! use glam::Vec2;
 //! use rjw_color::Color;
-//! use rjw_transform::Rect;
 //! use rjw_ui::draw::TextVAlign;
-//! use rjw_ui::{Response, TextAlign, Ui, Widget};
+//! use rjw_ui::{Response, Sense, TextAlign, Ui, Widget};
 //!
 //! /// 标签块：圆角底 + 居中文字（**最小可用自定义控件**）。
 //! pub struct Tag<'a> {
@@ -73,31 +75,28 @@
 //! }
 //!
 //! impl Widget for Tag<'_> {
-//!     fn size(&self, ui: &mut Ui) -> Vec2 {
-//!         let st = ui.theme().label.clone();
-//!         let t = ui.text_size(self.text, st.font_size, st.font_family.as_deref());
-//!         Vec2::new(t.x + 16.0, ui.theme().row_h) // 文字宽 + 左右内边距
-//!     }
-//!
-//!     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-//!         // 身份 = **绝对 id**（控件级遮挡按它区分"谁盖住谁"，见第 7 条硬约定）。
-//!         let abs = ui.id_for(self.id);
-//!         // 命中（含窗口遮挡 / 控件级遮挡 / 强制裁剪层）。
-//!         let hovered = ui.hit_abs(&abs, &rect);
+//!     fn ui(self, ui: &mut Ui) -> Response {
+//!         // ① 先量：文字宽 + 左右内边距（申请之前量，`avail_w()` 才是本控件的可用宽）
 //!         let st = ui.theme().button.clone();
-//!         ui.push_panel_like(rect, st.pick_bg(false, hovered), st.border, st.border_w, st.radius, 1);
-//!         ui.push_text_rect(
+//!         let t = ui.text_size(self.text, st.font_size, st.font_family.as_deref());
+//!         let size = Vec2::new(t.x + 16.0, ui.theme().row_h);
+//!         // ② 申请 + 收交互（身份 = 绝对 id；控件级遮挡按它区分"谁盖住谁"）
+//!         let (rect, resp) = ui.allocate_sense(self.id, size, Sense::CLICK);
+//!         // ③ 画（一个绘制块一个 painter；背景/文字各自取当时的 elem_hint）
+//!         let p = ui.painter();
+//!         p.panel(rect, st.pick_bg(resp.pressed, resp.hovered), st.border, st.border_w, st.radius);
+//!         p.text(
 //!             rect,
 //!             self.text,
 //!             st.font_size,
 //!             self.fg.unwrap_or(st.fg),
-//!             None,
+//!             st.font_family.clone(),
 //!             TextAlign::Center,
 //!             TextVAlign::Center,
 //!             None,
 //!             None,
 //!         );
-//!         Response { hovered, ..Default::default() }
+//!         resp
 //!     }
 //! }
 //!
@@ -106,29 +105,32 @@
 //! # }
 //! ```
 //!
-//! ### 什么时候需要重写 `constraints()` / `expansion()`
+//! ### 撑大父级 / 可用宽 / min-max 尺寸怎么表达
 //!
 //! | 需求 | 用 |
 //! |---|---|
-//! | 内容可能超出父级（长文本 / 列表）：取 `min(内容, 可用宽)` 后**自己**自洽绘制 | [`Expansion::LimitedInParent`]（配 `ui.avail_w()` 换行 / 省略） |
-//! | 不撑大父级（分隔线 / 装饰件） | [`Expansion::DisableAutoExpansion`] |
-//! | 有压缩下限 / 上限（可缩放输入框） | [`Widget::constraints`] + [`SizeConstraints`] |
+//! | 内容可能超出父级（长文本 / 列表）：取 `min(内容, 可用宽)` 后**自己**自洽绘制 | `ui.allocate_mode(size, `[`Expansion::LimitedInParent`]`)`（配 `ui.avail_w()` 换行 / 省略） |
+//! | 不撑大父级（分隔线 / 装饰件） | `ui.allocate_mode(size, `[`Expansion::DisableAutoExpansion`]`)` |
+//! | 有压缩下限 / 上限（可缩放输入框） | [`SizeConstraints`] + [`apply_constraints`]：`ui.allocate(apply_constraints(desired, c))` |
+//!
+//! ⚠ **申请之前**取 `avail_w()` / `text_size()`：申请会推进容器光标，之后的
+//! `avail_w()` 是"下一项"的约束。
 //!
 //! ## 1. Powerful：把交互做完整
 //!
 //! | 想要 | 用什么 |
 //! |---|---|
-//! | 悬停 / 按下 / 点击 | `ui.hit_abs(&abs, &rect)` + `ui.mouse_left()` + [`hit::update_interact`](crate::hit::update_interact) → [`InteractEvents`](crate::hit::InteractEvents) |
-//! | 拖拽（自带语义） | 按下时 `ui.claim_press()` + [`hit::update_drag`](crate::hit::update_drag) + 基准存 `WidgetState::{press_panel, press_mouse}` |
+//! | 悬停 / 按下 / 点击 | [`Ui::allocate_sense`](crate::Ui::allocate_sense)（含 hover/click/drag/focus 的 [`Sense`]）或 [`Ui::interact`](crate::Ui::interact) |
+//! | 拖拽（自带语义） | `Sense::DRAG`（按下即 `claim_press`）+ 基准存 `WidgetState::{press_panel, press_mouse}` |
 //! | 2D / 竖向"点哪取哪" | `ui.mouse_local()` + [`hit::normalize_x`](crate::hit::normalize_x) / [`hit::normalize_y`](crate::hit::normalize_y) |
-//! | 键盘 / Tab 导航 | `ui.register_focus(&ui.id_for(id), rect, [`FocusKind`])` + `ui.key_click(&abs, kind)` |
+//! | 键盘 / Tab 导航 | `Sense::focus(`[`FocusKind`](crate::FocusKind)`)` + `ui.key_click(&abs, kind)` |
 //! | 跨帧状态（交互） | `ui.state_mut().widget(&abs)` → [`WidgetState`](crate::state::WidgetState)（hovered/pressed/dragging/caret/scroll…） |
 //! | 跨帧数据（**自己的类型**） | 定义在**控件自己的模块**里、挂到 [`UiState`](crate::UiState)（范例：`ColorPickerState`）——别把控件层的事实塞进 `ui.rs` |
 //! | 文本输入（焦点 / 选择 / IME / 剪贴板全套） | `ui.text_input_at(id, rect, &mut String)`；不想让调用方持有 `String` 就学 `NumberInput`：编辑缓冲 take/写回 `WidgetState` |
 //! | 浮层 / 弹出面板 | `ui.window("id::popup")` + z 哨兵 `WIN_TOPMOST`（`ui.state_mut().window_z.insert(..)`），范例见 `colorpicker/panel.rs` |
-//! | 绘制原语 | `push_panel_like`（圆角 + 刷 + 边框）/ `rounded_rect_at` / `gradient_rect_at` / `icon_at` / `image_at` / `push_text_rect` / `push_solid_rect` / `push_border_rect` / `debug_*` |
-//! | **画在自家背景之上的装饰**（手柄 / 箭头 / 分隔线） | `ui.elem_hint()` + `push_panel_like(.., elem)` —— 见下面第 6 条硬约定 |
-//! | 裁剪 | 容器强制层（`Scroll` / Clip 沙箱）自动生效；`push_text_rect` 另加内容裁剪，自洽内容用 `push_text_rect_noclip` |
+//! | 绘制原语 | `ui.painter()` → `panel / panel_elem / panel_img / solid / border / rounded_at / gradient_at / icon_at / image_at / text`（绝对定位糖仍在 `Ui`：`push_solid_rect` 等） |
+//! | **画在自家背景之上的装饰**（手柄 / 箭头 / 分隔线） | **重新取一次 `ui.painter()`**（此时 `elem_hint` 已更大）；容器装饰用 `elem = 0`——见下面第 6 条硬约定 |
+//! | 裁剪 | 容器强制层（`Scroll` / Clip 沙箱）自动生效（就在 painter 的 `clip()` 上）；`push_text_rect` 另加内容裁剪，自洽内容用 `push_text_rect_noclip` |
 //! | 光标 | `ui.set_cursor(UiCursor::EwResize)`（悬停 / 拖拽时；`finish` 统一落到系统光标） |
 //! | 数值 / 颜色等热路径数学 | 抽成**自由函数**放自己的子模块里单测（范例：`colorpicker/{format,hsv}.rs`） |
 //!
@@ -136,10 +138,9 @@
 //!
 //! ```no_run
 //! use glam::Vec2;
-//! use rjw_transform::Rect;
 //! use rjw_ui::draw::TextVAlign;
-//! use rjw_ui::hit::{update_drag, update_interact};
-//! use rjw_ui::{FocusKind, Response, TextAlign, Ui, Widget};
+//! use rjw_ui::hit::update_drag;
+//! use rjw_ui::{FocusKind, Response, Sense, TextAlign, Ui, Widget};
 //! use winit::keyboard::KeyCode;
 //!
 //! /// 旋钮：**竖直拖动改值** + `↑`/`↓` 微调（演示交互状态机 / 焦点 / 跨帧状态）。
@@ -156,37 +157,23 @@
 //! }
 //!
 //! impl Widget for Knob<'_> {
-//!     fn size(&self, _ui: &mut Ui) -> Vec2 {
-//!         Vec2::new(30.0, 30.0)
-//!     }
-//!
-//!     fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-//!         // ① 状态键必须是**绝对 id**（`id_for` 返回 `IdAbsolute`；嵌套里同名相对 id 会互相踩）。
+//!     fn ui(self, ui: &mut Ui) -> Response {
+//!         // ① 身份 = **绝对 id**（状态键必须是绝对 id：嵌套里同名相对 id 会互相踩）。
 //!         let abs = ui.id_for(self.id);
-//!         // ② 进焦点链：Tab 可到、焦点描边由引擎画。
-//!         ui.register_focus(&abs, rect, FocusKind::Slider);
-//!
-//!         let hit = ui.hit_abs(&abs, &rect);
-//!         let btn = ui.mouse_left();
-//!         // ③ 拖拽语义：按下就占用本次按压，外层窗口/面板不会把它当成窗口拖动。
-//!         if btn.down_edge() && hit {
-//!             ui.claim_press();
-//!         }
-//!         // ④ 先拷出鼠标（`&self`），再借 `state_mut()`——借用顺序不能颠倒。
+//!         // ② 申请 + 收交互：`Sense::DRAG` = 按下即认领本次按压（外层窗口/面板不会把
+//!         //    它当成窗口拖动）+ 进焦点链（Tab 可到、焦点描边由引擎画）。
+//!         let (rect, resp) =
+//!             ui.allocate_sense(self.id, Vec2::new(30.0, 30.0), Sense::DRAG.focus(FocusKind::Slider));
+//!         // ③ 拖拽基准：按下时记鼠标 + 起始值（`interact` 已把 dragging 落到状态里）。
 //!         let mouse = ui.mouse_screen();
-//!         let ev = {
+//!         let btn = ui.mouse_left();
+//!         let dragging = {
 //!             let ws = ui.state_mut().widget(&abs);
-//!             let ev = update_interact(ws, hit, btn);
-//!             if btn.down_edge() && hit {
-//!                 // 拖拽基准：按下时的鼠标 + 按下时的值（与 `NumberInput` 手柄同一套）。
+//!             if btn.down_edge() && resp.hovered {
 //!                 ws.press_mouse = Some(mouse);
 //!                 ws.press_panel = Some(Vec2::new(0.0, *self.value));
 //!             }
-//!             ev
-//!         };
-//!         let dragging = {
-//!             let ws = ui.state_mut().widget(&abs);
-//!             update_drag(ws, hit, btn)
+//!             update_drag(ws, resp.hovered, btn)
 //!         };
 //!         if dragging {
 //!             let (base, pm) = {
@@ -199,7 +186,7 @@
 //!             let d = (mouse.y - pm.y) * span * 0.005 * fine;
 //!             *self.value = (base - d).clamp(self.range.0, self.range.1);
 //!         }
-//!         // ⑤ 键盘：焦点在自己身上时用 `key_down_edge`（纯输入，状态自己维护）。
+//!         // ④ 键盘：焦点在自己身上时用 `key_down_edge`（纯输入，状态自己维护）。
 //!         let focused = ui.state().focused.as_ref().is_some_and(|f| f.as_str() == abs.as_str());
 //!         if focused {
 //!             let step = (self.range.1 - self.range.0) * 0.02;
@@ -210,32 +197,36 @@
 //!                 *self.value = (*self.value + step).clamp(self.range.0, self.range.1);
 //!             }
 //!         }
-//!         // ⑥ 绘制：公开原语组合（圆角 + 指针 + 数值文本），坐标 = `rect` 局部。
+//!         // ⑤ 绘制：一个绘制块一个 painter（坐标 = `rect` 局部）。
 //!         let t = ((*self.value - self.range.0) / (self.range.1 - self.range.0)).clamp(0.0, 1.0);
-//!         ui.rounded_rect_at(
+//!         let raised = ui.theme().palette.surface_raised;
+//!         let accent = ui.theme().palette.accent;
+//!         let fg = ui.theme().label.color;
+//!         let p = ui.painter();
+//!         p.rounded_at(
 //!             Vec2::new(rect.x + 1.0, rect.y + 1.0),
 //!             Vec2::new(rect.w - 2.0, rect.h - 2.0),
 //!             7.0,
-//!             ui.theme().palette.surface_raised,
+//!             raised,
 //!         );
-//!         ui.rounded_rect_at(
+//!         p.rounded_at(
 //!             Vec2::new(rect.x + (rect.w - 6.0) * t, rect.y + rect.h - 8.0),
 //!             Vec2::new(6.0, 5.0),
 //!             2.0,
-//!             ui.theme().palette.accent,
+//!             accent,
 //!         );
-//!         ui.push_text_rect(
+//!         p.text(
 //!             rect,
 //!             &format!("{:.0}", *self.value * 100.0),
 //!             11.0,
-//!             ui.theme().label.color,
+//!             fg,
 //!             None,
 //!             TextAlign::Center,
 //!             TextVAlign::Top,
 //!             None,
 //!             None,
 //!         );
-//!         Response { hovered: hit, pressed: dragging, clicked: ev.clicked, ..Default::default() }
+//!         resp
 //!     }
 //! }
 //!
@@ -297,6 +288,7 @@
 use glam::Vec2;
 use rjw_transform::Rect;
 
+use crate::focus::FocusKind;
 use crate::state::ButtonState;
 use crate::ui::Ui;
 
@@ -338,9 +330,15 @@ pub use slider::{Slider, SliderValue};
 
 // ─── 统一响应 ───────────────────────────────────────────────────
 
-/// 控件统一交互响应（hover / pressed / clicked / released / toggled）。
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// 控件统一交互响应（hover / pressed / clicked / released / toggled + 最终矩形）。
+///
+/// `rect` = 本控件这一帧**实际占用的矩形**（[`Ui::allocate`](crate::Ui::allocate) 的返回，
+/// 或 [`Ui::interact`](crate::Ui::interact) 的入参）——调用方据此知道控件落到了哪里
+/// （`UiAdd::label` 就是用它把尺寸返回给应用的）。
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Response {
+    /// 本控件这一帧的最终矩形（绝对逻辑屏幕坐标）。
+    pub rect: Rect,
     /// 鼠标悬停在本体（含按下时）。
     pub hovered: bool,
     /// 处于按下状态（按下后未释放）。
@@ -351,6 +349,73 @@ pub struct Response {
     pub released: bool,
     /// 勾选 / 单选类控件：本帧是否切换（其余控件恒 `false`）。
     pub toggled: bool,
+}
+
+/// 手写 `Default`：`Rect` 没有 `Default`（它是几何值，没有"零矩形"的自然含义，
+/// 用 [`Rect::ZERO`] 表示"尚未放置"）。
+impl Default for Response {
+    fn default() -> Self {
+        Self {
+            rect: Rect::ZERO,
+            hovered: false,
+            pressed: false,
+            clicked: false,
+            released: false,
+            toggled: false,
+        }
+    }
+}
+
+/// **交互意图**（参考 egui 的 `Sense`）：告诉 [`Ui::allocate_sense`](crate::Ui::allocate_sense)
+/// / [`Ui::interact`](crate::Ui::interact) "这个控件要哪些交互"——命中测试、焦点链、
+/// 按下认领（拖拽语义）由引擎一次做完，控件作者不再手写那套组合。
+///
+/// ```no_run
+/// # use rjw_ui::{FocusKind, Sense, Ui, Widget, Response};
+/// # struct Knob<'a> { id: &'a str, v: &'a mut f32 }
+/// impl Widget for Knob<'_> {
+///     fn ui(self, ui: &mut Ui) -> Response {
+///         // 竖直拖动改值 + 可 Tab 聚焦：一句拿到 (rect, Response)
+///         let (rect, resp) = ui.allocate_sense(self.id, glam::Vec2::new(30.0, 30.0), Sense::DRAG.focus(FocusKind::Slider));
+///         ui.painter().rounded_at(rect.min(), rect.size(), 7.0, rjw_color::Color::BLACK);
+///         resp
+///     }
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sense {
+    /// 需要命中测试（hover 态）。`click` / `drag` 隐含 `hover`。
+    pub hover: bool,
+    /// 需要点击语义（`Response::clicked` / `released`）。
+    pub click: bool,
+    /// **有拖拽语义**：按下即 `claim_press()`（外层窗口/面板不再把这次按下当作拖动基准）。
+    pub drag: bool,
+    /// 进焦点链（Tab / 方向键可到 + 焦点描边）；`None` = 不进。
+    pub focus: Option<FocusKind>,
+}
+
+impl Sense {
+    /// 什么都不需要（纯展示）。
+    pub const NONE: Self = Self { hover: false, click: false, drag: false, focus: None };
+    /// 只要悬停。
+    pub const HOVER: Self = Self { hover: true, click: false, drag: false, focus: None };
+    /// 可点击（含悬停）。
+    pub const CLICK: Self = Self { hover: true, click: true, drag: false, focus: None };
+    /// 可拖拽（含悬停；按下即认领，见 [`Sense::drag`]）。
+    pub const DRAG: Self = Self { hover: true, click: true, drag: true, focus: None };
+
+    /// 进焦点链（Tab 可到；Enter/Space 激活见 [`Ui::key_click`](crate::Ui::key_click)）。
+    #[inline]
+    pub fn focus(mut self, kind: FocusKind) -> Self {
+        self.focus = Some(kind);
+        self
+    }
+
+    /// 是否需要命中测试（任一交互意图 ⇒ 需要）。
+    #[inline]
+    pub fn needs_hit(self) -> bool {
+        self.hover || self.click || self.drag
+    }
 }
 
 impl Response {
@@ -384,13 +449,17 @@ impl From<ButtonState> for Response {
             clicked: s.clicked,
             released: s.released,
             toggled: false,
+            ..Default::default()
         }
     }
 }
 
 // ─── Widget trait ───────────────────────────────────────────────
 
-/// **控件尺寸约束**（每轴可选；`None` = 该轴不约束）。见 [`Widget::constraints`]。
+/// **控件尺寸约束**（每轴可选；`None` = 该轴不约束）。
+///
+/// 控件在 `ui()` 里**自己**应用到申请尺寸上：
+/// `ui.allocate(apply_constraints(desired, c))`（不再是 `Widget` 的 trait 钩子）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SizeConstraints {
     pub min_w: Option<f32>,
@@ -399,7 +468,9 @@ pub struct SizeConstraints {
     pub max_h: Option<f32>,
 }
 
-/// **控件膨胀模式**（内容尺寸相对父级空间的行为）。见 [`Widget::expansion`]。
+/// **控件膨胀模式**（内容尺寸相对父级空间的行为）：申请矩形时用
+/// [`Ui::allocate_mode`](crate::Ui::allocate_mode) 选定——不再是 `Widget` 的 trait 钩子
+/// （参考 egui：`allocate_exact_size` 与 `allocate_space` 的差别就在申请方式上）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[derive(Default)]
 pub enum Expansion {
@@ -416,33 +487,47 @@ pub enum Expansion {
 }
 
 
-/// **控件 trait**：新控件 = 实现此 trait 的 builder 结构体（普通 Rust，无宏）。
+/// **控件 trait**：新控件 = 实现**这一个方法**的 builder 结构体（普通 Rust，无宏）。
 ///
-/// - [`Widget::size`]：期望尺寸（**逻辑像素**；内容测量可调用 `ui.text_size` /
-///   `ui.text_size_wrap`，或读取样式常量）；
-/// - [`Widget::ui`]：在分配好的矩形内渲染 + 交互，返回 [`Response`]。
+/// 尺寸在 [`Widget::ui`] 里**就地申请**（参考 egui 的 `allocate_exact_size`）：
 ///
-/// 放置：[`Ui::add`](crate::ui::Ui::add)（容器内占光标）/
-/// [`Ui::add_at`](crate::ui::Ui::add_at)（绝对定位）；容器包装经
-/// [`crate::ui::UiAdd`] 提供同样的 `add` / `add_at` 与全部便捷方法（`p.button` 等）。
+/// ```no_run
+/// # use glam::Vec2;
+/// # use rjw_color::Color;
+/// # use rjw_ui::{Sense, Ui, Widget, Response};
+/// # struct Tag<'a> { id: &'a str, text: &'a str }
+/// impl Widget for Tag<'_> {
+///     fn ui(self, ui: &mut Ui) -> Response {
+///         // ① 先量（文本测量 / 读主题）——必须在 allocate 之前（申请会推进光标）
+///         let st = ui.theme().button.clone();
+///         let t = ui.text_size(self.text, st.font_size, st.font_family.as_deref());
+///         let size = Vec2::new(t.x + 16.0, ui.theme().row_h);
+///         // ② 申请 + 收交互（一句话：id / 命中 / 焦点 / 按下认领 / update_interact）
+///         let (rect, resp) = ui.allocate_sense(self.id, size, Sense::CLICK);
+///         // ③ 画（一个绘制块一个 painter）
+///         let p = ui.painter();
+///         p.panel(rect, st.pick_bg(resp.pressed, resp.hovered), st.border, st.border_w, st.radius);
+///         p.text(rect, self.text, st.font_size, st.fg, None,
+///                rjw_ui::TextAlign::Center, rjw_ui::draw::TextVAlign::Center, None, None);
+///         resp
+///     }
+/// }
+/// ```
+///
+/// - 放置：[`Ui::add`](crate::Ui::add)（容器内占光标）/ [`Ui::add_at`](crate::Ui::add_at)
+///   （绝对定位）；容器包装（`Panel` / `Pack` / `Grid` / `Window` / `Scroll` /
+///   `FlexCtx`）经 [`crate::ui::UiAdd`] 提供同样的 `add` / `add_at`；
+/// - **要不要撑大父级 / 要不要被父级可用宽限制**由**申请方式**决定，不再是 trait 钩子：
+///   [`Ui::allocate`](crate::Ui::allocate)（撑大父级，默认）/
+///   [`Ui::allocate_mode`](crate::Ui::allocate_mode)（`DisableAutoExpansion` = 不撑大 /
+///   `LimitedInParent` = 压到 `avail_w`）；
+/// - **min/max 尺寸**：[`SizeConstraints`] + [`apply_constraints`]，在 `ui()` 里自己应用
+///   （`ui.allocate(apply_constraints(desired, c))`）。
 pub trait Widget {
-    /// 期望尺寸（逻辑像素；内容测量可经 `&mut Ui` 排版/缓存）。
-    fn size(&self, ui: &mut Ui) -> Vec2;
-
-    /// 在 `rect`（相对当前容器内容原点，逻辑像素）内渲染 + 交互。
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response;
-
-    /// **尺寸约束**（每轴 `Option<f32>`；默认全 `None`，不约束）。
-    /// `Ui::add` 在布局前对 `size()` 结果按此 clamp。
-    fn constraints(&self) -> SizeConstraints {
-        SizeConstraints::default()
-    }
-
-    /// **膨胀模式**（默认 [`Expansion::UnlimitedExpansion`]）：
-    /// 决定内容是否撑大父级 / 是否限制在父级可用空间内（见 [`Expansion`]）。
-    fn expansion(&self) -> Expansion {
-        Expansion::UnlimitedExpansion
-    }
+    /// 申请空间（[`Ui::allocate`](crate::Ui::allocate) 一族）→ 绘制 → 收交互
+    /// （[`Ui::interact`](crate::Ui::interact) / [`Ui::allocate_sense`](crate::Ui::allocate_sense)），
+    /// 返回本帧响应。
+    fn ui(self, ui: &mut Ui) -> Response;
 }
 
 /// 应用尺寸约束：`natural` 每轴 clamp 到 `min`/`max`（纯函数，可单测）。

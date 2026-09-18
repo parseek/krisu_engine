@@ -19,7 +19,6 @@
 //! 双精度只是接口便利）。
 
 use glam::Vec2;
-use rjw_transform::Rect;
 use crate::ui::Ui;
 use super::{Response, Widget};
 
@@ -140,11 +139,9 @@ impl<'a, T: SliderValue> Slider<'a, T> {
 }
 
 impl<T: SliderValue> Widget for Slider<'_, T> {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
-        Vec2::new(ui.theme.slider.min_w.max(40.0), ui.theme.slider.height)
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+    fn ui(self, ui: &mut Ui) -> Response {
+        // ① 申请（尺寸 = 主题，不需要测量）
+        let rect = ui.allocate(Vec2::new(ui.theme.slider.min_w.max(40.0), ui.theme.slider.height));
         // 拖拽灵敏度 = 每像素数值倍率 × 修饰键速度（Shift 快 / Ctrl 慢）。
         let speed = self.resolve_speed(ui);
         // 进出各换算一次：类型只在 API 边界出现，交互 / 绘制全程 `f32`。
@@ -163,7 +160,7 @@ impl<T: SliderValue> Widget for Slider<'_, T> {
         if new != cur {
             *self.value = T::from_f32(new);
         }
-        Response::default()
+        Response { rect, ..Default::default() }
     }
 }
 

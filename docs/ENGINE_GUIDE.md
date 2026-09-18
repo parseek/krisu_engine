@@ -2030,3 +2030,48 @@ painter/debug.rs    // debug_line / debug_rect_outline / … （进 debug_queue�
 **等价性怎么验**：迁移前后同一场景 `[perf] cmds=` / `wins=` / `cache_hit=` 逐项相同（实测
 `cmds=380 wins=7 cache_hit=13 cache_miss=0`，与迁移前的 HEAD 构建逐位一致），外加全部
 `--sim-*` 判定行不变、`cargo test -p rjw_ui` 全绿。
+
+### 18.19 Widget 协议：**尺寸在 `ui()` 里就地申请**（v0.3）
+
+**动机**：旧协议要写两个方法（`fn size(&self, ui)` + `fn ui(self, ui, rect)`），于是
+"尺寸怎么算"与"怎么画"被拆到两处、必须手工保持一致；而控件内部那一整套交互样板
+（`id_for` → `hit_abs` → `mouse_left` → `register_focus` → `claim_press` →
+`update_interact` → `update_drag`）在 `NumberInput` / `Dropdown` / 示例探针里抄了七八遍，
+借用顺序还容易写错。现在：
+
+```rust
+pub trait Widget {
+    fn ui(self, ui: &mut Ui) -> Response;      // 唯一的必写方法
+}
+```
+
+`ui()` 里三步：**先量 → 申请 → 画**：
+
+| 步骤 | API | 注意 |
+|---|---|---|
+| 量 | `ui.text_size(_wrap)` / `ui.avail_w()` / 主题常量 | **必须在申请之前**（申请会推进容器光标，`avail_w()` 随后变成"下一项"的约束） |
+| 申请 | `allocate` / `allocate_mode(size, Expansion)` / `allocate_at` / `allocate_sense(_mode/_at)` | 尺寸是**物理像素 `Vec2`**（刻意不收 `Into<Size<Vec2>>`：`text_size` 与主题常量已是物理像素，再换算一次会 ×DPI） |
+| 画 | `ui.painter()`（`panel` / `solid` / `text` / `rounded_at` / …） | 一个绘制块一个 painter（见 §18.18） |
+| 交互 | `Sense`（`hover/click/drag/focus`）+ `Ui::interact`（`allocate_sense*` 已含） | `drag` = 按下即 `claim_press()`；`Response.pressed` = **持续按住**、`clicked` = 本帧点击 |
+
+- **膨胀模式**从 trait 钩子变成**申请方式**（`Expansion::{UnlimitedExpansion, LimitedInParent,
+  DisableAutoExpansion}`）；**min/max** 用 `apply_constraints(desired, c)` 自己应用
+  （`SizeConstraints` 仍是公开纯函数）；
+- `Ui::add` / `add_at` / `UiAdd::add` **签名不变**（调用点零改动）：`add = w.ui(self)`，
+  `add_at` = 打一个**一次性放置覆盖**（控件的第一次申请消费它）；
+- `Ui::widget_size` 删除；`Response` 增 `rect`（最终矩形）——`UiAdd::label` 靠它返回尺寸。
+
+**踩到的坑（都写进注释/文档了）**：
+
+1. `Vec2 → Size::Logical` 的隐式换算：首次实现让 `allocate` 收 `impl Into<Size<Vec2>>`，
+   于是 `scale = 1.5` 下**每个控件又乘了一次 DPI**（所有窗口尺寸 +50%、标题栏按钮点空、
+   下拉面板下移 20px）。`--sim-chrome` / `--sim-dropdown` 当场抓住；现在签名只收 `Vec2`
+   并注明"物理像素"。
+2. `Divider` 曾被我改成 `DisableAutoExpansion`（"装饰件不撑大父级"听起来对，但旧代码是
+   默认 Expand）：固定宽窗口的高度少掉分隔线那一块 ⇒ 窗口尺寸整块变掉。**行为一致性优先于
+   命名直觉**。
+3. `Response.pressed` 必须是**持续按住**（旧 `ButtonState::pressed` / `ws.pressed` 的语义）：
+   读"本帧边沿"会让按住期间的三态配色退回悬停色。
+4. 交错交互与绘制的控件（`Segmented` 每段命中、`NumberInput` 手柄拖拽）要**先收完交互再画**
+   （painter 借 `&mut Ui`，不能边画边命中）；`Segmented` 据此重排成"逐段申请+收交互 → 一个
+   painter 画完"。

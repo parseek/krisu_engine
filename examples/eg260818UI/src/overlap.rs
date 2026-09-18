@@ -13,8 +13,7 @@
 
 use rjw_krusie::prelude::*;
 use rjw_krusie::ui::draw::TextVAlign;
-use rjw_krusie::ui::hit::update_interact;
-use rjw_krusie::ui::{Position, Response, TextAlign, Widget};
+use rjw_krusie::ui::{Position, Response, Sense, TextAlign, Widget};
 
 /// 探针尺寸（**物理像素**，固定值 ⇒ 脚本算得出重叠区）。
 fn probe_size() -> Vec2 {
@@ -102,15 +101,10 @@ struct HitProbe<'a> {
 }
 
 impl Widget for HitProbe<'_> {
-    fn size(&self, _ui: &mut Ui) -> Vec2 {
-        probe_size()
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-        // ① 身份 = 控件自己的**绝对 id**（控件级遮挡按它区分"谁盖住谁"）。
-        let abs = ui.id_for(self.id);
-        // ② 命中：含窗口遮挡 + 控件级遮挡 + 强制裁剪层过滤。
-        let hit = ui.hit_abs(&abs, &rect);
+    fn ui(self, ui: &mut Ui) -> Response {
+        // ① 申请 + 收交互（`Sense::CLICK`：命中 / 跨帧状态机一句话；探针不认领按下，
+        //    所以不用 `Sense::DRAG`——外层窗口仍可拖）。
+        let (rect, resp) = ui.allocate_sense(self.id, probe_size(), Sense::CLICK);
         // 排障开关（`RJ_OVERLAP_TRACE=1`）：打印两个探针每帧的矩形 / 鼠标 / 命中 /
         // 本帧被控件级遮挡拦下的次数——"为什么这个控件不响应"最快的一条线索。
         if std::env::var_os("RJ_OVERLAP_TRACE").is_some() {
@@ -126,31 +120,19 @@ impl Widget for HitProbe<'_> {
                     rect.h,
                     ui.mouse_local().x,
                     ui.mouse_local().y,
-                    hit,
+                    resp.hovered,
                     st.widget_occluded_hits(),
                 );
             }
         }
-        let btn = ui.mouse_left();
-        // ③ 跨帧状态机（hover / pressed / clicked 落到 WidgetState）。
-        let ev = {
-            let ws = ui.state_mut().widget(&abs);
-            update_interact(ws, hit, btn)
-        };
-        if ev.clicked {
+        if resp.clicked {
             *self.hits += 1;
         }
-        // ④ 自绘：可交互时用亮一档的颜色（灰/蓝的语义之外再给一点反馈）。
-        let bg = if hit || ev.pressed { self.hot } else { self.idle };
-        ui.push_panel_like(
-            rect,
-            bg,
-            Color::rgba_u8(20, 24, 32, 255),
-            1.0,
-            CornerRadius::all(6.0),
-            ui.elem_hint(),
-        );
-        ui.push_text_rect(
+        // ② 自绘：可交互时用亮一档的颜色（灰/蓝的语义之外再给一点反馈）。
+        let bg = if resp.hovered || resp.pressed { self.hot } else { self.idle };
+        let p = ui.painter();
+        p.panel(rect, bg, Color::rgba_u8(20, 24, 32, 255), 1.0, CornerRadius::all(6.0));
+        p.text(
             rect,
             self.label,
             12.0,
@@ -161,11 +143,6 @@ impl Widget for HitProbe<'_> {
             None,
             None,
         );
-        Response {
-            hovered: hit,
-            pressed: ev.pressed,
-            clicked: ev.clicked,
-            ..Default::default()
-        }
+        resp
     }
 }

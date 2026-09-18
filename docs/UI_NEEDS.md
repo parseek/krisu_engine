@@ -29,7 +29,7 @@ UI模块的需求：
 * ✅ 部分代码可以合并简化、抽象化、责任拆分（**View 沙箱** `crates/rjw_ui/src/view.rs`：裁剪分层（强制层/软层）+ 可用宽度 + 命中过滤，ScrollView/文本框/严格窗口共用；`edit.rs` 收纳纯文本逻辑：`apply_frame_edits` 编辑状态机 / `caret_horiz` / `word_range` / `ellipsize` / 剪贴板，单行/多行去重；`Metric<T>` 物理/逻辑单位包装，内部计算一律物理像素；`resize_handle` 通用拖拽缩放原语）
 
 Widget：
-* ✅ 设置可选的 min、max 大小，可以设置 DisableAutoExpansion, LimitedInParent, UnlimitedExpansion（`SizeConstraints{min_w,max_w,min_h,max_h}` 四字段全 `Option<f32>` + `Expansion` 三模式；`Ui::add` 统一 clamp/调整）
+* ✅ 设置可选的 min、max 大小，可以设置 DisableAutoExpansion, LimitedInParent, UnlimitedExpansion（`SizeConstraints{min_w,max_w,min_h,max_h}` 四字段全 `Option<f32>` + `Expansion` 三模式；v0.3 起尺寸**在 `ui()` 里就地申请**：`ui.allocate_mode(size, 模式)`，min/max 用 `apply_constraints` 自己应用——不再有 `Widget::constraints/expansion` trait 钩子）
 * ✅ 可选的允许用户拖拽在可选的范围内缩放（`Ui::resize_handle` 通用原语 + `Resize` 枚举（`None`/`Horizontal`/`Both`，v0.3 起取代 `Widget::resizable()` 裸布尔）+ `UiState::sizes` 持久尺寸；`ui.window(id).width(w)` 宽度缩放、`resizable_text_input_at` / `resizable_text_area_at` 均基于它）
 * ✅ Widget 输入数据由父级换算、过滤（父级负责局部坐标换算 `abs_base`、窗口遮挡、**控件级遮挡**（同窗口内重叠控件只让最上层响应，`hit_abs(绝对ID, rect)`）、`press_claimed` 拖拽占用；Clip 沙箱外命中失效并入 `hit_abs`）
 * ✅ 绘制方面提供服从内容裁剪的绘制方法和不服从裁剪的方法（`push_text_rect_noclip` 等：不附加软层、内容自洽；**仍服从 ScrollView 强制层**——父级强制裁切躲不掉，无 Scroll 的普通容器本无强制层）

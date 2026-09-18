@@ -169,11 +169,10 @@ struct DragProbe<'a> {
 }
 
 impl Widget for DragProbe<'_> {
-    fn size(&self, _ui: &mut Ui) -> Vec2 {
-        Vec2::new(PROBE_W, PROBE_H)
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+    fn ui(self, ui: &mut Ui) -> Response {
+        // 探针要**原始输入**（hit / down_edge / dragging）做计数，所以只借新协议的
+        // "就地申请"，交互仍手写（`interact` 会把这些边沿收进 `Response` 里）。
+        let rect = ui.allocate(Vec2::new(PROBE_W, PROBE_H));
         let abs = ui.id_for(self.id);
         let hit = ui.hit_abs(&abs, &rect);
         let btn = ui.mouse_left();
@@ -210,15 +209,9 @@ impl Widget for DragProbe<'_> {
             );
         }
         let bg = if dragging { BLUE } else { GREY };
-        ui.push_panel_like(
-            rect,
-            bg,
-            Color::rgba_u8(20, 24, 32, 255),
-            1.0,
-            CornerRadius::all(6.0),
-            ui.elem_hint(),
-        );
-        ui.push_text_rect(
+        let p = ui.painter();
+        p.panel(rect, bg, Color::rgba_u8(20, 24, 32, 255), 1.0, CornerRadius::all(6.0));
+        p.text(
             rect,
             "拖拽探针（被盖住时不该收到按下）",
             12.0,
@@ -229,6 +222,6 @@ impl Widget for DragProbe<'_> {
             None,
             None,
         );
-        Response { hovered: hit, pressed: dragging, ..Default::default() }
+        Response { rect, hovered: hit, pressed: dragging, ..Default::default() }
     }
 }

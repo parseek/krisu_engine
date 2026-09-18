@@ -78,14 +78,18 @@ scroll / row）压一帧。控件经 `child_rect(w, h)` 在栈顶帧内占一个
 - **min/max 约束**：`p.min_size(w,h)` / `p.max_size(w,h)` 作用于下一子项；
 - **row（等高）**：水平排列 + `Theme.row_h` 强制所有子项等高 → 文字中心线对齐。
 
-**Widget 尺寸契约**（`widget.rs`）：
+**Widget 尺寸契约**（`widgets.rs`，v0.3 起**就地申请**）：
 ```rust
-fn constraints(&self) -> SizeConstraints { SizeConstraints::default() }  // min_w/max_w/min_h/max_h 全 Option<f32>
-fn expansion(&self) -> Expansion { Expansion::UnlimitedExpansion }       // DisableAutoExpansion / LimitedInParent / UnlimitedExpansion
-fn resizable(&self) -> Option<(Vec2, Vec2)> { None }                      // 可选拖拽缩放范围
+pub trait Widget {
+    /// 只在 ui() 里申请：allocate / allocate_mode(Expansion) / allocate_at / allocate_sense
+    fn ui(self, ui: &mut Ui) -> Response;
+}
 ```
-`Ui::add` 统一 clamp + 膨胀调整。`LimitedInParent` 取 min(内容, 父级可用宽
-`Ui::avail_w()`)，超出由控件自洽（Label 换行 / 省略、Button 省略、TextArea 滚动）。
+`ui.allocate(size)` = 占光标、撑大父级（默认）；`allocate_mode(size, Expansion::LimitedInParent)`
+= 宽度压到父级可用宽 `Ui::avail_w()`（超出由控件自洽：Label 换行 / 省略、Button 省略、
+TextArea 滚动）；`Expansion::DisableAutoExpansion` = 不撑大父级。
+**min/max 约束**：`apply_constraints(desired, c)` 后交给 `allocate`（不再是 trait 钩子）。
+尺寸一律**物理像素**（`Theme` 已预乘 DPI）。
 
 **容器尺寸必须包住子控件**：`grid_at` / `pack_at` / `add_at` 这类**绝对放置**不占光标，
 若容器只按流内子项结算尺寸，内容就会"长到容器外"——画得出来却不在窗口矩形里（拖不动、
@@ -316,37 +320,39 @@ ui.end_frame(r2d_ui);   // 帧收尾 + 提交（UI 无需相机/视口参数：�
 实现 `Widget` trait（`size` 测量 + `ui` 渲染/交互），属性用 `Option` 字段 + builder setter：
 
 ```rust
-use rjw_ui::{Response, Ui, Widget};
+use rjw_ui::{Response, Sense, Ui, Widget};
 
 pub struct MyButton<'a> { id: &'a str, label: &'a str }
 impl<'a> MyButton<'a> {
     pub fn new(id: &'a str, label: &'a str) -> Self { Self { id, label } }
 }
 impl Widget for MyButton<'_> {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
-        let style = ui.theme.button.clone();
+    fn ui(self, ui: &mut Ui) -> Response {
+        // ① 先量 ② 申请 + 收交互（`Sense` 决定 hover/click/drag/focus）③ 画
+        let style = ui.theme().button.clone();
         let t = ui.text_size(self.label, style.font_size, style.font_family.as_deref());
-        Vec2::new(t.x + style.padding.x * 2.0, t.y + style.padding.y * 2.0)
-    }
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-        // 复用现有控件 / 原语；交互用 ui.hit_abs(&abs, &rect) / ui.mouse_left() /
-        // ui.state_mut().widget(&id_for)
-        // （状态键 / 焦点 / **控件级遮挡身份**都用**绝对 ID**：let abs = ui.id_for(self.id);）
-        let st = ui.button_at(self.id, rect, self.label);
-        st.into()   // ButtonState → Response
+        let desired = Vec2::new(t.x + style.padding.x * 2.0, t.y + style.padding.y * 2.0);
+        let (rect, resp) = ui.allocate_sense(self.id, desired, Sense::CLICK);
+        let p = ui.painter();
+        p.panel(rect, style.pick_bg(resp.pressed, resp.hovered), style.border, style.border_w, style.radius);
+        p.text(rect, self.label, style.font_size, style.fg, style.font_family.clone(),
+               TextAlign::Center, TextVAlign::Center, None, None);
+        resp
     }
 }
 ```
 
-公开原语：`text_size(_wrap)`（测量）、`hit_abs(&绝对ID, &rect)`（命中）/ `hit_body_abs(&rect)`
-（窗口 / 面板本体）/ `mouse_left` / `mouse_logical`、
+公开原语：`text_size(_wrap)`（测量）、`allocate(_mode/_at/_sense)`（申请）、
+`interact(&绝对ID, rect, Sense)`（命中 / 焦点 / 按下认领 / 状态机一次做完）、
+`hit_abs(&绝对ID, &rect)` / `mouse_left` / `mouse_logical`、
 `claim_press` / `register_focus` / `key_click`（焦点；**收绝对 ID** `&ui.id_for(id_relative)`）、
-`state_mut().widget(&id_for)`（持久状态 +
-`hit::update_drag/update_interact`）、`push_solid_rect` / `push_border_rect` /
-`push_text_rect(_noclip)` / `push_panel_like` / `resize_handle`（绘制）。
+`state_mut().widget(&id_for)`（持久状态 + `hit::update_drag/update_interact`）、
+`painter()`（`panel` / `solid` / `border` / `text` / `rounded_at` / `gradient_at` / `icon_at`）与
+`resize_handle`（拖拽缩放原语）。
 
-**注意**：`rect` 是相对当前容器 origin 的**局部坐标**；坐标换算、窗口遮挡、控件级遮挡、
-裁剪过滤都由父级（容器/沙箱）负责，控件只需"相对自己"绘制与命中。
+**注意**：申请/绘制的 `rect` 是相对当前容器 origin 的**局部坐标**，尺寸是**物理像素**；
+坐标换算、窗口遮挡、控件级遮挡、裁剪过滤都由父级（容器/沙箱）负责，控件只需"相对自己"
+测量、申请、绘制与命中。
 
 ---
 

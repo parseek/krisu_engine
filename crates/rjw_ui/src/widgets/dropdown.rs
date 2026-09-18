@@ -397,18 +397,15 @@ impl<'a, F: MenuContent> Dropdown<'a, F> {
 }
 
 impl<F: MenuContent> Widget for Dropdown<'_, F> {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
+    fn ui(self, ui: &mut Ui) -> Response {
         let (st, fs) = self.resolve(&ui.theme, ui.scale());
-        self.trigger_size(ui, &st, fs)
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+        // ① 先量（触发器尺寸：文字宽 + 内边距，或显式 `.width(..)`）
+        let size = self.trigger_size(ui, &st, fs);
+        // ② 申请：**触发器在窄容器里被截断**（文字走省略号），不把父级撑破 ⇒
+        //    `LimitedInParent`（旧 `Widget::expansion()` 的等价物）。
+        let rect = ui.allocate_mode(size, crate::widgets::Expansion::LimitedInParent);
+        // ③ 交互 + 绘制 + 面板（与 `Ui::combo_at` 共用 `show_in`）
         self.show_in(ui, rect)
-    }
-
-    /// 触发器在窄容器里被截断（文字走省略号），不把父级撑破。
-    fn expansion(&self) -> crate::widgets::Expansion {
-        crate::widgets::Expansion::LimitedInParent
     }
 }
 

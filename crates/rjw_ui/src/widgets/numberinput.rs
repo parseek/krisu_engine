@@ -111,11 +111,9 @@ fn fmt_step(v: f32, step: f32) -> String {
 }
 
 impl Widget for NumberInput<'_> {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
-        Vec2::new(ui.theme.input.min_w, ui.theme.input.height)
-    }
-
-    fn ui(mut self, ui: &mut Ui, rect: Rect) -> Response {
+    fn ui(mut self, ui: &mut Ui) -> Response {
+        // ① 申请（尺寸 = 主题固定值；手柄与文本框的切分见下）
+        let rect = ui.allocate(Vec2::new(ui.theme.input.min_w, ui.theme.input.height));
         let id_for = ui.id_for(self.id);
         let focused = ui
             .state()
@@ -331,13 +329,13 @@ impl Widget for NumberInput<'_> {
             elem,
         );
         // 手柄图标用**矢量三横**（`≡` 字形会随字体变宽变高，甚至缺字形）。
-        ui.icon_at(
+        ui.painter().icon_at(
             Position::Physical(Vec2::new(grip.x + (grip.w - 12.0) * 0.5, grip.y + (grip.h - 14.0) * 0.5)),
             Size::Physical(Vec2::new(12.0, 14.0)),
             Icon::Grip,
             glyph,
         );
-        Response::default()
+        Response { rect, ..Default::default() }
     }
 }
 

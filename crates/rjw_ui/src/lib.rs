@@ -50,11 +50,14 @@
 //!   颜色 / 字号 / 字体 / 内边距等属性（未设置回落全局 [`Theme`]），统一
 //!   [`widgets::Response`] 响应，经 [`Ui::add`] / [`Ui::add_at`]（容器包装见
 //!   [`ui::UiAdd`]）放置。
-//! - **Widget 尺寸契约**：[`widgets::SizeConstraints`]（`min_w/max_w/min_h/max_h` 四字段
-//!   全 `Option<f32>`）+ [`widgets::Expansion`]（`DisableAutoExpansion` /
-//!   `LimitedInParent` / `UnlimitedExpansion`）+ [`widgets::Widget::resizable`]
-//!   （可选拖拽缩放，[`Ui::resize_handle`] 通用原语 + [`UiState::sizes`] 持久尺寸）——
-//!   `Ui::add` 统一 clamp / 膨胀调整。
+//! - **Widget 尺寸契约（v0.3：就地申请）**：[`widgets::Widget`] **只有一个方法**
+//!   `fn ui(self, ui) -> Response`——尺寸在 `ui()` 里申请（[`Ui::allocate`] /
+//!   [`Ui::allocate_mode`] / [`Ui::allocate_at`] / [`Ui::allocate_sense`]，**物理像素**）；
+//!   膨胀语义是申请方式（[`widgets::Expansion`]：`DisableAutoExpansion` /
+//!   `LimitedInParent` / `UnlimitedExpansion`），min/max 用 [`widgets::apply_constraints`]
+//!   自己应用；交互用 [`widgets::Sense`] + [`Ui::interact`]（命中 / 焦点 / 按下认领 /
+//!   跨帧状态机一次做完），最终矩形在 [`widgets::Response::rect`]；可选拖拽缩放用
+//!   [`Ui::resize_handle`] + [`UiState::sizes`]。
 //! - **View 沙箱**（[`view`]）：闭包作用域 [`Ui::view_at`]，`ViewMode::{Expand, Clip}`——
 //!   裁剪分层（**强制层** = ScrollView 可视区 / Clip 沙箱，所有绘制含 noclip 都服从；
 //!   **软层** = 控件自身内容边界，自洽控件可跳过）、可用宽度（[`Ui::avail_w`]）、
@@ -193,9 +196,9 @@ pub use rjw_text::{Stretch, Style, Weight};
 pub use widgets::{
     Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, Dropdown,
     FONT_WEIGHT_CHOICES, FontModal, GRIP_W, Item, Label, MENU_GAP, MenuBar, MenuClick, MenuContent,
-    MenuCtx, MenuFn, NumberInput, PopupSide, Response, Segmented, Slider, SliderValue, Widget,
-    WidgetId, color_hex, format_color, format_f, format_u8, ink_on, item_h, luma, parse_color,
-    parse_hex, popup_gap, popup_origin, popup_padding, weight_label,
+    MenuCtx, MenuFn, NumberInput, PopupSide, Response, Segmented, Sense, Slider, SliderValue,
+    Widget, WidgetId, color_hex, format_color, format_f, format_u8, ink_on, item_h, luma,
+    parse_color, parse_hex, popup_gap, popup_origin, popup_padding, weight_label,
 };
 
 /// **UI 文本模块**（公开）：`rjw_ui` 里与文字渲染相关的全部公开面。

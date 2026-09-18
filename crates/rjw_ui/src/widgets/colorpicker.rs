@@ -150,12 +150,9 @@ fn focus_inside(ui: &Ui, abs: &IdAbsolute<'_>) -> bool {
 }
 
 impl Widget for ColorPicker<'_> {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
-        // 内联只占**一行**：面板弹出，不参与这里的尺寸结算。
-        Vec2::new(ui.theme.input.min_w, SWATCH_H)
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+    fn ui(self, ui: &mut Ui) -> Response {
+        // 申请：内联只占**一行**（面板弹出，不参与这里的尺寸结算）。
+        let rect = ui.allocate(Vec2::new(ui.theme.input.min_w, SWATCH_H));
         // 先解构：`color`（&mut Color）与 `hex`（Option<&mut String>）是**互不相干**的
         // 借用，颜色值在外面读写成 `Copy` 的 `Color`，两边不打架。
         let ColorPicker { id, color, alpha, hex, popup_w } = self;
@@ -197,7 +194,7 @@ impl Widget for ColorPicker<'_> {
         }
 
         if !open {
-            return Response { hovered: hit, ..Default::default() };
+            return Response { rect, hovered: hit, ..Default::default() };
         }
 
         // ── 弹出面板（尺寸解算 / 绘制 / 交互都在 `panel` 子模块）──
@@ -208,6 +205,6 @@ impl Widget for ColorPicker<'_> {
         if btn.down_edge() && !hit && !inside {
             ui.state_mut().color_picker.close(&abs);
         }
-        Response { hovered: hit, ..Default::default() }
+        Response { rect, hovered: hit, ..Default::default() }
     }
 }

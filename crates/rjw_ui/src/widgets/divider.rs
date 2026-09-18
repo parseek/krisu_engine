@@ -45,21 +45,19 @@ impl Default for Divider {
 }
 
 impl Widget for Divider {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
+    fn ui(self, ui: &mut Ui) -> Response {
         let st = ui.theme.divider.clone();
         let t = self.thickness.map(|x| x.to_physical(ui.scale())).unwrap_or(st.thickness);
         let m = self.margin.map(|x| x.to_physical(ui.scale())).unwrap_or(st.margin);
+        let c = self.color.unwrap_or(st.color);
         // 宽 = 容器可用宽（固定宽窗口 / 沙箱）；无可用宽 = 默认 120。
         let w = ui.avail_w().unwrap_or(120.0);
-        Vec2::new(w, t + m * 2.0)
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-        let st = ui.theme.divider.clone();
-        let t = self.thickness.map(|x| x.to_physical(ui.scale())).unwrap_or(st.thickness);
-        let c = self.color.unwrap_or(st.color);
+        // ⚠ 占光标、**撑大父级**（与旧 `size()` + 默认 `Expansion::UnlimitedExpansion` 一致）：
+        // 分隔线"宽 = 可用宽"本身就是父级宽度的一部分；改成 `DisableAutoExpansion` 会让
+        // 固定宽窗口的尺寸整块变掉（实测：所有窗口尺寸 +50%）。
+        let rect = ui.allocate(Vec2::new(w, t + m * 2.0));
         let y = rect.y + (rect.h - t) * 0.5; // 垂直居中（行高被 clamp 时仍居中）
-        ui.push_solid_rect(Rect::new(rect.x, y, rect.w, t), c);
-        Response::default()
+        ui.painter().solid(Rect::new(rect.x, y, rect.w, t), c);
+        Response { rect, ..Default::default() }
     }
 }

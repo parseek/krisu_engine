@@ -146,51 +146,46 @@ impl<'a> Label<'a> {
 }
 
 impl Widget for Label<'_> {
-    fn size(&self, ui: &mut Ui) -> Vec2 {
-        let size = self
-            .font_size
-            .map(|s| s.to_physical(ui.scale()))
-            .unwrap_or(ui.theme.label.font_size);
-        let family = match self.font_family {
-            Some(f) => Some(Arc::from(f)),
-            None => ui.theme.label.font_family.clone(),
-        };
-        let wrap = self.wrap.map(|w| w.to_physical(ui.scale()));
-        // 显式换行宽：直接按它测量。
-        let natural = match wrap {
-            Some(w) if w > 0.0 => ui.text_size_wrap(self.text, size, family.as_deref(), w),
-            _ => ui.text_size(self.text, size, family.as_deref()),
-        };
-        if self.ellipsis {
-            // 省略：宽度 ≤ 可用宽（单行；高度 = 自然行高）。
-            if let Some(avail) = ui.avail_w()
-                && avail < natural.x {
-                    return Vec2::new(avail, natural.y);
-                }
-            natural
-        } else if wrap.is_none() || wrap.is_some_and(|w| w <= 0.0) {
-            // 默认（无显式换行宽）：**LimitedInParent**——在父级可用宽内自动换行
-            // （Resizable 窗口缩窄后 Label 不溢出；无可用宽 = 自然尺寸）。
-            if let Some(avail) = ui.avail_w()
-                && avail < natural.x {
-                    return ui.text_size_wrap(self.text, size, family.as_deref(), avail);
-                }
-            natural
-        } else {
-            natural
-        }
-    }
-
-    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
-        // 解析样式（主题回落）后，按省略 / 换行两种模式分别绘制（见 `draw_ellipsis` /
-        // `draw_wrapped`）。
+    /// **就地申请 + 绘制**：先按省略 / 换行两种模式量出期望尺寸（`LimitedInParent` 语义
+    /// 由这里自己实现——不再经 `Widget::expansion()` 钩子），再申请、再画。
+    fn ui(self, ui: &mut Ui) -> Response {
         let (color, size, align, family) = self.resolve_style(ui);
+        // ① 先量（申请之前，`avail_w()` 才是"本控件可用宽"）
+        let natural = {
+            let family_ref = family.as_deref();
+            let wrap = self.wrap.map(|w| w.to_physical(ui.scale()));
+            let natural = match wrap {
+                Some(w) if w > 0.0 => ui.text_size_wrap(self.text, size, family_ref, w),
+                _ => ui.text_size(self.text, size, family_ref),
+            };
+            if self.ellipsis {
+                // 省略：宽度 ≤ 可用宽（单行；高度 = 自然行高）。
+                match ui.avail_w() {
+                    Some(avail) if avail < natural.x => Vec2::new(avail, natural.y),
+                    _ => natural,
+                }
+            } else if wrap.is_none() || wrap.is_some_and(|w| w <= 0.0) {
+                // 默认（无显式换行宽）：**LimitedInParent**——在父级可用宽内自动换行
+                // （Resizable 窗口缩窄后 Label 不溢出；无可用宽 = 自然尺寸）。
+                match ui.avail_w() {
+                    Some(avail) if avail < natural.x => {
+                        ui.text_size_wrap(self.text, size, family_ref, avail)
+                    }
+                    _ => natural,
+                }
+            } else {
+                natural
+            }
+        };
+        // ② 申请（占光标）
+        let rect = ui.allocate(natural);
+        // ③ 画（省略 / 换行两条路径各自负责自洽内容）
         if self.ellipsis {
             self.draw_ellipsis(ui, rect, color, size, align, family);
         } else {
             self.draw_wrapped(ui, rect, color, size, align, family);
         }
-        Response::default()
+        Response { rect, ..Default::default() }
     }
 }
 

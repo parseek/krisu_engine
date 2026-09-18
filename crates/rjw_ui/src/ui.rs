@@ -66,7 +66,6 @@ use crate::painter::Painter;
 use crate::state::{ButtonState, CheckboxState, TEXT_BUFFER_CACHE_CAP, UiState, WidgetState};
 use crate::style::{ButtonStyle, CheckboxStyle, GripShape, GripStyle, PanelStyle, Theme};
 use crate::view::{clip_for_view, ViewCtx, ViewMode};
-use crate::widgets::Widget as _;
 
 // ─── 文本编辑辅助（纯函数，可单测） ─────────────────────────────
 
@@ -276,6 +275,7 @@ impl<'a> UiInit<'a> {
             painter: Painter::new(scale),
             avail_stack: Vec::new(),
             abs_base: Vec2::ZERO,
+            place_once: None,
             cur_win_id: None,
             win_hit_bounds: None,
             z0_ranges: Vec::new(),
@@ -431,6 +431,10 @@ pub struct Ui<'a> {
     avail_stack: Vec<Option<f32>>,
     /// 当前容器绝对原点（命中测试用，逻辑像素）。
     abs_base: Vec2,
+    /// **一次性放置覆盖**（[`Self::add_at`] 写入、`allocate*` 消费后即清）：
+    /// 控件不在光标处申请，而落在指定的绝对坐标（相对当前容器内容原点）。
+    /// ⚠ 只作用于控件的**第一次**申请（见 [`Self::add_at`] 文档）。
+    place_once: Option<Vec2>,
     /// **当前窗口的绝对 ID**（非窗口内容 = `None`；嵌套窗口进出时保存/恢复）。
     ///
     /// 用途：`hit_impl` 记下"这次按下认领属于哪扇窗"时**必须存 ID 而不是 z**——z 会在帧末
@@ -1871,54 +1875,197 @@ impl<'a> Ui<'a> {
             .child_rect_exp(w, h, child == Child::Expand)
     }
 
-    /// **放置控件**（[`crate::widgets::Widget`] trait）：容器内**占光标**（尺寸 = 控件
-    /// 测量值经 [`crate::widgets::SizeConstraints`] clamp 与膨胀模式调整）；返回统一
-    /// 交互响应 [`crate::widgets::Response`]。顶层无容器时请用 [`Self::add_at`]。
+    /// **放置控件**（[`crate::widgets::Widget`] trait）：容器内**占光标**；尺寸由控件
+    /// 自己在 `ui()` 里就地申请（[`Self::allocate`] 一族），因此这里只是把 `Ui` 交给它。
     ///
     /// 属性化 builder 示例：`ui.add(Button::new("ok", "确定").color(Color::WHITE))`。
     /// 容器包装（`Panel` / `Pack` / `Grid` / `Window` / `Scroll` / `FlexCtx`）经
     /// [`UiAdd`] 提供同样的 `add` / `add_at` 与全部便捷方法（`p.button` / `p.label` 等）。
     pub fn add(&mut self, w: impl crate::widgets::Widget) -> crate::widgets::Response {
-        let (size, child) = self.widget_size(&w);
-        let rect = self.child_rect(size.x, size.y, child);
-        w.ui(self, rect)
+        w.ui(self)
     }
 
-    /// **绝对定位放置控件**（`pos` 相对当前容器内容原点；不占光标）。
+    /// **绝对定位放置控件**（`pos` 相对当前容器内容原点；**不占光标**）。
+    ///
+    /// 实现 = 给 `Ui` 打一个**一次性放置覆盖**，控件的第一次申请（[`Self::allocate`] /
+    /// [`Self::allocate_sense`] / …）消费它 ⇒ 控件自身的 `ui()` 不必关心"我是被 `add`
+    /// 还是 `add_at` 放的"。
+    ///
+    /// ⚠ 只作用于**第一次**申请：控件要摆多个矩形时用 [`Self::allocate_at`]。
     pub fn add_at(
         &mut self,
         pos: impl Into<Position>,
         w: impl crate::widgets::Widget,
     ) -> crate::widgets::Response {
-        let pos = pos.into().to_physical(self.scale);
-        let (size, _) = self.widget_size(&w);
-        let rect = Rect::new(pos.x, pos.y, size.x, size.y);
-        // 绝对放置的控件也要算进当前容器的尺寸（见 `Frame::content_bounds`）。
-        if let Some(frame) = self.frames.last_mut() {
-            frame.note_content(rect);
-        }
-        w.ui(self, rect)
+        self.place_once = Some(pos.into().to_physical(self.scale));
+        let resp = w.ui(self);
+        // 兜底清掉（控件可能一次申请都没做）。
+        self.place_once = None;
+        resp
     }
 
-    /// 测量控件最终放置尺寸：`size()` 自然值 → `SizeConstraints` clamp → 按
-    /// `Expansion` 模式调整（`LimitedInParent` 限制在父级可用宽内），并返回该
-    /// 控件对父级尺寸的贡献方式（`DisableAutoExpansion` ⇒ [`Child::Fit`]）。
-    fn widget_size(&mut self, w: &impl crate::widgets::Widget) -> (Vec2, Child) {
-        let natural = w.size(self);
-        let c = w.constraints();
-        let mut size = crate::widgets::apply_constraints(natural, c);
-        let child = match w.expansion() {
-            crate::widgets::Expansion::DisableAutoExpansion => Child::Fit,
-            crate::widgets::Expansion::LimitedInParent => {
-                if let Some(avail) = self.avail_w()
-                    && avail < size.x {
-                        size.x = avail;
-                    }
-                Child::Expand
-            }
-            crate::widgets::Expansion::UnlimitedExpansion => Child::Expand,
+    // ── 申请布局（控件作者用：参考 egui 的 allocate_*） ──────────
+    //
+    // ⚠ **尺寸一律是物理像素 `Vec2`**（与"`Theme` 已预乘、内部全物理像素"的约定一致）；
+    // 要写逻辑单位就在自己的 API 边界换算（`Size::Logical(x).to_physical(ui.scale())`）。
+    // 这里**刻意不收** `impl Into<Size<Vec2>>`：那会把已经是物理像素的测量结果
+    // （`text_size` / 主题常量）再乘一次 DPI —— 实测 bug：scale = 1.5 时所有控件
+    // 长到 1.5 倍，固定宽窗口的尺寸也跟着变。
+
+    /// **占光标申请矩形**（撑大父级；**物理像素**）。
+    ///
+    /// 控件 `ui()` 的第一步。⚠ **先量后申请**：`avail_w()` / `text_size()` 要在本调用
+    /// **之前**取值——申请会推进容器光标，之后的 `avail_w()` 是"下一项"的约束。
+    #[inline]
+    pub fn allocate(&mut self, size: Vec2) -> Rect {
+        self.allocate_mode(size, crate::widgets::Expansion::UnlimitedExpansion)
+    }
+
+    /// **占光标申请矩形**，并指定**膨胀模式**（取代旧 `Widget::expansion()`）：
+    /// - [`Expansion::UnlimitedExpansion`]：撑大父级（默认）；
+    /// - [`Expansion::DisableAutoExpansion`]：不撑大父级（装饰件 / 分隔线）；
+    /// - [`Expansion::LimitedInParent`]：宽度压到父级可用宽（`avail_w`）。
+    pub fn allocate_mode(&mut self, size: Vec2, mode: crate::widgets::Expansion) -> Rect {
+        self.allocate_rect(size, mode)
+    }
+
+    /// **绝对定位申请矩形**（不占光标；`pos` 相对当前容器内容原点，`size` 物理像素）。
+    ///
+    /// 与 [`Self::add_at`] 的区别：这是控件**自己在 `ui()` 里**决定位置（比如一个控件
+    /// 要摆多块），`add_at` 是调用方决定控件的落点。
+    pub fn allocate_at(&mut self, pos: impl Into<Position>, size: Vec2) -> Rect {
+        let pos = pos.into().to_physical(self.scale);
+        let rect = Rect::new(pos.x, pos.y, size.x, size.y);
+        self.note_placed(rect);
+        rect
+    }
+
+    /// **申请 + 一次性收交互**（egui `allocate_exact_size` 的对应物；`size` 物理像素）：
+    /// 命中测试 / 焦点链 / 按下认领（`sense.drag`）/ 跨帧状态一次做完。
+    #[inline]
+    pub fn allocate_sense(
+        &mut self,
+        id: &str,
+        size: Vec2,
+        sense: crate::widgets::Sense,
+    ) -> (Rect, crate::widgets::Response) {
+        self.allocate_sense_mode(id, size, crate::widgets::Expansion::UnlimitedExpansion, sense)
+    }
+
+    /// [`Self::allocate_sense`] + 膨胀模式（见 [`Self::allocate_mode`]）。
+    pub fn allocate_sense_mode(
+        &mut self,
+        id: &str,
+        size: Vec2,
+        mode: crate::widgets::Expansion,
+        sense: crate::widgets::Sense,
+    ) -> (Rect, crate::widgets::Response) {
+        let rect = self.allocate_mode(size, mode);
+        let abs = self.id_for(id);
+        let resp = self.interact(&abs, rect, sense);
+        (rect, resp)
+    }
+
+    /// **绝对定位申请 + 收交互**（不占光标）。
+    pub fn allocate_sense_at(
+        &mut self,
+        pos: impl Into<Position>,
+        id: &str,
+        size: Vec2,
+        sense: crate::widgets::Sense,
+    ) -> (Rect, crate::widgets::Response) {
+        let rect = self.allocate_at(pos, size);
+        let abs = self.id_for(id);
+        let resp = self.interact(&abs, rect, sense);
+        (rect, resp)
+    }
+
+    /// 申请的核心（已换算物理像素）：按模式调整 → 消费一次性放置覆盖 → 占光标。
+    fn allocate_rect(&mut self, mut size: Vec2, mode: crate::widgets::Expansion) -> Rect {
+        use crate::widgets::Expansion;
+        // `LimitedInParent`：宽度压到父级可用宽（`avail_w`）；无可用宽 = 自然尺寸。
+        if mode == Expansion::LimitedInParent
+            && let Some(avail) = self.avail_w()
+            && avail < size.x
+        {
+            size.x = avail;
+        }
+        // `add_at` 的一次性覆盖：不占光标，直接落在指定坐标。
+        if let Some(pos) = self.place_once.take() {
+            let rect = Rect::new(pos.x, pos.y, size.x, size.y);
+            self.note_placed(rect);
+            return rect;
+        }
+        let child = if mode == Expansion::DisableAutoExpansion {
+            Child::Fit
+        } else {
+            Child::Expand
         };
-        (size, child)
+        self.child_rect(size.x, size.y, child)
+    }
+
+    /// **收交互**（控件作者用；[`Self::allocate_sense`] 的底层）：按 [`crate::widgets::Sense`]
+    /// 把"命中 → 焦点 → 按下认领 → 跨帧状态机"一次做完，返回本帧 [`crate::widgets::Response`]。
+    ///
+    /// 与既有内置控件逐条对齐（`button_at_styled` / `checkbox_at_styled` 等就是这套组合）：
+    /// 1. `hit = hit_abs(id, rect)`（含窗口遮挡 / 控件级遮挡 / 强制裁剪层）；
+    /// 2. `sense.focus` ⇒ `register_focus(id, rect, kind)`（Tab 可到 + 焦点描边）；
+    /// 3. `sense.focus` ⇒ `key_click(id, kind)`（Enter/Space 合成点击）；
+    /// 4. `sense.drag && 按下边沿 && hit` ⇒ `claim_press()`（外层窗口/面板不再把这次按下
+    ///    当作拖动基准）；
+    /// 5. `update_interact`（hover/pressed/clicked/released 跨帧状态）+ 键盘点击合成；
+    /// 6. `pressed` ⇒ `note_press_handled()`（帧末"点空白清焦点"要区分按下与空白）；
+    /// 7. `sense.drag` ⇒ `update_drag`（拖拽态；基准用 `WidgetState::{press_mouse,press_panel}`）。
+    ///
+    /// ⚠ 有拖拽语义的控件**仍要自己**维护拖拽基准（按下时写 `press_mouse` / `press_panel`）
+    /// 与数值映射——本方法只负责状态机与认领。
+    pub fn interact(
+        &mut self,
+        id: &IdAbsolute<'_>,
+        rect: Rect,
+        sense: crate::widgets::Sense,
+    ) -> crate::widgets::Response {
+        use crate::widgets::Response;
+        let hit = sense.needs_hit() && self.hit_abs(id, &rect);
+        if let Some(kind) = sense.focus {
+            self.register_focus(id, rect, kind);
+        }
+        let btn = self.mouse_left();
+        let key_click = sense.focus.is_some_and(|kind| self.key_click(id, kind));
+        // 拖拽语义：按下边沿 + 命中 ⇒ 认领本次按压（阻止窗口/面板的拖动基准）。
+        if sense.drag && hit && btn.down_edge() {
+            self.claim_press();
+        }
+        let mut ev = {
+            let ws = self.state_mut().widget(id);
+            let ev = update_interact(ws, hit, btn);
+            if key_click {
+                // 键盘激活：合成"按下"，与鼠标路径同形（见各内置控件的 key_click 处理）。
+                ws.pressed = true;
+            }
+            ev
+        };
+        if key_click {
+            ev.clicked = true;
+        }
+        if ev.pressed || key_click {
+            self.note_press_handled();
+        }
+        if sense.drag {
+            let ws = self.state_mut().widget(id);
+            update_drag(ws, hit, btn);
+        }
+        // `pressed` = **持续按住**（与 `ButtonState::pressed` 同义），不是"本帧按下边沿"：
+        // 三态配色（常态/悬停/按下）靠它，读边沿会让按住期间退回悬停色。
+        let held = self.state().widgets.get(id.as_str()).is_some_and(|ws| ws.pressed);
+        Response {
+            rect,
+            hovered: hit,
+            pressed: held,
+            clicked: ev.clicked,
+            released: ev.released,
+            toggled: false,
+        }
     }
 
     /// 通用容器：push 帧 → 闭包 → 结算（返回尺寸与最大子尺寸）→ 平移子命令 → pop。
@@ -4659,13 +4806,10 @@ pub trait UiAdd<'a> {
     /// 容器持有的 `Ui`（包装字段，仅本 crate 内实现）。
     fn ui_mut(&mut self) -> &mut Ui<'a>;
 
-    /// 在容器内**占光标**放置 [`crate::widgets::Widget`] 控件（尺寸 = 控件测量值
-    /// 经约束 clamp 与膨胀模式调整）。
+    /// 在容器内**占光标**放置 [`crate::widgets::Widget`] 控件（尺寸由控件自己在
+    /// `ui()` 里申请，见 [`Ui::allocate`]）。
     fn add(&mut self, w: impl crate::widgets::Widget) -> crate::widgets::Response {
-        let ui = self.ui_mut();
-        let (size, child) = ui.widget_size(&w);
-        let rect = ui.child_rect(size.x, size.y, child);
-        w.ui(ui, rect)
+        self.ui_mut().add(w)
     }
 
     /// **绝对定位**放置 [`crate::widgets::Widget`] 控件（`pos` 相对当前容器内容原点；
@@ -4688,11 +4832,9 @@ pub trait UiAdd<'a> {
     /// **自动换行**，Resizable 窗口缩窄后不溢出）。
     fn label(&mut self, text: &str) -> Vec2 {
         let ui = self.ui_mut();
-        let l = crate::widgets::Label::new(text);
-        let size = l.size(ui);
-        let rect = ui.child_rect(size.x, size.y, Child::Expand);
-        l.ui(ui, rect);
-        size
+        // 尺寸由控件申请；`Response::rect` 就是它最终占的矩形（见 `Widget::ui`）。
+        let resp = crate::widgets::Widget::ui(crate::widgets::Label::new(text), ui);
+        resp.rect.size()
     }
 
     /// 绝对定位标签（`pos` 相对当前容器内容原点）。
@@ -5445,69 +5587,41 @@ impl Ui<'_> {
         label: &str,
         style: &ButtonStyle,
     ) -> ButtonState {
-        let id_for = self.id_for(id);
-
+        let abs = self.id_for(id);
         self.note_placed(rect);
-        let hit = self.hit_abs(&id_for, &rect);
-        let btn = self.mouse_left();
-        // 登记焦点链（键盘导航：Tab/方向键可到；Enter/Space 激活 —— 见 `key_click`）。
-        self.register_focus(&id_for, rect, FocusKind::Button);
-        // 键盘激活（Enter/Space + 焦点）→ 视为点击；先取出（不借用 self）
-        let key_click = self.key_click(&id_for, FocusKind::Button);
-        if key_click {
-            self.any_pressed = true;
-        }
-        {
-            let ws = self.state.widgets.entry(id_for.to_static()).or_default();
-            let mut ev = update_interact(ws, hit, btn);
-            if key_click {
-                // 焦点键盘点击：合成 pressed + clicked（触发本帧回调）。
-                ws.pressed = true;
-                ev.clicked = true;
-            }
-            if ev.pressed {
-                self.any_pressed = true;
-            }
-            let (pressed, hovered) = (ws.pressed, ws.hovered);
-            // 记录绘制（ws 借用已结束）
-            let bg = style.pick_bg(pressed, hovered);
-            let depth = self.painter.q.depth;
-            let win = self.painter.q.cur_win;
-            let elem = self.painter.q.seq + 1;
-            // 背景 + 边框（radius > 0 走圆角双层矩形）。
-            self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
-            // 按钮文本自动省略（Resizable 窗口缩窄 / max 约束下不溢出）：
-            // 文本超出可用区（rect 宽 - 水平内边距）→ "…"截断（内容自洽，noclip）。
-            let label_owned = self.ellipsized(
-                label,
-                style.font_size,
-                style.font_family.as_deref(),
-                (rect.w - style.padding.x * 2.0).max(0.0),
-            );
-            let draw_label: &str = label_owned.as_deref().unwrap_or(label);
-            let text_seq = self.next_seq();
-            self.painter.q.queue.push(text_cmd(
-                depth,
-                text_seq,
-                win,
-                elem,
-                rect,
-                Arc::from(draw_label),
-                style.font_size,
-                style.fg,
-                TextAlign::Center,
-                TextVAlign::Center,
-                style.font_family.clone(),
-                None,
-                self.painter.q.clip,
+        // 命中 / 焦点链 / 键盘激活 / 跨帧状态机：一句话（`Sense::CLICK` —— 按钮没有拖拽语义，
+        // 所以不 `claim_press`）。
+        let resp = self.interact(&abs, rect, crate::widgets::Sense::CLICK.focus(FocusKind::Button));
+        let bg = style.pick_bg(resp.pressed, resp.hovered);
+        let elem = self.elem_hint();
+        // 背景 + 边框（radius > 0 走圆角双层矩形）。
+        self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
+        // 按钮文本自动省略（Resizable 窗口缩窄 / max 约束下不溢出）：
+        // 文本超出可用区（rect 宽 - 水平内边距）→ "…"截断（内容自洽，noclip）。
+        let label_owned = self.ellipsized(
+            label,
+            style.font_size,
+            style.font_family.as_deref(),
+            (rect.w - style.padding.x * 2.0).max(0.0),
+        );
+        let draw_label: String = label_owned.unwrap_or_else(|| label.to_owned());
+        // 文本与背景同 elem（旧写法）：`push_text_rect` 会取更大的 elem ⇒ 文字在上。
+        self.painter.text(
+            rect,
+            &draw_label,
+            style.font_size,
+            style.fg,
+            style.font_family.clone(),
+            TextAlign::Center,
+            TextVAlign::Center,
             None,
-            ));
-            ButtonState {
-                hovered,
-                pressed,
-                clicked: ev.clicked,
-                released: ev.released,
-            }
+            None,
+        );
+        ButtonState {
+            hovered: resp.hovered,
+            pressed: resp.pressed,
+            clicked: resp.clicked,
+            released: resp.released,
         }
     }
 
@@ -5709,39 +5823,16 @@ impl Ui<'_> {
     ) -> CheckboxState {
         let abs = self.id_for(id);
         self.note_placed(rect);
-        let hit = self.hit_abs(&abs, &rect);
-        let btn = self.mouse_left();
-        // 登记焦点链（键盘导航：Tab 可到；Enter/Space 切换）。
-        self.register_focus(&abs, rect, FocusKind::Checkbox);
-        let key_click = self.key_click(&abs, FocusKind::Checkbox);
-        if key_click {
-            self.any_pressed = true;
-        }
-        let mut ev = {
-            let ws = self.state.widgets.entry(abs.to_static()).or_default();
-            let ev = update_interact(ws, hit, btn);
-            if key_click {
-                ws.pressed = true;
-            }
-            ev
-        };
-        if key_click {
-            ev.clicked = true;
-        }
-        if ev.pressed {
-            self.any_pressed = true;
-        }
-        let (hovered, pressed) = {
-            let ws = self.state.widgets.get(abs.as_str()).expect("checkbox ws");
-            (ws.hovered, ws.pressed)
-        };
-        self.draw_check_common(rect, label, checked, hovered, style);
+        // 命中 / 焦点链 / 键盘激活 / 跨帧状态机：一句话（勾选框没有拖拽语义）。
+        let resp =
+            self.interact(&abs, rect, crate::widgets::Sense::CLICK.focus(FocusKind::Checkbox));
+        self.draw_check_common(rect, label, checked, resp.hovered, style);
         CheckboxState {
-            hovered,
-            pressed,
+            hovered: resp.hovered,
+            pressed: resp.pressed,
             checked,
-            toggled: ev.clicked,
-            clicked: ev.clicked,
+            toggled: resp.clicked,
+            clicked: resp.clicked,
         }
     }
 
