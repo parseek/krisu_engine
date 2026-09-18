@@ -47,9 +47,9 @@ use crate::draw::{
     screen_fixed_tf, snap_rect, text_block_offset, text_cmd,
 };// 顶点收集 / 合批机制（原在此文件，见 `gpu_batch` 模块文档）。
 use crate::gpu_batch::{
-    CacheStats, CachedQuad, Geom, QuadCollector, clip_key, clip_rect, cmd_sig_hash,
-    debug_layout_outline, fully_outside, line_row_at_y, resample_gradient_local, safe_line_slice,
-    segment_runs, vertex_p3u2c4,
+    BatchPlan, CacheSlot, CacheStats, CachedQuad, Geom, QuadCollector, SubmitUnit, clip_rect,
+    cmd_sig_hash, debug_layout_outline, fully_outside, line_row_at_y,
+    resample_gradient_local, safe_line_slice, segment_runs, vertex_p3u2c4,
 };
 use crate::edit::{
     byte_to_char, caret_at_visual_click, caret_index_by_width, char_to_byte, insert_char_at,
@@ -3582,44 +3582,117 @@ impl<'a> Ui<'a> {
         let sort_us = t_sort.elapsed().as_secs_f64() * 1e6;
         // —— 计时累加器（本帧各阶段 µs 统计，finish 末尾写入 UiState.stats） ——
         let mut stats = CacheStats::default();
-        let mut quads = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh); // 非窗口 + 缓存 miss 重建
-        // 缓存命中：克隆局部顶点到提交列表（简单可靠——零拷贝两阶段读取在窗口 z /
-        // id 映射变化时有"整窗不提交"的竞态风险，曾导致拖动/内容变化时窗口
-        // "消失与显示交替"闪烁）。
-        let mut cached: Vec<CachedQuad> = Vec::new();
-        // —— 按窗口生成可提交顶点（含 win=0 放置子槽缓存 + 窗口顶点缓存） ——
-        self.cache_all_windows(
-            &mut groups,
-            &wins,
-            &mut quads,
-            &mut cached,
-            white_uid,
-            white_uv_tl,
-            white_uv_wh,
-            &mut stats,
-        );
-        // 提交：**UI 自行管理绘制顺序**，UI 的 Render2D 必须 `set_sort_mode(SortMode::None)`
-        // （关闭排序，完全按提交顺序绘制）；`set_sort_mode(SortMode::LayerOnly)`（稳定排序）
-        // 同层保持提交顺序也可。⚠ 不要用 `SortMode::LayerAndStates`：
-        // 它按 `(rstates, texture_uid)` 重排，字形图集页 uid < 程序化纹理页 uid →
-        // 圆角/渐变会被排在文字之后绘制，盖住文字。
+        // 收集器：**未命中**的单元在这里镶嵌（含 `debug_layout` 的布局描边——那条路径
+        // 每帧重建，见 `collect_units`）。命中单元不进这里：它们直接在缓存里。
+        let mut quads = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh);
+        // —— 收集本帧的**提交单元**（窗口 / win=0 顶层放置）——
         //
-        // 统一排序键 `(win, 元素序, 图形/文字组, 纹理 uid)`，每 (窗口, 元素, 组, 纹理)
-        // 一次 quads：
-        // 1. **win 升序**：非窗口内容（win=0，layer = base）最底，窗口按 z 从下到上
-        //    （layer = base + z）——后提交的窗口覆盖先提交的；
-        // 2. **窗口内按元素序（控件录制序）**：后录控件覆盖先录控件（重叠层级正确）；
-        //    **元素内"背景/图形 → 文字"**（`g`）——文字不被自身图形覆盖。
-        //    ⚠ 不可按 (win, g, tex) 提交：那会把所有背景排到所有文字之前，后录控件的
-        //    背景会被先录控件的文字盖住（白纹理合批后语义仍错）。
+        // 每个单元 = `(win, place)`：一扇窗，或 win=0 的一个顶层放置。命中 ⇒ 计划从缓存
+        // **move 出来**（零顶点拷贝）；未命中 ⇒ 现场镶嵌 + 合并（`build_plans`），本帧
+        // 照常提交它，提交完再 move 回缓存（下面的回填循环）⇒ **"重建帧照常绘制、
+        // 不消失一帧"由结构保证**（见 `collect_units` 的文档）。
+        let t_asm = Instant::now();
+        let mut units: Vec<SubmitUnit> = std::mem::take(&mut self.state.scratch_units);
+        units.clear();
+        self.collect_units(&mut groups, &wins, &mut units, &mut quads, &mut stats);
+        // 单元级排序（每帧 ~15 个）：`(win, place)`——非窗口内容（win=0）按**放置序**
+        // （后录制者在上），窗口按 z（非窗口恒在窗口之下）。**单元内**的顺序已在计划里
+        // 烘好（`BatchPlan`）：`elem`（后录控件覆盖先录）+ `g`（图形先于文字）+ `tex` +
+        // `clip`（一次 draw 只能一个 scissor）。
+        units.sort_unstable_by_key(|u| (u.win, u.place));
+        // 「装配」= 收集 + 合并 + 单元排序，扣掉已单独计时的 `sig` / `collect`
+        // （那是"索引"与"镶嵌"的账，不是几何搬运）。
+        let submit_asm_us =
+            (t_asm.elapsed().as_secs_f64() * 1e6 - stats.sig_us - stats.collect_us).max(0.0);
+        // ── 提交：每个计划一次 `flush_seg`。计划是**借来的**（`&BatchPlan`）⇒ 命中路径
+        //    全程零拷贝；`UiBatch` 借用切片交给后端，不做"再拷一份"。
+        //
+        // ⚠ **UI 自行管理绘制顺序**：UI 的 Render2D 必须 `set_sort_mode(SortMode::None)`
+        // （关闭排序，完全按提交顺序绘制）；`LayerOnly`（稳定排序）同层保持提交顺序也可。
+        // 不要用 `LayerAndStates`：它按 `(rstates, texture_uid)` 重排，字形图集页 uid <
+        // 程序化纹理页 uid → 圆角/渐变会被排在文字之后绘制，盖住文字。
         //
         // transform = 屏幕固定变换（窗口原点物理像素）→ 局部顶点映射到世界。
-        // ── 提交：**尽力而为的窗口合批**（`submit_quads`：ordered 排序 + 连续运行切段 +
-        //    每段一次 `quads(..).color(tint)`；窗口级 FX 应用在段实例上，顶点缓存不变）──
+        //
+        // **绘制序追踪**（诊断，`RJ_ORDER_TRACE=<帧号>|all`）：按**真实提交顺序**逐条打印
+        // 批次计划。为什么需要它：`elem = 0` 的语义是"画在**本容器**元素之下"，只有
+        // "每个顶层放置一个排序空间"（`place`）才成立；"某个 win=0 控件被别的 win=0 内容
+        // 穿透 / 看错层级"这类现象只能靠这份序核对。
+        //
+        // 阶段 9 起计划是"单元内已合并好的"，所以打的是**计划级**：`(win, place, tex,
+        // clip, verts, 元素区间, 首顶点)`——`v0` 用来认出这是谁（如面板底 `(30,30)` vs
+        // FPS 标签 `(25,23)`）。**单元内**（`elem = 0` 的装饰 vs 自家内容）的顺序由
+        // `merge_plans` 的排序保证，单测
+        // `submit_order_puts_a_placement_above_earlier_content_and_below_its_own_children` 钉住。
+        //
+        // ⚠ 一帧 ~50 行且 `eprintln!` 无缓冲：`all` 时**必须重定向到真文件**（经
+        // PowerShell 管道重定向会顶满缓冲把应用压到 ~1fps——实测踩过，与引擎无关）。
+        let trace = match std::env::var("RJ_ORDER_TRACE") {
+            Ok(v) if v == "all" => true,
+            Ok(v) => v.parse::<u64>().map(|f| f == self.state.frame).unwrap_or(false),
+            Err(_) => false,
+        };
+        if trace {
+            let mut i = 0usize;
+            for u in &units {
+                for plan in &u.plans {
+                    let v0 = plan
+                        .geom
+                        .verts
+                        .first()
+                        .map(|v| (v.pos[0].round(), v.pos[1].round()));
+                    eprintln!(
+                        "order[frame {}] i={i} win={} place={} tex={} clip={} verts={} elems={}..{} v0={v0:?}",
+                        self.state.frame,
+                        u.win,
+                        u.place,
+                        plan.texture,
+                        if plan.clip.is_some() { 1 } else { 0 },
+                        plan.geom.verts.len(),
+                        plan.elements.first().copied().unwrap_or(0),
+                        plan.elements.last().copied().unwrap_or(0),
+                    );
+                    i += 1;
+                }
+            }
+        }
+        let t_flush = Instant::now();
         let layer_base = self.base_layer;
-        let (submit_asm_us, submit_flush_us) =
-            self.submit_quads(backend, cached, &mut quads, layer_base);
+        for u in &units {
+            for plan in &u.plans {
+                if self.flush_seg(backend, layer_base, u.win, plan) {
+                    // 段统计（`[perf] segs=/verts=/tris=`）：**段数 = draw call 候选数**，
+                    // 顶点/三角数是"这一帧到底提交了多少"的直接度量。
+                    let acc = &mut self.state.frame_state.stats;
+                    acc.seg_count = acc.seg_count.saturating_add(1);
+                    acc.vert_count = acc.vert_count.saturating_add(plan.geom.verts.len() as u32);
+                    acc.tri_count = acc.tri_count.saturating_add(plan.geom.tris.len() as u32);
+                }
+            }
+        }
+        let submit_flush_us = t_flush.elapsed().as_secs_f64() * 1e6;
         let submit_us = submit_asm_us + submit_flush_us;
+        // ── 计划回填缓存（**move**，不是克隆）：命中与未命中都写"本帧的计划 + 本帧的
+        //    签名"——未命中时这份就是刚建好的新计划，于是"本帧提交的"与"缓存里的"逐位
+        //    一致，下一帧直接命中。
+        for u in &mut units {
+            match u.slot.take() {
+                // ⚠ 同帧同 id 出现两次时以**后者**为准（与旧实现的 `insert` 语义一致）。
+                Some(CacheSlot::Window(id)) => {
+                    self.state
+                        .window_quads
+                        .insert(id, (u.sig, std::mem::take(&mut u.plans)));
+                }
+                Some(CacheSlot::Z0(slot)) => {
+                    self.state
+                        .z0_quads
+                        .insert(slot, (u.sig, std::mem::take(&mut u.plans)));
+                }
+                None => {}
+            }
+        }
+        units.clear();
+        self.state.scratch_units = units;
 
         // ── Debug 叠加（DebugDraw / debug_layout 描边 / 焦点描边）────────────
         // 在**全部 UI 内容之后**提交（`submit_debug`：合并 debug_queue 与布局描边、
@@ -3730,73 +3803,80 @@ impl<'a> Ui<'a> {
         self.state.press_cancelled_by_window = self.state.press_cancelled_by_window.saturating_add(1);
     }
 
-    /// **按窗口生成可提交顶点**（`finish` 的核心缓存步骤）：遍历分桶后的窗口——
-    /// - `debug_layout` 开启 → 每帧重建（布局描边是调试视图，跳过缓存）；
-    /// - `win == 0`（非窗口内容）→ 按放置子槽缓存（[`Self::cache_z0_window`]）；
-    /// - 有窗口 id → 全量签名顶点缓存（[`Self::cache_window`]）；
-    /// - 无 id → 直接重建（不缓存）。
+    /// **收集本帧的提交单元**（`finish` 的核心缓存步骤）：遍历分桶后的窗口，把每个
+    /// **提交单元**（一扇窗 / win=0 的一个顶层放置）变成一份 [`BatchPlan`] 列表：
     ///
-    /// 缓存命中把局部顶点克隆进 `cached`（供提交）；未命中重建并写回缓存。各阶段
-    /// 耗时 / 计数累加到 `stats`（`finish` 末尾写入 [`UiStats`]）。
-    fn cache_all_windows(
+    /// - **命中 ⇒ `remove` 出计划**（move 一个 `Vec`，**零顶点拷贝**）；
+    /// - **未命中 ⇒ 现场镶嵌 + 合并**（[`Self::build_plans`]），本帧照常提交它，提交完
+    ///   再把计划 move 回缓存（`finish` 末尾的回填循环）。
+    ///
+    /// "重建帧照常绘制、不消失一帧"这条**历史不变量由结构本身保证**：数据是当前帧亲手
+    /// 从缓存里拿出来的**所有权值**，z→id 映射只解一次，不存在"按旧 z 读新表"的竞态
+    /// （那是更早的"零拷贝两阶段读取"版本踩过的坑）。
+    ///
+    /// `debug_layout` 开启时**每帧重建**（布局描边是调试视图，跳过缓存）。
+    /// 各阶段耗时 / 计数累加到 `stats`（`finish` 末尾写入 [`UiStats`]）。
+    fn collect_units(
         &mut self,
         groups: &mut std::collections::HashMap<u32, Vec<Vec<UiDraw>>>,
         wins: &[u32],
+        units: &mut Vec<SubmitUnit>,
         quads: &mut QuadCollector,
-        cached: &mut Vec<CachedQuad>,
-        white_uid: u64,
-        white_uv_tl: Vec2,
-        white_uv_wh: Vec2,
         stats: &mut CacheStats,
     ) {
         for &win in wins {
             let cmds = groups.remove(&win).expect("group exists");
-            // debug_layout：每帧重建（布局描边是调试视图，跳过窗口顶点缓存）。
-            if self.debug_layout {
-                self.collect_cmds(quads, win, &cmds);
-                continue;
-            }
             if win == 0 {
-                self.cache_z0_window(
-                    &cmds,
-                    cached,
-                    white_uid,
-                    white_uv_tl,
-                    white_uv_wh,
-                    stats,
-                );
+                // 非窗口内容：按**顶层放置**切单元（`place` 既是排序空间也是缓存键）。
+                self.collect_z0_units(&cmds, units, quads, stats);
                 continue;
             }
             let Some(id) = self.win_ids.get(&win).cloned() else {
-                self.collect_cmds(quads, win, &cmds);
+                // 没有 id 的窗口（理论上不会有）⇒ 只现场建计划，不进缓存。
+                let plans = self.build_plans(win, &cmds, quads, 0, stats);
+                units.push(SubmitUnit { win, place: 0, sig: 0, slot: None, plans });
                 continue;
             };
             stats.win_count += 1;
-            self.cache_window(
+            let t_sig = Instant::now();
+            // **anchor = 本窗原点**：缓存里存的是窗口局部顶点，签名也必须按局部坐标算，
+            // 否则"窗口移动 = 内容变化"⇒ 拖动/滚动每帧整窗重镶嵌。
+            let anchor = self.win_origins.get(&win).copied().unwrap_or(Vec2::ZERO);
+            let sig = self.hash_cmds(cmds.iter().flatten(), anchor);
+            stats.sig_us += t_sig.elapsed().as_secs_f64() * 1e6;
+            let hit = !self.debug_layout
+                && self
+                    .state
+                    .window_quads
+                    .get(&id)
+                    .is_some_and(|(s, _)| *s == sig);
+            let plans = if hit {
+                stats.cache_hits += 1;
+                // **move 出缓存**（不是克隆）：本帧提交完再原样放回去。
+                self.state.window_quads.remove(&id).expect("just checked").1
+            } else {
+                stats.cache_misses += 1;
+                self.build_plans(win, &cmds, quads, 0, stats)
+            };
+            units.push(SubmitUnit {
                 win,
-                id,
-                &cmds,
-                cached,
-                white_uid,
-                white_uv_tl,
-                white_uv_wh,
-                stats,
-            );
+                place: 0,
+                sig,
+                slot: (!self.debug_layout).then_some(CacheSlot::Window(id)),
+                plans,
+            });
         }
     }
 
-    /// **非窗口（win=0）内容按放置缓存**：按 `seq` 把命令归入其**放置**
-    /// （[`Self::z0_place_for_seq`]），逐放置做**全量签名**（[`Self::hash_cmds`]）→ 命中
-    /// 复用缓存顶点 / 未命中重建该放置；值/交互变化只重建对应放置，其余 win=0 放置复用。
-    /// 未开放置的独立顶层命令（`label_at` 等）自成一段放置（同样全量签名缓存）。
-    /// 最后只保留本帧录制过的放置（放置消失/条件渲染时清陈旧，防跨帧误复用）。
-    fn cache_z0_window(
+    /// **win=0：按顶层放置收集提交单元**（[`Self::z0_place_for_seq`] 的 `place`）。
+    ///
+    /// 每个放置一个单元 ⇒ 单元内 `place` 恒定 ⇒ 计划能整体缓存；跨单元的序由
+    /// `(win, place)` 在 `finish` 里排（~15 个单元，代价可忽略）。
+    fn collect_z0_units(
         &mut self,
         cmds: &[Vec<UiDraw>],
-        cached: &mut Vec<CachedQuad>,
-        white_uid: u64,
-        white_uv_tl: Vec2,
-        white_uv_wh: Vec2,
+        units: &mut Vec<SubmitUnit>,
+        quads: &mut QuadCollector,
         stats: &mut CacheStats,
     ) {
         let mut by_place: Vec<(u32, Vec<&UiDraw>)> = Vec::new();
@@ -3808,8 +3888,7 @@ impl<'a> Ui<'a> {
             }
         }
         // **放置槽布局**（诊断，`RJ_ORDER_TRACE=slot`）：逐帧打印每个放置槽的 `seq` 区间。
-        // 用来回答"同一个容器是不是被拆进了两个排序空间"——那正是本次修的两个闪烁的
-        // 形态（面板底被邻居穿透 / 滚动条与自己的列表项分属两个 `place`）。
+        // 用来回答"同一个容器是不是被拆进了两个排序空间"。
         if std::env::var("RJ_ORDER_TRACE").is_ok_and(|v| v == "slot") {
             for (place, refs) in &by_place {
                 let lo = refs.iter().map(|d| d.seq).min().unwrap_or(0);
@@ -3827,11 +3906,11 @@ impl<'a> Ui<'a> {
             );
         }
         for (place, refs) in by_place {
-            // **槽 = (段号, 放置序)**：`place` 是段内派生的计数（各段从 0 起），
-            // 故必须带段前缀，否则不同段的同号槽共用一个缓存条目、每帧交替覆盖 → 永远 miss。
+            // **槽 = (段号, 放置序)**：`place` 是段内派生的计数（各段从 0 起），故必须带
+            // 段前缀，否则不同段的同号槽共用一个缓存条目、每帧交替覆盖 → 永远 miss。
             // ⚠ `place` **逐帧重算**（不存进 `UiDraw`）：放置增删会让后面的 `place` 整体
             // 平移，键跟着变 ⇒ 直接判 miss 重建，绝不会"命中一个 `place` 已过期的条目"
-            // 而把绘制序搞错一帧（那正是本次修复的闪烁形态）。
+            // 而把绘制序搞错一帧（那正是阶段 8 修掉的闪烁形态）。
             let slot = (self.segment, place);
             if !self.state.frame_state.z0_seen.contains(&slot) {
                 self.state.frame_state.z0_seen.push(slot);
@@ -3840,103 +3919,137 @@ impl<'a> Ui<'a> {
             // 非窗口内容的 anchor = 0（其坐标本就是绝对屏幕坐标）。
             let sig = self.hash_cmds(refs.iter().copied(), Vec2::ZERO);
             stats.sig_us += t_sig.elapsed().as_secs_f64() * 1e6;
-            let entry = self.state.z0_quads.entry(slot).or_insert((0, Vec::new()));
-            if entry.0 == sig {
+            let hit = !self.debug_layout
+                && self.state.z0_quads.get(&slot).is_some_and(|(s, _)| *s == sig);
+            let plans = if hit {
                 stats.cache_hits += 1;
-                let t_clone = Instant::now();
-                for (elem, gg, tex, clip, geom) in &entry.1 {
-                    // `place` 来自**槽键**（本帧重算的那个），不是缓存里的陈旧值。
-                    cached.push((0, place, *elem, *gg, *tex, *clip, geom.clone(), vec![*elem]));
-                }
-                stats.clone_us += t_clone.elapsed().as_secs_f64() * 1e6;
-                continue;
-            }
-            stats.cache_misses += 1;
-            let t_collect = Instant::now();
-            let mut q = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh);
-            // 该放置重建（克隆命令为 owned 单桶传入 collect_cmds）。
-            let owned: Vec<UiDraw> = refs.iter().map(|d| (*d).clone()).collect();
-            self.collect_cmds(&mut q, 0, std::slice::from_ref(&owned));
-            stats.collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
-            self.trace_cache_miss(&format!("z0 place {place}"), refs.len(), t_collect);
-            let mut grp: Vec<(u32, u8, u64, Option<Rect>, Geom)> = Vec::new();
-            for ((_, _, elem, gg, tex, clip), geom) in q.quads {
-                // 缓存存克隆、本帧提交原几何（各一份）——重建帧照常绘制，不"消失 1 帧"。
-                let clip = clip.map(clip_rect);
-                grp.push((elem, gg, tex, clip, geom.clone()));
-                cached.push((0, place, elem, gg, tex, clip, geom, vec![elem]));
-            }
-            // 缓存组顺序与提交顺序一致：元素序 → 元素内图形 → 文字 → 纹理 → 裁剪——跨帧稳定。
-            grp.sort_by_key(|&(elem, gg, tex, clip, _)| (elem, gg, tex, clip_key(clip)));
-            self.state.z0_quads.insert(slot, (sig, grp));
+                // **move 出缓存**（不是克隆）：本帧提交完再原样放回去。
+                self.state.z0_quads.remove(&slot).expect("just checked").1
+            } else {
+                stats.cache_misses += 1;
+                // 该放置重建（克隆命令为 owned 单桶传入 `collect_cmds`）。
+                let owned: Vec<UiDraw> = refs.iter().map(|d| (*d).clone()).collect();
+                self.build_plans(
+                    0,
+                    std::slice::from_ref(&owned),
+                    quads,
+                    place,
+                    stats,
+                )
+            };
+            units.push(SubmitUnit {
+                win: 0,
+                place,
+                sig,
+                slot: (!self.debug_layout).then_some(CacheSlot::Z0(slot)),
+                plans,
+            });
         }
         // 陈旧放置的清理**不在这里**：本函数每段跑一次、只见到本段的槽，按段清会把同帧
         // 其它段刚写好的缓存删掉（那些槽于是每帧 miss）。这里只把本段见到的槽记进帧级
         // 暂存（`z0_seen`），由 `UiState::begin_frame` 在**下一帧开场**按完整集合清一次。
     }
 
-    /// **窗口顶点缓存**：对窗口命令做**全量签名**（[`Self::hash_cmds`]），命中
-    /// `window_quads[id]` 则克隆局部顶点到 `cached`（跳过重建）；未命中则 `collect_cmds`
-    /// 重建并写回缓存。⚠ 必须全量签名——"轻量摘要"漏颜色位会导致 hover/click 变色
-    /// 不刷新（历史 bug）。
-    fn cache_window(
+    /// **现场建计划**（缓存未命中）：镶嵌（`collect_cmds`）+ 合并成该单元的
+    /// [`BatchPlan`] 列表。`place` 只用于诊断归因（`RJ_CACHE_TRACE`）。
+    fn build_plans(
         &mut self,
         win: u32,
-        id: IdAbsolute<'static>,
         cmds: &[Vec<UiDraw>],
-        cached: &mut Vec<CachedQuad>,
-        white_uid: u64,
-        white_uv_tl: Vec2,
-        white_uv_wh: Vec2,
+        quads: &mut QuadCollector,
+        place: u32,
         stats: &mut CacheStats,
-    ) {
-        let t_sig = Instant::now();
-        // **anchor = 本窗原点**：缓存里存的是窗口局部顶点，签名也必须按局部坐标算，
-        // 否则"窗口移动 = 内容变化"⇒ 拖动/滚动每帧整窗重镶嵌。
-        let anchor = self.win_origins.get(&win).copied().unwrap_or(Vec2::ZERO);
-        let sig = self.hash_cmds(cmds.iter().flatten(), anchor);
-        stats.sig_us += t_sig.elapsed().as_secs_f64() * 1e6;
-        // 命中缓存：直接用缓存的局部顶点（分组复制到提交列表），跳过重建
-        {
-            let entry = self.state.window_quads.entry(id.clone()).or_insert((0, Vec::new()));
-            if entry.0 == sig {
-                stats.cache_hits += 1;
-                let t_clone = Instant::now();
-                for (elem, g, tex, clip, geom) in &entry.1 {
-                    // `place = 0`：窗口自带独立排序空间（`win`），`elem = 0` 的装饰
-                    // 只在本窗内"画在最底"，不会漏到别处（见 `Self::z0_ranges`）。
-                    cached.push((win, 0, *elem, *g, *tex, *clip, geom.clone(), vec![*elem]));
-                }
-                stats.clone_us += t_clone.elapsed().as_secs_f64() * 1e6;
-                return;
-            }
-        }
-        stats.cache_misses += 1;
-        // 未命中：收集该窗口命令为局部几何，写入缓存
+    ) -> Vec<BatchPlan> {
         let t_collect = Instant::now();
-        let mut q = QuadCollector::new(white_uid, white_uv_tl, white_uv_wh);
-        self.collect_cmds(&mut q, win, cmds);
+        self.collect_cmds(quads, win, cmds);
         stats.collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
-        self.trace_cache_miss(&format!("win {win} id={}", id.as_str()), cmds.iter().map(|v| v.len()).sum(), t_collect);
-        let mut grp: Vec<(u32, u8, u64, Option<Rect>, Geom)> = Vec::new();
-        for ((_, _, elem, g, tex, clip), geom) in q.quads {
-            // 缓存存克隆、本帧提交原几何（各一份）——**重建帧窗口照常绘制**：
-            // 否则窗口内容一变就"消失 1 帧"（缓存冷启动 / 拖动中 hover、光标
-            // 闪烁、滚动等逐帧变化 → 窗口每帧重建、每帧消失 → "消失与显示
-            // 瞬间交替"闪烁）。
-            // 量化键 → 实际矩形（1px 精度；最终 scissor 本来就按整数像素取整）。
-            let clip = clip.map(clip_rect);
-            grp.push((elem, g, tex, clip, geom.clone()));
-            cached.push((win, 0, elem, g, tex, clip, geom, vec![elem]));
-        }
-        // 缓存组顺序与提交顺序一致：控件序 → 元素内图形 → 文字 → 纹理 → 裁剪——跨帧稳定。
-        grp.sort_by_key(|&(elem, g, tex, clip, _)| (elem, g, tex, clip_key(clip)));
-        self.state.window_quads.insert(id, (sig, grp));
+        self.trace_cache_miss(
+            &format!("win {win} place {place}"),
+            cmds.iter().map(|v| v.len()).sum(),
+            t_collect,
+        );
+        self.merge_plans(quads, win, place)
     }
 
-    /// **缓存未命中的逐窗 / 逐槽归因**（诊断，`RJ_CACHE_TRACE=1`）：窗口 id（或 win=0 槽号）、
-    /// 命令条数、本次重建耗时。用来回答"稳态下到底是哪几扇窗 / 哪几个 win=0 槽每帧
-    /// 重镶嵌、各占多少"——顶点缓存 miss 的代价远高于命中（整块重新镶嵌，含投影的同心环）。
+    /// **把收集器里属于 `(win, place)` 的几何合并成提交计划**（`finish` 的装配步骤）。
+    ///
+    /// 只在**未命中**时调用一次；命中路径直接用缓存里的计划（零拷贝）。步骤：
+    /// 取出本单元的条目 → 按 `(elem, group, tex, clip)` 排序 → `segment_runs` 切段 →
+    /// 每段几何拼成一段（单条段直接 move，多条段 `append` 一次）→ 附上元素序列表。
+    ///
+    /// ⚠ 段**不跨单元**合并：两个相邻单元即使 `(win, tex, clip)` 相同也各出一次批次
+    /// ⇒ **真实 draw call 会小幅上升**（实测 40 → 44；`Render2D` 的相邻合批对 UI 批次
+    /// 不生效，因为每个 `mesh_indexed` 带自己的矩阵下标）。取舍与理由见 [`BatchPlan`]。
+    fn merge_plans(&mut self, quads: &mut QuadCollector, win: u32, place: u32) -> Vec<BatchPlan> {
+        let mut ordered: Vec<CachedQuad> = std::mem::take(&mut self.state.scratch_ordered);
+        ordered.clear();
+        // 取出**本单元**的条目（`(win, place)` 唯一定位；其余条目留给别的单元）。
+        let keys: Vec<crate::gpu_batch::QuadKey> = quads
+            .quads
+            .keys()
+            .copied()
+            .filter(|k| k.0 == win && k.1 == place)
+            .collect();
+        for k in keys {
+            let geom = quads.quads.remove(&k).expect("just listed");
+            let elems = quads.elems.remove(&k).unwrap_or_default();
+            ordered.push((k.0, k.1, k.2, k.3, k.4, k.5.map(clip_rect), geom, elems));
+        }
+        ordered.sort_unstable_by_key(crate::gpu_batch::submit_sort_key);
+        let runs = segment_runs(
+            ordered.iter().map(|q| (q.0, q.4, q.5, q.6.verts.len())),
+            MAX_UI_SEG_VERTS,
+        );
+        let mut plans: Vec<BatchPlan> = Vec::with_capacity(runs.len());
+        let mut next = 0usize;
+        // 复用同一个 `Geom` scratch（每个单元 1 次分配，而不是每段 1 次）。
+        let mut scratch_seg = Geom::default();
+        for run in runs {
+            let geom = if run.quads == 1 {
+                // 单条：直接 move（省一次 `append` 全量拷贝）——`ordered` 是 scratch。
+                Geom {
+                    verts: std::mem::take(&mut ordered[next].6.verts),
+                    tris: std::mem::take(&mut ordered[next].6.tris),
+                }
+            } else {
+                scratch_seg.verts.clear();
+                scratch_seg.tris.clear();
+                scratch_seg.verts.reserve(run.verts);
+                for q in &ordered[next..next + run.quads] {
+                    // 索引按已累计顶点数平移（`Geom::append`）——各段索引从 0 起。
+                    scratch_seg.append(&q.6);
+                }
+                Geom {
+                    verts: std::mem::take(&mut scratch_seg.verts),
+                    tris: std::mem::take(&mut scratch_seg.tris),
+                }
+            };
+            // 本段覆盖的**元素序集合**（去重；`UiBatchSource::elements` 的来源）。
+            let mut elements: Vec<u32> = ordered[next..next + run.quads]
+                .iter()
+                .flat_map(|q| q.7.iter().copied())
+                .collect();
+            elements.sort_unstable();
+            elements.dedup();
+            next += run.quads;
+            if geom.is_empty() {
+                continue;
+            }
+            plans.push(BatchPlan {
+                texture: run.texture,
+                clip: run.clip,
+                geom,
+                elements,
+            });
+        }
+        self.state.scratch_ordered = ordered;
+        plans
+    }
+
+    /// **缓存未命中的逐窗 / 逐放置归因**（诊断，`RJ_CACHE_TRACE=1`）：窗口 id（或 win=0
+    /// 放置序）、命令条数、本次重建耗时。用来回答"稳态下到底是哪几扇窗 / 哪几个 win=0
+    /// 放置每帧重镶嵌、各占多少"——顶点缓存 miss 的代价远高于命中（整块重新镶嵌，含
+    /// 投影的同心环）。
     ///
     /// 只在 miss 分支调用（命中路径零开销）；env 读取也只发生在未命中时。
     /// 历史战绩：稳态 `cache_miss` 恒等于槽数、`collect` ≈ 0.6ms 时，靠它一眼看出
@@ -3953,7 +4066,7 @@ impl<'a> Ui<'a> {
         );
     }
 
-    /// 对一组命令做**全量内容签名**（`cmd_sig` 哈希）：窗口 / win=0 子槽顶点缓存的 key。
+    /// 对一组命令做**全量内容签名**（`cmd_sig` 哈希）：窗口 / win=0 放置顶点缓存的 key。
     ///
     /// 签名里**并入字形图集的区域失效世代号**（[`rjw_text::Text::atlas_revision`]）：
     /// 本缓存烘的是**最终 UV**（字形 + WHITE 基础纹理都取自字形图集），图集一旦重排
@@ -3967,7 +4080,7 @@ impl<'a> Ui<'a> {
     /// "改了行距 / 字重但窗口几何仍命中旧缓存"卡住（固定矩形里的居中文本尤其明显）。
     /// 两者都是主题令牌、只在主题变更时改，代价可忽略。
     ///
-    /// `anchor` = 该窗口 / 子槽的原点（物理像素）：见 [`cmd_sig_hash`]——按局部坐标入签名，
+    /// `anchor` = 该窗口 / 放置的原点（物理像素）：见 [`cmd_sig_hash`]——按局部坐标入签名，
     /// 于是**窗口移动 / 滚动不会让签名变化**（拖动窗口不再每帧整窗重镶嵌）。
     fn hash_cmds<'c>(
         &self,
@@ -3984,173 +4097,29 @@ impl<'a> Ui<'a> {
         geom_cache_sig(h.finish(), self.text.atlas_revision())
     }
 
-    /// **提交顶点**（`finish` 的提交步骤）：把"本帧重建 + 缓存命中"的顶点统一排序
-    /// （`(win, 元素序, 图形/文字组, 纹理)`），按 `(win, tex)` 的**连续运行**切段，每段一次
-    /// `quads(..).color(tint)`（单一窗口 transform + 窗口 tint）→ Render2D 一次 draw_indexed 合批。
-    /// 不同窗口 / 不同纹理（层级需保序）或超 `MAX_UI_SEG_VERTS` 时切段；窗口级 FX
-    /// （tint + transform override）应用在段实例上（顶点缓存不变）。
-    ///
-    /// 返回 `(装配 µs, 交后端 µs)`：前者是 `rjw_ui` 自己的顶点搬运（组装 / 排序 / 切段 /
-    /// 段内 `append`），后者是 [`Self::flush_seg`] 循环（含 `UiBackend::submit`——真实后端
-    /// 在这里把顶点拷进 `rjw_2d_render` 暂存）。两笔账必须分开记，否则无法判断
-    /// "提交这 0.3ms 是 UI 花掉的还是渲染器吸收的"（见 [`crate::UiStats::submit_asm_us`]）。
-    fn submit_quads(
-        &mut self,
-        backend: &mut dyn UiBackend,
-        cached: Vec<CachedQuad>,
-        quads: &mut QuadCollector,
-        layer_base: f64,
-    ) -> (f64, f64) {
-        let t_submit = Instant::now();
-        // ② **复用 scratch 缓冲**（住 `UiState`，跨帧保留容量）：本帧的"待提交段"列表与
-        // "段内元素序集合"都不再每帧新建（`segs` 段 × 每段一个 `BTreeSet` 的分配）。
-        let mut ordered: Vec<CachedQuad> = std::mem::take(&mut self.state.scratch_ordered);
-        ordered.clear();
-        let mut seg_elems: std::collections::BTreeSet<u32> =
-            std::mem::take(&mut self.state.scratch_elems);
-        // mem::take：只移走内容几何，`quads.debug`（调试叠加）留待最后提交。
-        for ((win, place, elem, g, tex_uid, clip), geom) in std::mem::take(&mut quads.quads) {
-            let elems = quads
-                .elems
-                .remove(&(win, place, elem, g, tex_uid, clip))
-                .unwrap_or_default();
-            ordered.push((win, place, elem, g, tex_uid, clip.map(clip_rect), geom, elems));
-        }
-        // 缓存命中路径（`cached`）来自 `cache_window` / `cache_z0_window`，
-        // 其元素数已在采集期统计。
-        ordered.extend(cached);
-        // 提交序：`(win, place, elem, group, tex, clip)`（`clip` 用整数像素键比较）。
-        // `place` = 顶层放置序（win=0 的排序空间，见 `Self::z0_ranges`）——必须在
-        // `elem` **之前**：否则一个放置的底装饰（`elem = 0`）会排到别的放置的内容之下。
-        // `sort_unstable`：键相同的条目之间**顺序无关**（同键必然合进同一段）。
-        ordered.sort_unstable_by_key(crate::gpu_batch::submit_sort_key);
-        // **绘制序追踪**（诊断，`RJ_ORDER_TRACE`）：逐条打印实际提交顺序。
-        //
-        // 为什么需要它：绘制序只由 `(win, place, elem, group, tex, clip)` 决定，而
-        // `elem = 0` 的语义是"画在本容器元素之下"——**只有"每个顶层放置一个排序空间"
-        // 才成立**。"某个 win=0 控件被别的 win=0 内容穿透 / 看错层级"这类现象只能靠
-        // 这份序核对。未命中 / 命中两条路径都汇进同一个 `ordered`，所以这里看到的就是真相。
-        //
-        // 取值：`RJ_ORDER_TRACE=<帧号>` 只打印那一帧（**推荐**）；`all` 打印每一帧。
-        // ⚠ 一帧 ≈ 200 行，且 `eprintln!` 是**无缓冲**的（每行一次 write）——
-        // `all` + 经管道重定向（如 PowerShell 的 `RedirectStandardError`）会顶满管道
-        // 缓冲，把应用压到 **~1fps**（实测踩过，与引擎无关）。要 `all` 就重定向到**真文件**
-        // （`cmd /c "app 2> log.txt"`）；按帧打印则完全没有这个问题。关闭时零开销。
-        let trace = match std::env::var("RJ_ORDER_TRACE") {
-            Ok(v) if v == "all" => true,
-            Ok(v) => v.parse::<u64>().map(|f| f == self.state.frame).unwrap_or(false),
-            Err(_) => false,
-        };
-        if trace {
-            for (i, q) in ordered.iter().enumerate() {
-                // 首顶点坐标：用来在 trace 里**认出**这是谁——比如"面板底色那条"与
-                // "FPS 标签那条"各在什么位置（缓存里存的是窗口/放置局部坐标）。
-                let v0 = q.6.verts.first().map(|v| (v.pos[0], v.pos[1]));
-                eprintln!(
-                    "order[frame {}] i={i} win={} place={} elem={} g={} tex={} clip={} verts={} v0={:?}",
-                    self.state.frame,
-                    q.0,
-                    q.1,
-                    q.2,
-                    q.3,
-                    q.4,
-                    if q.5.is_some() { 1 } else { 0 },
-                    q.6.verts.len(),
-                    v0.map(|(x, y)| (x.round(), y.round()))
-                );
-            }
-        }
-        // 连续运行合批：同 (win, tex, clip) 顶点合并成一段；窗口/纹理/**裁剪**切换或
-        // 超段顶点上限时切段。切段规则抽成纯函数 [`segment_runs`]，使「一次交互产生
-        // 几次 draw call」可在**无 GPU** 的情况下断言（见 `gpu_batch::batch_contract_tests`）。
-        let runs = segment_runs(
-            ordered.iter().map(|q| (q.0, q.4, q.5, q.6.verts.len())),
-            MAX_UI_SEG_VERTS,
-        );
-        // 「装配」= 到切段为止（组装 + 排序 + 切段）——纯 UI 自己的账。
-        let mut asm_us = t_submit.elapsed().as_secs_f64() * 1e6;
-        let mut flush_total = 0.0f64;
-        let mut next = 0usize;
-        // ③' **复用同一个 `Geom` scratch**（每帧 1 次分配，而不是每段 1 次）：
-        // `seg` 只是一份"本段顶点/索引"的临时容器，`flush_seg` 会把它 move 进批次，
-        // 所以每段新建 = 40 次 `Vec` 分配 + `reserve`。这里改用 `scratch_seg`：
-        // 单组段直接把那份几何 move 进批次（不需要拼接，见下），多组段在本容器里拼好
-        // 再 `std::mem::take` 出来。
-        let mut scratch_seg = Geom::default();
-        for run in runs {
-            // 段内顶点搬运（`mem::take` 或 `append` 拷贝）算「装配」——是 UI 自己的 memcpy。
-            let t_seg = Instant::now();
-            let seg = if run.quads == 1 {
-                // 单组：直接 move（省一次 `append` 全量拷贝）——只影响本帧这一份 `ordered`
-                // 条目（`ordered` 是本帧的 scratch，move 走即空）。
-                Geom { verts: std::mem::take(&mut ordered[next].6.verts), tris: std::mem::take(&mut ordered[next].6.tris) }
-            } else {
-                scratch_seg.verts.clear();
-                scratch_seg.tris.clear();
-                scratch_seg.verts.reserve(run.verts);
-                for q in &ordered[next..next + run.quads] {
-                    // 索引按已累计顶点数平移（`Geom::append`）——不同段的索引各自从 0 起。
-                    scratch_seg.append(&q.6);
-                }
-                Geom { verts: std::mem::take(&mut scratch_seg.verts), tris: std::mem::take(&mut scratch_seg.tris) }
-            };
-            seg_elems.clear();
-            for q in &ordered[next..next + run.quads] {
-                seg_elems.extend(q.7.iter().copied());
-            }
-            next += run.quads;
-            let n = seg_elems.len() as u32;
-            // 段统计（`[perf] segs=/verts=/tris=`）：**段数 = draw call 候选数**，
-            // 顶点/三角数是"这一帧到底镶嵌了多少"的直接度量。
-            let (sv, st) = (seg.verts.len() as u32, seg.tris.len() as u32);
-            asm_us += t_seg.elapsed().as_secs_f64() * 1e6;
-            let emitted = !seg.is_empty();
-            let t_flush = Instant::now();
-            self.flush_seg(
-                backend,
-                layer_base,
-                seg,
-                run.window,
-                run.texture,
-                run.clip,
-                n,
-            );
-            flush_total += t_flush.elapsed().as_secs_f64() * 1e6;
-            if emitted {
-                let acc = &mut self.state.frame_state.stats;
-                acc.seg_count = acc.seg_count.saturating_add(1);
-                acc.vert_count = acc.vert_count.saturating_add(sv);
-                acc.tri_count = acc.tri_count.saturating_add(st);
-            }
-        }
-        // ② 归还 scratch（容量留到下一帧；元素里的 `Geom` 已 move/丢弃，不影响复用）。
-        self.state.scratch_ordered = ordered;
-        self.state.scratch_elems = seg_elems;
-        (asm_us, flush_total)
-    }
-
-    /// **冲刷一个窗口段**：把累计的几何段作为 [`UiBatch`] 提交（单一窗口的
+    /// **冲刷一个批次计划**：把 [`BatchPlan`] 作为 [`UiBatch`] 提交（单一窗口的
     /// `screen_fixed_tf` 变换 + 窗口级 FX tint/transform override + **batch scissor**）。
     ///
-    /// `clip` = 本段的环境裁剪层（绝对逻辑坐标；`None` = 不裁剪）⇒ 经
+    /// `plan.clip` = 本段的环境裁剪层（窗口 / 放置**局部**坐标）⇒ 经
     /// [`crate::view::batch_scissor`] 映射成该批次的屏幕像素 scissor。
     ///
+    /// ⚠ **几何按引用交给后端**（`UiBatch` 借用切片）：计划是缓存里的东西，提交期不能
+    /// 把它的顶点搬走——这正是阶段 9 去掉"每帧克隆一遍几何"的关键。
+    ///
     /// **解耦**：不直接调 `Render2D`，只产出数据；后端决定如何提交。
+    /// 返回是否真的提交了（纹理缺失 / 空几何 ⇒ `false`，供段统计口径一致）。
     fn flush_seg(
         &mut self,
         backend: &mut dyn UiBackend,
         layer_base: f64,
-        seg: Geom,
         win: u32,
-        tex_uid: u64,
-        clip: Option<Rect>,
-        elements: u32,
-    ) {
-        if seg.is_empty() {
-            return;
+        plan: &BatchPlan,
+    ) -> bool {
+        if plan.geom.is_empty() {
+            return false;
         }
-        let Some(texture) = backend.texture(tex_uid) else {
-            return;
+        let Some(texture) = backend.texture(plan.texture) else {
+            return false;
         };
         let anchor_px = self.win_origins.get(&win).copied().unwrap_or(Vec2::ZERO);
         let base_tf = screen_fixed_tf(anchor_px);
@@ -4187,12 +4156,12 @@ impl<'a> Ui<'a> {
         // 诊断：记录本窗口**实际提交用的平移量**（`debug_dump` 的 `submit` 字段）——
         // 与 `origin` 比对即可判定"引擎状态 vs 视觉"是否一致。
         self.state.debug_submit.insert(win, tf.pos);
-        // **batch scissor**：窗口**局部**裁剪层 → 本批次的屏幕像素矩形（见
+        // **batch scissor**：窗口/放置**局部**裁剪层 → 本批次的屏幕像素矩形（见
         // [`crate::view::batch_scissor`]）。`tf` 通常只是"平移到窗口原点"⇒ 结果 = 局部
         // 裁剪 + 窗口原点；窗口 FX（缩放/旋转）下走保守 AABB（宁可多画一点，绝不误裁）。
         // ⚠ 裁剪层必须与**缓存里的顶点同空间**（局部）：否则窗口一动，命中的旧缓存会把
         // scissor 留在旧位置（"scissor 不跟内容一起移动"，用户实测）。
-        let clip = clip.map(|c| crate::view::batch_scissor(c, &tf));
+        let clip = plan.clip.map(|c| crate::view::batch_scissor(c, &tf));
         if let Some(c) = clip {
             // 诊断 + 计数：本帧带 scissor 的批次数（`[perf] clip_batches`）。
             self.state.debug_clip.insert(win, c);
@@ -4201,14 +4170,19 @@ impl<'a> Ui<'a> {
         }
         backend.submit(UiBatch {
             texture,
-            vertices: seg.verts,
-            indices: seg.tris,
+            vertices: &plan.geom.verts,
+            indices: &plan.geom.tris,
             transform: tf,
             tint: fx.tint,
             layer: layer_base + win as f64 * 1.0,
             clip,
-            source: UiBatchSource { window: win, elements, debug: false },
+            source: UiBatchSource {
+                window: win,
+                elements: plan.elements.len() as u32,
+                debug: false,
+            },
         });
+        true
     }
 
     /// **提交 Debug 叠加**（`finish` 末尾，全部 UI 内容之后）：合并 `debug_queue`
@@ -4249,8 +4223,8 @@ impl<'a> Ui<'a> {
             self.state.debug_submit.insert(win, tf.pos);
             backend.submit(UiBatch {
                 texture,
-                vertices: geom.verts,
-                indices: geom.tris,
+                vertices: &geom.verts,
+                indices: &geom.tris,
                 transform: tf,
                 tint: Color::WHITE,
                 layer: layer_base + win as f64 * 1.0,

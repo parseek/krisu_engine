@@ -2085,17 +2085,20 @@ UiDraw.clip（绝对屏幕坐标）
 
 ### 18.21 提交期优化（①–⑤′；⑥ GPU 持久缓冲不做）
 
-> **决策记录**：⑥（GPU 持久缓冲）不做。下一刀不是"再抠一次 memcpy"，而是**缓存提交
-> 计划而非几何碎片**（把合并/切段从每帧搬到缓存填充时）——理由、实测数据与取舍见
-> [`UI_ARCHITECTURE.md`](UI_ARCHITECTURE.md) §6。
+> **决策记录**：⑥（GPU 持久缓冲）不做。⑥ 之外的**下一刀已落地**（阶段 9）：**缓存提交
+> 计划而非几何碎片**——把"合并 / 切段"从每帧搬到缓存填充时，命中路径变成
+> `remove`（move 一个 `Vec`）→ 借用提交 → `insert`，**零顶点拷贝**。`finish` 实测
+> **0.68ms → 0.36ms（−47%）**、`clone_us` 恒为 0、`asm` 170µs → 23µs，代价是
+> **draw call 40 → 44（+10%）**。理由、数据与取舍见
+> [`UI_ARCHITECTURE.md`](UI_ARCHITECTURE.md) §6.2 与 §18.24。
 
 | # | 做法 | 效果（实测） |
 |---|---|---|
 | ① | **签名去绝对化**：`cmd_sig_hash` 哈希 `rect − anchor` / `clip − anchor`（与"缓存里存的是窗口局部顶点"同口径） | 拖动窗口从"**每帧 1 次整窗 MISS**"（`RJ_CACHE_TRACE`：f22…f61 每帧一条 `MISS win`）变成**稳态 0 MISS**（只剩 f1 冷启动 7 条）。`--sim-drag` 实测 |
-| ② | **scratch 复用**：`submit_quads` 的 `ordered`（待提交段列表）与 `seg_elems`（段内元素序集合）住 `UiState`，每帧 `clear()` 复用 | 去掉每帧 1 个 `Vec` + 每段 1 个 `BTreeSet` 的分配（演示 `segs=39`/帧） |
+| ② | **scratch 复用**：提交期的临时容器（阶段 9 起是 `scratch_units`（提交单元列表）与 `scratch_ordered`（单元内待切段条目））住 `UiState`，每帧 `clear()` 复用 | 去掉每帧 `Vec` / `BTreeSet` 的反复分配（演示 `segs=40`/帧） |
 | ③ | **单组段直接 move 几何**：`run.quads == 1` 时 `mem::take` 该条几何，省一次 `append` | 省一次全量拷贝（多条段仍走 `append`）。⚠ 曾一度撤销：当时 `--sim-dropdown` 子菜单面板整块丢失，**误判为它的锅**——真因是同期"裁剪层绝对/局部空间不一致"（见 §18.22 坑 1）。空间修正后重新启用，全部 `--sim-*` 通过 |
 | ④ | **签名瘦身**：环境裁剪以量化 `i32` 四元组入签名（4 次整型写入）；文本只哈希**自身软裁剪**（环境层已上移到 batch scissor） | `sig_us` 未见增长（57–61µs，与改动前同档） |
-| ⑤ | **`[perf]` 计数**：`UiStats` 增 `clip_batches / seg_count / vert_count / tri_count`，示例 `[perf]` 打印 `clip_batches= segs= verts= tris=` | `segs` = "scissor 让 draw 变多"的直接度量；`verts/tris` = 这一帧镶嵌了多少 |
+| ⑤ | **`[perf]` 计数**：`UiStats` 增 `clip_batches / seg_count / vert_count / tri_count`，示例 `[perf]` 打印 `clip_batches= segs= verts= tris=`；阶段 9 又加了 **`draw_ops=`**（UI 层 `Render2D::draw_op_count()`，**真实 draw 数**） | `segs` = 批次候选数；**`draw_ops` 才是真的发了几次 draw**（实测两者相等：每个 `mesh_indexed` 带自己的矩阵下标 ⇒ `Render2D` 的动态段合批对 UI 批次不生效）；`verts/tris` = 这一帧提交了多少 |
 | ⑤' | **`submit` 拆两笔账**：`UiStats::submit_asm_us`（UI 自己装配：组装/排序/切段/段内拼接）+ `submit_flush_us`（`flush_seg` → `UiBackend::submit`，真实后端在这里把顶点拷进渲染器暂存） | **不拆这两笔就无法判断那 0.3ms 该算谁**。实测 `submit=283µs(asm=166 flush=117)`——上一轮把整块当成"一次拷贝"就是这么来的 |
 
 > 现场看 `[perf]` 稳态（**改前 / 改后各 3 轮交错跑、取中位数**，480 帧/轮；机器状态
@@ -2219,6 +2222,50 @@ win=0 的缓存槽按 `place` 切得更细（每条命中条目的 per-entry 开
 三个档位（`slot` 打每个放置槽的 `seq` 区间，就是定位上面两个坑的工具）；7 条纯函数单测
 （放置序语义 + 提交排序键 + **反例**：把 `place` 从键里去掉，断言必须失败）；全部
 16 个 `--sim-*` 通过。
+
+### 18.24 提交期优化落地：**缓存"提交计划"而不是"几何碎片"**
+
+**一句话**：把"合并 / 切段"从**每帧**搬到**缓存填充时**——缓存的东西从"碎片几何"变成
+"已经按提交序合并好的批次计划"（`BatchPlan`，粒度 = 一个**提交单元** `(win, place)`）。
+
+**流程**（`Ui::finish`）：
+
+```text
+collect_units  每个单元：
+                 命中 ⇒ 把计划从缓存 remove 出来（move 一个 Vec，零顶点拷贝）
+                 未命中 ⇒ collect_cmds 镶嵌 + merge_plans 合并（这一帧只做一次）
+units.sort     (win, place)：单元级排序（~15 个；单元内顺序已烘在计划里）
+flush_seg(&plan) × N   计划**借用**提交（UiBatch 的顶点/索引改成 &[..]）
+回填          命中与未命中都把"本帧计划 + 本帧签名"move 回缓存
+```
+
+**实测（同机交错 A/B 3 轮 × 480 帧，取中位数）**：
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| `finish` | 0.68ms | **0.36ms（−47%）** |
+| `clone_us` | 193.6µs | **0.0µs**（恒为 0，回归哨兵） |
+| `submit_asm_us` | 169.6µs | **22.8µs** |
+| `segs` / `draw_ops`（真实 draw） | 40 / 40 | **44 / 44（+10%）** |
+| `verts / tris` | 23936 / 31887 | **逐位不变** |
+
+**为什么 draw call 会涨**（一度写错，实测纠正）：`Render2D` 的动态段合批条件含
+`dyn_seg_mat`，而每个 `mesh_indexed(..)` 都带**自己的矩阵下标** ⇒ **UI 批次之间永远
+不合并**（`draw_op_count() == segs` 坐实）。所以"批次不再跨单元合并"= 真的多 4 次 draw。
+取舍：**+10% draw call 换掉每帧两次全量顶点 memcpy**（在 `frame ≈ 1.8ms / ui ≈ 0.5ms`
+的账上划算）。将来 UI 批次多到 draw 成为瓶颈时，可在**提交期**只把"相邻且同
+`(tex, clip, 变换)`"的少数几对计划合并（会重新引入一次拷贝，但只针对那几对）。
+
+**公共 API 变化**：`UiBatch` 的 `vertices` / `indices` 改成**借用切片**（`UiBatch<'a>`），
+`UiBackend::submit(&mut self, UiBatch<'_>)`；`RecordingBackend` 改存**拥有**顶点的
+`RecordedBatch`。`docs/API_REFERENCE.md` §5.6 已同步。
+
+**不变量**：命中与未命中**都提交本帧的每个单元**——而且这次是**结构性**成立的（数据是
+`remove` 出来的所有权值，`z`→`id` 只解一次），不是靠"克隆一份兜底"；历史那类"整窗不提交
+一帧"的竞态在结构上不存在。
+
+**验证**：16 个 `--sim-*` 全通过（44 条 `[OK]`）；`cargo test --workspace` 全绿；
+`verts/tris` 与改前逐位一致（几何没变，只是搬运次数变了）。
 
 ### 18.19 Widget 协议：**尺寸在 `ui()` 里就地申请**（v0.3）
 

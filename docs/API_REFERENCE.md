@@ -859,10 +859,10 @@ pub trait UiBackend {
 ```rust
 pub type Tri = [u16; 3];
 
-pub struct UiBatch {
+pub struct UiBatch<'a> {
     pub texture: Arc<TextureWrapped>,
-    pub vertices: Vec<VertexP3U2C4>,   // 已是最终屏幕物理像素坐标
-    pub indices: Vec<Tri>,             // 相对 vertices；UI 全程直出三角形
+    pub vertices: &'a [VertexP3U2C4],  // 已是最终屏幕物理像素坐标
+    pub indices: &'a [Tri],            // 相对 vertices；UI 全程直出三角形
     pub transform: Transform2D,        // 实例级（窗口 FX 不重建顶点）
     pub tint: Color,                   // 实例级整段染色（顶点色已含控件自身 tint）
     pub layer: f64,
@@ -873,6 +873,12 @@ pub struct UiBatch {
 pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 ```
 
+> **⚠ 借用（v0.3 / 阶段 9）**：`vertices` / `indices` 是**借来的切片**——几何住在
+> `rjw_ui` 的提交计划缓存里，提交期只借用一次，**不再"克隆一份再交给后端"**（那是
+> `finish` 里最大的一笔 memcpy）。后端必须在 `submit` 调用内消费完（拷进自己的缓冲 /
+> 命令队列），不要存起来跨帧用。`RecordingBackend` 因此把批次存成**拥有**顶点的
+> `RecordedBatch`（`batches: Vec<RecordedBatch>`）。
+>
 > **`clip`（v0.3）**：UI 的环境裁剪（严格窗口内容 / ScrollView 可视区 / Clip 沙箱 /
 > 文本框盒）以**批次 scissor** 交付，几何保持原形（圆角 / 环带 / 投影不再被切平）。
 > 后端把它交给渲染器的**命令级 scissor**（`Draw2D::scissor`，见 §5.6）；`None` = 只受
@@ -891,10 +897,16 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 规则 | 原因 |
 |---|---|
-| 同一窗口内**所有控件 / 容器**合成一批 | 「尽量减少 DrawCall」——实例内容范围 = 整个窗口（≈1~2 次/窗口） |
+| 同一**提交单元**（窗口 / win=0 顶层放置）内所有控件 / 容器合成一批 | 「尽量减少 DrawCall」——实例内容范围 = 整个单元 |
 | **按窗口切** | 批次的 `transform` / `tint` 是窗口级的；烘进顶点会让 FX 动画每帧重建整窗顶点，摧毁窗口顶点缓存 |
+| **按 win=0 顶层放置切**（v0.3 / 阶段 8–9） | 每个放置要有自己的**排序空间**（否则 `elem = 0` 的装饰被邻居穿透）；同时使"合并结果"能作为**计划**整体跨帧缓存 |
 | **按纹理切** | 一次 draw call 只能绑一个纹理（bind group） |
 | 超 `MAX_UI_SEG_VERTS` 切 | u16 索引上限 |
+
+> ⚠ **批次数 = draw 数**：每个 `mesh_indexed(..)` 带自己的矩阵下标，`Render2D` 的动态段
+> 合批对 UI 批次**不生效**（实测 UI 层 `draw_op_count() == segs`）。所以"分成几个批次"
+> 是真的多画几次——阶段 9 用 **+4 次 draw（40 → 44）** 换掉了每帧 ~300µs 的顶点拷贝，
+> 详见 `UI_ARCHITECTURE.md` §6.2。
 
 `source.elements` 记录本批次覆盖的控件数，是上述取舍的可观测指标。
 切段规则由纯函数 `segment_runs` 裁决，契约由 `ui::batch_contract_tests` 断言

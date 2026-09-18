@@ -111,6 +111,71 @@ pub(crate) fn submit_sort_key(q: &CachedQuad) -> (u32, u32, u32, u8, u64, Option
     (q.0, q.1, q.2, q.3, q.4, clip_key(q.5))
 }
 
+/// **一个可提交的批次计划**：某个**提交单元**内、已按提交序合并好的一段几何。
+///
+/// 提交单元的粒度 = `(win, place)`：一扇窗（`win > 0`）或 win=0 的一个顶层放置
+/// （`place`，见 [`crate::Ui::z0_ranges`](crate::ui::Ui)）。单元内的排序键
+/// `(elem, group, tex, clip)` 是**帧内稳定**的（内容不变则逐位一致），所以
+/// **合并结果（= 这个计划）可以整体跨帧缓存**：
+///
+/// - 命中 ⇒ 直接拿计划里的 `geom` 提交，**零顶点拷贝**（不再"克隆碎片 → 每帧重新
+///   合并"——那正是阶段 9 之前 `clone_us + asm_us ≈ 0.3ms` 的来源）；
+/// - 未命中 ⇒ 现场镶嵌 + 合并一次，计划整体 move 进缓存，本帧同时提交它
+///   （保持"重建帧照常绘制、不消失一帧"这条历史不变量）。
+///
+/// ⚠ 段（一次 draw 的候选）**不再跨单元合并**：两个相邻单元即使 `(win, tex, clip)`
+/// 相同也各出一次批次 ⇒ **真实 draw call 会小幅上升**（实测：演示界面 `segs` 40 → 44、
+/// UI 层 `Render2D::draw_op_count()` 同步 44）。
+///
+/// 为什么不能指望 `Render2D` 把相邻批次合回去：每个 `mesh_indexed(..)` 都带**自己的
+/// 矩阵下标**（`Mesh { mat_idx }`），而动态段的合批条件含 `dyn_seg_mat` ⇒ **UI 批次
+/// 之间永远不会合并**（实测 `draw_ops == segs`，1 批 = 1 draw）。这是 `UiBatch` 粒度
+/// 的固有代价：**用 +10% 的 draw call 换掉每帧两次全量顶点 memcpy**（`finish` −50%），
+/// 在当前 `frame ≈ 1.8ms / ui ≈ 0.5ms` 的账上划算；若将来 UI 批次多到 draw call 成为
+/// 瓶颈，应按 `(tex, clip, 变换)` 在**提交期**把相邻单元的计划合并（那会重新引入拷贝，
+/// 但只需合并"相邻且同状态"的少数几对）。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BatchPlan {
+    /// 本段使用的纹理 uid。
+    pub(crate) texture: u64,
+    /// 本段的**环境裁剪层**（窗口 / 放置**局部**坐标；提交时经 `batch_scissor` 映射）。
+    pub(crate) clip: Option<Rect>,
+    /// 本段几何（顶点 + 索引；索引相对本段 `verts`）。
+    pub(crate) geom: Geom,
+    /// 本段覆盖的元素序列表（[`crate::UiBatchSource::elements`] 的来源）。
+    pub(crate) elements: Vec<u32>,
+}
+
+/// **提交单元的几何缓存在哪**（`finish` 提交完把计划 move 回这里）。
+#[derive(Debug, Clone)]
+pub(crate) enum CacheSlot {
+    /// 一扇窗（`win > 0`）：按窗口**绝对 ID** 缓存。
+    Window(crate::id::IdAbsolute<'static>),
+    /// win=0 的一个顶层放置：按 `(段号, 放置序)` 缓存。
+    Z0((u32, u32)),
+}
+
+/// **本帧要提交的一个单元**（窗口 / win=0 顶层放置），计划按值持有。
+///
+/// 生命周期：`collect_units` 建它（命中 = 从缓存 `remove` 出来；未命中 = 现场建）→
+/// `finish` 按 `(win, place)` 排序并把每个计划**借给** `flush_seg` 提交 →
+/// 提交完按 `slot` 把计划 move 回缓存。全程**没有一次顶点拷贝**。
+///
+/// 住 `UiState::scratch_units`（跨帧复用容量），所以是 crate 内公开类型。
+#[derive(Debug, Clone)]
+pub(crate) struct SubmitUnit {
+    /// 所属窗口 z（非窗口 = 0）。
+    pub(crate) win: u32,
+    /// win=0 的顶层放置序（窗口恒 0）；排序键的第二位。
+    pub(crate) place: u32,
+    /// 本单元的内容签名（回填缓存用；不缓存的单元为 0）。
+    pub(crate) sig: u64,
+    /// 计划提交完放回哪里（`None` = 不进缓存，如 `debug_layout` 帧）。
+    pub(crate) slot: Option<CacheSlot>,
+    /// 本单元按提交序合并好的批次计划。
+    pub(crate) plans: Vec<BatchPlan>,
+}
+
 /// 一个合批段（= 一个 [`crate::UiBatch`] = 一次 draw call 的候选）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SegRun {

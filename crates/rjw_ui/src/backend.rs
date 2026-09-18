@@ -54,14 +54,19 @@ pub type Tri = [u16; 3];
 /// 顶点已是**最终屏幕物理像素坐标**；`transform` / `tint` 保留为**实例级**数据，
 /// 使窗口 FX 动画不需要重建顶点缓冲（见模块文档）。
 ///
+/// ⚠ **顶点 / 索引是借来的切片**（阶段 9 起）：几何住在 `rjw_ui` 的提交计划缓存里，
+/// 提交期只借用一次——**不再"克隆一份再交给后端"**（那是 `finish` 里最大的一笔
+/// memcpy）。后端必须在 `submit` 调用期间消费完（真后端就是拷进自己的暂存缓冲，
+/// 那一步是渲染器的账，见 `docs/UI_ARCHITECTURE.md` 的拷贝链 C3）。
+///
 /// 注：未派生 `Debug`（`TextureWrapped` / `wgpu::Texture` 不实现 `Debug`）；
 /// 调试请读 `vertices.len()` / `layer` / `source` 等字段。
 #[derive(Clone)]
-pub struct UiBatch {
+pub struct UiBatch<'a> {
     /// 所在页纹理（`Arc` 共享；UI 不关心它来自字形图集还是程序化图集）。
     pub texture: Arc<TextureWrapped>,
     /// 顶点数据（屏幕物理像素）。
-    pub vertices: Vec<VertexP3U2C4>,
+    pub vertices: &'a [VertexP3U2C4],
     /// 三角形索引（相对 `vertices`；`u16` ⇒ 单段顶点数必须 ≤ 65535）。
     ///
     /// **非空**：UI 全程直出三角形（圆角 + 羽化由 CPU 镶嵌产生，见
@@ -70,7 +75,7 @@ pub struct UiBatch {
     /// 兼容：允许为空——此时后端应把顶点按「每 4 个一组、顺序 TL,TR,BL,BR」的
     /// 旧四边形约定补出索引（`rjw_krusie` 的桥接后端即如此回退），使外部
     /// `UiBackend` 实现者仍可只产出顶点。
-    pub indices: Vec<Tri>,
+    pub indices: &'a [Tri],
     /// 实例变换（屏幕固定 + 窗口 FX 组合后的结果）。
     pub transform: Transform2D,
     /// 实例颜色（窗口 FX tint；批内顶点色已含控件自身 tint，这里是**整段**染色）。
@@ -114,7 +119,25 @@ pub trait UiBackend {
     fn texture(&self, uid: u64) -> Option<Arc<TextureWrapped>>;
 
     /// 提交一个批次。**调用顺序即绘制顺序**，后端不得重排。
-    fn submit(&mut self, batch: UiBatch);
+    ///
+    /// `batch` **借用**顶点 / 索引切片（见 [`UiBatch`]）：实现必须在本次调用内消费完
+    /// （拷进自己的缓冲 / 命令队列），不要试图把它存起来跨帧用。
+    fn submit(&mut self, batch: UiBatch<'_>);
+}
+
+/// **记录型后端**的批次快照（**拥有**顶点，供测试跨帧断言）。
+///
+/// 独立于 [`UiBatch`]（后者是借用的）是必要的：记录器要把它存进 `Vec` 留到断言时用。
+#[derive(Clone)]
+pub struct RecordedBatch {
+    pub texture: Arc<TextureWrapped>,
+    pub vertices: Vec<VertexP3U2C4>,
+    pub indices: Vec<Tri>,
+    pub transform: Transform2D,
+    pub tint: Color,
+    pub layer: f64,
+    pub clip: Option<Rect>,
+    pub source: UiBatchSource,
 }
 
 /// 记录型后端（**纯 CPU，无需 GPU**）：把批次收集进 `Vec`，供测试断言
@@ -123,8 +146,8 @@ pub trait UiBackend {
 /// 这是把「尽量减少 DrawCall」从口头承诺变成**可回归断言**的机制。
 #[derive(Default)]
 pub struct RecordingBackend {
-    /// 已提交的批次（顺序 = 绘制顺序）。
-    pub batches: Vec<UiBatch>,
+    /// 已提交的批次快照（顺序 = 绘制顺序；顶点是**拷贝**，见 [`RecordedBatch`]）。
+    pub batches: Vec<RecordedBatch>,
     /// 纹理 uid → 纹理 的预置映射（测试注入；无 GPU 时可为空）。
     pub textures: std::collections::HashMap<u64, Arc<TextureWrapped>>,
 }
@@ -172,7 +195,17 @@ impl UiBackend for RecordingBackend {
         self.textures.get(&uid).cloned()
     }
 
-    fn submit(&mut self, batch: UiBatch) {
-        self.batches.push(batch);
+    fn submit(&mut self, batch: UiBatch<'_>) {
+        // 借用 → 拥有：记录器要留到断言时用，所以这里**必须拷一份**（测试路径，代价无关）。
+        self.batches.push(RecordedBatch {
+            texture: batch.texture,
+            vertices: batch.vertices.to_vec(),
+            indices: batch.indices.to_vec(),
+            transform: batch.transform,
+            tint: batch.tint,
+            layer: batch.layer,
+            clip: batch.clip,
+            source: batch.source,
+        });
     }
 }

@@ -43,22 +43,26 @@ impl UiBackend for Render2dUiBackend<'_> {
         self.r2d.textures().get(uid)
     }
 
-    fn submit(&mut self, batch: UiBatch) {
+    fn submit(&mut self, batch: UiBatch<'_>) {
         // 一个批次 = 一个实例 = 一次 `mesh_indexed(..)` 提交（`Render2D` 内按
-        // (layer, rstates, tex, transform) 继续合批；UI 层已关闭排序，保持提交顺序）。
+        // (layer, rstates, tex, transform, scissor) 继续合批；UI 层已关闭排序，
+        // 保持提交顺序）。
+        //
+        // ⚠ `UiBatch` 的顶点/索引是**借用**的（阶段 9 起）——`mesh_indexed` 会把它们
+        // 拷进 `MeshStorage`（渲染器的账，见 `docs/UI_ARCHITECTURE.md` 的拷贝链 C3）。
         let fallback: Vec<Tri>;
         let indices: &[Tri] = if batch.indices.is_empty() {
             fallback = quad_indices(batch.vertices.len());
             &fallback
         } else {
-            &batch.indices
+            batch.indices
         };
         if indices.is_empty() {
             return;
         }
         let mut b = self
             .r2d
-            .mesh_indexed(&batch.vertices, indices, &batch.texture)
+            .mesh_indexed(batch.vertices, indices, &batch.texture)
             .transform(batch.transform)
             .layer(Layer::from(batch.layer));
         // **批次 scissor**：UI 的窗口内容 / 滚动可视区 / Clip 沙箱裁剪。

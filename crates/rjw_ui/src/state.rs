@@ -121,11 +121,15 @@ pub struct UiStats {
     pub sig_us: f64,
     /// 缓存未命中 → 顶点重建（collect_cmds）耗时（µs）。
     pub collect_us: f64,
-    /// 缓存命中 → 提交列表组装（顶点克隆）耗时（µs）。
+    /// 缓存命中 → 提交列表组装（**顶点克隆**）耗时（µs）。
+    ///
+    /// ⚠ **阶段 9 起恒为 0**：命中路径改成"把缓存的**提交计划** move 出来 → 借用提交 →
+    /// move 回去"，不再逐条克隆几何。保留这个字段是**回归哨兵**（一旦它不为 0，就说明
+    /// 又有人在命中路径上拷贝了顶点）。
     pub clone_us: f64,
-    /// 提交（ordered 排序 + quads）耗时（µs）= [`Self::submit_asm_us`] + [`Self::submit_flush_us`]。
+    /// 提交耗时（µs）= [`Self::submit_asm_us`] + [`Self::submit_flush_us`]。
     pub submit_us: f64,
-    /// **提交·装配**（`submit_quads` 前半：`ordered` 组装 + 排序 + 切段 + 段内顶点拼接）耗时（µs）。
+    /// **提交·装配**（收集单元 + 合并计划 + 单元排序，扣掉单列的 `sig` / `collect`）耗时（µs）。
     ///
     /// 这一半是 `rjw_ui` **自己**的账（纯 CPU 顶点搬运），与后半（交后端）分开，
     /// 才能回答"这 0.3ms 该算 UI 还是算渲染器"。
@@ -379,8 +383,13 @@ pub struct UiState {
     /// 若只看当前帧候选会误判为"非组合"而执行本地退格（误删已有文本）。
     /// 组合中或刚结束的帧，退格/删除/方向键一律交给 IME 系统处理。
     pub(crate) ime_composing: bool,
-    /// **窗口几何缓存**：窗口 **绝对 ID** → (内容签名, 按 **(元素序, 组, 纹理)** 分组的**局部几何**)。
-    /// 组：`0` = 图形（白纹理 / 圆角 / 渐变 / 边框）、`1` = 文字（字形图集）。
+    /// **窗口几何缓存**：窗口 **绝对 ID** → (内容签名, **提交计划**列表)。
+    ///
+    /// 计划 = 该窗内按提交序**合并好**的 `(纹理, 裁剪, 几何, 元素序)` 段（见
+    /// [`crate::gpu_batch::BatchPlan`]）——**合并结果本身跨帧缓存**：命中的帧直接把这些
+    /// 段交给后端（`UiBatch` 借用切片，**零顶点拷贝**），不必"克隆碎片 → 每帧重新合并"
+    /// （那正是阶段 9 之前 `clone_us + asm_us ≈ 0.3ms` 的来源）。
+    ///
     /// 窗口内容不变时复用（`finish` 按**全量签名**命中），**移动窗口只改变换、顶点不重建**；
     /// 任何内容变化（hover 变色、点击按下、文字编辑、滚动等）都会使签名变化而自动重建。
     ///
@@ -393,9 +402,9 @@ pub struct UiState {
     /// （"陈旧文字" / "背景消失"），而命令内容不变 ⇒ 只靠命令哈希永不失效。
     /// 见 [`crate::ui::geom_cache_sig`](crate::ui) 与 `crate::Ui` 的 `hash_cmds`。
     pub(crate) window_quads:
-        HashMap<IdAbsolute<'static>, (u64, Vec<(u32, u8, u64, Option<Rect>, crate::gpu_batch::Geom)>)>,
-    /// **非窗口（win=0）内容的按放置几何缓存**：`(段号, 放置序)` → (内容签名, 局部几何)。
-    /// 分组与缓存机制同 `window_quads`（**全量签名** → 命中复用 / 未命中重建），但针对
+        HashMap<IdAbsolute<'static>, (u64, Vec<crate::gpu_batch::BatchPlan>)>,
+    /// **非窗口（win=0）内容的按放置几何缓存**：`(段号, 放置序)` → (内容签名, 提交计划)。
+    /// 机制同 `window_quads`（**全量签名** → 命中复用 / 未命中重建），但针对
     /// **顶层非窗口放置**（pack / flex / scroll / list / drag_panel / container，以及
     /// 两段放置之间的散装顶层命令各成一段）。值/交互变化只重建对应放置，其余 win=0
     /// 放置仍命中复用（缓解"任何 win=0 变化 → 整区重建"）。
@@ -411,7 +420,7 @@ pub struct UiState {
     /// 键跟着变 ⇒ 直接判 miss 重建。反过来若把 `place` 当成缓存条目里的陈旧字段，
     /// 就会出现"命中一个序已过期的条目"⇒ **绘制序错一帧**（闪烁）。
     pub(crate) z0_quads:
-        HashMap<(u32, u32), (u64, Vec<(u32, u8, u64, Option<Rect>, crate::gpu_batch::Geom)>)>,
+        HashMap<(u32, u32), (u64, Vec<crate::gpu_batch::BatchPlan>)>,
     /// **圆角镶嵌缓存**：单位四分之一圆弧表（一张表服务所有半径）。
     ///
     /// 住这里而不是 `Ui`：`Ui` 每帧由 `begin` 重建，放它里面等于每帧重建表。
@@ -442,14 +451,14 @@ pub struct UiState {
     /// Ui 每帧由 egin 重建，帧内诊断（Ui::debug_dump）常在本帧**录制期**调用，
     /// 故放在跨帧状态里；与 win_origins 对照即可判定"引擎状态 vs 视觉"是否一致。
     pub(crate) debug_submit: HashMap<u32, Vec2>,
-    /// **提交期 scratch 缓冲**（②：每帧复用，免每帧新建 `Vec`/`BTreeSet`）。
+    /// **提交期 scratch 缓冲**（每帧复用，免每帧新建 `Vec`）。
     ///
-    /// - `scratch_ordered`：`submit_quads` 的"本帧待提交几何段"列表；
-    /// - `scratch_elems`：每个段收集元素序的 `BTreeSet`（段间 `clear()` 复用）。
+    /// - `scratch_units`：本帧的**提交单元**列表（窗口 / win=0 顶层放置，计划按值持有）；
+    /// - `scratch_ordered`：`merge_plans` 合并一个单元时的"待切段条目"列表。
     ///
     /// 住 `UiState`（跨帧）而不是 `Ui`（每帧重建）才有意义——否则等于每帧新建。
+    pub(crate) scratch_units: Vec<crate::gpu_batch::SubmitUnit>,
     pub(crate) scratch_ordered: Vec<crate::gpu_batch::CachedQuad>,
-    pub(crate) scratch_elems: std::collections::BTreeSet<u32>,
     /// **窗口 z → 最近一次提交的批次 scissor**（[`crate::UiBatch::clip`]；`flush_seg` 写）。
     /// 与 `debug_submit` 同源，回答"这一窗的裁剪到底是多少"。
     pub(crate) debug_clip: HashMap<u32, Rect>,

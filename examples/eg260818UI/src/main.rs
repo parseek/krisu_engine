@@ -1595,6 +1595,10 @@ struct PerfAgg {
     segs: u64,
     verts: u64,
     tris: u64,
+    /// 本帧**真实 draw op 数**（`Render2D::draw_op_count()`，`prepare` 之后可查）。
+    /// 与 `segs`（`UiBatch` 数 = 批次候选数）配对照：阶段 9 起提交计划按单元缓存，
+    /// `segs` 会略涨，但相邻同状态批次在 `Render2D` 里合成一个动态段 ⇒ `draw_ops` 不涨。
+    draw_ops: u64,
 }
 
 /// 每多少帧打印一次 [perf] 统计（165Hz 下约 0.7 秒一次）。
@@ -1628,6 +1632,7 @@ impl PerfAgg {
             segs: 0,
             verts: 0,
             tris: 0,
+            draw_ops: 0,
         }
     }
 
@@ -1686,7 +1691,7 @@ impl PerfAgg {
                submit={:.1}us(asm={:.1} flush={:.1}) \
              | render: total={:.2}ms begin={:.1}us encode={:.1}us submit={:.1}us present={:.1}us \
              | cmds={:.0} wins={:.0} cache_hit={:.1} cache_miss={:.1} clip_batches={:.0} \
-             segs={:.0} verts={:.0} tris={:.0}",
+             segs={:.0} draw_ops={:.0} verts={:.0} tris={:.0}",
             self.frame_us / n / 1000.0,
             self.sort_us / n,
             self.sig_us / n,
@@ -1706,6 +1711,7 @@ impl PerfAgg {
             self.misses as f64 / n,
             self.clip_batches as f64 / n,
             self.segs as f64 / n,
+            self.draw_ops as f64 / n,
             self.verts as f64 / n,
             self.tris as f64 / n,
         );
@@ -3446,6 +3452,12 @@ impl App for UiApp {
             Clear::color(Color::rgb(0.09, 0.11, 0.16)),
         );
         let submit_us = t_sub.elapsed().as_secs_f64() * 1e6;
+        // **UI 层的真实 draw op 数**（`Render2D::prepare` 之后可查；UI 有自己的
+        // `Render2D`，见 `Frame::draw_ui`）：与 UI 自己的 `[perf] segs=`（**批次候选数**
+        // = `UiBatch` 数）是**两个口径**——阶段 9 之后提交计划按单元缓存，`segs` 会略涨，
+        // 但相邻同状态批次会被 `Render2D` 合成一个动态段，所以 `draw_ops` 才是
+        // "UI 这一帧真的发了几次 draw"。⚠ 别读 `f.draw()`（那是**世界层**）。
+        let draw_ops = f.draw_ui().draw_op_count() as u64;
         let t_present = Instant::now();
         f.present();
         let present_us = t_present.elapsed().as_secs_f64() * 1e6;
@@ -3453,8 +3465,16 @@ impl App for UiApp {
         // 性能统计：整帧 / 渲染（细分）/ UI 各阶段（每 PERF_PRINT_EVERY 帧打印一次）
         let render_us = begin_us + encode_us + submit_us + present_us;
         let frame_us = t_frame.elapsed().as_secs_f64() * 1e6;
-        self.perf
-            .add(&ui_stats, frame_us, render_us, begin_us, encode_us, submit_us, present_us);
+        self.perf.add(
+            &ui_stats,
+            frame_us,
+            render_us,
+            begin_us,
+            encode_us,
+            submit_us,
+            present_us,
+        );
+        self.perf.draw_ops += draw_ops;
         if self.perf.frames >= PERF_PRINT_EVERY {
             self.perf.flush(fps);
         }
