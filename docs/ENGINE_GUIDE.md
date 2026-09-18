@@ -2031,6 +2031,51 @@ painter/debug.rs    // debug_line / debug_rect_outline / … （进 debug_queue�
 `cmds=380 wins=7 cache_hit=13 cache_miss=0`，与迁移前的 HEAD 构建逐位一致），外加全部
 `--sim-*` 判定行不变、`cargo test -p rjw_ui` 全绿。
 
+### 18.20 环境裁剪：batch scissor（不再切割几何）
+
+**动机**：环境裁剪层（严格窗口内容 / 固定高窗口 / ScrollView 可视区 / Clip 沙箱 /
+文本框盒）原本在 `collect_cmds` 里**逐命令与几何求交**（`draw::clipped`）。代价与副作用：
+
+- **圆角被切平**：`RoundedRect` / 圆角环带被切成直角（历史 bug："窗口拖到视口边缘时整个
+  边框瞬间变方"就是这条）；
+- **投影要特例**：部分可见时"内轮廓"会错位成暗带 ⇒ 只能整块跳过（`fully_visible`）；
+- 每命令一次矩形求交 + 渐变重采样（`resample_gradient_local`）。
+
+现在：**几何保持原形，越界像素交给 GPU scissor**（`glScissor` 语义）。
+
+```
+UiDraw.clip（绝对屏幕坐标）
+  → QuadCollector 分组键（win, elem, group, tex, clip_key=量化 i32 四元组）
+  → CachedQuad / SegRun.clip
+  → batch_scissor(clip, anchor, tf)   // view.rs：减窗口原点再经批次变换（保守 AABB）
+  → UiBatch.clip                       // rjw_ui → 后端的公开字段
+  → 桥接：Draw2D::scissor(rect)        // rjw_krusie/runtime/layers/ui_backend.rs
+  → Render2D 逐 DrawOp set_scissor_rect（最终 = 命令级 ∩ 画面级 ∩ 目标矩形）
+```
+
+- **切段规则**：`(win, tex, clip)` 任一不同即切段（一次 `draw_indexed` 只能一个 scissor）
+  ——`gpu_batch::batch_contract_tests::clip_change_splits_the_run` 钉住；
+- **空 scissor ⇒ 丢 op**（不是退化成"不裁剪"）：`prepare` 跳组、`scissor_px` 返回 `None`；
+- **签名**：`cmd_sig_hash` 现在**哈希 `d.clip`**（量化）——旧实现不哈希它，裁剪变了而命令
+  内容相同时窗口顶点缓存会命中旧分组（"裁剪不生效"的陈旧几何）；
+- **窗口 FX**：`batch_scissor` 把裁剪区经批次变换映射（纯平移 ⇒ 逐位相等；缩放 ⇒ 跟着缩；
+  旋转 ⇒ 保守 AABB，宁可多画一点绝不误裁）；
+- **文本软裁剪仍是 CPU**（`DrawKind::Text::clip`）：它是排版/省略语义，不是像素裁剪。
+
+**可观测证据**：
+
+| 通道 | 看什么 |
+|---|---|
+| `[perf] ... clip_batches=N` | 本帧带 scissor 的批次数（远大于窗口数 ⇒ 裁剪区太碎，每个不同 scissor 都多一次 draw） |
+| `--ui-dump` 的 `clip=` | 每窗**最后一批**的 scissor（`None` = 不裁） |
+| `--sim-clip` | 严格窗口的 scissor == 它的内容区（`origin` + `size`）且 `clip_batches > 0` |
+| 渲染器单测 | `scissor_px`（取整/钳制/全外 ⇒ 跳过）、`rect_intersect`（命令级 ∩ 画面级） |
+
+⚠ **代价**：裁剪区越多，draw call 越多（每个不同 scissor 至少要一段）。演示场景实测
+`clip_batches=11`（1 个严格窗口 + 若干文本框盒 + 滚动可视区），`cmds/wins/cache_*` 与
+改动前逐位一致——即"裁剪改道"没有带来额外几何重建。若某天 `clip_batches` 暴涨，先看
+是不是每个控件都给自己套了一层裁剪（`painter_clipped` 用得太碎）。
+
 ### 18.19 Widget 协议：**尺寸在 `ui()` 里就地申请**（v0.3）
 
 **动机**：旧协议要写两个方法（`fn size(&self, ui)` + `fn ui(self, ui, rect)`），于是

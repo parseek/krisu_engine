@@ -1150,6 +1150,9 @@ struct UiApp {
     /// --sim-shadow：**脚本化改投影颜色**（第 30 帧换成红色），打印主题里的
     /// `panel.shadow.color` 证明"色块 → ShadowStyle → 主题"这条线是通的。
     sim_shadow: bool,
+    /// --sim-clip：**环境裁剪走 batch scissor**（不是逐命令切割几何）。
+    /// 第 30 / 90 帧打印 `clip_batches` + 严格窗口 / 普通窗口的 `clip`（`--ui-dump` 同源）。
+    sim_clip: bool,
     /// --sim-shadow：第 20 帧的主题投影色（第 40 帧对比用）。
     shadow_probe: Option<Color>,
     /// --sim-tuner：脚本化鼠标的两个目标点（**录制时运行时解算**）：
@@ -1462,6 +1465,7 @@ impl UiApp {
             sim_chrome: false,
             sim_weight: false,
             sim_shadow: false,
+            sim_clip: false,
             shadow_probe: None,
             sim_tuner_pts: None,
             tuner_probe: None,
@@ -1544,6 +1548,10 @@ struct PerfAgg {
     wins: u64,
     hits: u64,
     misses: u64,
+    /// 本帧带 scissor 的批次数（环境裁剪：严格窗口 / 滚动可视区 / Clip 沙箱 / 文本框盒）。
+    /// 诊断用：它 = 0 而界面里明明有 Clip 沙箱 ⇒ 裁剪没接上；远大于窗口数 ⇒ 裁剪区太碎
+    /// （每个不同 scissor 单独一次 draw，见 `docs/ENGINE_GUIDE.md` §18.20）。
+    clip_batches: u64,
 }
 
 /// 每多少帧打印一次 [perf] 统计（165Hz 下约 0.7 秒一次）。
@@ -1571,6 +1579,7 @@ impl PerfAgg {
             wins: 0,
             hits: 0,
             misses: 0,
+            clip_batches: 0,
         }
     }
 
@@ -1605,6 +1614,7 @@ impl PerfAgg {
         self.wins += s.win_count as u64;
         self.hits += s.cache_hits as u64;
         self.misses += s.cache_misses as u64;
+        self.clip_batches += s.clip_batches as u64;
     }
 
     /// 打印近 N 帧均值（ms / µs）后清零。
@@ -1621,7 +1631,7 @@ impl PerfAgg {
              record={record_ms:.2} finish={finish_ms:.2}) \
              | ui: sort={:.1}us sig={:.1}us collect={:.1}us clone={:.1}us submit={:.1}us \
              | render: total={:.2}ms begin={:.1}us encode={:.1}us submit={:.1}us present={:.1}us \
-             | cmds={:.0} wins={:.0} cache_hit={:.0} cache_miss={:.0}",
+             | cmds={:.0} wins={:.0} cache_hit={:.0} cache_miss={:.0} clip_batches={:.0}",
             self.frame_us / n / 1000.0,
             self.sort_us / n,
             self.sig_us / n,
@@ -1637,6 +1647,7 @@ impl PerfAgg {
             self.wins as f64 / n,
             self.hits as f64 / n,
             self.misses as f64 / n,
+            self.clip_batches as f64 / n,
         );
         *self = Self::new();
     }
@@ -2406,6 +2417,38 @@ impl App for UiApp {
             // 且段 2 那份还应包含段 1 录的窗口（帧级暂存跨段共享）。
             if ui_dump {
                 eprintln!("[段 1] {}", ui.debug_dump());
+            }
+            // ── `--sim-clip`（放在**窗口都录完**之后：`debug_dump` 只看本帧已录窗口）──
+            // 环境裁剪走 batch scissor（严格窗口 / Clip 沙箱），而不是逐命令切割几何。
+            // 判定口径（第 30 / 90 帧）：
+            // ① `stats.clip_batches > 0`：本帧确实提交了带 scissor 的批次；
+            // ② `strict_win` 的 `clip` 有值，且 = 该窗口内容区（原点 + 结算尺寸）——
+            //    矩形错了 scissor 就裁错地方。
+            // ⚠ 不做"普通窗必须无裁剪"的断言：任何窗口里的**文本框盒裁剪**都是一个
+            // legit 的 scissor（`win_b` 实测就有一个 210×90 的输入框裁剪），
+            // `debug_clip` 记的是该窗**最后一批**的 scissor。
+            if self.sim_clip && (sim_frame == 30 || sim_frame == 90) {
+                let dump = ui.debug_dump();
+                let strict = dump.windows.iter().find(|w| w.id.ends_with("strict_win"));
+                let strict_clip = strict.and_then(|w| w.clip);
+                let clip_batches = ui.state().stats.clip_batches;
+                let ok_rect = strict.map(|w| (w.origin, w.size)).is_some_and(|(o, s)| {
+                    strict_clip.is_some_and(|c| {
+                        (c.x - o.x).abs() <= 1.0
+                            && (c.y - o.y).abs() <= 1.0
+                            && (c.w - s.x).abs() <= 2.0
+                    })
+                });
+                let ok = clip_batches > 0 && ok_rect;
+                eprintln!(
+                    "sim-clip: 帧={sim_frame} clip_batches={clip_batches} 严格窗 clip={strict_clip:?}（内容区={:?}） {}",
+                    strict.map(|w| (w.origin, w.size)),
+                    if ok {
+                        "[OK] 环境裁剪进了批次 scissor（严格窗口的 scissor = 其内容区）"
+                    } else {
+                        "[FAIL] 裁剪没进 scissor 或矩形不对"
+                    }
+                );
             }
             // 段收尾：提交本段到 UI 层自己的 `Render2D`；`f` 的借用到此结束。
             ui.finish();
@@ -3299,6 +3342,7 @@ fn main() -> Result<(), RunError> {
     app.sim_chrome = args.iter().any(|a| a == "--sim-chrome");
     app.sim_weight = args.iter().any(|a| a == "--sim-weight");
     app.sim_shadow = args.iter().any(|a| a == "--sim-shadow");
+    app.sim_clip = args.iter().any(|a| a == "--sim-clip");
     app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
     app.sim_import = parse_str_arg(&args, "--sim-import");
     app.theme_file = parse_str_arg(&args, "--theme");

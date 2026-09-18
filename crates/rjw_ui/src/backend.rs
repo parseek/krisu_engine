@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use rjw_color::Color;
 use rjw_render::TextureWrapped;
-use rjw_transform::Transform2D;
+use rjw_transform::{Rect, Transform2D};
 
 pub use rjw_2d_render::VertexP3U2C4;
 
@@ -77,6 +77,16 @@ pub struct UiBatch {
     pub tint: Color,
     /// 排序层级（由 UI 决定，后端**不得**重排批次顺序）。
     pub layer: f64,
+    /// **本批次的 scissor**（**目标空间的屏幕物理像素**、左上原点；`None` = 不裁剪）。
+    ///
+    /// 语义 = "这一批的绘制只允许落在这个矩形内"（轴对齐、**不做圆角**）。UI 的窗口
+    /// 内容裁剪 / 滚动可视区 / Clip 沙箱 / 文本框盒裁剪都走它——**几何本身不再被切割**
+    /// （圆角、环带、投影保持原形，只被裁掉越界像素）。
+    ///
+    /// 后端应把它交给渲染器的**命令级 scissor**（`rjw_krusie` 的桥接 = `Draw2D::scissor`），
+    /// 由渲染器负责钳制到目标尺寸；空矩形应**跳过该批次**（不是"不裁剪"）。
+    /// `None` 表示"只受画面级 scissor 约束"。
+    pub clip: Option<Rect>,
     /// 批次来源（实例用户数据）。
     pub source: UiBatchSource,
 }
@@ -142,6 +152,18 @@ impl RecordingBackend {
     #[inline]
     pub fn total_triangles(&self) -> usize {
         self.batches.iter().map(|b| b.indices.len()).sum()
+    }
+
+    /// 本帧**带 scissor 的批次**数量（诊断 / 断言"窗口内容真的走了裁剪"）。
+    #[inline]
+    pub fn clipped_batches(&self) -> usize {
+        self.batches.iter().filter(|b| b.clip.is_some()).count()
+    }
+
+    /// 本帧各批次的 scissor（顺序 = 绘制顺序；`None` = 不裁剪）。
+    #[inline]
+    pub fn clips(&self) -> Vec<Option<Rect>> {
+        self.batches.iter().map(|b| b.clip).collect()
     }
 }
 

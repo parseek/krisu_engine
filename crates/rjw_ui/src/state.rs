@@ -101,6 +101,11 @@ pub struct UiStats {
     pub cmd_count: u32,
     /// 本帧提交的窗口数（win > 0）。
     pub win_count: u32,
+    /// 本帧**带 scissor 的批次数**（环境裁剪：严格窗口 / 滚动可视区 / Clip 沙箱 /
+    /// 文本框盒）。诊断用：它为 0 而界面里明明有 Clip 沙箱 ⇒ 裁剪没接上；
+    /// 它远大于窗口数 ⇒ 裁剪区太碎（每个不同 scissor 都要单独一次 draw，见
+    /// [`crate::UiBatch::clip`]）。
+    pub clip_batches: u32,
     /// 窗口顶点缓存命中 / 未命中次数。
     pub cache_hits: u32,
     pub cache_misses: u32,
@@ -374,7 +379,7 @@ pub struct UiState {
     /// （"陈旧文字" / "背景消失"），而命令内容不变 ⇒ 只靠命令哈希永不失效。
     /// 见 [`crate::ui::geom_cache_sig`](crate::ui) 与 `crate::Ui` 的 `hash_cmds`。
     pub(crate) window_quads:
-        HashMap<IdAbsolute<'static>, (u64, Vec<(u32, u8, u64, crate::gpu_batch::Geom)>)>,
+        HashMap<IdAbsolute<'static>, (u64, Vec<(u32, u8, u64, Option<Rect>, crate::gpu_batch::Geom)>)>,
     /// **非窗口（win=0）内容的按放置子槽几何缓存**：放置子槽组号 → (内容签名, 局部几何)。
     /// 分组与缓存机制同 `window_quads`（**全量签名** → 命中复用 / 未命中重建），但针对
     /// **顶层非窗口放置**（pack / flex / scroll / list / drag_panel / container 等，
@@ -387,7 +392,7 @@ pub struct UiState {
     /// 判 miss…… 两个槽**永远命中不了**，每帧各自重镶嵌一遍（实测 7 个 win=0 槽每帧
     /// 全量重建 ≈ 0.6ms，`cache_miss` 恒等于槽数）。加段前缀后同帧各段互不干扰。
     pub(crate) z0_quads:
-        HashMap<(u32, u32), (u64, Vec<(u32, u8, u64, crate::gpu_batch::Geom)>)>,
+        HashMap<(u32, u32), (u64, Vec<(u32, u8, u64, Option<Rect>, crate::gpu_batch::Geom)>)>,
     /// **圆角镶嵌缓存**：单位四分之一圆弧表（一张表服务所有半径）。
     ///
     /// 住这里而不是 `Ui`：`Ui` 每帧由 `begin` 重建，放它里面等于每帧重建表。
@@ -418,6 +423,9 @@ pub struct UiState {
     /// Ui 每帧由 egin 重建，帧内诊断（Ui::debug_dump）常在本帧**录制期**调用，
     /// 故放在跨帧状态里；与 win_origins 对照即可判定"引擎状态 vs 视觉"是否一致。
     pub(crate) debug_submit: HashMap<u32, Vec2>,
+    /// **诊断**：窗口 z → 最近一次提交的**批次 scissor**（[`crate::UiBatch::clip`]；
+    /// `flush_seg` 写）。与 `debug_submit` 同源，回答"这一窗的裁剪到底是多少"。
+    pub(crate) debug_clip: HashMap<u32, Rect>,
     /// **滚动容器状态**：`scroll_at` 的 **绝对 ID** → (偏移, 内容高)，跨帧持久。
     pub(crate) scrolls: HashMap<IdAbsolute<'static>, ScrollState>,
     /// **下拉菜单展开状态**：当前展开的 [`Dropdown`](crate::Dropdown)（或

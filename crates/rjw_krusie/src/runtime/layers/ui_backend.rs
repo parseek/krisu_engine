@@ -1,8 +1,8 @@
 //! **UI 后端桥接**：把 `rjw_ui::UiBackend` 接到 `rjw_2d_render::Render2D`。
 //!
-//! `rjw_ui` 只输出 [`UiBatch`]（纹理 + 顶点 + 索引 + 实例变换 + 实例数据），本模块是
-//! **唯一**知道「批次要变成 `Render2D::mesh_indexed(..)` 调用」的地方。
-//! 放在 `rjw_krusie` 是因为它同时依赖二者——`rjw_ui` 不反向依赖渲染器。
+//! `rjw_ui` 只输出 [`UiBatch`]（纹理 + 顶点 + 索引 + 实例变换 + 实例数据 + **批次
+//! scissor**），本模块是**唯一**知道「批次要变成 `Render2D::mesh_indexed(..)` 调用」的
+//! 地方。放在 `rjw_krusie` 是因为它同时依赖二者——`rjw_ui` 不反向依赖渲染器。
 
 use std::sync::Arc;
 
@@ -61,6 +61,15 @@ impl UiBackend for Render2dUiBackend<'_> {
             .mesh_indexed(&batch.vertices, indices, &batch.texture)
             .transform(batch.transform)
             .layer(Layer::from(batch.layer));
+        // **批次 scissor**：UI 的窗口内容 / 滚动可视区 / Clip 沙箱裁剪。
+        //
+        // 语义 = "这一批只能画在这个屏幕矩形内"（渲染器负责钳到目标；空矩形 ⇒ 丢 draw）。
+        // 这是"环境裁剪不再切割几何"的落点：顶点保持原形（圆角、环带、投影都不被切平），
+        // 越界像素由 scissor 裁掉。`Render2D` 自带画面级 scissor，两者**叠加**
+        // （最终 = 命令级 ∩ 画面级 ∩ 目标矩形）。
+        if let Some(clip) = batch.clip {
+            b = b.scissor(clip);
+        }
         // **仅在窗口 FX tint 生效时**才把 tint 抬到实例上。
         //
         // `mesh_indexed` 是 `ColorMode::Instance` ⇒ `tint` = 整段实例色（顶点色 × tint）。

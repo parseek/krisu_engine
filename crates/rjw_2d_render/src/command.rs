@@ -61,6 +61,30 @@ pub(crate) enum DrawCommand {
     Custom { idx: usize },
 }
 
+/// **绘制命令的整数像素裁剪键**（比较 / 排序用；`Rect` 是 f32，不能直接做 `Ord` 键）。
+///
+/// 取整规则：**四舍五入**到最近像素（最终 `set_scissor_rect` 也按像素取整；
+/// 顶点本身已是物理像素整数，所以不存在"少裁一条边"的问题）。
+#[inline]
+pub(crate) fn clip_px(rect: Rect) -> (i32, i32, i32, i32) {
+    let r = rect.normalized();
+    (
+        r.x.round() as i32,
+        r.y.round() as i32,
+        r.w.round() as i32,
+        r.h.round() as i32,
+    )
+}
+
+/// 裁剪矩形是否为空（`w/h <= 0`，或含 NaN/∞）——空 ⇒ 该 draw **整条跳过**。
+#[inline]
+pub(crate) fn clip_is_empty(rect: Rect) -> bool {
+    let r = rect.normalized();
+    let has_area = r.w > 0.0 && r.h > 0.0;
+    let finite = r.x.is_finite() && r.y.is_finite() && r.w.is_finite() && r.h.is_finite();
+    !(has_area && finite)
+}
+
 /// 层级：数值越小越先绘制（越靠后）
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Layer(ordered_float::OrderedFloat<f64>);
@@ -103,12 +127,18 @@ impl Layer {
     }
 }
 
-/// 渲染状态（Pipeline + 绑定组），不拥有所有权。
-/// 实现排序 trait，相邻相同状态可合批。
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// 渲染状态（Pipeline + 绑定组 + 命令级 scissor），不拥有所有权。
+/// 相邻相同状态（含 scissor）才合批。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub(crate) struct States {
     pub(crate) rstates: Option<RStates>,
     pub(crate) texture_uid: Option<u64>,
+    /// **命令级 scissor**（屏幕 / 目标像素、左上原点；[`crate::Draw2D::scissor`]）；
+    /// `None` = 继承画面级（[`Render2D::scissor`](crate::Render2D::scissor)）。
+    ///
+    /// 只参与"相邻同状态才合批"的比较（**不参与排序**：公开的
+    /// [`SortKey`](crate::SortKey) 里没有它，加字段会破坏外部结构体字面量）。
+    pub(crate) scissor: Option<Rect>,
 }
 
 /// 绘制命令队列：命令 + 层级 + 状态（三条并行数组 + 索引数组）。
@@ -236,8 +266,21 @@ mod queue_tests {
                 transform: Transform2D::IDENTITY,
             },
             Layer::from(0.0),
-            States { rstates, texture_uid: None },
+            States { rstates, texture_uid: None, scissor: None },
         );
+    }
+
+    /// **命令级 scissor：整数像素键**（比较用；`Rect` 是 f32 不能直接做排序键）。
+    ///
+    /// 空矩形（`w/h <= 0`，含 NaN）⇒ 调用方据此**跳过该 draw**（而不是退化成"不裁剪"）。
+    #[test]
+    fn scissor_round_out_expands() {
+        assert_eq!(clip_px(Rect::new(1.2, 2.7, 10.4, 5.1)), (1, 3, 10, 5), "四舍五入到像素");
+        // 负宽高先归一化
+        assert_eq!(clip_px(Rect::new(10.0, 10.0, -4.0, -3.0)), (6, 7, 4, 3));
+        // 空 / 非有限 ⇒ 空（该 draw 整条跳过）
+        assert!(clip_is_empty(Rect::new(0.0, 0.0, 0.0, 10.0)));
+        assert!(clip_is_empty(Rect::new(f32::NAN, 0.0, 10.0, 10.0)));
     }
 
     /// 附件需求由**命令状态**驱动：任一命令声明 depth / stencil ⇒ 需要深度附件。

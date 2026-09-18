@@ -43,12 +43,13 @@ use crate::backend::{UiBackend, UiBatch, UiBatchSource};
 use crate::draw::{
     CornerRadius, DebugShape, DrawKind, Gradient, Icon, ImageBg, Position, Size, TextAlign,
     TextVAlign,
-    UiDraw, border_rects, centered_square, clipped, debug_shape_segments, intersect_rect,
+    UiDraw, border_rects, centered_square, debug_shape_segments, intersect_rect,
     screen_fixed_tf, snap_rect, text_block_offset, text_cmd,
 };// 顶点收集 / 合批机制（原在此文件，见 `gpu_batch` 模块文档）。
 use crate::gpu_batch::{
-    CacheStats, CachedQuad, Geom, QuadCollector, cmd_sig_hash, debug_layout_outline, line_row_at_y,
-    resample_gradient_local, safe_line_slice, segment_runs, vertex_p3u2c4,
+    CacheStats, CachedQuad, Geom, QuadCollector, clip_key, clip_rect, cmd_sig_hash,
+    debug_layout_outline, line_row_at_y, resample_gradient_local, safe_line_slice, segment_runs,
+    vertex_p3u2c4,
 };
 use crate::edit::{
     byte_to_char, caret_at_visual_click, caret_index_by_width, char_to_byte, insert_char_at,
@@ -866,6 +867,7 @@ impl<'a> Ui<'a> {
                 press_panel: ws.and_then(|w| w.press_panel),
                 stored_pos: self.state.panel_pos.get(id.as_str()).copied(),
                 submit_pos: self.state.debug_submit.get(&z).copied(),
+                clip: self.state.debug_clip.get(&z).copied(),
             });
         }
         windows.sort_by_key(|w| w.z);
@@ -3760,8 +3762,8 @@ impl<'a> Ui<'a> {
             if entry.0 == sig {
                 stats.cache_hits += 1;
                 let t_clone = Instant::now();
-                for (elem, gg, tex, geom) in &entry.1 {
-                    cached.push((0, *elem, *gg, *tex, geom.clone(), vec![*elem]));
+                for (elem, gg, tex, clip, geom) in &entry.1 {
+                    cached.push((0, *elem, *gg, *tex, *clip, geom.clone(), vec![*elem]));
                 }
                 stats.clone_us += t_clone.elapsed().as_secs_f64() * 1e6;
                 continue;
@@ -3774,13 +3776,15 @@ impl<'a> Ui<'a> {
             self.collect_cmds(&mut q, 0, std::slice::from_ref(&owned));
             stats.collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
             self.trace_cache_miss(&format!("z0 group {g}"), refs.len(), t_collect);
-            let mut grp: Vec<(u32, u8, u64, Geom)> = Vec::new();
-            for ((_, elem, gg, tex), geom) in q.quads {
+            let mut grp: Vec<(u32, u8, u64, Option<Rect>, Geom)> = Vec::new();
+            for ((_, elem, gg, tex, clip), geom) in q.quads {
                 // 缓存存克隆、本帧提交原几何（各一份）——重建帧照常绘制，不"消失 1 帧"。
-                grp.push((elem, gg, tex, geom.clone()));
-                cached.push((0, elem, gg, tex, geom, vec![elem]));
+                let clip = clip.map(clip_rect);
+                grp.push((elem, gg, tex, clip, geom.clone()));
+                cached.push((0, elem, gg, tex, clip, geom, vec![elem]));
             }
-            grp.sort_by_key(|&(elem, gg, tex, _)| (elem, gg, tex));
+            // 缓存组顺序与提交顺序一致：控件序 → 元素内图形 → 文字 → 纹理 → 裁剪——跨帧稳定。
+            grp.sort_by_key(|&(elem, gg, tex, clip, _)| (elem, gg, tex, clip_key(clip)));
             self.state.z0_quads.insert(slot, (sig, grp));
         }
         // 陈旧子槽的清理**不在这里**：本函数每段跑一次、只见到本段的槽，按段清会把同帧
@@ -3812,8 +3816,8 @@ impl<'a> Ui<'a> {
             if entry.0 == sig {
                 stats.cache_hits += 1;
                 let t_clone = Instant::now();
-                for (elem, g, tex, geom) in &entry.1 {
-                    cached.push((win, *elem, *g, *tex, geom.clone(), vec![*elem]));
+                for (elem, g, tex, clip, geom) in &entry.1 {
+                    cached.push((win, *elem, *g, *tex, *clip, geom.clone(), vec![*elem]));
                 }
                 stats.clone_us += t_clone.elapsed().as_secs_f64() * 1e6;
                 return;
@@ -3826,17 +3830,19 @@ impl<'a> Ui<'a> {
         self.collect_cmds(&mut q, win, cmds);
         stats.collect_us += t_collect.elapsed().as_secs_f64() * 1e6;
         self.trace_cache_miss(&format!("win {win} id={}", id.as_str()), cmds.iter().map(|v| v.len()).sum(), t_collect);
-        let mut grp: Vec<(u32, u8, u64, Geom)> = Vec::new();
-        for ((_, elem, g, tex), geom) in q.quads {
+        let mut grp: Vec<(u32, u8, u64, Option<Rect>, Geom)> = Vec::new();
+        for ((_, elem, g, tex, clip), geom) in q.quads {
             // 缓存存克隆、本帧提交原几何（各一份）——**重建帧窗口照常绘制**：
             // 否则窗口内容一变就"消失 1 帧"（缓存冷启动 / 拖动中 hover、光标
             // 闪烁、滚动等逐帧变化 → 窗口每帧重建、每帧消失 → "消失与显示
             // 瞬间交替"闪烁）。
-            grp.push((elem, g, tex, geom.clone()));
-            cached.push((win, elem, g, tex, geom, vec![elem]));
+            // 量化键 → 实际矩形（1px 精度；最终 scissor 本来就按整数像素取整）。
+            let clip = clip.map(clip_rect);
+            grp.push((elem, g, tex, clip, geom.clone()));
+            cached.push((win, elem, g, tex, clip, geom, vec![elem]));
         }
-        // 缓存组顺序与提交顺序一致：控件序 → 元素内图形 → 文字 → 纹理——跨帧稳定。
-        grp.sort_by_key(|&(elem, g, tex, _)| (elem, g, tex));
+        // 缓存组顺序与提交顺序一致：控件序 → 元素内图形 → 文字 → 纹理 → 裁剪——跨帧稳定。
+        grp.sort_by_key(|&(elem, g, tex, clip, _)| (elem, g, tex, clip_key(clip)));
         self.state.window_quads.insert(id, (sig, grp));
     }
 
@@ -3898,18 +3904,22 @@ impl<'a> Ui<'a> {
         let t_submit = Instant::now();
         let mut ordered: Vec<CachedQuad> = Vec::with_capacity(cached.len() + quads.quads.len());
         // mem::take：只移走内容几何，`quads.debug`（调试叠加）留待最后提交。
-        for ((win, elem, g, tex_uid), geom) in std::mem::take(&mut quads.quads) {
-            let elems = quads.elems.remove(&(win, elem, g, tex_uid)).unwrap_or_default();
-            ordered.push((win, elem, g, tex_uid, geom, elems));
+        for ((win, elem, g, tex_uid, clip), geom) in std::mem::take(&mut quads.quads) {
+            let elems = quads
+                .elems
+                .remove(&(win, elem, g, tex_uid, clip))
+                .unwrap_or_default();
+            ordered.push((win, elem, g, tex_uid, clip.map(clip_rect), geom, elems));
         }
         // 缓存命中路径（`cached`）来自 `cache_window`，其元素数已在采集期统计。
         ordered.extend(cached);
-        ordered.sort_by_key(|&(win, elem, g, tex_uid, _, _)| (win, elem, g, tex_uid));
-        // 连续运行合批：同 (win, tex) 顶点合并成一段；窗口/纹理切换或超段顶点上限时切段。
-        // 切段规则抽成纯函数 [`segment_runs`]，使「一次交互产生几次 draw call」
-        // 可在**无 GPU** 的情况下断言（回归测试见 `backend::batch_contract_tests`）。
+        // 提交序：`(win, elem, group, tex, clip)`（`clip` 用整数像素键比较）。
+        ordered.sort_by_key(|q| (q.0, q.1, q.2, q.3, clip_key(q.4)));
+        // 连续运行合批：同 (win, tex, clip) 顶点合并成一段；窗口/纹理/**裁剪**切换或
+        // 超段顶点上限时切段。切段规则抽成纯函数 [`segment_runs`]，使「一次交互产生
+        // 几次 draw call」可在**无 GPU** 的情况下断言（见 `gpu_batch::batch_contract_tests`）。
         let runs = segment_runs(
-            ordered.iter().map(|q| (q.0, q.3, q.4.verts.len())),
+            ordered.iter().map(|q| (q.0, q.3, q.4, q.5.verts.len())),
             MAX_UI_SEG_VERTS,
         );
         let mut next = 0usize;
@@ -3919,18 +3929,29 @@ impl<'a> Ui<'a> {
             let mut seg_elems: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
             for q in &ordered[next..next + run.quads] {
                 // 索引按已累计顶点数平移（`Geom::append`）——不同段的索引各自从 0 起。
-                seg.append(&q.4);
-                seg_elems.extend(q.5.iter().copied());
+                seg.append(&q.5);
+                seg_elems.extend(q.6.iter().copied());
             }
             next += run.quads;
             let n = seg_elems.len() as u32;
-            self.flush_seg(backend, layer_base, seg, run.window, run.texture, n);
+            self.flush_seg(
+                backend,
+                layer_base,
+                seg,
+                run.window,
+                run.texture,
+                run.clip,
+                n,
+            );
         }
         t_submit.elapsed().as_secs_f64() * 1e6
     }
 
     /// **冲刷一个窗口段**：把累计的几何段作为 [`UiBatch`] 提交（单一窗口的
-    /// `screen_fixed_tf` 变换 + 窗口级 FX tint/transform override）。
+    /// `screen_fixed_tf` 变换 + 窗口级 FX tint/transform override + **batch scissor**）。
+    ///
+    /// `clip` = 本段的环境裁剪层（绝对逻辑坐标；`None` = 不裁剪）⇒ 经
+    /// [`crate::view::batch_scissor`] 映射成该批次的屏幕像素 scissor。
     ///
     /// **解耦**：不直接调 `Render2D`，只产出数据；后端决定如何提交。
     fn flush_seg(
@@ -3940,6 +3961,7 @@ impl<'a> Ui<'a> {
         seg: Geom,
         win: u32,
         tex_uid: u64,
+        clip: Option<Rect>,
         elements: u32,
     ) {
         if seg.is_empty() {
@@ -3983,6 +4005,16 @@ impl<'a> Ui<'a> {
         // 诊断：记录本窗口**实际提交用的平移量**（`debug_dump` 的 `submit` 字段）——
         // 与 `origin` 比对即可判定"引擎状态 vs 视觉"是否一致。
         self.state.debug_submit.insert(win, tf.pos);
+        // **batch scissor**：环境裁剪层（绝对逻辑坐标）→ 本批次的屏幕像素矩形。
+        // `tf` 通常只是"平移到窗口原点"，此时结果就是原矩形；窗口 FX（缩放/旋转）下
+        // 走保守 AABB（宁可多画一点，绝不误裁），见 [`crate::view::batch_scissor`]。
+        let clip = clip.map(|c| crate::view::batch_scissor(c, anchor_px, &tf));
+        if let Some(c) = clip {
+            // 诊断 + 计数：本帧带 scissor 的批次数（`[perf] clip_batches`）。
+            self.state.debug_clip.insert(win, c);
+            self.state.frame_state.stats.clip_batches =
+                self.state.frame_state.stats.clip_batches.saturating_add(1);
+        }
         backend.submit(UiBatch {
             texture,
             vertices: seg.verts,
@@ -3990,6 +4022,7 @@ impl<'a> Ui<'a> {
             transform: tf,
             tint: fx.tint,
             layer: layer_base + win as f64 * 1.0,
+            clip,
             source: UiBatchSource { window: win, elements, debug: false },
         });
     }
@@ -4037,6 +4070,8 @@ impl<'a> Ui<'a> {
                 transform: tf,
                 tint: Color::WHITE,
                 layer: layer_base + win as f64 * 1.0,
+                // 调试叠加**不受内容裁剪**（诊断图元要看得见）：scissor = None。
+                clip: None,
                 source: UiBatchSource { window: win, elements: 1, debug: true },
             });
         }
@@ -4135,28 +4170,27 @@ impl<'a> Ui<'a> {
         for d in cmds.iter().flatten() {
             // 当前元素序：push 方法按其分组（控件级提交顺序——见 QuadCollector）。
             quads.cur_elem = d.elem;
-            // 裁剪区（绝对物理；内容已随容器平移成绝对逻辑坐标）。
-            let clip_abs = d.clip.map(|c| snap_rect(&c));
+            // **环境裁剪层**（绝对物理；内容已随容器平移成绝对坐标）：进分组键。
+            //
+            // ⚠ 这里**不再切割几何**（旧实现逐命令 `clipped(..)`）：环境裁剪改由 batch
+            // scissor 在 GPU 侧执行（见 `UiBatch::clip` / `batch_scissor`）。收益：
+            // ① 圆角 / 环带不再被切平；② 省掉每命令的矩形求交与渐变重采样；
+            // ③ 投影不再需要"部分可见就整块跳过"的特例（像素级裁边更干净）。
+            quads.cur_clip = d.clip.map(|c| snap_rect(&c));
             match &d.kind {
                 DrawKind::Solid(color) => {
                     if d.rect.w > 0.0 && d.rect.h > 0.0 {
                         let pr = snap_rect(&d.rect);
-                        if let Some(r) = clipped(pr, clip_abs) {
-                            quads.push_white(
-                                win,
-                                Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h),
-                                *color,
-                            );
-                            debug_layout_outline(quads, win, anchor_px, r, dbg);
+                        if pr.w > 0.0 && pr.h > 0.0 {
+                            quads.push_white(win, local_of(pr, anchor_px), *color);
+                            debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
                     }
                 }
                 DrawKind::RoundedRect { corners, radius } => {
                     let pr = snap_rect(&d.rect);
-                    if let Some(local) = clipped(pr, clip_abs).map(|r| {
-                        Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
-                    })
-                        && local.w > 0.0 && local.h > 0.0 {
+                    let local = local_of(pr, anchor_px);
+                    if local.w > 0.0 && local.h > 0.0 {
                             // **无纹理、无着色器改动**：CPU 把圆角矩形镶嵌成三角形
                             // （硬体 + 1 物理像素羽化带，见 `crate::tess`）。
                             // 半径不做取整 / 9-patch clamp——镶嵌器接受任意半径并把
@@ -4179,23 +4213,11 @@ impl<'a> Ui<'a> {
                     // **顶点色软阴影**（无纹理 / 无着色器 / 不增 draw call）。
                     // `rect` = 本体矩形（内轮廓恒在本体边缘，无"等浓度平台"）。
                     let pr = snap_rect(&d.rect);
-                    // 投影的**实际外沿**（最外圈 = 本体外扩 blur 再偏 offset）。
-                    let outer = Rect::new(
-                        pr.x - *blur + offset.x,
-                        pr.y - *blur + offset.y,
-                        pr.w + (*blur + offset.x.abs()) * 2.0,
-                        pr.h + (*blur + offset.y.abs()) * 2.0,
-                    );
-                    // 投影**整体**必须在裁剪区内才画：被裁掉一部分时"内轮廓"也跟着变形，
-                    // 画出来是一圈错位的暗带（严格裁剪窗口 / 滚动容器内）。那种场景下
-                    // 投影本来也会被裁掉，直接跳过更干净。
-                    let fully_visible = clip_abs.is_none_or(|c| c.contains(&outer));
-                    if fully_visible
-                        && let Some(local) = clipped(pr, clip_abs).map(|r| {
-                            Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
-                        })
-                        && local.w > 0.0 && local.h > 0.0 && *blur > 0.0
-                    {
+                    // ⚠ **不再需要"部分可见就整块跳过"**：环境裁剪由 scissor 在像素级执行，
+                    // 几何不会被形变（旧实现切割矩形会让投影的内轮廓错位成一条暗带，
+                    // 于是只能在"被裁掉一部分"时整块放弃）。被裁的部分由 scissor 裁掉即可。
+                    let local = local_of(pr, anchor_px);
+                    if local.w > 0.0 && local.h > 0.0 && *blur > 0.0 {
                         let table = self.state.tess.table();
                         quads.push_rounded_shadow(
                             win, &table, local, *radius, *blur, *offset, *color,
@@ -4204,13 +4226,10 @@ impl<'a> Ui<'a> {
                 }
                 DrawKind::Rect(gradient) => {
                     let pr = snap_rect(&d.rect);
-                    if let Some(local) = clipped(pr, clip_abs).map(|r| {
-                        Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
-                    })
-                        && local.w > 0.0 && local.h > 0.0 {
+                    let local = local_of(pr, anchor_px);
+                    if local.w > 0.0 && local.h > 0.0 {
                             // **无纹理**：四角颜色直接进顶点色（光栅化器双线性插值）。
-                            // 裁剪后的矩形按它在**原矩形**中的相对位置重采样四角色，
-                            // 保证渐变锚定在原矩形上（裁剪不会让颜色整体平移）。
+                            // 四角色按它在**原矩形**中的相对位置采样，保证渐变锚定不变。
                             let c = resample_gradient_local(*gradient, local, pr, anchor_px);
                             quads.push_white_quad(win, local, c);
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
@@ -4218,8 +4237,8 @@ impl<'a> Ui<'a> {
                 }
                 DrawKind::Border { color, width, radius } => {
                     let pr = snap_rect(&d.rect);
-                    if let Some(r) = clipped(pr, clip_abs) {
-                        let local = Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h);
+                    if pr.w > 0.0 && pr.h > 0.0 {
+                        let local = local_of(pr, anchor_px);
                         if !radius.is_zero() {
                             // 圆角环带：只画一次边界，圆角处不会像"外圈实心 + 内圈实心"
                             // 那样把抗锯齿边缘混合两次。
@@ -4254,10 +4273,8 @@ impl<'a> Ui<'a> {
                     // 矢量图标：单位方框内的凸分片映射到 `rect`（窗口局部），
                     // 并按 `Theme::feather` 做边缘羽化——与圆角矩形同一套 AA 机制。
                     let pr = snap_rect(&d.rect);
-                    if let Some(local) = clipped(pr, clip_abs).map(|r| {
-                        Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
-                    })
-                        && local.w > 0.0 && local.h > 0.0 {
+                    let local = local_of(pr, anchor_px);
+                    if local.w > 0.0 && local.h > 0.0 {
                             // **等比**：图标分片画在 `[0,1]²` 的方形域里，把 `rect` 直接映射过去
                             // 会在非方形框里被拉扁（`row` 内 `force_h_all` 就会把 18×26 的框
                             // 交给这里）。故取 `min(w,h)` 的**居中方块**——图标永不形变。
@@ -4312,10 +4329,8 @@ impl<'a> Ui<'a> {
                     // 背景图：与实心背景同一条镶嵌路径（CPU 直出三角形 + 羽化），
                     // 只多一个"逐顶点 UV 的仿射映射"（见 `QuadCollector::push_image`）。
                     let pr = snap_rect(&d.rect);
-                    if let Some(local) = clipped(pr, clip_abs).map(|r| {
-                        Rect::new(r.x - anchor_px.x, r.y - anchor_px.y, r.w, r.h)
-                    })
-                        && local.w > 0.0 && local.h > 0.0 {
+                    let local = local_of(pr, anchor_px);
+                    if local.w > 0.0 && local.h > 0.0 {
                             let table = self.state.tess.table();
                             quads.push_image(win, &table, local, *bg, self.theme.feather);
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
@@ -4324,13 +4339,8 @@ impl<'a> Ui<'a> {
                 DrawKind::Caret { color, width } => {
                     let r = Rect::new(d.rect.x, d.rect.y, *width, d.rect.h);
                     let pr = snap_rect(&r);
-                    if let Some(rr) = clipped(pr, clip_abs)
-                        && rr.w > 0.0 && rr.h > 0.0 {
-                            quads.push_white(
-                                win,
-                                Rect::new(rr.x - anchor_px.x, rr.y - anchor_px.y, rr.w, rr.h),
-                                *color,
-                            );
+                    if pr.w > 0.0 && pr.h > 0.0 {
+                            quads.push_white(win, local_of(pr, anchor_px), *color);
                             debug_layout_outline(quads, win, anchor_px, pr, dbg);
                         }
                 }
@@ -5247,6 +5257,12 @@ pub struct UiWindowInfo {
     /// 与 `origin` 不一致 ⇒ "引擎状态 vs 视觉"不一致（渲染/变换路径问题；
     /// 历史 bug：Mesh/quads 命令忽略 `.transform(..)` ⇒ 提交平移恒为 0，窗口全在左上角）。
     pub submit_pos: Option<Vec2>,
+    /// **本窗最近一次提交的批次 scissor**（屏幕物理像素；`None` = 该窗内容不裁剪）。
+    ///
+    /// 引擎把环境裁剪层（严格窗口 / 滚动可视区 / Clip 沙箱 / 文本框盒）作为 **batch
+    /// scissor** 交给 GPU（不再切割几何）——这个字段就是"到底裁到哪"的直接证据
+    /// （见 [`crate::UiBatch::clip`] 与 `docs/ENGINE_GUIDE.md` §18.20）。
+    pub clip: Option<Rect>,
 }
 
 /// **UI 引擎状态快照**（[`Ui::debug_dump`]；`Display` 为单行可 grep 格式）。
@@ -5285,8 +5301,8 @@ impl std::fmt::Display for UiDebugDump {
         for w in &self.windows {
             write!(
                 f,
-                " | {} z={} origin=({:.0},{:.0}) submit={:?} size=({:.0},{:.0}) drag={} press={:?} stored={:?}",
-                w.id, w.z, w.origin.x, w.origin.y, w.submit_pos, w.size.x, w.size.y, w.dragging, w.press_panel, w.stored_pos
+                " | {} z={} origin=({:.0},{:.0}) submit={:?} clip={:?} size=({:.0},{:.0}) drag={} press={:?} stored={:?}",
+                w.id, w.z, w.origin.x, w.origin.y, w.submit_pos, w.clip, w.size.x, w.size.y, w.dragging, w.press_panel, w.stored_pos
             )?;
         }
         Ok(())
@@ -7331,6 +7347,15 @@ fn clamp_window_pos(abs: Vec2, size: Vec2, sw: f32, sh: f32) -> Vec2 {
     let min_y = (sh - size.y).min(0.0);
     let max_y = (sh - size.y).max(0.0);
     Vec2::new(abs.x.clamp(min_x, max_x), abs.y.clamp(min_y, max_y))
+}
+
+/// **绝对矩形 → 窗口局部矩形**（提交 / 镶嵌用的窗口局部物理坐标）。
+///
+/// 只是平移（减窗口原点）：**环境裁剪不再切割几何**——裁剪改由 batch scissor 在
+/// GPU 侧执行（见 [`UiBatch::clip`] / `crate::view::batch_scissor`）。
+#[inline]
+pub(crate) fn local_of(pr: Rect, anchor_px: Vec2) -> Rect {
+    Rect::new(pr.x - anchor_px.x, pr.y - anchor_px.y, pr.w, pr.h)
 }
 
 /// `ui` 模块的单元测试（独立文件，见该目录下的 `tests.rs`）。

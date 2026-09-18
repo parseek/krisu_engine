@@ -34,6 +34,12 @@ English：
 - `RStates`：Blend / Sampler / Cull+Raster / Depth / Stencil 位域（u64）；全局默认走 `states_mut(RStates)`。
 - 排序：`sort(SortMode)` / `sort_custom(Box<dyn SortPolicy>)`；剔除：`cull(Cull::Off | Viewport | Rect | Fn)`（`Cull::from(&cam)`）。
 - 调试图元：`r2d.debug(DebugStyle::new(Color::RED).width(2.0)).line(a, b)`。
+- **Scissor 两级**：画面级 `Render2D::scissor(Option<Rect>)`（整画面，浮点、按目标钳制）+
+  **命令级** `Draw2D::scissor(rect)` / `.scissor_opt(..)`（逐条命令，屏幕像素；最终
+  = 命令级 ∩ 画面级 ∩ 目标矩形）。空/全在目标外 ⇒ **该 draw 整条跳过**；不同 scissor
+  的命令不合批（一次 `draw_indexed` 只能一个 scissor）。UI 的环境裁剪（窗口内容 / 滚动
+  可视区 / Clip 沙箱 / 文本框盒）就走它——**几何不再被切割**，圆角与投影保持原形。
+  `Render2D::draw_op_count()` 可查上一帧 draw 数（诊断 scissor 带来的 draw 增长）。
 - 句柄类型化：`static_mesh(MeshId, &tex)`；资源创建走 `Gpu::{texture, mesh}`（`rjw_render`）。
 
 ## 示例代码 / Example

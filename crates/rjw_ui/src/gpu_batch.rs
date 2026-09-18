@@ -87,46 +87,83 @@ impl Geom {
 ///
 /// 末位是**本片段覆盖的元素序列表**（[`crate::UiBatchSource::elements`] 的来源；
 /// 缓存命中路径在采集期已统计）。
-pub(crate) type CachedQuad = (u32, u32, u8, u64, Geom, Vec<u32>);
+/// **可提交的几何段**：`(win, elem, group, tex, clip, geom, 元素序列表)`。
+///
+/// `clip` = 本段的环境裁剪层（绝对逻辑坐标；`None` = 不裁剪）——提交时按它算
+/// [`crate::UiBatch::clip`]（batch scissor），几何本身**不再被切割**。
+pub(crate) type CachedQuad = (u32, u32, u8, u64, Option<Rect>, Geom, Vec<u32>);
 
 
 /// 一个合批段（= 一个 [`crate::UiBatch`] = 一次 draw call 的候选）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SegRun {
     /// 段所属窗口。
     pub(crate) window: u32,
     /// 段使用的纹理 uid。
     pub(crate) texture: u64,
+    /// 本段的**环境裁剪层**（绝对逻辑坐标；`None` = 不裁剪）。
+    /// 段内必须一致：一次 draw 只能有一个 scissor。
+    pub(crate) clip: Option<Rect>,
     /// 本段包含的四边形条目数。
     pub(crate) quads: usize,
     /// 本段顶点总数。
     pub(crate) verts: usize,
 }
 
-/// **切段规则**（纯函数，可无 GPU 单测）：把已按 `(win, elem, group, tex)` 排好序的
+/// **环境裁剪层的量化键**（绝对逻辑坐标 → 1px 整数四元组 `(x, y, w, h)`）。
+///
+/// 为什么需要量化而不用 `Rect` 本身：几何缓存 / 合批的分组键必须 `Eq + Hash + Ord`，
+/// 而 `Rect` 是 `f32`。量化到 1px 与"最终 scissor 本来就是整数像素"的口径一致。
+pub(crate) type ClipKey = (i32, i32, i32, i32);
+
+/// 由绝对逻辑矩形构造量化键（归一化 + 四舍五入到 1px）；`None` 原样传递。
+#[inline]
+pub(crate) fn clip_key(clip: Option<Rect>) -> Option<ClipKey> {
+    clip.map(|c| {
+        let r = c.normalized();
+        (
+            r.x.round() as i32,
+            r.y.round() as i32,
+            r.w.round() as i32,
+            r.h.round() as i32,
+        )
+    })
+}
+
+/// 量化键还原成矩形（1px 精度）。**量化误差无妨**：最终 scissor 本来就按整数像素取整。
+#[inline]
+pub(crate) fn clip_rect(key: ClipKey) -> Rect {
+    Rect::new(key.0 as f32, key.1 as f32, key.2 as f32, key.3 as f32)
+}
+
+/// **切段规则**（纯函数，可无 GPU 单测）：把已按 `(win, elem, group, tex, clip)` 排好序的
 /// 四边形序列切成若干段，使每段满足：
 ///
-/// 1. **同一 `(window, texture)`**——窗口不同则实例变换 / tint 不同（无法合并）；
+/// 1. **同一 `(window, texture, clip)`**——窗口不同则实例变换 / tint 不同（无法合并）；
 ///    纹理不同则 bind group 不同（一次 draw call 只能绑一个纹理）；
+///    **裁剪不同则 scissor 不同**（一次 draw 只能一个 scissor，见 `crate::UiBatch::clip`）；
 /// 2. **顶点数不超过 `max_verts`**——受 u16 索引上限约束。
 ///
 /// 返回顺序 = 绘制顺序。**段数 = draw call 数**，因此本函数是「尽量减少 DrawCall」
 /// 这一目标的唯一裁决点，抽出以便直接断言。
 pub(crate) fn segment_runs(
-    quads: impl Iterator<Item = (u32, u64, usize)>,
+    quads: impl Iterator<Item = (u32, u64, Option<Rect>, usize)>,
     max_verts: usize,
 ) -> Vec<SegRun> {
     let mut runs: Vec<SegRun> = Vec::new();
-    for (window, texture, verts) in quads {
+    for (window, texture, clip, verts) in quads {
         let fits = runs.last().is_some_and(|r| {
-            r.window == window && r.texture == texture && r.verts + verts <= max_verts
+            r.window == window
+                && r.texture == texture
+                && r.clip == clip
+                && r.verts + verts <= max_verts
         });
         if fits {
             let r = runs.last_mut().expect("just checked");
             r.quads += 1;
             r.verts += verts;
         } else {
-            runs.push(SegRun { window, texture, quads: 1, verts });
+            runs.push(SegRun { window, texture, clip, quads: 1, verts });
         }
     }
     runs
@@ -149,12 +186,18 @@ pub(crate) struct CacheStats {
 
 // ─── 四边形收集器 ─────────────────────────────────────────────
 
-/// 按 `(win, elem, group, tex)` 分组的几何收集器（`finish` 提交用）。
+/// **四边形分组键**：`(win, elem, group, tex, clip)`。
+///
+/// 末位是**环境裁剪层**（绝对逻辑坐标的量化键，见 [`ClipKey`]）——裁剪不同的几何
+/// **不能合进同一段**（一次 draw 只能一个 scissor，见 [`crate::UiBatch::clip`]）。
+pub(crate) type QuadKey = (u32, u32, u8, u64, Option<ClipKey>);
+
+/// 按 `(win, elem, group, tex, clip)` 分组的几何收集器（`finish` 提交用）。
 ///
 /// `debug` 是**屏幕调试叠加**（DebugDraw 图元 + debug_layout 布局描边）——
 /// 按 `win` 分组、恒用白纹理，在全部 UI 内容**之后**提交。
 pub(crate) struct QuadCollector {
-    pub(crate) quads: std::collections::HashMap<(u32, u32, u8, u64), Geom>,
+    pub(crate) quads: std::collections::HashMap<QuadKey, Geom>,
     /// 调试叠加几何（白纹理；窗口局部物理坐标）。
     pub(crate) debug: std::collections::HashMap<u32, Geom>,
     white_uid: u64,
@@ -163,9 +206,12 @@ pub(crate) struct QuadCollector {
     white_uv_wh: Vec2,
     /// **当前元素序**（`collect_cmds` 每处理一个命令设置；push 方法按其分组）。
     pub(crate) cur_elem: u32,
+    /// **当前环境裁剪层**（绝对逻辑坐标；`collect_cmds` 每处理一个命令设置）——
+    /// 与 `cur_elem` 一起进入分组键。
+    pub(crate) cur_clip: Option<Rect>,
     /// **每条几何所属的元素序**（键与 `quads` 同构，供提交期统计
     /// 「一个批次覆盖了多少个元素」——即 [`crate::UiBatchSource::elements`]）。
-    pub(crate) elems: std::collections::HashMap<(u32, u32, u8, u64), Vec<u32>>,
+    pub(crate) elems: std::collections::HashMap<QuadKey, Vec<u32>>,
 }
 
 impl QuadCollector {
@@ -177,12 +223,19 @@ impl QuadCollector {
             white_uv_tl,
             white_uv_wh,
             cur_elem: 0,
+            cur_clip: None,
             elems: std::collections::HashMap::new(),
         }
     }
 
+    /// **本帧当前分组键**（`win` + 当前元素序 + 组 + 纹理 + 当前裁剪层）。
+    #[inline]
+    pub(crate) fn key(&self, win: u32, group: u8, tex: u64) -> QuadKey {
+        (win, self.cur_elem, group, tex, clip_key(self.cur_clip))
+    }
+
     /// 取（或建）某分组键的几何段，并登记本段所属的元素序。
-    fn geom(&mut self, key: (u32, u32, u8, u64)) -> &mut Geom {
+    fn geom(&mut self, key: QuadKey) -> &mut Geom {
         let elem = key.1;
         self.elems.entry(key).or_default().push(elem);
         self.quads.entry(key).or_default()
@@ -223,7 +276,7 @@ impl QuadCollector {
             vertex_p3u2c4(Vec2::new(r.x, r.y + r.h), [uv_tl.x, uv_br.y], c_bl),
             vertex_p3u2c4(Vec2::new(r.x + r.w, r.y + r.h), [uv_br.x, uv_br.y], c_br),
         ];
-        let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
+        let key = self.key(win, GROUP_GRAPHIC, self.white_uid);
         self.geom(key).push_quad(&quad);
     }
 
@@ -248,7 +301,7 @@ impl QuadCollector {
             vertex_p3u2c4(Vec2::new(r.x, r.y + r.h), [uv_tl.x, uv_br.y], ca),
             vertex_p3u2c4(Vec2::new(r.x + r.w, r.y + r.h), [uv_br.x, uv_br.y], ca),
         ];
-        let key = (win, self.cur_elem, GROUP_GRAPHIC, tex);
+        let key = self.key(win, GROUP_GRAPHIC, tex);
         self.geom(key).push_quad(&quad);
     }
 
@@ -268,7 +321,7 @@ impl QuadCollector {
         feather: f32,
         corners: [Color; 4],
     ) -> crate::tess::TessOutput {
-        let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
+        let key = self.key(win, GROUP_GRAPHIC, self.white_uid);
         let uv = self.white_uv_center();
         let g = self.geom(key);
         crate::tess::push_rounded_rect(
@@ -304,7 +357,7 @@ impl QuadCollector {
         // `spec.uv` 恒不被使用（逐顶点 UV 优先），但**必须给合法值**——「绝不写 (0,0)」
         // 是这条路径的硬约定（写错会静默采到字形像素）。
         let fallback_uv = self.white_uv_center();
-        let g = self.geom((win, self.cur_elem, GROUP_GRAPHIC, bg.tex));
+        let g = self.geom(self.key(win, GROUP_GRAPHIC, bg.tex));
         // 铺排矩形左上角 → UV 的线性映射（`uv_at(p) = uv0 + (p - min) * k`）。
         let uv_at = move |p: Vec2| {
             let k = Vec2::new(
@@ -364,7 +417,7 @@ impl QuadCollector {
         feather: f32,
         color: Color,
     ) -> crate::tess::TessOutput {
-        let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
+        let key = self.key(win, GROUP_GRAPHIC, self.white_uid);
         let uv = self.white_uv_center();
         let g = self.geom(key);
         crate::tess::push_rounded_ring(
@@ -394,7 +447,7 @@ impl QuadCollector {
         offset: Vec2,
         color: Color,
     ) -> crate::tess::TessOutput {
-        let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
+        let key = self.key(win, GROUP_GRAPHIC, self.white_uid);
         let uv = self.white_uv_center();
         let g = self.geom(key);
         crate::tess::push_rounded_shadow(
@@ -422,7 +475,7 @@ impl QuadCollector {
         color: Color,
         feather: f32,
     ) -> crate::tess::TessOutput {
-        let key = (win, self.cur_elem, GROUP_GRAPHIC, self.white_uid);
+        let key = self.key(win, GROUP_GRAPHIC, self.white_uid);
         let uv = self.white_uv_center();
         let g = self.geom(key);
         let v0 = g.verts.len();
@@ -444,7 +497,7 @@ impl QuadCollector {
     }
 
     /// 追加一个带 UV 的四边形（字形用；文字组）。
-    pub(crate) fn push_tex_quad(&mut self, win: u32, tex: u64, quad: [VertexP3U2C4; 4]) {        let key = (win, self.cur_elem, GROUP_TEXT, tex);
+    pub(crate) fn push_tex_quad(&mut self, win: u32, tex: u64, quad: [VertexP3U2C4; 4]) {        let key = self.key(win, GROUP_TEXT, tex);
         self.geom(key).push_quad(&quad);
     }
 
@@ -585,6 +638,15 @@ pub(crate) fn cmd_sig_hash(h: &mut std::collections::hash_map::DefaultHasher, d:
     d.rect.y.to_bits().hash(h);
     d.rect.w.to_bits().hash(h);
     d.rect.h.to_bits().hash(h);
+    // **环境裁剪层进签名**：它决定几何落到哪个缓存分组（`QuadKey` 末位），也是
+    // 批次 scissor 的输入。⚠ 旧实现把 `d.clip` 当"收集期几何切割"的输入、却不哈希它
+    // ——裁剪变了（严格窗口开关 / 滚动可视区变化）而命令内容相同时，窗口顶点缓存会
+    // 命中旧分组，表现为"裁剪不生效 / 圆角仍是被切平的旧几何"。量化到 1px（与分组键
+    // 同口径），代价 = 4 次整型写入。
+    match clip_key(d.clip) {
+        Some(k) => k.hash(h),
+        None => 0u8.hash(h),
+    }
     match &d.kind {
         DrawKind::Solid(c) => {
             0u8.hash(h);
@@ -775,7 +837,7 @@ mod batch_contract_tests {
     #[test]
     fn one_window_one_texture_is_one_draw_call() {
         // 20 个四边形条目，全部同 (win=1, tex=100)。
-        let quads = std::iter::repeat_n((1u32, 100u64, 4usize), 20);
+        let quads = std::iter::repeat_n((1u32, 100u64, None, 4usize), 20);
         let runs = segment_runs(quads, MAX_UI_SEG_VERTS);
         assert_eq!(runs.len(), 1, "同窗口同纹理的 20 个控件必须合批成 1 段");
         assert_eq!(runs[0].quads, 20);
@@ -786,15 +848,37 @@ mod batch_contract_tests {
     #[test]
     fn elements_do_not_split_batches() {
         // 同 (win, tex) 下 200 个条目（模拟 200 个控件 + 容器背景）仍应 1 段。
-        let quads = std::iter::repeat_n((7u32, 3u64, 4usize), 200);
+        let quads = std::iter::repeat_n((7u32, 3u64, None, 4usize), 200);
         assert_eq!(segment_runs(quads, MAX_UI_SEG_VERTS).len(), 1);
+    }
+
+    /// **环境裁剪不同的几何必须切段**：一次 `draw_indexed` 只能有一个 scissor
+    /// （见 [`crate::UiBatch::clip`]）。同裁剪仍合批。
+    #[test]
+    fn clip_change_splits_the_run() {
+        let a = Some(rjw_transform::Rect::new(0.0, 0.0, 100.0, 100.0));
+        let b = Some(rjw_transform::Rect::new(10.0, 10.0, 50.0, 50.0));
+        // 同 clip ⇒ 仍 1 段（并把裁剪层带到段上）
+        let same = [(1u32, 10u64, a, 4usize), (1, 10, a, 4)];
+        let runs = segment_runs(same.into_iter(), MAX_UI_SEG_VERTS);
+        assert_eq!(runs.len(), 1, "同窗口同纹理同裁剪 ⇒ 合批");
+        assert_eq!(runs[0].clip, a);
+        // clip 变 ⇒ 2 段
+        let diff = [(1u32, 10u64, a, 4usize), (1, 10, b, 4)];
+        let runs = segment_runs(diff.into_iter(), MAX_UI_SEG_VERTS);
+        assert_eq!(runs.len(), 2, "裁剪不同 ⇒ 必须切段（scissor 不能中途改）");
+        assert_eq!(runs[0].clip, a);
+        assert_eq!(runs[1].clip, b);
+        // 无裁剪 vs 有裁剪：同样切段
+        let mixed = [(1u32, 10u64, None, 4usize), (1, 10, a, 4)];
+        assert_eq!(segment_runs(mixed.into_iter(), MAX_UI_SEG_VERTS).len(), 2);
     }
 
     /// 窗口数 = 段数下界（不同窗口的实例变换 / tint 不同，无法合并）。
     #[test]
     fn each_window_needs_its_own_run() {
         // 3 个窗口，各 1 个纹理、各若干四边形。
-        let quads = [(1u32, 10u64, 4usize), (2, 10, 4), (3, 10, 4)];
+        let quads = [(1u32, 10u64, None, 4usize), (2, 10, None, 4), (3, 10, None, 4)];
         let runs = segment_runs(quads.into_iter(), MAX_UI_SEG_VERTS);
         assert_eq!(runs.len(), 3);
         assert_eq!(runs.iter().map(|r| r.window).collect::<Vec<_>>(), vec![1, 2, 3]);
@@ -804,7 +888,7 @@ mod batch_contract_tests {
     #[test]
     fn texture_switch_splits() {
         // 同窗口，纹理从 10 → 11 → 10：必须 3 段（第 3 段无法与前两段合并）。
-        let quads = [(1u32, 10u64, 4usize), (1, 11, 4), (1, 10, 4)];
+        let quads = [(1u32, 10u64, None, 4usize), (1, 11, None, 4), (1, 10, None, 4)];
         let runs = segment_runs(quads.into_iter(), MAX_UI_SEG_VERTS);
         assert_eq!(runs.len(), 3);
         assert_eq!(runs.iter().map(|r| r.texture).collect::<Vec<_>>(), vec![10, 11, 10]);
@@ -815,7 +899,7 @@ mod batch_contract_tests {
     fn vertex_budget_splits_runs() {
         let budget = 100usize;
         // 每段 40 顶点：40+40 = 80 ≤ 100，再加 40 → 120 > 100 ⇒ 2 条/段。
-        let quads = std::iter::repeat_n((1u32, 5u64, 40usize), 10);
+        let quads = std::iter::repeat_n((1u32, 5u64, None, 40usize), 10);
         let runs = segment_runs(quads, budget);
         assert_eq!(runs.len(), 5, "10 条 × 40 顶点 / 预算 100 ⇒ 5 段");
         assert!(runs.iter().all(|r| r.verts <= budget), "每段都不得超预算");
@@ -826,7 +910,7 @@ mod batch_contract_tests {
     #[test]
     fn oversized_single_quad_gets_its_own_run() {
         let budget = 10usize;
-        let quads = [(1u32, 5u64, 400usize)];
+        let quads = [(1u32, 5u64, None, 400usize)];
         let runs = segment_runs(quads.into_iter(), budget);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].verts, 400, "超大条目原样成段（上游有 MAX_UI_SEG_VERTS 兜底）");

@@ -167,6 +167,8 @@ pub(crate) enum DrawOp {
         index_range: Range<u32>,
         rstates: u64,
         tex_uid: Option<u64>,
+        /// 命令级 scissor（`None` = 继承画面级）。
+        scissor: Option<rjw_transform::Rect>,
     },
     /// 动态缓冲段（`mesh*` 系列）：使用 `draw_page.mesh_vb / mesh_ib`。
     /// `index_range` 为动态段的三倍三角形范围。
@@ -179,11 +181,15 @@ pub(crate) enum DrawOp {
         index_range: Range<u32>,
         rstates: u64,
         tex_uid: Option<u64>,
+        /// 命令级 scissor（`None` = 继承画面级）。
+        scissor: Option<rjw_transform::Rect>,
     },
     /// 外部自定义绘制调用（`draw()` 中执行）。
     /// `idx` 指向 `Render2D::buf_custom_draws`。
     Custom {
         idx: usize,
+        /// 命令级 scissor（`None` = 继承画面级）。
+        scissor: Option<rjw_transform::Rect>,
     },
 }
 

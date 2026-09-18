@@ -18,7 +18,7 @@
 
 use crate::draw::intersect_rect;
 use crate::ui::{Ui, UiAdd};
-use rjw_transform::Rect;
+use rjw_transform::{Rect, Transform2D};
 
 /// View 沙箱模式（见[模块文档](self)）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +49,22 @@ pub(crate) fn clip_for_view(outer: Option<Rect>, view_abs: Rect, mode: ViewMode)
 /// 沙箱闭包上下文（经 [`crate::ui::UiAdd`] 提供容器内全部便捷方法）。
 pub struct ViewCtx<'ui, 'a> {
     pub(crate) ui: &'ui mut Ui<'a>,
+}
+
+/// **环境裁剪层 → 批次的屏幕 scissor**（纯函数，可单测）。
+///
+/// 批次的顶点是**窗口局部坐标**，提交时经 `tf`（屏幕固定变换 + 窗口 FX）映射到屏幕；
+/// 而环境裁剪层 `clip` 是**绝对屏幕坐标**（不含 FX）。所以：
+///
+/// 1. 先把 `clip` 减窗口原点 `anchor`（回到顶点所在空间）；
+/// 2. 再用 `tf` 映射回屏幕（`Rect::transform` 取四角保守 AABB）。
+///
+/// - `tf` 是纯平移（**绝大多数帧**）⇒ 结果**逐位等于** `clip`（只是减法加法各一次）；
+/// - `tf` 含缩放 ⇒ 裁剪区跟着缩放（与几何一致）；
+/// - `tf` 含旋转 ⇒ 取保守 AABB（**宁可多画一点，绝不误裁**）。
+pub(crate) fn batch_scissor(clip: Rect, anchor: glam::Vec2, tf: &Transform2D) -> Rect {
+    let local = Rect::new(clip.x - anchor.x, clip.y - anchor.y, clip.w, clip.h);
+    local.transform(tf)
 }
 
 impl<'ui, 'a> UiAdd<'a> for ViewCtx<'ui, 'a> {
@@ -88,5 +104,25 @@ mod tests {
         assert_eq!(clip_for_view(outer_away, view, ViewMode::Clip), None);
         // Clip + 无外层 → 可视区本身
         assert_eq!(clip_for_view(None, view, ViewMode::Clip), Some(view));
+    }
+
+    /// **批次的 scissor 映射**：纯平移逐位相等；缩放跟着走；旋转取保守 AABB。
+    #[test]
+    fn batch_scissor_maps_through_the_batch_transform() {
+        let clip = Rect::new(100.0, 50.0, 200.0, 100.0);
+        let anchor = glam::Vec2::new(40.0, 30.0);
+        // 纯平移（窗口原点）⇒ 与输入**逐位相等**
+        let tf = Transform2D::IDENTITY.with_pos(anchor);
+        assert_eq!(batch_scissor(clip, anchor, &tf), clip);
+        // 平移 + 缩放 2×（锚点处）⇒ 裁剪区跟着放大
+        let tf2 = Transform2D::IDENTITY
+            .with_pos(anchor)
+            .with_scale(glam::Vec2::splat(2.0));
+        let s = batch_scissor(clip, anchor, &tf2);
+        assert_eq!(s, Rect::new(160.0, 70.0, 400.0, 200.0));
+        // 旋转 ⇒ 保守 AABB（比原矩形大，绝不误裁）
+        let tf3 = Transform2D::IDENTITY.with_pos(anchor).with_rot(std::f32::consts::FRAC_PI_4);
+        let r = batch_scissor(clip, anchor, &tf3);
+        assert!(r.w > clip.w && r.h > clip.h, "旋转下取保守 AABB：{:?}", r);
     }
 }

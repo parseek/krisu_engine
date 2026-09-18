@@ -25,7 +25,7 @@ use std::ops::Range;
 use glam::Vec2;
 use rjw_color::Color;
 use rjw_render::ArcTextureWrapped;
-use rjw_transform::Transform2D;
+use rjw_transform::{Rect, Transform2D};
 
 use crate::command::{DrawCommand, DrawCommandQueue, Layer, States};
 use crate::data::{Index, MeshSink, MeshStorage, SpriteRect, TriIndices, VertexP3U2C4};
@@ -114,6 +114,11 @@ pub struct Draw2D<'a, K: DrawKind> {
     model: Option<glam::Mat4>,
     /// `None` = 继承渲染器全局默认状态（`Render2D::states()`）。
     states: Option<RStates>,
+    /// **命令级 scissor**（屏幕 / 目标像素、左上原点）。
+    ///
+    /// 最终生效的 scissor = 本矩形 ∩ 画面级 [`Render2D::scissor`] ∩ 目标矩形；
+    /// 空矩形 ⇒ 该 draw **整条跳过**（不是"不裁剪"）。
+    scissor: Option<Rect>,
     layer: Layer,
 
     _k: PhantomData<K>,
@@ -142,6 +147,7 @@ impl<'a, K: DrawKind> Draw2D<'a, K> {
             transform: Transform2D::IDENTITY,
             model: None,
             states: None,
+            scissor: None,
             layer: Layer::default(),
             _k: PhantomData,
         }
@@ -155,6 +161,7 @@ impl<'a, K: DrawKind> Draw2D<'a, K> {
             States {
                 rstates: self.states,
                 texture_uid: self.tex,
+                scissor: self.scissor,
             },
         );
     }
@@ -171,6 +178,31 @@ impl<K: DrawKind> Draw2D<'_, K> {
     #[inline]
     pub fn layer(mut self, layer: impl Into<Layer>) -> Self {
         self.layer = layer.into();
+        self
+    }
+
+    /// **命令级 scissor**（屏幕 / 目标像素、左上原点）。
+    ///
+    /// 与画面级的 [`Render2D::scissor(..)`](crate::Render2D::scissor)（作用于整个画面、
+    /// 浮点、按目标钳制）**叠加**而非替换：
+    ///
+    /// - 最终 scissor = **命令级 ∩ 画面级 ∩ 目标矩形**（`render2d::scissor_px`）；
+    /// - 负宽高自动归一化；空矩形（`w <= 0` / `h <= 0`）⇒ 本命令**整条跳过**
+    ///   （0 draw，而不是全屏乱画）；
+    /// - 不同 scissor 的命令**不会合批**（一次 `draw_indexed` 只能有一个 scissor）。
+    ///
+    /// 典型用途：UI 的窗口内容 / 滚动容器 / Clip 沙箱裁剪——把"逐命令几何切割"换成
+    /// "每条 draw 一次 `set_scissor_rect`"（圆角不再被切平，CPU 不再切几何）。
+    #[inline]
+    pub fn scissor(mut self, rect: Rect) -> Self {
+        self.scissor = Some(rect.normalized());
+        self
+    }
+
+    /// [`Draw2D::scissor`] 的可选版本（`None` = 不设，继承画面级）。
+    #[inline]
+    pub fn scissor_opt(mut self, rect: Option<Rect>) -> Self {
+        self.scissor = rect.map(Rect::normalized);
         self
     }
 

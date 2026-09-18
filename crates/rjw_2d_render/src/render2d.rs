@@ -38,7 +38,7 @@ use rjw_render::{
 use rjw_atlas::AtlasSprite;
 use rjw_transform::{Camera2D, Rect};
 
-use crate::command::{DrawCommand, DrawCommandQueue, Layer};
+use crate::command::{DrawCommand, DrawCommandQueue, Layer, clip_is_empty, clip_px};
 use crate::cull::{self, Cull, Culler};
 use crate::debug_draw::{DebugPainter, DebugStyle};
 use crate::data::{
@@ -83,6 +83,8 @@ struct BatchItem {
     index_range: std::ops::Range<u32>,
     rstates: u64,
     tex_uid: Option<u64>,
+    /// 命令级 scissor（`None` = 继承画面级）；参与"相邻同状态才合批"的分组键。
+    scissor: Option<Rect>,
     instance: InstanceData,
 }
 
@@ -302,6 +304,15 @@ impl Render2D {
     #[inline]
     pub fn will_use_depth_stencil(&self) -> bool {
         self.command_queue.requires_depth_stencil()
+    }
+
+    /// **上一帧 `prepare()` 后的 draw op 数**（= `draw_indexed` / 自定义调用的次数）。
+    ///
+    /// 用途：把"命令级 scissor 让 draw call 变多"变成可观测数字（`[perf]` 打印）。
+    /// 在 `record_into` 之后（即一帧渲染完）读才有意义；未渲染过 = 0。
+    #[inline]
+    pub fn draw_op_count(&self) -> usize {
+        self.buf_ops.len()
     }
 
     /// 命令排序模式（默认 [`SortMode::LayerAndStates`]）。
@@ -730,6 +741,8 @@ impl Render2D {
         let mut dyn_seg_mat: Option<usize> = None;
         let mut dyn_seg_color: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
         let mut dyn_seg_layer: Layer = Layer::default();
+        // 当前动态段的命令级 scissor（段内必须一致；变化即冲刷）。
+        let mut dyn_seg_scissor: Option<Rect> = None;
         let mut dyn_seq_counter = 0u32;
 
         /// 关闭当前动态段（如果有）：push 一个 identity 实例的 BatchItem。
@@ -747,6 +760,7 @@ impl Render2D {
                             index_range: (start as u32 * 3)..(end as u32 * 3),
                             rstates: dyn_seg_rr,
                             tex_uid: dyn_seg_tu,
+                            scissor: dyn_seg_scissor,
                             instance: match dyn_seg_mat {
                                 Some(mi) => {
                                     let m = self.command_queue.matrices[mi];
@@ -767,7 +781,16 @@ impl Render2D {
                 if !self.buf_items.is_empty() {
                     self.buf_items.sort_by_key(|b| {
                         // 排序键：layer 为主（保证图层绘制顺序），其次为后台分组键。
-                        (b.layer, b.mesh_id, b.dyn_seq, b.rstates, b.tex_uid)
+                        // `scissor` 并入分组键末尾（**整数像素键**，`Rect` 是 f32 不能直接比）：
+                        // **同 scissor 才能合批**（一次 draw_indexed 只能有一个 scissor）。
+                        (
+                            b.layer,
+                            b.mesh_id,
+                            b.dyn_seq,
+                            b.rstates,
+                            b.tex_uid,
+                            b.scissor.map(clip_px),
+                        )
                     });
                     let mut k = 0usize;
                     while k < self.buf_items.len() {
@@ -775,6 +798,20 @@ impl Render2D {
                         let seq = self.buf_items[k].dyn_seq;
                         let rr = self.buf_items[k].rstates;
                         let tu = self.buf_items[k].tex_uid;
+                        let sc = self.buf_items[k].scissor;
+                        // 空 scissor（`w/h <= 0`）⇒ **整组跳过**：不是"不裁剪"，是"不画"。
+                        if sc.is_some_and(clip_is_empty) {
+                            while k < self.buf_items.len()
+                                && self.buf_items[k].mesh_id == mid
+                                && self.buf_items[k].dyn_seq == seq
+                                && self.buf_items[k].rstates == rr
+                                && self.buf_items[k].tex_uid == tu
+                                && self.buf_items[k].scissor == sc
+                            {
+                                k += 1;
+                            }
+                            continue;
+                        }
                         // ── 跨层安全合批（不可移除） ──
                         // 分组键**刻意不含 layer**：当不同 layer 的元素（mesh_id + RStates + 纹理
                         // 完全相同）在按 layer 排序后的队列中**连续**（中间无其他 layer / 其他内容
@@ -782,13 +819,15 @@ impl Render2D {
                         // 若中间夹有其他 layer 的元素，连续扫描会在此自然断开，不会误合批。
                         // 正确性由上方 sort_by_key（layer 主键保证总顺序）与 Custom 屏障共同保证。
                         // 注意：动态段按唯一 dyn_seq 分组，绝不跨段合批（否则 identity 实例会
-                        // 重复绘制整段动态缓冲），此约束同样不可移除。
+                        // 重复绘制整段动态缓冲），此约束同样不可移除。`scissor` 不同也必须断开
+                        // （同一 draw 只能一个 scissor）。
                         let mut j = k;
                         while j < self.buf_items.len()
                             && self.buf_items[j].mesh_id == mid
                             && self.buf_items[j].dyn_seq == seq
                             && self.buf_items[j].rstates == rr
                             && self.buf_items[j].tex_uid == tu
+                            && self.buf_items[j].scissor == sc
                         {
                             j += 1;
                         }
@@ -816,6 +855,7 @@ impl Render2D {
                                     index_range: idx_range.clone(),
                                     rstates: rr,
                                     tex_uid: tu,
+                                    scissor: sc,
                                 }
                             } else {
                                 DrawOp::DynamicMesh {
@@ -824,6 +864,7 @@ impl Render2D {
                                     index_range: idx_range.clone(),
                                     rstates: rr,
                                     tex_uid: tu,
+                                    scissor: sc,
                                 }
                             };
                             self.buf_ops.push(op);
@@ -839,6 +880,13 @@ impl Render2D {
         for (cmd, layer, states) in self.command_queue.iter() {
             let tu = states.texture_uid;
             let rr = states.rstates.unwrap_or(self.default_states).raw();
+            // 本命令（及其动态段）的命令级 scissor。
+            let sc = states.scissor;
+            // 动态段 key 变化就冲刷（含 scissor：一次 draw 只能一个 scissor）。
+            if dyn_seg_tri_start.is_some() && dyn_seg_scissor != sc {
+                flush_dyn!();
+            }
+            dyn_seg_scissor = sc;
             match cmd {
                 DrawCommand::Sprite2D {
                     rect,
@@ -853,6 +901,7 @@ impl Render2D {
                         index_range: 0..QUAD_TRI_INDICIES.len() as u32,
                         rstates: rr,
                         tex_uid: tu,
+                        scissor: sc,
                         instance: InstanceData::from_sprite(rect, *color, *transform),
                     });
                 }
@@ -870,6 +919,7 @@ impl Render2D {
                         index_range: 0..QUAD_TRI_INDICIES.len() as u32,
                         rstates: rr,
                         tex_uid: tu,
+                        scissor: sc,
                         instance: InstanceData::from_sprite_matrix(rect, *color, m),
                     });
                 }
@@ -887,6 +937,7 @@ impl Render2D {
                         index_range: 0..mesh.index_count,
                         rstates: rr,
                         tex_uid: tu,
+                        scissor: sc,
                         instance: InstanceData::from_static_transform(*color, *transform),
                     });
                 }
@@ -905,6 +956,7 @@ impl Render2D {
                         index_range: 0..mesh.index_count,
                         rstates: rr,
                         tex_uid: tu,
+                        scissor: sc,
                         instance: InstanceData::from_static(*color, m),
                     });
                 }
@@ -980,7 +1032,10 @@ impl Render2D {
                     self.buf_items.clear();
                     // `idx` 由 `add_custom` 分配、随命令参与排序，
                     // 保证排序后仍指向 `buf_custom_draws` 中正确的闭包。
-                    self.buf_ops.push(DrawOp::Custom { idx: *idx });
+                    // 空 scissor ⇒ 整条跳过（与网格路径一致）。
+                    if !sc.is_some_and(clip_is_empty) {
+                        self.buf_ops.push(DrawOp::Custom { idx: *idx, scissor: sc });
+                    }
                 }
             }
         }
@@ -1114,20 +1169,26 @@ impl Render2D {
         pass.set_bind_group(1, &bg, &[]);
     }
 
-    /// 应用本画面的 viewport / scissor（像素、左上原点；按目标尺寸钳制并取整）。
+    /// **本画面的基准 scissor**（像素、左上原点；按目标尺寸钳制并取整）。
     ///
-    /// - `viewport = None`（默认 / [`Render2D::reset`]）⇒ 不调用，wgpu 默认即全目标
-    ///   （与单画面旧行为逐位等价、零开销）；
-    /// - scissor 默认与视口一致：旋转相机 / 大几何画出矩形之外时，防止画面互相串味。
-    fn apply_viewport(&self, pass: &mut wgpu::RenderPass<'_>, target_size: (u32, u32)) {
+    /// - `viewport = None`（默认 / [`Render2D::reset`]）⇒ 返回**整个目标**（此时不调用
+    ///   `set_viewport`，但命令级 scissor 仍要与"全目标"求交）；
+    /// - `viewport = Some(v)` ⇒ `set_viewport(v)`，基准 scissor = `clamp(v ∩ self.scissor)`。
+    ///
+    /// 命令级 scissor（[`Draw2D::scissor`](crate::Draw2D::scissor)）在此基础上**再求交**：
+    /// 最终 = **命令级 ∩ 画面级 ∩ 目标**（见 `scissor_px`）。
+    fn apply_viewport(&self, pass: &mut wgpu::RenderPass<'_>, target_size: (u32, u32)) -> ScissorPx {
+        let full = (0, 0, target_size.0, target_size.1);
         let Some(v) = self.viewport else {
-            return;
+            return full;
         };
         let Some((vp, sc)) = clamp_viewport(v, self.scissor, target_size) else {
-            return;
+            // 视口与目标不相交：整画面不画（返回空 scissor）。
+            return (0, 0, 0, 0);
         };
         pass.set_viewport(vp.0, vp.1, vp.2, vp.3, 0.0, 1.0);
         pass.set_scissor_rect(sc.0, sc.1, sc.2, sc.3);
+        sc
     }
 
     /// 把 `prepare()` 的合批结果写进 pass。
@@ -1136,12 +1197,41 @@ impl Render2D {
     /// （bind group + 动态偏移；一帧内多画面互不干扰）。
     fn draw(&mut self, pass: &mut wgpu::RenderPass<'_>, ctx: PassContext<'_>) {
         let target_size = ctx.target_size;
-        self.apply_viewport(pass, target_size);
+        // 画面级基准（视口 / view-scissor），已钳到目标像素。
+        let base = self.apply_viewport(pass, target_size);
+        let base_rect = Rect::new(
+            base.0 as f32,
+            base.1 as f32,
+            base.2 as f32,
+            base.3 as f32,
+        );
         if self.buf_ops.is_empty() {
             return;
         }
+        // 当前已设置的 scissor（**只在变化时**调 `set_scissor_rect`：命令级 scissor 逐条
+        // 一样的场景——例如整屏 UI 只有一两个裁剪区——几乎零额外调用）。
+        let mut cur: ScissorPx = base;
         let mut i = 0usize;
         while i < self.buf_ops.len() {
+            // 逐 op 解析最终 scissor；空 ⇒ **跳过该 op**（不发 draw）。
+            let scissor = match &self.buf_ops[i] {
+                DrawOp::InstancedMesh { scissor, .. }
+                | DrawOp::DynamicMesh { scissor, .. }
+                | DrawOp::Custom { scissor, .. } => *scissor,
+            };
+            let want = match scissor {
+                // 命令级 ∩ 画面级（都是屏幕像素矩形）
+                Some(r) => scissor_px(rect_intersect(r, base_rect), target_size),
+                None => Some(base),
+            };
+            let Some(want) = want else {
+                i += 1;
+                continue;
+            };
+            if want != cur {
+                pass.set_scissor_rect(want.0, want.1, want.2, want.3);
+                cur = want;
+            }
             match &self.buf_ops[i] {
                 DrawOp::InstancedMesh {
                     mesh_id,
@@ -1150,6 +1240,7 @@ impl Render2D {
                     index_range,
                     rstates,
                     tex_uid,
+                    ..
                 } => {
                     // 先复制字段，释放 `&self.buf_ops` 借用，再执行 `&mut self` 操作。
                     let (mesh_id, page, instance_range, index_range, rstates, tex_uid) = (
@@ -1194,6 +1285,7 @@ impl Render2D {
                     index_range,
                     rstates,
                     tex_uid,
+                    ..
                 } => {
                     // 先复制字段，释放 `&self.buf_ops` 借用，再执行 `&mut self` 操作。
                     let (page, instance_range, index_range, rstates, tex_uid) = (
@@ -1229,9 +1321,12 @@ impl Render2D {
                     }
                     i += 1;
                 }
-                DrawOp::Custom { idx } => {
+                DrawOp::Custom { idx, .. } => {
                     let cd = Arc::clone(&self.buf_custom_draws[*idx]);
                     cd.draw(pass);
+                    // 自定义闭包可能自己改过 scissor / viewport：令缓存失效，
+                    // 下一条 op 会重新 `set_scissor_rect`（不做假设）。
+                    cur = (u32::MAX, u32::MAX, u32::MAX, u32::MAX);
                     i += 1;
                 }
             }
@@ -1262,12 +1357,59 @@ impl PassRecorder for Render2D {
 
 // ─── 视口换算（纯函数：便于单测） ──────────────────────────────
 
+/// wgpu `set_scissor_rect` 的原始形态：`(x, y, w, h)` 无符号整数。
+pub(crate) type ScissorPx = (u32, u32, u32, u32);
+
 /// 把画面矩形换算成 `set_viewport` / `set_scissor_rect` 的参数：
 /// 按目标尺寸钳制 + 取整；矩形与目标不相交（宽或高 < 1px）时返回 `None`（不设置）。
 ///
 /// `(viewport, scissor)` 的 wgpu 原始形态：`viewport = (x, y, w, h)` 浮点、
 /// `scissor = (x, y, w, h)` 无符号整数。
-pub(crate) type ViewportScissor = ((f32, f32, f32, f32), (u32, u32, u32, u32));
+pub(crate) type ViewportScissor = ((f32, f32, f32, f32), ScissorPx);
+
+/// **命令级 scissor → wgpu 参数**（已含与目标矩形的求交与钳制）。
+///
+/// `None` ⇒ **该 draw 必须整体跳过**（矩形在目标外或为空——不是"不裁剪"）。
+///
+/// 与 [`clamp_viewport`] 的分工：那个管**画面级**（view-scissor，浮点、带 viewport），
+/// 这个管**命令级**（[`Draw2D::scissor`](crate::Draw2D::scissor) 给的屏幕像素矩形；
+/// 传入前已与画面级结果求交）。
+pub(crate) fn scissor_px(rect: Rect, target_size: (u32, u32)) -> Option<ScissorPx> {
+    let r = rect.normalized();
+    let has_area = r.w > 0.0 && r.h > 0.0;
+    if !has_area {
+        return None;
+    }
+    let finite = r.x.is_finite() && r.y.is_finite() && r.w.is_finite() && r.h.is_finite();
+    if !finite {
+        // 非有限输入（NaN / ∞）：当作"空"⇒ 跳过，绝不猜一个坐标去画。
+        return None;
+    }
+    let (tw, th) = (target_size.0 as f32, target_size.1 as f32);
+    // 取整到像素后钳到 [0, target]（**不**缩小：越界/退化就返回 None ⇒ 跳过）
+    let x0 = r.x.round().clamp(0.0, tw) as u32;
+    let y0 = r.y.round().clamp(0.0, th) as u32;
+    let x1 = (r.x + r.w).round().clamp(0.0, tw) as u32;
+    let y1 = (r.y + r.h).round().clamp(0.0, th) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0, y0, x1 - x0, y1 - y0))
+}
+
+/// **两个屏幕像素矩形的交集**（`None` 可出现在任一侧：`None` 视为"不裁剪"= 另一侧）。
+///
+/// 命令级与画面级 scissor 叠加用它（先求交，再交给 [`scissor_px`] 钳制）。
+#[inline]
+pub(crate) fn rect_intersect(a: Rect, b: Rect) -> Rect {
+    let a = a.normalized();
+    let b = b.normalized();
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.w).min(b.x + b.w);
+    let y1 = (a.y + a.h).min(b.y + b.h);
+    Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+}
 
 /// 把画面矩形与裁剪矩形夹到渲染目标范围内（含 DPI / 越界钳制 / 空矩形判定）。
 ///
@@ -1341,5 +1483,32 @@ mod viewport_tests {
         .unwrap();
         assert_eq!(vp, (0.0, 0.0, 640.0, 720.0));
         assert_eq!(sc, (16, 16, 200, 100));
+    }
+
+    /// **命令级 scissor → wgpu 参数**：目标内原样、越界钳制、全外/空 ⇒ `None`（跳过 draw）。
+    #[test]
+    fn command_scissor_clamps_and_rejects_empty() {
+        let t = (1280u32, 720u32);
+        // 目标内：按像素取整
+        assert_eq!(scissor_px(Rect::new(10.4, 20.2, 100.0, 50.0), t), Some((10, 20, 100, 50)));
+        // 负原点 / 越右下：钳到目标（**不**报错、**不**跳过）
+        assert_eq!(scissor_px(Rect::new(-10.0, -10.0, 100.0, 100.0), t), Some((0, 0, 90, 90)));
+        assert_eq!(scissor_px(Rect::new(1200.0, 700.0, 200.0, 200.0), t), Some((1200, 700, 80, 20)));
+        // 完全在目标外 / 空 ⇒ None（该 draw 整体跳过，而不是退化成"不裁剪"）
+        assert_eq!(scissor_px(Rect::new(2000.0, 0.0, 100.0, 100.0), t), None);
+        assert_eq!(scissor_px(Rect::new(0.0, 0.0, 0.0, 10.0), t), None);
+        assert_eq!(scissor_px(Rect::new(f32::NAN, 0.0, 10.0, 10.0), t), None);
+    }
+
+    /// **命令级 ∩ 画面级**：求交后再钳制（两者都不裁剪时结果 = 目标全屏）。
+    #[test]
+    fn command_scissor_composes_with_view_scissor() {
+        let base = Rect::new(0.0, 0.0, 640.0, 720.0); // 画面级（左半屏）
+        let cmd = Rect::new(100.0, 100.0, 800.0, 200.0); // 命令级（横跨半屏边界）
+        let inter = rect_intersect(cmd, base);
+        assert_eq!(inter, Rect::new(100.0, 100.0, 540.0, 200.0));
+        assert_eq!(scissor_px(inter, (1280, 720)), Some((100, 100, 540, 200)));
+        // 不相交 ⇒ 空 ⇒ 跳过
+        assert_eq!(scissor_px(rect_intersect(cmd, Rect::new(0.0, 0.0, 50.0, 720.0)), (1280, 720)), None);
     }
 }

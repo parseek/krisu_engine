@@ -396,6 +396,20 @@ r2d.polygon_with(|p| {
 > `Draw2D<'a, K>` 是本工程**唯一的绘制 Builder**（`Sprite` / `Mesh` / `StaticMesh` / `Custom` 四个 kind）；
 > 类型别名 `SpriteBuilder` / `MeshBuilder` / `StaticMeshBuilder` / `CustomBuilder` 供签名标注。
 
+#### 5.6.1 Scissor（命令级裁剪，v0.3 新增）
+
+| 函数 | 说明 |
+|---|---|
+| `Draw2D::scissor(rect: Rect)` | **命令级 scissor**（屏幕/目标像素、左上原点）。最终 = 命令级 **∩** 画面级 `Render2D::scissor` **∩** 目标矩形；**空矩形 ⇒ 该命令整条跳过**（0 draw，不是"不裁剪"）；不同 scissor 的命令**不合批**（一次 `draw_indexed` 只能一个 scissor） |
+| `Draw2D::scissor_opt(Option<Rect>)` | 同上，`None` = 不设（继承画面级） |
+| `Render2D::scissor(Option<Rect>)` | **画面级** scissor（整画面；浮点、按目标钳制；见 §5.1） |
+| `Render2D::draw_op_count() -> usize` | 上一帧 `prepare()` 后的 draw op 数（= draw call 数），诊断"scissor 让 draw 变多" |
+
+> `scissor` 走**两级**：画面级（`Render2D`，作用于整个 `pass`）与命令级（`Draw2D`，逐条命令）。
+> 两者的矩形都在绘制时按像素取整并钳到目标；任一为空/全在目标外则该 op 不发 draw。
+> UI 用它承载环境裁剪（[`UiBatch::clip`]），从而**不再切割几何**——圆角、环边、投影
+> 保持原形。见 `docs/ENGINE_GUIDE.md` §18.20。
+
 ### 5.7 静态网格 StaticMesh
 
 | 函数 | 说明 |
@@ -852,11 +866,19 @@ pub struct UiBatch {
     pub transform: Transform2D,        // 实例级（窗口 FX 不重建顶点）
     pub tint: Color,                   // 实例级整段染色（顶点色已含控件自身 tint）
     pub layer: f64,
+    pub clip: Option<Rect>,            // **批次 scissor**（屏幕物理像素；None = 不裁剪）
     pub source: UiBatchSource,         // 实例用户数据
 }
 
 pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 ```
+
+> **`clip`（v0.3）**：UI 的环境裁剪（严格窗口内容 / ScrollView 可视区 / Clip 沙箱 /
+> 文本框盒）以**批次 scissor** 交付，几何保持原形（圆角 / 环带 / 投影不再被切平）。
+> 后端把它交给渲染器的**命令级 scissor**（`Draw2D::scissor`，见 §5.6）；`None` = 只受
+> 画面级 `Render2D::scissor` 约束；**空矩形应跳过该批次**（不是"不裁剪"）。
+>
+> `RecordingBackend` 提供 `clipped_batches()` / `clips()` 供断言。
 
 > `indices` 允许为空——后端此时应按「每 4 顶点一组、顺序 `TL,TR,BL,BR`」的旧四边形
 > 约定补出索引（`Render2dUiBackend` 即如此回退），使外部后端仍可只产出顶点。

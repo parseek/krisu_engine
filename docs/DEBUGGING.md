@@ -54,6 +54,10 @@ ui[frame=21 scale=1.50 viewport=(1920,1080) mouse=(1180,200) in_win=true focus=N
 | **拖不动** | 拖拽时 `drag` 是否为 `true`、`press` 是否有值、`origin` 是否跟着鼠标变 | `drag=false` ⇒ 命中被挡（`window_occluded` / `press_claimed`）或鼠标坐标没更新；`drag=true` 但 `origin` 不变 ⇒ 责任链优先级或被 clamp |
 | 松手后弹回 | `stored` 是否被写入新的位置 | `stored=None` ⇒ 拖拽没进入激活态（位移 < `DRAG_ACTIVATE_PX` / 基准被清） |
 | 层级不对 | `z` 排序；世界内容是否本就在**世界层** | 屏幕固定 UI 应走 `f.draw_ui()` / `f.text_ui()` / `f.ui()`（UI 层恒在世界层之后提交） |
+| **裁剪没生效**（内容画到窗口/沙箱外） | `--ui-dump` 里该窗的 `clip=`；`[perf] ... clip_batches=` | `clip=None` 而该窗本该裁 ⇒ 强制层没建立（`Placement::Clip` / 固定高 / `view_at(Clip)`）或该批次没带 scissor；`clip_batches=0` ⇒ 裁剪完全没接上（渲染器/后端链路） |
+| **裁剪位置不对**（裁多了/裁少了/整块不见） | `clip=` 的矩形 vs 该窗 `origin` + `size` | 不等 ⇒ `batch_scissor` 的映射错了（窗口 FX 变换 / anchor）；`clip` 为空 ⇒ 空 scissor 会**整条跳过**（不是"不裁"） |
+| **圆角被切平**（窗口拖到视口边缘时边框变方） | 是不是把环境裁剪又写回几何切割了 | 环境裁剪应走 batch scissor（`UiBatch.clip`），几何保持原形——见 `docs/ENGINE_GUIDE.md` §18.20 |
+| **draw call 变多** | `[perf] clip_batches=` 与 `cmds/wins` | 每个**不同** scissor 至少要一段（一次 draw 一个 scissor）；`clip_batches` 远大于窗口数 ⇒ 控件给自己套了太多层裁剪 |
 
 ---
 
