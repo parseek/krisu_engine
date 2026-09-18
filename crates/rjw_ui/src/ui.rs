@@ -795,8 +795,19 @@ impl<'a> Ui<'a> {
     /// 在 `f.ui(|ui| { ...; ui.debug_dump() })` 闭包末尾调用可拿到全部窗口。
     pub fn debug_dump(&self) -> UiDebugDump {
         let mut windows: Vec<UiWindowInfo> = Vec::new();
-        for (z, id) in &self.win_ids {
-            let origin = self.win_origins.get(z).copied().unwrap_or(Vec2::ZERO);
+        // ⚠ 遍历**本帧录制过的窗口 id**（帧级、各段累加），不是 `Ui` 帧内的 `win_ids`
+        // （**按 z 键** ⇒ 同一帧的多个 `WIN_TOPMOST` 浮层只会留下最后一个，嵌套子菜单
+        // 从 dump 里消失）。原点取 `state.window_origins`（**按 id**）。
+        for id in &self.state.frame_state.window_ids_seen {
+            let Some(z) = self.state.window_z.get(id.as_str()).copied() else {
+                continue;
+            };
+            let origin = self
+                .state
+                .window_origins
+                .get(id.as_str())
+                .copied()
+                .unwrap_or(Vec2::ZERO);
             let size = self
                 .state
                 .window_sizes
@@ -812,13 +823,13 @@ impl<'a> Ui<'a> {
             let ws = self.state.widgets.get(id.as_str());
             windows.push(UiWindowInfo {
                 id: id.as_str().to_owned(),
-                z: *z,
+                z,
                 origin,
                 size,
                 dragging: ws.is_some_and(|w| w.dragging),
                 press_panel: ws.and_then(|w| w.press_panel),
                 stored_pos: self.state.panel_pos.get(id.as_str()).copied(),
-                submit_pos: self.state.debug_submit.get(z).copied(),
+                submit_pos: self.state.debug_submit.get(&z).copied(),
             });
         }
         windows.sort_by_key(|w| w.z);
@@ -2665,6 +2676,8 @@ impl<'a> Ui<'a> {
         id: &str,
         pos: Vec2,
         width: Option<f32>,
+        // 内容子项间距（物理；`None` = `Theme::gap`）。下拉 / 菜单浮层传更紧的值。
+        content_gap: Option<f32>,
         topmost: bool,
         strict: bool,
         style: Option<&PanelStyle>,
@@ -2705,7 +2718,10 @@ impl<'a> Ui<'a> {
         let style = style
             .cloned()
             .unwrap_or_else(|| self.theme.panel.clone());
-        let (pad_total, gap) = (style.padding + style.border_w, self.theme.gap);
+        let (pad_total, gap) = (
+            style.padding + style.border_w,
+            content_gap.unwrap_or(self.theme.gap),
+        );
         let saved_base = self.abs_base;
         let (sw, sh) = (
             self.window.inner_size().width as f32,
@@ -2856,9 +2872,10 @@ impl<'a> Ui<'a> {
         //
         // **标题栏先录**（窗口内容第一行，与用户内容同一个 `Frame` 结算 ⇒ 窗口高度自然
         // 包含它）；**收起**时只录标题栏、跳过用户闭包（`*collapsed` 由调用方持有）。
-        // 通条高度 = **面板上内边距 + 一行**：标题行录在内容流的第一行，起点是
-        // `pad_total`，所以底色要从窗口顶边（0）铺到该行的下沿才"通"。
-        let bar_h = if chrome.bar_on() { pad_total + self.theme.row_h } else { 0.0 };
+        // 通条高度 = **一行**（标题行**贴窗口顶边**录，起点 0）：内容上抬 `pad_total`、
+        // 条高不再含上内边距，下面的内容与窗口高度随之各少一个 `pad_total`。
+        // ⚠ 条只是**背景装饰、不裁剪内容**：标题 / ▲ / ✕ 可以比条高再高一点（用户要求）。
+        let bar_h = if chrome.bar_on() { title_bar_h(self.theme.row_h) } else { 0.0 };
         let collapsed = chrome.collapsed();
         self.with_id(id, |ui| {
             let mut w = Window { ui };
@@ -2928,6 +2945,12 @@ impl<'a> Ui<'a> {
         }
         // 记录窗口原点（顶点局部化基准；win=0 非窗口默认 (0,0)）与窗口 id（缓存 key）
         self.win_origins.insert(z, display_pos);
+        // **按 id 再记一份**：同一帧可以有多个 z 相同的 `WIN_TOPMOST` 浮层（下拉里开子菜单），
+        // z 键表只剩最后一个 ⇒ `debug_dump` 会漏掉嵌套浮层（渲染不受影响：采集减、提交加
+        // 用的是同一个 z 键值）。id 键表让每个浮层都能被诊断到。
+        self.state
+            .window_origins
+            .insert(id_for.to_static(), display_pos);
         self.win_ids.insert(z, id_for.to_static());
         // 窗口矩形入遮挡判定缓存（跨帧；finish 末尾只保留本帧录制的窗口）。
         // ⚠ 存**绝对**坐标：嵌套窗口 / 下拉浮层在容器内时 `display_pos` 是容器
@@ -3129,6 +3152,7 @@ impl<'a> Ui<'a> {
             id,
             pos,
             width,
+            None,
             false,
             false,
             None,
@@ -5092,8 +5116,14 @@ pub struct UiWindowInfo {
     pub id: String,
     /// z 序（越大越上）。
     pub z: u32,
-    /// **本帧提交原点**（物理像素、屏幕左上原点）——即 `win_origins[z]`，
-    /// 渲染时经 `screen_fixed_tf(origin)` 变换 ⇒ **这个值就是窗口在屏幕上的位置**。
+    /// **本帧提交原点**（物理像素）—— 即 `win_origins[z]`。
+    ///
+    /// ⚠ 它是**相对直接容器**的原点（顶点管线"采集时减去本窗口 origin、提交时再加回来"，
+    /// 所以两者一致 ⇒ 渲染正确）：
+    /// - **顶层窗口**（`abs_base = 0` 处录制）= **屏幕坐标**，直接可用；
+    /// - **嵌套窗口**（如对话框里的下拉浮层）**不是**屏幕坐标 —— 想用它算屏幕位置，
+    ///   要把每层外层窗口的 `origin` 累加（实测：对话框内下拉 dump 里是 `(14,162)`，
+    ///   屏幕上在 `(704,492)` = 对话框 `(690,330)` + 它）。
     pub origin: Vec2,
     /// 结算尺寸（物理像素）。
     pub size: Vec2,
@@ -5247,6 +5277,16 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
         self.o.resize = Some((allow, axes));
         self
     }
+    /// **内容子项间距**（[`Size<f32>`]：`Logical`（默认，× scale 取整）/ `Physical` 原样）：
+    /// 本窗口内容**垂直栈的行距**（不调 = [`Theme::gap`]）。
+    ///
+    /// 用途：**下拉 / 菜单这类"内容行紧挨着"的浮层**需要比主题更紧的行距
+    /// （见 [`crate::widgets::menu::popup_gap`]：逻辑 1px）。容器自身的 `Theme::gap`
+    /// 是给普通窗口内容用的，菜单行按它排会"每两行之间空一大截"（用户实测）。
+    pub fn gap(mut self, g: impl Into<Size<f32>>) -> Self {
+        self.o.gap = Some(g.into());
+        self
+    }
     /// **标题栏**（可选）：画一条标题栏作为窗口内容**第一行** —— 底色
     /// `Palette::surface_raised`、底边 1px `PanelStyle::border` 分隔线、文字用 `label` 样式。
     ///
@@ -5288,6 +5328,7 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
         // API 边界换算：Logical → Physical（内部布局/绘制全物理）。
         let pos = o.pos.to_physical(ui.scale);
         let width = o.width.map(|w| w.to_physical(ui.scale));
+        let content_gap = o.gap.map(|g| g.to_physical(ui.scale));
         // 枚举 → 内部两个开关（公开面不再出现裸布尔）。
         let topmost = o.level == Level::Topmost;
         let strict = o.placement == Placement::Clip;
@@ -5296,6 +5337,7 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
             id,
             pos,
             width,
+            content_gap,
             topmost,
             strict,
             o.style.as_ref(),
@@ -7054,6 +7096,16 @@ impl From<TextAlign> for Align {
 
 // ─── 窗口标题栏（窗口外框部件） ──────────────────────────────────
 
+/// **标题栏条高**（纯函数，可单测）= **一行** [`Theme::row_h`]。
+///
+/// 内容贴顶后不再需要"上内边距 + 一行"：标题行录在窗口顶边（`y = 0`），条高就是那一行。
+/// ⚠ 条只是**背景装饰、不裁剪内容** —— 标题 / ▲ / ✕（边长 `row_h - 2`）允许**比条高再高一点**
+/// （用户明确要求"内容可以比条高再高一点"），本函数**与按钮边长无关**。
+#[inline]
+fn title_bar_h(row_h: f32) -> f32 {
+    row_h
+}
+
 /// **窗口标题栏**（窗口内容**第一行**）：标题文字 + 右侧"收缩 / 关闭"图标按钮。
 ///
 /// 要素：
@@ -7104,6 +7156,12 @@ fn window_title_bar(
 
     let mut close_clicked = false;
     let mut shrink_clicked = false;
+    // **标题行贴窗口顶边**：把内容光标临时抬到 `y = 0`（x 保持内容左缘）。
+    // `row()` 按该光标放置、并在结算后把光标推进到「条下沿 + gap」⇒ 后续内容自然上移
+    // `pad_total`（条高同时从 `pad_total + row_h` 变成 `row_h`，见 [`title_bar_h`]）。
+    if let Some(fr) = w.ui_mut().frames.last_mut() {
+        fr.cursor.y = 0.0;
+    }
     w.row(|r| {
         // 标题：省略号模式 ⇒ 过长时按 `title_max` 截断（不撑宽窗口、不挤走按钮）；
         // 不超长时绘制与普通 `label` 完全一致。

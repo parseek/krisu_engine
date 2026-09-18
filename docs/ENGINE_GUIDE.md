@@ -1584,7 +1584,8 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 |---|---|
 | **不调三个选项 = 逐像素等于旧行为** | `WindowChrome::bar_on()` 为假 ⇒ 不录标题栏、不加通条、不动任何几何（既有截图 / sim 基线不受影响） |
 | 标题栏 = 内容**第一行** | 先录标题栏再录用户闭包（同一个 `Frame` 结算）⇒ 窗口高度**自然**包含它；`title` 过长按**省略号**截断（不撑宽窗口） |
-| 通条底色 + 分隔线 | 整窗宽矩形，高 = `pad_total + row_h`（含面板上内边距才"通"），底边那条就是面板边框色的 1px 分隔线；圆角取面板**上面两角**，与面板边框**连续**（不会"标题栏把上边框啃掉"） |
+| **标题行贴窗口顶边** | 录标题行**之前**把内容光标抬到 `y = 0`（x 保持内容左缘）⇒ 标题 / ▲ / ✕ **上移一个 `pad_total`**，下一个内容行自然落在「条下沿 + `gap`」——即**下面的内容与窗口高度各少一个 `pad_total`**（用户实测："可以往上抬"） |
+| 通条底色 + 分隔线 | 整窗宽矩形，高 = `title_bar_h(row_h)` = **一行**（`title_bar_h` 是纯函数、可单测），底边那条就是面板边框色的 1px 分隔线；圆角取面板**上面两角**，与面板边框**连续**（不会"标题栏把上边框啃掉"）。⚠ 条只是**背景装饰、不裁剪内容**：标题 / ▲ / ✕（边长 `row_h - 2`）允许**比条高再高一点**（用户明确要求） |
 | 标题栏空白处仍可拖窗 | 只有 `×` / `⌃` 上的按下会 `claim_press()`（与滑块 / 滚动条同一机制）——点按钮不会顺带把窗口拖走 |
 | `×` 的关闭语义 | `*open = false` 时**整窗短路**：不录制、不写原点 / 尺寸、**不占遮挡矩形**（不会留下"看不见却挡点击"的窗口）；下一帧起彻底消失，**重开是应用的责任** |
 | `shrink(show, collapsed)` | `collapsed` 在录制**开头**读取（点击当帧不变、下一帧生效）；`show = false` 时按钮不画，但 `*collapsed` **照旧生效**——菜单 / 代码可收起展开而不必放按钮 |
@@ -1656,7 +1657,7 @@ ui.window("popup").width(300.0).resize(false, Resize::None).show(|w| ..); // 固
 ```bash
 cargo run -p eg260818UI -- --sim-chrome --frames 100      # 真的去点 ⌃ / ×（坐标由主题 + DPI 解算）
 # sim-chrome: win_a open=true  collapsed=false size=(358,320)   ← 初始
-# sim-chrome: win_a open=true  collapsed=true  size=(358,67)    ← 点 ⌃：只剩一行标题栏
+# sim-chrome: win_a open=true  collapsed=true  size=(358,53)    ← 点 ⌃：只剩一行标题栏
 # sim-chrome: win_a open=false collapsed=true  size=(0,0)       ← 点 ×：整窗短路
 # sim-chrome: win_a open=true  collapsed=true  size=(358,67)    ← 应用重开
 # sim-chrome: win_a open=true  collapsed=false size=(358,320)   ← 应用展开
@@ -1789,10 +1790,14 @@ ui.add(Dropdown::options("diff", "普通", &mut idx, &["简单", "普通", "困�
 // ② 富内容模式：菜单内容自己写（`m` 是 MenuCtx ⇒ 全部 UiAdd 方法 + 菜单语义）。
 ui.add(Dropdown::new("file", "文件名过滤").width(160.0).menu(|m| {
     m.text_input("filter", &mut filter);        // ← 菜单里的文本输入
+    // **责任链菜单项**（`Item`）：普通 / 勾选 / **子菜单** 三种形态 + 点击行为 flag。
+    m.item(Item::new("保持打开").click_behavior(MenuClick::Keep));   // 点完**不收起**
+    m.item(Item::new("窗口 A 显示").checked(&mut show_a));           // 勾选项（自持）
+    m.submenu("编码", |s| {                                          // = Submenu
+        if s.item("UTF-8") { }                                       // Hover 在行**右侧**展开
+    });
     m.separator();                              // ← 分割线（自绘，满内容宽）
-    if m.item("导入图片…") { /* 点完自动收起 */ }
-    m.add(Dropdown::options("enc", "UTF-8", &mut enc, &["ASCII", "UTF-8"])  // ← 菜单里再 add
-            .side(PopupSide::Right));                                       //   子菜单开在右侧
+    if m.item("导入图片…") { /* 点完自动收起（旧写法 = Item::new(..)，`From<&str>`） */ }
 }));
 ```
 
@@ -1802,7 +1807,27 @@ ui.add(Dropdown::new("file", "文件名过滤").width(160.0).menu(|m| {
 | `Dropdown::new(id, label).menu(\|m\| ..)` | 富内容模式（图二）：菜单体是闭包，参数 [`MenuCtx`](crate::MenuCtx) |
 | `.side(PopupSide::{Below,Right})` | 面板方位：`Below`（默认，正下方 2px）/ `Right`（子菜单） |
 | `.width(..)` / `.font_size(..)` | 触发器固定宽（默认按文字自动）/ 字号 |
+| `m.item("文本")` | **旧写法（糖）**：= `Item::new("文本")`，返回"本帧是否被点击"；点击即收起 |
+| `m.item(Item::new(..)…)` | **责任链菜单项**（[`Item`](crate::Item)）：`.click_behavior(MenuClick)` / `.checked(&mut bool)` / `.submenu(\|s\| ..)` |
+| `MenuClick::{Close,Keep}` | **点击行为 flag**：点完「收起整个 popup」（默认）/「**保留** popup」（"点了还要继续操作"的项）。⚠ `Submenu` 恒为"不收起" |
+| `m.submenu(label, \|s\| ..)` | **子菜单（Submenu）**：普通项样式 + 右侧 ▸，**Hover** 在行**右侧**展开（= `Item::new(label).submenu(..)`） |
+| `m.item_checked(label, &mut bool)` | 旧写法（糖）：= `Item::new(label).checked(..)` |
+| `m.caption(text)` / `m.separator()` | 分组标题（小字号 + `text_muted`）/ 自绘分割线 |
 | `Ui::combo_at` / `UiAdd::combo` | **糖**（旧的"下拉框"入口，签名 / 行为不变）：= 选项列表模式 + 固定布局宽。`FontModal` 的字重下拉仍走它 |
+
+**`Submenu` 的五条语义**（`Item::submenu` / `m.submenu`）：
+
+| 行为 | 机制 |
+|---|---|
+| **Hover 即开** | 行的 `hit`（`hit_abs`）⇒ 开；判据是纯函数 `menu::submenu_open_now(hit, was, inside)` |
+| **鼠标进子面板保持** | `inside` = 鼠标在本行**子面板或其任意后代窗口**内（`state.window_rects` 绝对矩形 + `id_in_window_tree` **按 `/` 边界**的祖先前缀判定）⇒ 移到同菜单其他行 / 移出菜单自动收起 |
+| **开在行右侧** | `PopupSide::Right` ⇒ `popup_origin(行矩形, Right) = (行右缘 + 2, 行顶)`；面板最小宽用 `ComboStyle::item_min_w`（**不用行宽**，否则与父面板一样宽） |
+| **点击不收起** | 子菜单行恒 `close_on_click = false`（`MenuClick` 对它无效），也不切换（Hover 已决定，避免抖动） |
+| **链式收起** | 子面板里点普通项 ⇒ 子面板 `popup_show` 报 `item_clicked` ⇒ `*self.close = true` **冒泡到父** ⇒ 整条链（子 + 父）一起收 |
+
+**状态**：子菜单是否展开是**行自持**的 `WidgetState::submenu_open`（`pub(crate)`，`reset()` 随
+`widgets` 清空）——⚠ **绝不借** `UiState::combo_open`（那是**父下拉**的槽位：早期"菜单里嵌一个
+`Dropdown`"就被它覆盖，症状是"点一下整条 popup 消失"）。层级不限（子菜单里还能再 `submenu`）。
 
 **状态与语义**：展开状态跨帧持久于 [`UiState::combo_open`](crate::UiState::combo_open)
 （**控件（触发器）的绝对 ID**，与 `menu_open` 记触发器一致；面板窗口 id = `<控件 id>::popup`）。
@@ -1828,14 +1853,17 @@ ui.add(Dropdown::new("file", "文件名过滤").width(160.0).menu(|m| {
 `menu::popup_origin(trigger, side)`（面板原点）。它们与引擎**同源**：
 `--sim-dropdown` 就是用它们算点击点、并用 `popup_origin` 反查"面板该在哪"。
 
-**验证**：`--sim-dropdown`（5 段，全 `[OK]`）——
+**验证**：`--sim-dropdown`（**7 段，全 `[OK]`**）——
 ① 点触发器开下拉且**面板原点 = `popup_origin(触发器, Below)`**；
 ② 点选项 ⇒ 选中索引变 + 自动收起 + 面板消失；
 ③ 富内容下拉同样开得起来（同一个控件、同一套浮层）；
 ④ `text_focus()` 落在 `<下拉 id>::popup/...` ⇒ **菜单里的文本输入真可聚焦**；
-⑤ 点菜单项 ⇒ 执行 + 自动收起。引擎侧不变量由纯函数单测守着（`menu.rs` /
-`dropdown.rs`：行高公式、方位、宽度收敛、关闭真值表、行底色优先级、勾选判定；`state.rs`：
-`combo_open()` 可读 + `reset` 清空）。
+⑤ **只悬停**子菜单行 ⇒ 子面板原点 = `popup_origin(行, Right)` 且**父 popup 未消失**；
+⑥ 点子菜单里的项 ⇒ 应用状态变 + **整条链**（子 + 父）收起；
+⑦ 点 `MenuClick::Keep` 项 ⇒ 执行 + **popup 保留**。
+引擎侧不变量由纯函数单测守着（`menu.rs`：行高公式、面板方位、宽度收敛、关闭真值表、行底色
+优先级、勾选判定、**子菜单展开真值表**、**窗口子树前缀边界**、`Item` 责任链默认档；`ui/tests.rs`：
+`title_bar_h` 贴顶；`dropdown.rs`；`state.rs`：`combo_open()` 可读 + `reset` 清空）。
 
 ### 18.16 维护约定（对 AI）
 
@@ -1849,6 +1877,11 @@ ui.add(Dropdown::new("file", "文件名过滤").width(160.0).menu(|m| {
   复制一份浮层录制代码 = 迟早出现"两套菜单观感不一致"（本轮就是来消除这个的）。
 - 浮层的**几何**要能被脚本算出来：新增/改动行高或内边距时，同步改 `menu::item_h` /
   `menu::popup_padding`（公开助手），别让脚本自己抄一遍公式。
+- **同一帧可以有多个 z 相同的 `WIN_TOPMOST` 浮层**（下拉里再开子菜单）：`Ui` 帧内的
+  `win_ids` / `win_origins` **按 z 键**，相同 z 只会留下最后一个 ⇒ 诊断**必须按窗口 ID**
+  （[`Ui::debug_dump`](crate::Ui::debug_dump) 走 `frame_state.window_ids_seen` +
+  `UiState::window_origins`）。渲染不受影响：采集时减、提交时加用的是同一个 z 键值。
+  跨帧状态槽位同理：**子菜单状态挂行自己（`WidgetState`），不要挤 `UiState::combo_open`**。
 - 新增**交互**控件时必须调用 `register_focus(&id_for, rect, FocusKind::X)`（键盘导航 / 焦点描边；`id_for = ui.id_for(id)` 为**绝对 ID**）；需要 Enter/Space 激活的控件用 `key_click(&id_for, kind)` 合成点击。持久状态一律经 `state_mut().widget(&id_for)` 读写（绝对 ID）。
 - 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
 - **半透明与元素序**（两条都会静默毁掉画面）：

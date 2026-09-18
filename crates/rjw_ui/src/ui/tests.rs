@@ -1159,3 +1159,15 @@ fn window_content_clips_when_height_is_user_fixed() {
     assert!(window_content_clipped(true, Some(120.0)));
     assert!(!window_content_clipped(false, None), "默认 Expand 不裁剪");
 }
+
+#[test]
+fn title_bar_hugs_the_top_and_does_not_clip_content() {
+    // 标题行**贴窗口顶边**录（`window_title_bar` 把内容光标抬到 y=0）⇒ 条高 = **一行**，
+    // 不再含上内边距（用户实测："可以往上抬"）。
+    assert_eq!(title_bar_h(45.0), 45.0);
+    // ⚠ 条只是**背景装饰**：标题 / ▲ / ✕ 的边长是 `row_h - 2`，允许**比条高**（用户明确
+    // 要求"内容可以比条高再高一点"）⇒ 条高**与按钮边长无关**（这里只吃 `row_h` 一个参数，
+    // 谁想改成"条比内容更矮"就改这一个函数）。
+    let btn = 45.0 - 2.0;
+    assert!(btn < title_bar_h(45.0) + 1.0, "按钮可以接近/超过条高");
+}

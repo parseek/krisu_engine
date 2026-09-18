@@ -326,7 +326,10 @@ pub use colorpicker::{
 pub use divider::Divider;
 pub use dropdown::Dropdown;
 pub use fontmodal::{FONT_WEIGHT_CHOICES, FontModal, weight_label};
-pub use menu::{MenuContent, MenuCtx, MenuFn, PopupSide, item_h, popup_origin, popup_padding};
+pub use menu::{
+    Item, MENU_GAP, MenuClick, MenuContent, MenuCtx, MenuFn, PopupSide, item_h, popup_gap,
+    popup_origin, popup_padding,
+};
 pub use menubar::MenuBar;
 pub use segmented::Segmented;
 pub use label::Label;

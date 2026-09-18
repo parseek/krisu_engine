@@ -63,16 +63,25 @@ krusie 引擎的 UI 模块：**hybrid 模式**（立即外观 + ID 持久状态�
   任何容器。① `Dropdown::options(id, label, &mut u32, &[&str])` = 选项列表模式（选中行打勾 +
   整行高亮 + 点击写回 + ↑/↓ 切换）；② `Dropdown::new(id, label).menu(|m| ..)` = 富内容模式，
   `m` 是 `MenuCtx`（`Deref` 到 `Window`）⇒ **菜单内又可以 `UiAdd::add`**（文本输入 / 分割线 /
-  菜单项 / 横向排版 / 再嵌一个 `Dropdown::side(PopupSide::Right)` 当子菜单）。展开状态
-  `UiState::combo_open()`（**控件绝对 ID**；面板 = 它 + `::popup`）。旧的 `combo` / `combo_at`
-  退化成糖（签名 / 行为不变）。几何助手 `item_h` / `popup_padding` / `popup_origin` 公开
-  （脚本算坐标与引擎同源）；`eg260818UI --sim-dropdown` 脚本化守护（五段）。
+  横向排版 / **责任链菜单项**）。展开状态 `UiState::combo_open()`（**控件绝对 ID**；面板 = 它
+  + `::popup`）。旧的 `combo` / `combo_at` 退化成糖（签名 / 行为不变）。几何助手 `item_h` /
+  `popup_padding` / `popup_origin` / `popup_gap` 公开（脚本算坐标与引擎同源）；
+  `eg260818UI --sim-dropdown` 脚本化守护（**7 段**）。
+- **菜单项 `Item`（责任链）+ `Submenu`**：`m.item(Item::new("…").click_behavior(MenuClick::Keep))`
+  / `.checked(&mut bool)` / `.submenu(|s| ..)`（旧写法 `m.item("文本")` 经 `From<&str>` 继续可用）。
+  **点击行为 flag** `MenuClick::{Close,Keep}`：点完收起 / **保留 popup**。
+  `Submenu`：普通项样式 + 右侧 ▸，**Hover 在行右侧**展开（`PopupSide::Right`）、**点击不收起**、
+  鼠标进子面板保持、子面板里点项 ⇒ **整条链**收起；状态**行自持**（`WidgetState::submenu_open`，
+  绝不挤 `UiState::combo_open`——那正是"点一下整条 popup 消失"的根因）；层级不限。
 - **菜单栏**：`Ui::menu_bar(id, pos, |bar| ..)` —— 横向触发器 + **同一套**下拉面板
-  （`MenuCtx` 有 `item`（点完自动收起）/ `item_checked`（翻转 `&mut bool`）/ `caption` /
-  `separator`）。展开状态 `UiState::menu_open`（同一时刻只有一个菜单开着；点项 / 点栏外 /
-  Esc 收起；点**另一个触发器** = 切换）。下拉的**录制 / 样式 / 宽度 / 关闭规则**与 `Dropdown`
+  （`MenuCtx` 的 `item` / `item_checked` / `submenu` / `caption` / `separator`）。展开状态
+  `UiState::menu_open`（同一时刻只有一个菜单开着；点项 / 点栏外 / Esc 收起；点**另一个触发器**
+  = 切换）。下拉的**录制 / 样式 / 宽度 / 行距（`popup_gap` = 逻辑 1px）/ 关闭规则**与 `Dropdown`
   共用 `widgets::menu::popup_show`（`WIN_TOPMOST` 哨兵 ⇒ 菜单栏录在哪里都盖得住别人；
   "点在任意 `WIN_TOPMOST` 浮层上不收起"是给**子菜单**留的）。
+- **标题栏贴顶**：标题行录在窗口**顶边**（`y = 0`），条高 = `title_bar_h(row_h)` = **一行**
+  （纯函数）；下面的内容与窗口高度各少一个 `pad_total`。条只是**背景装饰、不裁剪内容**
+  （标题 / ▲ / ✕ 允许比条高）。`eg260818UI --sim-chrome` 断言按钮命中（其 y 公式同步去掉 `pad`）。
 - **全局字重**：`Theme::font_weight`（`Weight`，默认 `NORMAL` = 400，任意数值可用）；
   它是**排版输入**（改字形与步进宽度）⇒ 与 `line_spacing` 同样进「排版缓冲缓存键 +
   窗口 / 子槽几何签名前缀」两处，改它不会留下陈旧几何。`Density` / `scaled(DPI)` 都不碰它。

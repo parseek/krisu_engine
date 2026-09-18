@@ -67,6 +67,13 @@ pub struct WidgetState {
     /// **拖拽灵敏度记录**（`NumberInput` / `Slider` 用）：本控件上次拖拽的每像素速度
     /// 倍率；**变化时（按住 Shift/Ctrl 切换）重设拖拽基准**——从当前值继续、不跳变。
     pub(crate) drag_sens: f32,
+    /// **子菜单是否展开**（菜单项控件 `Submenu` 的行自持状态；`reset()` 随 `widgets` 清空）。
+    ///
+    /// 为什么放在**行自己**身上、而不是 `UiState` 的全局槽位：一个菜单里可以有多层子菜单
+    /// （子菜单里还能再 `submenu`），全局单槽会被内层覆盖 ⇒ 外层误判"自己没开"而收起。
+    /// ⚠ 绝不能借用 `UiState::combo_open`——那是**父下拉**的槽位，早期"菜单里嵌 `Dropdown`"
+    /// 的做法正是被它覆盖，症状是"点一下整条 popup 消失"。
+    pub(crate) submenu_open: bool,
 }
 
 /// 滚动容器状态（`UiState.scrolls`，跨帧持久）。
@@ -322,6 +329,13 @@ pub struct UiState {
     /// 矩形 = 窗口盒子 ∪ 本帧子控件命中区（`Ui::win_hit_bounds`，见其字段文档）；
     /// 每帧录到时写入，帧末只保留本帧录过的窗口。
     pub(crate) window_rects: HashMap<IdAbsolute<'static>, Rect>,
+    /// **窗口本帧提交原点**：窗口**绝对 ID** → `display_pos`（物理；**相对直接容器**）。
+    ///
+    /// ⚠ 与 `Ui` 的帧内 `win_origins`（**按 z 键**）并存是必要的：同一帧里可以有**多个
+    /// `WIN_TOPMOST` 浮层**（下拉里再开子菜单），它们的 z 相同 ⇒ z 键表只剩最后一个，
+    /// 而 id 键表能给出**每一个**浮层自己的原点（[`crate::Ui::debug_dump`] 用它；
+    /// 渲染不受影响：采集时减、提交时加用的是同一个 z 键值）。
+    pub(crate) window_origins: HashMap<IdAbsolute<'static>, Vec2>,
     /// grid 容器：**绝对 ID** → 结算后的单元格尺寸（跨帧缓存，保证布局稳定）。
     pub grid_cells: HashMap<IdAbsolute<'static>, Vec2>,
     /// 控件文本排版缓存：`(文本, 字号位模式, 字体族, 换行宽度位模式, 版本)` →
@@ -536,6 +550,7 @@ impl UiState {
         self.panel_sizes.clear();
         self.window_z.clear();
         self.window_rects.clear();
+        self.window_origins.clear();
         self.text_buffers.clear();
         self.frame = 0;
         self.ime_composing = false;

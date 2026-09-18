@@ -303,9 +303,10 @@ impl<'a, F: MenuContent> Dropdown<'a, F> {
             .combo_open
             .as_ref()
             .is_some_and(|o| o.as_str() == abs.as_str());
-        // ── 键盘：焦点下 ↑/↓ 循环切换选项（选中即收起）──
+        // ── 键盘：焦点下 ↑/↓ 循环切换选项（**选中即收起**，与旧 `combo` 行为一致）──
         // 先取边沿、先写回 `sel`：本帧面板的"选中行"就是切换后的那一行（不再落后一帧）。
         let mut sel = sel;
+        let mut key_picked = false;
         if is_open && ui.focused_is(&abs) {
             let n = opts.len() as u32;
             if let Some(s) = sel.as_mut()
@@ -314,9 +315,11 @@ impl<'a, F: MenuContent> Dropdown<'a, F> {
                 let cur = s.selected().unwrap_or(0).min(n - 1);
                 if ui.key_down_edge(winit::keyboard::KeyCode::ArrowUp) {
                     s.set(if cur == 0 { n - 1 } else { cur - 1 });
+                    key_picked = true;
                 }
                 if ui.key_down_edge(winit::keyboard::KeyCode::ArrowDown) {
                     s.set(if cur + 1 >= n { 0 } else { cur + 1 });
+                    key_picked = true;
                 }
             }
         }
@@ -377,7 +380,10 @@ impl<'a, F: MenuContent> Dropdown<'a, F> {
                     None => content.render(m),
                 }
             }));
-            if menu::dropdown_should_close(res.item_clicked, res.down_outside, hit, esc) {
+            if key_picked
+                || menu::dropdown_should_close(res.item_clicked, res.down_outside, hit, esc)
+            {
+                // 键盘选中即收起（旧 `combo` 语义）；其余按关闭规则四条。
                 ui.state_mut().combo_open = None;
             }
         }

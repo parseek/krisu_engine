@@ -17,16 +17,20 @@
 //! 行高 / 内边距各写一遍）。现在**只有这一处**实现浮层，两边的差别只剩"触发器长什么样"
 //! 与"菜单内容谁来写"（选项列表由 `Dropdown::options` 生成，或应用用闭包自己写）。
 //!
-//! # 几何契约（三条一起才对齐，缺一条就"看着有点怪"）
+//! # 几何契约（四条一起才对齐，缺一条就"看着有点怪"）
 //!
 //! 1. **内边距 = [`popup_padding`]**（`ComboStyle::item_pad_x`，四边同值）：
 //!    菜单项 / `caption` / `separator` / `row` 全部从**同一个内容原点**起排 ⇒ 天然同列。
 //!    （别用"给下一子项缩进"的花招：垂直栈里子项 `x` **恒等于内容原点**，缩进宽度无效。）
-//! 2. **面板宽 = 上一帧的结算宽**（`UiState::window_sizes`，首帧自然宽、次帧起精确）：
+//! 2. **行距 = [`popup_gap`]**（`MENU_GAP` 逻辑 1px ⇒ `(1.0 × scale).floor()` 物理）：
+//!    **不是** [`Theme::gap`] —— 那个是给普通窗口内容用的，菜单行按它排会"每两行之间
+//!    空一大截"（用户实测："空位可以缩小为逻辑 1px"）。窗口侧靠
+//!    [`WindowBuilder::gap`](crate::WindowBuilder::gap) 传进来。
+//! 3. **面板宽 = 上一帧的结算宽**（`UiState::window_sizes`，首帧自然宽、次帧起精确）：
 //!    固定宽已知（`fill = true`）时子项请求"极宽"由窗口 clamp 到内容宽 ⇒ **高亮 /
 //!    分割线铺满面板**；首帧必须请求**自然宽**，否则 1e6 的请求会把自然尺寸撑成一百万、
 //!    面板宽度再也收不回来。见 [`popup_content_w`] / [`popup_child_w`]。
-//! 3. **分割线自己画**，不用 [`Divider`](crate::Divider)：`Divider` 的宽 = `avail_w()`，
+//! 4. **分割线自己画**，不用 [`Divider`](crate::Divider)：`Divider` 的宽 = `avail_w()`，
 //!    而**自动宽**窗口里那是 `None` ⇒ 退回固定 120 ⇒ 线又短又不在该在的位置
 //!    （用户实测："Menu 分割线错位"）。自己画时请求"极宽"由窗口 clamp ⇒ 恒等于内容宽。
 //!
@@ -43,7 +47,7 @@
 //! `Dropdown`（`PopupSide::Right`）时，点子菜单不该被外层菜单当成"点面板外"而把外层一起关掉。
 //!
 //! 排查通道：`RJ_MENU_TRACE=1` 打印每个下拉内容的**行矩形**（`x/y/w/h`）——正确时
-//! 菜单项 / 分割线 / 标题必须同 `x`、同 `w`（实测 `x=8 w=234`）。
+//! 菜单项 / 分割线 / 标题必须同 `x`、同 `w`（实测 `x=8 w=224`，DPI 1.5）。
 
 use glam::Vec2;
 use rjw_color::Color;
@@ -73,6 +77,22 @@ pub fn item_h(font_size: f32) -> f32 {
 #[inline]
 pub fn popup_padding(theme: &Theme) -> f32 {
     theme.combo.item_pad_x
+}
+
+/// **菜单行间距**（**逻辑**像素）：比 [`Theme::gap`] 紧得多。
+///
+/// 为什么单独一个值：`Theme::gap` 是给普通窗口内容用的（`--density` 还会再放大它），
+/// 菜单行按它排会"每两行之间空一大截"（用户实测："空位可以缩小为逻辑 1px"）。
+pub const MENU_GAP: f32 = 1.0;
+
+/// **菜单行间距的物理值** = `(MENU_GAP × scale).floor()`。
+///
+/// ⚠ 用 **floor 而不是 round**（用户指定的换算）：`1.0 逻辑 @1.5 = 1.5 → 1px`
+/// （`.round()` 会变成 2px，行距立刻又"松"了）。公开它是因为示例 / 脚本算"下一行在哪"
+/// 要用同一个值（见 `--sim-dropdown` / `--sim-weight-modal`）。
+#[inline]
+pub fn popup_gap(scale: f32) -> f32 {
+    (MENU_GAP * scale).floor()
 }
 
 /// **面板相对触发器的方位**。
@@ -126,6 +146,17 @@ impl<F> MenuFn<F> {
 impl MenuContent for () {
     #[inline]
     fn render(self, _m: &mut MenuCtx<'_, '_, '_>) {}
+}
+
+/// **子菜单内容**（[`Item::submenu`] 里装箱的那种 `for<>` trait object）。
+///
+/// 装箱的形态让 [`Item`] 不必带泛型参数（⇒ `m.item(Item::new(..).submenu(..))` 与
+/// `m.item("文本")` 能共用同一个入口）。
+impl MenuContent for Box<dyn for<'w, 'x, 'y> FnOnce(&mut MenuCtx<'w, 'x, 'y>) + '_> {
+    #[inline]
+    fn render(self, m: &mut MenuCtx<'_, '_, '_>) {
+        (self)(m);
+    }
 }
 
 impl<F> MenuContent for MenuFn<F>
@@ -216,6 +247,8 @@ pub(crate) fn popup_show(
         );
     }
     let mut close = false;
+    // 行距先算好（`ui.scale()` 要在 `ui.window(..)` 的可变借用**之前**取）。
+    let menu_gap = popup_gap(ui.scale());
     let mut b = ui
         .window(spec.id)
         .pos(Position::Physical(pos))
@@ -224,6 +257,8 @@ pub(crate) fn popup_show(
         // 定，也不该出现缩放柄。`.width(..)` 只用来把内容宽钉在上一帧结算值上。
         .clamp(WindowClamp::Locked)
         .resize(false, crate::Resize::None)
+        // **行距 = 逻辑 1px 的物理值**（不是 `Theme::gap`）：菜单行必须紧挨着。
+        .gap(Size::Physical(menu_gap))
         .level(Level::Normal)
         .style(style);
     if let Some(w) = content_w {
@@ -305,6 +340,52 @@ pub(crate) fn option_marked(i: usize, sel: Option<u32>) -> bool {
     sel == Some(i as u32)
 }
 
+/// **子菜单该不该展开**（纯函数，真值表）：
+/// `hit`（鼠标在本行）⇒ 开；已开且鼠标还在**本子面板或其后代**里 ⇒ 保持；否则收起。
+///
+/// ⇒ 悬停即开；鼠标移进子面板保持；移到同菜单其他行 / 移出菜单自动收起
+/// （不需要其他行配合，也不需要一个全局"当前子菜单"槽位）。
+#[inline]
+fn submenu_open_now(hit: bool, was_open: bool, inside_tree: bool) -> bool {
+    hit || (was_open && inside_tree)
+}
+
+/// `id` 是否等于 `root` 或位于 `root` 的**窗口子树**里。
+///
+/// 窗口 id 用 `/` 分段（`with_id` 压栈时拼 `前缀/相对名`），所以祖先判定必须**按 `/` 边界**：
+/// 裸 `starts_with` 会把兄弟窗口 `a/b/subX` 误判成 `a/b/sub` 的后代
+/// （⇒ 鼠标停在兄弟面板上时子菜单不会收起）。
+#[inline]
+fn id_in_window_tree(id: &str, root: &str) -> bool {
+    id == root
+        || (id.len() > root.len()
+            && id.starts_with(root)
+            && id.as_bytes()[root.len()] == b'/')
+}
+
+/// 鼠标是否落在**某个窗口子树**（`root` = 窗口绝对 id）的任何窗口矩形内。
+///
+/// 用 `UiState::window_rects`（**绝对**矩形，键 = 窗口绝对 ID）——它在录制期写入、
+/// 帧末只保留本帧录制的窗口 ⇒ 面板消失后自然不再命中（不需要额外清理）。
+fn mouse_in_window_tree(ui: &Ui<'_>, root: &str) -> bool {
+    let m = ui.mouse_screen();
+    ui.state().window_rects.iter().any(|(id, r)| {
+        id_in_window_tree(id.as_str(), root) && r.contains_point(m)
+    })
+}
+
+/// 一行的几何 / 交互结果（[`MenuCtx::item`] 用它录子菜单面板）。
+struct RowInfo {
+    /// 行矩形（**当前容器局部**坐标）。
+    rect: Rect,
+    /// 行的**相对 id**（子面板 id = `<它>::sub`）。
+    rel_id: String,
+    /// 本帧是否被点击。
+    clicked: bool,
+    /// 鼠标是否在本行上（Hover）。
+    hit: bool,
+}
+
 // ─── 菜单内容上下文 ─────────────────────────────────────────────
 
 /// **下拉面板的内容上下文**（`Dropdown::menu(..)` / `MenuBar::menu(..)` 的 `m`）。
@@ -340,24 +421,153 @@ impl<'w, 'a, 'b> std::ops::DerefMut for MenuCtx<'w, 'a, 'b> {
     }
 }
 
-impl MenuCtx<'_, '_, '_> {
-    /// **菜单项**（占一行）：返回本帧是否被点击；点击即"执行 + 收起"。
+/// **菜单项点击行为**（责任链上的一档：`.click_behavior(..)`）。
+///
+/// 用户建议的"行为 flag"：点完这一项之后，整个 popup 是**收起**还是**保留**。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MenuClick {
+    /// 点击后**收起整个 popup**（普通菜单项；默认）。
+    #[default]
+    Close,
+    /// 点击后**保留 popup**（"点了还要继续操作"的项：开关 / 连续多选 / 微调）。
     ///
-    /// 整行可点（不是只有文字），hover / 按下整行高亮（与选项行同一观感）。
-    pub fn item(&mut self, label: &str) -> bool {
-        self.item_core(label, None, false)
+    /// ⚠ [`Item::submenu`] 恒为"不收起"（子菜单靠 Hover 展开，点击不该关掉整条链），
+    /// 与该档位无关。
+    Keep,
+}
+
+/// **菜单项**（责任链 builder）：`m.item(Item::new("导入图片…"))`。
+///
+/// ```no_run
+/// # use rjw_ui::{Item, MenuClick, Ui};
+/// # use rjw_ui::widgets::menu::MenuCtx;
+/// # fn f(m: &mut MenuCtx<'_, '_, '_>, mut show_a: bool) {
+/// if m.item("导入图片…") { /* 旧写法：点击即收起 */ }
+/// // 责任链：点击后保留 popup
+/// if m.item(Item::new("保持打开").click_behavior(MenuClick::Keep)) { }
+/// // 责任链：勾选项（自持状态，点击直接翻转）
+/// m.item(Item::new("窗口 A 显示").checked(&mut show_a));
+/// // 责任链：**子菜单**（`Submenu` 形态）—— Hover 在原 popup **右侧**展开
+/// m.item(Item::new("编码").submenu(|s| { if s.item("UTF-8") { } }));
+/// # }
+/// ```
+///
+/// # 为什么是 builder 而不是 `Widget`
+///
+/// 菜单行必须与 [`MenuCtx`] 手里的语义绑定：行高 `item_h` 与内边距、高亮铺满内面板、
+/// "点击是否写 `popup_show` 的 `close` 句柄"、子菜单的跨帧悬停状态、`fill` 宽度收敛。
+/// 做成 `Widget` 就得给 `UiState` 再开一条"点击请求 → 由 popup 消费"的隐式通道。
+/// 所以 `Item` 只承载**配置**（责任链），执行留在 [`MenuCtx::item`]。
+///
+/// `From<&str>`：旧的 `m.item("文本")` 写法继续可用（等价 `Item::new("文本")`）。
+pub struct Item<'a> {
+    label: &'a str,
+    /// 点击行为（默认 [`MenuClick::Close`]）。
+    click: MenuClick,
+    /// 勾选项：当前是否勾选（点击时**由 `MenuCtx::item` 翻转**）。
+    checked: Option<&'a mut bool>,
+    /// **子菜单**（`Submenu` 形态）的内容。
+    ///
+    /// 用**显式 `for<>` 的 trait object`**（不是泛型参数）：闭包进结构体字段时，`'_` 形式的
+    /// HRTB 边界不好写；显式 late-bound 是标准且一定可行的写法（每个子菜单项每帧一次分配，
+    /// 数量级可忽略）。
+    submenu: Option<Box<dyn for<'w, 'x, 'y> FnOnce(&mut MenuCtx<'w, 'x, 'y>) + 'a>>,
+}
+
+impl<'a> Item<'a> {
+    /// 普通菜单项（点击即收起）。
+    pub fn new(label: &'a str) -> Self {
+        Self { label, click: MenuClick::Close, checked: None, submenu: None }
+    }
+
+    /// **点击行为**（[`MenuClick::Close`]（默认）/ [`MenuClick::Keep`]）。
+    pub fn click_behavior(mut self, b: MenuClick) -> Self {
+        self.click = b;
+        self
+    }
+
+    /// **勾选项**：左侧方框勾选（`&mut bool` 自持），点击时**直接翻转**。
+    pub fn checked(mut self, on: &'a mut bool) -> Self {
+        self.checked = Some(on);
+        self
+    }
+
+    /// **子菜单**（`Submenu` 形态）：行右侧画 ▸，**Hover 时在行的右边**展开 `content`。
+    ///
+    /// 与 [`Self::checked`] 互斥（同时用会 `debug_assert` 失败）。
+    pub fn submenu(mut self, f: impl FnOnce(&mut MenuCtx<'_, '_, '_>) + 'a) -> Self {
+        debug_assert!(self.checked.is_none(), "Submenu 与 checked 不能同时设置");
+        self.submenu = Some(Box::new(f));
+        self
+    }
+
+    /// 本项是否是子菜单（`Submenu`）形态。
+    #[inline]
+    pub fn is_submenu(&self) -> bool {
+        self.submenu.is_some()
+    }
+}
+
+impl<'a> From<&'a str> for Item<'a> {
+    #[inline]
+    fn from(label: &'a str) -> Self {
+        Item::new(label)
+    }
+}
+
+impl std::fmt::Debug for Item<'_> {
+    /// 手写 `Debug`：字段里的 boxed `FnOnce` 没有 `Debug`（只打印"有没有"）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Item")
+            .field("label", &self.label)
+            .field("click", &self.click)
+            .field("checked", &self.checked.is_some())
+            .field("submenu", &self.submenu.is_some())
+            .finish()
+    }
+}
+
+impl MenuCtx<'_, '_, '_> {
+    /// **菜单项**（占一行；责任链配置见 [`Item`]）：返回本帧是否被点击。
+    ///
+    /// - 整行可点（不是只有文字），hover / 按下整行高亮（与选项行同一观感）；
+    /// - 点击后是否收起整个 popup 由 [`Item::click_behavior`] 决定（默认 [`MenuClick::Close`]）；
+    /// - [`Item::checked`]：勾选框自绘 + 点击翻转 `&mut bool`；
+    /// - [`Item::submenu`]：右侧 ▸ + Hover 展开（点击**不**收起）。
+    pub fn item<'i>(&mut self, item: impl Into<Item<'i>>) -> bool {
+        let Item { label, click, checked, submenu } = item.into();
+        // 勾选框状态：`Some(当前值)` ⇒ 画方框（勾/空），否则整列留白（文字仍对齐）。
+        let check = checked.as_ref().map(|b| **b);
+        // **Submenu**：行右画 ▸，且**点击不收起**（子菜单靠 Hover 展开，点它不该关掉整条链）。
+        let trailing = submenu.is_some().then_some(Icon::ChevronRight);
+        let close_on_click = click == MenuClick::Close && submenu.is_none();
+        let row = self.item_core(label, check, false, close_on_click, trailing);
+        if row.clicked && let Some(b) = checked {
+            *b = !*b;
+        }
+        if let Some(content) = submenu {
+            let clicked = row.clicked;
+            self.submenu_panel(row, content);
+            return clicked;
+        }
+        row.clicked
     }
 
     /// **带勾选的菜单项**（视图显隐这类）：点击直接翻转 `&mut bool` 并收起。
     ///
     /// 勾选标记是**方框**（矢量画的圆角方框 + 勾号，`border_w = 0` 时退化成实心底）——
     /// 不用 "✓" 字形：字体缺字形时菜单里会出现豆腐块。
+    ///
+    /// = `m.item(Item::new(label).checked(checked))`（责任链写法见 [`Item`]）。
     pub fn item_checked(&mut self, label: &str, checked: &mut bool) -> bool {
-        let clicked = self.item_core(label, Some(*checked), false);
-        if clicked {
-            *checked = !*checked;
-        }
-        clicked
+        self.item(Item::new(label).checked(checked))
+    }
+
+    /// **子菜单**（`Submenu`）：`label` 行的右边 Hover 展开 `content`。
+    ///
+    /// = `m.item(Item::new(label).submenu(content))`；语义见 [`Self::item`] 与模块文档。
+    pub fn submenu(&mut self, label: &str, content: impl FnOnce(&mut MenuCtx<'_, '_, '_>)) {
+        self.item(Item::new(label).submenu(content));
     }
 
     /// **选项行**（选项列表模式；`Dropdown::options` 用）：`marked` = 本行是当前选中。
@@ -366,7 +576,7 @@ impl MenuCtx<'_, '_, '_> {
     /// 与旧下拉框的 ✓ 观感一致），选中行整行用 `ComboStyle::item_selected` 高亮。
     /// 方框列**恒留位**（两类项文字都对得齐）。
     pub(crate) fn option(&mut self, label: &str, marked: bool) -> bool {
-        self.item_core(label, marked.then_some(true), marked)
+        self.item_core(label, marked.then_some(true), marked, true, None).clicked
     }
 
     /// 菜单里的一条**分割线**（满内容宽、与菜单项文字同列）。
@@ -431,16 +641,26 @@ impl MenuCtx<'_, '_, '_> {
         }
     }
 
-    /// 菜单项 / 选项行的公共实现：`check = Some(是否勾选)` 时左侧画一个**方框勾选框**。
+    /// 菜单项 / 选项行 / 子菜单行的公共实现：`check = Some(是否勾选)` 时左侧画一个
+    /// **方框勾选框**，`trailing = Some(icon)` 时在行右缘画一个尾部图标（子菜单的 ▸）。
     ///
     /// 勾选标记是**方框**（与 [`crate::Checkbox`] 同一观感：圆角方框 + 勾选时填
     /// `CheckboxStyle::checked_fill` + 矢量勾号），画在**菜单项内容里**、方框列**恒留位**
     /// （勾选与否文字都对齐）。为什么不用"左内边距里放一个 ✓"：那需要很大的左内边距
     /// （用户实测："边距太大"），而方框只占 `checkbox.box_size`，可以贴着小边距放。
     ///
+    /// `close_on_click = false` ⇒ 点击**不**收起 popup（[`MenuClick::Keep`] / 子菜单行）。
+    ///
     /// ⚠ 名字刻意不叫 `row`：`MenuCtx` 经 `Deref` 到 [`Window`]，同名私有方法会**遮蔽**
     /// `Window::row`（deref 方法优先级更低）⇒ 应用的 `m.row(..)` 会去调私有那个。
-    fn item_core(&mut self, label: &str, check: Option<bool>, selected: bool) -> bool {
+    fn item_core(
+        &mut self,
+        label: &str,
+        check: Option<bool>,
+        selected: bool,
+        close_on_click: bool,
+        trailing: Option<Icon>,
+    ) -> RowInfo {
         let (cs, font_size, ih, natural_w, box_size, box_gap, cb) = {
             let t = self.w.ui_mut().theme.clone();
             let fs = self.font_size.max(1.0);
@@ -534,11 +754,66 @@ impl MenuCtx<'_, '_, '_> {
             None,
             None,
         );
-        if ev.clicked {
+        // **尾部图标**（子菜单的 ▸）：贴内容**右缘**、垂直居中、与项文字同色。
+        if let Some(icon) = trailing {
+            let d = (box_size * 0.8).max(8.0);
+            ui.icon_at(
+                Position::Physical(Vec2::new(
+                    rect.x + rect.w - box_size,
+                    rect.y + (rect.h - d) * 0.5,
+                )),
+                Size::Physical(Vec2::splat(d)),
+                icon,
+                cs.fg,
+            );
+        }
+        if ev.clicked && close_on_click {
             *self.close = true;
         }
         self.trace("item", rect);
-        ev.clicked
+        RowInfo { rect, rel_id: item_id, clicked: ev.clicked, hit }
+    }
+
+    /// **子菜单面板**（[`Item::submenu`] / [`Self::submenu`] 的实现）：
+    /// Hover 在**行的右侧**（[`PopupSide::Right`]）展开、跨帧保持。
+    ///
+    /// 状态**每行自持**（[`WidgetState::submenu_open`](crate::WidgetState)）——
+    /// ⚠ **绝不碰** `UiState::combo_open`：那是**父下拉**的槽位，早期"菜单里嵌一个
+    /// `Dropdown`"的做法就是被它覆盖，症状是"点一下整条 popup 消失"。
+    fn submenu_panel(
+        &mut self,
+        row: RowInfo,
+        content: Box<dyn for<'w, 'x, 'y> FnOnce(&mut MenuCtx<'w, 'x, 'y>) + '_>,
+    ) {
+        let sub_rel = format!("{}::sub", row.rel_id);
+        let min_w = self.w.ui_mut().theme.combo.item_min_w;
+        // ① 展开状态：Hover 即开；已开且鼠标还在**本子面板或其子孙窗口**里 ⇒ 保持；否则收起。
+        let abs = self.w.ui_mut().id_for(row.rel_id.as_str());
+        let sub_abs = self.w.ui_mut().id_for(sub_rel.as_str());
+        let inside = mouse_in_window_tree(self.w.ui_mut(), sub_abs.as_str());
+        let was = self.w.ui_mut().state_mut().widget(&abs).submenu_open;
+        let open = submenu_open_now(row.hit, was, inside);
+        self.w.ui_mut().state_mut().widget(&abs).submenu_open = open;
+        if !open {
+            return;
+        }
+        // ② 录子面板：触发器 = 行矩形，方位 = 行**右侧**（与行顶对齐，2px 缝隙）。
+        let spec = PopupSpec {
+            id: &sub_rel,
+            trigger: row.rect,
+            side: PopupSide::Right,
+            font_size: self.font_size,
+            min_w,
+        };
+        let res = popup_show(self.w.ui_mut(), &spec, content);
+        // ③ **链式收起**：子面板里点了项 ⇒ 冒泡给父的 `close` ⇒ 整条链（子 + 父）一起收。
+        if res.item_clicked {
+            *self.close = true;
+        }
+        // ④ 点在子面板外（但仍在父面板里）⇒ 只收子菜单（父菜单按自己的规则处理）。
+        if res.down_outside {
+            self.w.ui_mut().state_mut().widget(&abs).submenu_open = false;
+        }
     }
 
     /// 面板内容的字号（应用自绘时对齐用）。
@@ -626,8 +901,66 @@ mod tests {
     }
 
     #[test]
+    fn popup_gap_is_floor_not_round() {
+        // 菜单行距 = **逻辑 1px** 的物理值，**向下取整**：1.0 逻辑 @1.5 = 1px。
+        // （若用 `.round()` 会得到 2px —— 行距立刻又"松"回去，正是用户报的那个观感。）
+        assert_eq!(popup_gap(1.0), 1.0);
+        assert_eq!(popup_gap(1.5), 1.0, "1.5 → floor = 1（round 会是 2）");
+        assert_eq!(popup_gap(2.0), 2.0);
+        assert_eq!(popup_gap(1.25), 1.0);
+        // 全物理、与主题 gap 无关：主题调密度也不影响菜单行距。
+        assert_eq!(popup_gap(0.9), 0.0, "小于 1 物理像素时贴紧（0 = 行挨着行）");
+    }
+
+    #[test]
     fn popup_padding_comes_from_the_combo_style() {
         let t = Theme::default();
         assert_eq!(popup_padding(&t), t.combo.item_pad_x);
+    }
+
+    #[test]
+    fn submenu_opens_on_hover_and_stays_while_inside() {
+        // 真值表：`hit`（悬停在行上）⇒ 开；已开且鼠标还在本子面板（或后代）里 ⇒ 保持；
+        // 其余 ⇒ 收起（鼠标移到同菜单其他行 / 移出菜单时自动收起，无需其他行配合）。
+        assert!(submenu_open_now(true, false, false), "悬停即开");
+        assert!(submenu_open_now(true, true, false), "悬停且已开 ⇒ 保持");
+        assert!(submenu_open_now(false, true, true), "鼠标进子面板 ⇒ 保持");
+        assert!(!submenu_open_now(false, true, false), "鼠标离开 ⇒ 收起");
+        assert!(!submenu_open_now(false, false, true), "没悬停过就不会被'在里面'打开");
+    }
+
+    #[test]
+    fn window_tree_prefix_respects_the_slash_boundary() {
+        // 祖先判定必须按 `/` 边界：裸 `starts_with` 会把**兄弟**窗口误判成后代
+        // （⇒ 鼠标停在兄弟面板上时子菜单不会收起）。
+        let root = "dd_file::popup/item::编码::sub";
+        assert!(id_in_window_tree(root, root), "自己是自己的子树");
+        assert!(
+            id_in_window_tree(&format!("{root}/item::ASCII::sub"), root),
+            "子孙窗口"
+        );
+        assert!(!id_in_window_tree(&format!("{root}X"), root), "同名前缀的兄弟（无 /）");
+        assert!(!id_in_window_tree("dd_file::popup/item::其他", root), "无关窗口");
+        assert!(!id_in_window_tree("dd_file::popup", root), "祖先不算后代");
+    }
+
+    #[test]
+    fn item_builder_defaults_are_the_plain_closing_item() {
+        let it = Item::new("导入图片…");
+        assert_eq!(it.click, MenuClick::Close, "默认点击即收起");
+        assert!(it.checked.is_none() && it.submenu.is_none());
+        assert!(!it.is_submenu());
+        // 责任链各档：`Keep` / `checked` / `submenu`。
+        assert_eq!(
+            Item::new("x").click_behavior(MenuClick::Keep).click,
+            MenuClick::Keep
+        );
+        let mut on = false;
+        assert!(Item::new("x").checked(&mut on).checked.is_some());
+        let sub = Item::new("编码").submenu(|_s| {});
+        assert!(sub.is_submenu());
+        // `From<&str>`：旧写法 `m.item("文本")` 与 builder 等价。
+        assert_eq!(Item::from("文本").label, "文本");
+        assert_eq!(MenuClick::default(), MenuClick::Close, "默认档是 Close");
     }
 }

@@ -777,7 +777,7 @@ f.text(|t| {
 | `UiState::reset()` / `remove(id)` | 示例"R 重开" | 清空全部 / 移除单个控件状态 |
 | `UiState::text_focus() -> Option<TextFocus>` | `if ui.state().text_focus().is_none() { /* 快捷键 */ }` | **文本焦点**（只有输入框/多行框持焦点才为 `Some`）；取代旧 `capturing_text()` —— 按钮/滑块的 Tab 焦点不再吞应用快捷键 |
 | `UiState::combo_open() -> Option<&str>` | `if ui.state().combo_open().is_none() && esc { /* 自己的 Esc */ }` | **当前展开的下拉菜单**（[`Dropdown`](crate::Dropdown) 的**控件绝对 ID**；面板窗口 id = 它 + `::popup`）。与 `menu_open()` 对称（两个槽分开存：栏是应用级 UI，下拉属于某个控件）；`reset()` 清空 |
-| `Ui::debug_dump() -> UiDebugDump` | `eprintln!("{}", ui.debug_dump())` | 引擎侧状态快照（每窗口 `id/z/origin/submit/size/drag/press/stored`），单行可 grep；任一段都能调用，帧级暂存跨段共享 ⇒ 后一段能看到前一段录的窗口。见 [DEBUGGING.md](DEBUGGING.md) §1 |
+| `Ui::debug_dump() -> UiDebugDump` | `eprintln!("{}", ui.debug_dump())` | 引擎侧状态快照（每窗口 `id/z/origin/submit/size/drag/press/stored`），单行可 grep；任一段都能调用，帧级暂存跨段共享 ⇒ 后一段能看到前一段录的窗口。⚠ 按**本帧录制过的窗口 ID** 列（不是按 z）：同一帧的多个 `WIN_TOPMOST` 浮层（**下拉里的子菜单**）z 相同，按 z 会只剩最后一个；`origin` 是**相对直接容器**的原点（顶层窗口 = 屏幕坐标，**嵌套浮层要叠加外层窗口原点**）。见 [DEBUGGING.md](DEBUGGING.md) §1 |
 
 ### UI 绘制后端（`rjw_ui::backend`，v0.3 新增）
 
@@ -856,15 +856,15 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.window(id)` | `.pos(..)` `.width(w)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` **`.resize(allow, axes)`** `.title(&str)` `.close_button(&mut bool)` `.shrink(bool, &mut bool)` `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**拖拽缩放** `.resize(allow: bool, axes: Resize)`：`allow = false` ⇒ 不画柄也不响应拖拽（`.width` 仍是布局固定宽）；`Resize::Both` ⇒ 宽高同调（高度持久于 `UiState::window_heights`，**并自动裁剪内容**）；**不调** = 旧行为（有 `.width` 才能横向拖）。**外框**（标题栏 / × / 收起）见下 |
+| `ui.window(id)` | `.pos(..)` `.width(w)` `.gap(Size)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` **`.resize(allow, axes)`** `.title(&str)` `.close_button(&mut bool)` `.shrink(bool, &mut bool)` `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；`.gap` = **内容子项行距**（不调 = `Theme::gap`；下拉 / 菜单浮层用 `Physical(popup_gap(scale))` 拿"逻辑 1px"的紧行距）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**拖拽缩放** `.resize(allow: bool, axes: Resize)`：`allow = false` ⇒ 不画柄也不响应拖拽（`.width` 仍是布局固定宽）；`Resize::Both` ⇒ 宽高同调（高度持久于 `UiState::window_heights`，**并自动裁剪内容**）；**不调** = 旧行为（有 `.width` 才能横向拖）。**外框**（标题栏 / × / 收起）见下 |
 | `ui.panel()` | `.pos(..)` `.drag(id)` `.style(..)` `.show(\|pp\| ..)` | 面板 = `panel_at` + `drag_panel_at` 统一入口 |
 | `ui.modal(id)` | `.pos(..)` `.width(w)` `.show(\|m\| ..)` | 模态对话框（唯一入口） |
 
-**菜单栏**（横向触发器 + 闭包下拉面板）：
+**菜单栏**（横向触发器 + 同一套下拉面板）：
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.menu_bar(id, pos, \|bar\| ..)` | `bar.menu(label, \|m\| ..)` → `MenuCtx::{item, item_checked, caption, separator}` | 返回栏尺寸；`pos` = 栏左上角（顶层 = 屏幕坐标）。展开状态跨帧持久于 `UiState::menu_open`（触发器绝对 ID）；**同一时刻只有一个菜单开着**，点菜单项 / 点栏外 / Esc 都收起（点**另一个触发器** = 切换，不算点外）。`MenuCtx` **`Deref` 到 `Window`** ⇒ 菜单里同样能放 `label` / `button` / `divider` / `row`（横向排版）/ `text_input` / `add(..)`（含再嵌一个 `Dropdown`）。**下拉面板与 [`Dropdown`](crate::Dropdown) 共用同一实现**（`crate::widgets::menu::popup_show`）：`Level::Normal` + **`WindowClamp::Locked`**（点它不置顶、**拖不动**）+ **不画缩放柄** + z 强制 `WIN_TOPMOST` 哨兵 —— 所以菜单栏录在哪里都盖得住别人。面板排版由引擎保证：内边距 = `ComboStyle::item_pad_x`（菜单项 / `caption` / `separator` 天然同列）、面板宽取上一帧结算宽（子项高亮 / 分割线**铺满面板**）、勾选是**方框**且画在项内容里、`caption` 用 `text_muted` + 小字号做分组标题。细节见 `docs/ENGINE_GUIDE.md` §18.13/§18.15；几何可 `RJ_MENU_TRACE=1` 打印 |
+| `ui.menu_bar(id, pos, \|bar\| ..)` | `bar.menu(label, \|m\| ..)` → `MenuCtx::{item, item_checked, submenu, caption, separator}` | 返回栏尺寸；`pos` = 栏左上角（顶层 = 屏幕坐标）。展开状态跨帧持久于 `UiState::menu_open`（触发器绝对 ID）；**同一时刻只有一个菜单开着**，点菜单项 / 点栏外 / Esc 都收起（点**另一个触发器** = 切换，不算点外）。`MenuCtx` **`Deref` 到 `Window`** ⇒ 菜单里同样能放 `label` / `button` / `divider` / `row`（横向排版）/ `text_input` / `add(..)`，以及 [`Item`](crate::Item) 责任链菜单项（含 **`Submenu`**：Hover 在行右侧展开）。**下拉面板与 [`Dropdown`](crate::Dropdown) 共用同一实现**（`crate::widgets::menu::popup_show`）：`Level::Normal` + **`WindowClamp::Locked`**（点它不置顶、**拖不动**）+ **不画缩放柄** + z 强制 `WIN_TOPMOST` 哨兵 + **行距 `popup_gap(scale)`** —— 所以菜单栏录在哪里都盖得住别人。面板排版由引擎保证：内边距 = `ComboStyle::item_pad_x`（菜单项 / `caption` / `separator` 天然同列）、面板宽取上一帧结算宽（子项高亮 / 分割线**铺满面板**）、勾选是**方框**且画在项内容里、`caption` 用 `text_muted` + 小字号做分组标题。细节见 `docs/ENGINE_GUIDE.md` §18.13/§18.15；几何可 `RJ_MENU_TRACE=1` 打印 |
 
 **窗口外框（标题栏 / 关闭 / 收起）**：三个选项各自独立、**都不调就完全没有外框**
 （逐像素等于旧行为）；任一开启都在窗口内容**第一行**录一条标题栏（底色
@@ -872,7 +872,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 选项 | 签名 | 语义 |
 |---|---|---|
-| `.title(t)` | `title(text: &str) -> Self` | 标题文字（过长按省略号截断，不撑宽窗口）；标题栏空白处**仍可拖动窗口** |
+| `.title(t)` | `title(text: &str) -> Self` | 标题文字（过长按省略号截断，不撑宽窗口）；标题栏空白处**仍可拖动窗口**。标题行**贴窗口顶边**（条高 = `title_bar_h(row_h)` = **一行**，纯函数）：下面的内容与窗口高度各少一个 `pad_total`（用户实测"可以往上抬"）；条只是**背景装饰、不裁剪内容** ⇒ 标题 / ▲ / ✕（边长 `row_h - 2`）允许**比条高** |
 | `.close_button(open)` | `close_button(open: &mut bool) -> Self` | 标题栏右侧画 ×；点击把 `*open` 置 `false`。`*open == false` 时**整窗短路**——不录制、不写原点/尺寸、**不占遮挡矩形**（不会留下"看不见却挡点击"的窗口）；重新打开是**应用的责任**（把 `*open` 置回 `true`，如菜单勾选） |
 | `.shrink(show, collapsed)` | `shrink(show: bool, collapsed: &mut bool) -> Self` | `collapsed = true` = 只留标题栏（跳过内容闭包）；点 ⌃ 取反。`show = false` 时**不画按钮**，但 `*collapsed` 照旧生效（由菜单/代码收起展开）——这是两个参数分开的用处 |
 
@@ -908,7 +908,8 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 | `text_input` | `p.text_input(id, &mut String)` | 单行输入框：点击聚焦/定位光标、打字/退格/删除/方向键、Enter/Esc 失焦、光标闪烁；**超长文本滚动跟随光标**（光标始终可见）、**拖选文本 + Ctrl+C/V/X 复制/粘贴/剪切**（选择优先于窗口拖拽）；**支持中文 IME**（组合候选浮动提示框 + 候选框定位到光标） |
 | `text_area` | `p.text_area(id, &mut String)` / `p.text_area_at(id, rect, &mut String)` | **多行文本输入框**：Enter 换行、↑/↓ 跨行（保持列）、Home/End 行首尾、按宽度自动换行、超出高度垂直滚动（滚轮 + 光标跟随）、跨行选择 + Ctrl+C/V/X、IME 支持；光标按逻辑行（`\n`）定位（超宽长行换行后近似） |
 | `NumberInput` | `p.add(NumberInput::new(id, &mut f32).range(min, max).step(s))` | **数字条**：右侧 `GRIP_W`（公开常量 **20px**）宽那条手柄**水平拖动**调值（向右 = 增；Shift ×10 / Ctrl ×0.1；拖到窗口边缘自动 warp），**文本框**点击 = 进入编辑（只收数字 / 负号 / 小数点）；显示精度跟 `step` 走（`0.25` → `2` 位小数、`≥1` → 整数）。常见组合：**滑杆后跟数字条**（拖滑杆粗调、数字条精确输入，两者绑同一个 `&mut f32`）——`eg260818UI` 的主题调节窗口整列都是这个形态，脚本化验证见 `--sim-tuner` |
-| `Dropdown` | `p.add(Dropdown::options(id, label, &mut u32, &[&str]))` / `p.add(Dropdown::new(id, label).menu(\|m\| ..))` | **按钮下拉菜单**（下拉框与菜单栏下拉**简并后**的唯一入口；`Widget` ⇒ 任意容器 `add`）：`options` = **选项列表模式**（菜单项由引擎排：选中行打勾 + 整行高亮，点击写回 `&mut u32` 并收起，键盘 ↑/↓ 切换）；`menu(..)` = **富内容模式**，闭包参数是 `MenuCtx`（`Deref` 到 `Window`）⇒ **菜单内又可以 `UiAdd::add`**（文本输入 / 分割线 / 菜单项 / 横向排版 / 再嵌一个 `Dropdown` 当子菜单）。`.side(PopupSide::Below\|Right)`（默认下方 2px）/ `.width(..)` / `.font_size(..)`。展开状态 = `UiState::combo_open()`（**控件绝对 ID**）；点触发器切换、点项执行+收起、点面板外 / Esc 收起、点**任意 `WIN_TOPMOST` 浮层**不收起（子菜单用）。面板 = 锁定位置 + 不画缩放柄 + `WIN_TOPMOST`。几何助手（公开，脚本算坐标用）：`item_h(font_size)` / `popup_padding(theme)` / `popup_origin(trigger, side)`。见 `docs/ENGINE_GUIDE.md` §18.15，仿真 `--sim-dropdown` |
+| `Dropdown` | `p.add(Dropdown::options(id, label, &mut u32, &[&str]))` / `p.add(Dropdown::new(id, label).menu(\|m\| ..))` | **按钮下拉菜单**（下拉框与菜单栏下拉**简并后**的唯一入口；`Widget` ⇒ 任意容器 `add`）：`options` = **选项列表模式**（菜单项由引擎排：选中行打勾 + 整行高亮，点击写回 `&mut u32` 并收起，键盘 ↑/↓ 切换）；`menu(..)` = **富内容模式**，闭包参数是 `MenuCtx`（`Deref` 到 `Window`）⇒ **菜单内又可以 `UiAdd::add`**（文本输入 / 分割线 / 菜单项 / 横向排版 / **子菜单**）。`.side(PopupSide::Below\|Right)`（默认下方 2px）/ `.width(..)` / `.font_size(..)`。展开状态 = `UiState::combo_open()`（**控件绝对 ID**）；点触发器切换、点项执行+收起、点面板外 / Esc 收起、点**任意 `WIN_TOPMOST` 浮层**不收起（子菜单用）。面板 = 锁定位置 + 不画缩放柄 + `WIN_TOPMOST`。几何助手（公开，脚本算坐标用）：`item_h(font_size)` / `popup_padding(theme)` / `popup_origin(trigger, side)` / `popup_gap(scale)`（行距 = 逻辑 1px 的 floor 值，见 `MENU_GAP`）。见 `docs/ENGINE_GUIDE.md` §18.15，仿真 `--sim-dropdown`（7 段） |
+| `Item`（菜单项责任链） | `m.item(Item::new("…").click_behavior(MenuClick::Keep))` / `.checked(&mut bool)` / `.submenu(\|s\| ..)` | **菜单项 builder**（`MenuCtx::item` 接受 `&str`（旧糖，`From<&str>`）或 `Item`；返回"本帧是否被点击"）。`.click_behavior(MenuClick::{Close,Keep})` = **点击行为 flag**（点完收起 / **保留 popup**）；`.checked(&mut bool)` = 勾选项（方框 + 点击自动翻转）；`.submenu(\|s\| ..)` = **子菜单（Submenu）**：普通项样式 + 右侧 ▸，**Hover 在行右侧展开**（`PopupSide::Right`），**点击不收起**，子面板里点项 ⇒ **整条链**收起；状态是**行自持**的 `WidgetState::submenu_open`（不碰 `combo_open`）。便捷糖：`m.item_checked(label, &mut bool)` / `m.submenu(label, \|s\| ..)` |
 | `combo` / `combo_at` | `p.combo(id, current, &[String], Option<u32>) -> Option<u32>` | **旧入口（糖）**：= `Dropdown` 的选项列表模式 + 固定布局宽，签名 / 返回值 / 行为与旧版一致（`None` = 无选择 / 未展开；`Some(i)` = 本帧新选中）。新代码请用 `Dropdown`；`FontModal` 的字重下拉仍走它（老代码不必改） |
 | `Segmented` | `p.add(Segmented::new(id, &["紧凑","标准","宽松"], &mut idx))` | **分段按钮组**（互斥选项**拼在一起**）：相邻段共享边、只有整组外侧角是圆角、选中段高亮；点击把新索引写进 `&mut usize`。**段间分隔线与 `ButtonStyle::border_w` 解耦**（边框关掉时退化成 `Palette::surface_dim`，否则三段连成一条）。`.font_size(..)` 可覆盖字号。见 `docs/ENGINE_GUIDE.md` §18.14 |
 
@@ -948,9 +949,15 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 `builtin::FontModal`（字体弹窗）现在同时管**字体族 + 字重**：
 `FontModal { input, weight: &mut Weight, apply: &mut dyn FnMut(&str, Weight) }`，
-字重下拉项来自 `rjw_ui::FONT_WEIGHT_CHOICES`（七档 300…900），显示名 `weight_label(w)`。
-`eg260818UI` 里字重由弹窗直接写回应用侧 `TopBar::font_weight`，下一帧主题按它重建；
-`--sim-weight` 脚本化守护这条路径（第 30 帧 400 → 700，前后量同一串文本的实测宽必须变）。
+字重下拉项来自 `rjw_ui::FONT_WEIGHT_CHOICES`（**九档 100…900**：超细/特细/细/常规/中等/半粗/粗/特粗/黑），
+显示名 `weight_label(w)`。
+⚠ `weight` 是**草稿**：下拉**选中那一帧就写回**（下拉是"点一次就收起"的控件，攒到"确定"会被
+下一帧重置 ⇒ 症状"选不中任何其他字重"）；应用要把它与"已应用值"分开（打开时拷入、确定提交、
+取消丢弃）。对话框里的**预览**用**草稿字重**排版（临时代换 `Theme::font_weight` 后还原；
+`RJ_FONT_TRACE=1` 打印预览用的字重 + 样本实测宽）。
+`eg260818UI` 里字重由弹窗写草稿、「确定」时经 `apply` 落到应用侧 `TopBar::font_weight`，
+下一帧主题按它重建；`--sim-weight`（字重是排版输入）/ `--sim-weight-modal`（下拉真能换档 +
+确定才提交）脚本化守护这两条路径。
 
 **投影令牌**：`PanelStyle::shadow: ShadowStyle { blur, offset, color }`（色令牌 `Palette::shadow`），
 主题级入口 `Theme::with_shadow(ShadowStyle)` / `Theme::without_shadow()`，逐容器入口

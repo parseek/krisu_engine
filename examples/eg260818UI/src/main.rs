@@ -44,9 +44,10 @@ use std::time::Instant;
 use rjw_krusie::prelude::*;
 // prelude 未含的 UI 类型（`rjw_ui` 公共导出；prelude 的 UI 子集见 `rjw_krusie::prelude`）。
 use rjw_krusie::ui::{
-    ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, Dropdown, FontModal, GRIP_W,
-    GripShape, GripStyle, IdAbsolute, Label, Palette, PopupSide, Position, Segmented, ShadowStyle,
-    Weight, item_h, popup_origin, popup_padding, weight_label,
+    ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, Dropdown, FONT_WEIGHT_CHOICES,
+    FontModal, GRIP_W, GripShape, GripStyle, IdAbsolute, Item, Label, MenuClick, Palette, PopupSide,
+    Position, Segmented, ShadowStyle, Weight, item_h, popup_gap, popup_origin, popup_padding,
+    weight_label,
 };
 
 /// 「重叠控件」演示模块（控件级遮挡：重叠处只有最上层被触发 + `--sim-overlap` 自证）。
@@ -87,7 +88,13 @@ struct TopBar {
     /// 当前**全局字重**（FontModal 的字重下拉；默认 400）。引擎侧是主题令牌
     /// `Theme::font_weight`——改它 = 全 UI 一起换字形（不只是"看着粗一点"，
     /// 步进宽度也会变 ⇒ 布局随之变）。
+    ///
+    /// 这是**已应用**值（主题每帧按它重建）。字体重叠对话框用的是**草稿**
+    /// `font_weight_draft`：对话框里选档位立刻写草稿（下拉是"点一次就生效"的控件），
+    /// 点「确定」才 `apply` 到这里，点「取消」丢弃草稿。
     font_weight: Weight,
+    /// 字体对话框里的**字重草稿**（每次打开时从 `font_weight` 拷入）。
+    font_weight_draft: Weight,
     /// 字体 Modal 输入框内容（跨帧持久）。
     font_input: String,
     /// 字体 Modal 开关。
@@ -110,6 +117,7 @@ impl TopBar {
             player_name: "Krisu".to_owned(),
             font_name: String::new(),
             font_weight: Weight::NORMAL,
+            font_weight_draft: Weight::NORMAL,
             font_input: String::new(),
             font_modal_open: false,
             demo_color: Color::rgba_u8(255, 128, 40, 255),
@@ -142,6 +150,8 @@ impl TopBar {
                 let fam = if self.font_name.is_empty() { "默认" } else { &self.font_name };
                 let label = format!("字体… {fam} / {}", weight_label(self.font_weight));
                 if r.button("font_btn", &label).clicked() {
+                    // 打开对话框 = **重置字重草稿**（上一轮取消掉的草稿不该漏进来）。
+                    self.font_weight_draft = self.font_weight;
                     self.font_modal_open = true;
                 }
                 if r.button("theme_btn", "主题调节…").clicked() {
@@ -189,10 +199,14 @@ impl TopBar {
             self.modal_recorded = true;
             FontModal {
                 input: &mut self.font_input,
-                weight: &mut self.font_weight,
-                // 字重由**弹窗直接写回**（确定时按下拉选中项赋值）⇒ 回调里不再碰
-                // `self.font_weight`（否则与上面那行 `&mut` 借用冲突）。
-                apply: &mut |name: &str, _w: Weight| self.font_name = name.to_owned(),
+                // 对话框写的是**草稿**；「确定」时经 `apply` 落到已应用值。
+                weight: &mut self.font_weight_draft,
+                // 字重由**弹窗直接写回**（草稿，选中即写）⇒ 这里只负责把草稿 + 字体名
+                // 一起提交到应用状态（`apply` 的两个参数都要用上）。
+                apply: &mut |name: &str, w: Weight| {
+                    self.font_name = name.to_owned();
+                    self.font_weight = w;
+                },
             }
             .show(ui, &mut self.font_modal_open);
         }
@@ -962,8 +976,8 @@ impl ThemeTuner {
                 // 来自全局跨帧状态（`ColorPickerState::text`）。
                 // 并排放一行，省纵向空间。
                 w.row(|w| {
-                    w.add(ColorPicker::new("th_bg", &mut self.bg));
-                    w.add(ColorPicker::new("th_border", &mut self.border));
+                    w.add(ColorPicker::new("th_bg", &mut self.bg).alpha(true));
+                    w.add(ColorPicker::new("th_border", &mut self.border).alpha(true));
                     w.add(ColorPicker::new("th_accent", &mut self.accent).alpha(true));
                 });
                 w.row(|w| {
@@ -1123,13 +1137,18 @@ struct UiApp {
     menu_filter: String,
     /// **统一后的下拉菜单**演示状态 ①：选项列表模式（`Dropdown::options`）的选中索引。
     dd_opt_idx: u32,
-    /// 演示状态 ②：富内容菜单里**子下拉**（`side(PopupSide::Right)`）的选中索引。
-    dd_enc_idx: u32,
+    /// 演示状态 ②：富内容菜单里**子菜单**（`Item::submenu`，Submenu）里点了第几项。
+    dd_sub_idx: Option<usize>,
     /// 演示状态 ③：富内容菜单里点了菜单项的次数。
     ///
     /// 为什么不用 `top.import_request` 判定：它在**下一帧开场**就被 `take` 走（真正的
     /// 导入通路），跨帧断言只会读到 `None`；计数器才跨帧稳定（`--sim-dropdown` 用它）。
     dd_item_clicks: u32,
+    /// 演示状态 ④：点了「保持打开」（`MenuClick::Keep`）的次数 ——
+    /// 点它之后 **popup 必须仍然开着**（`--sim-dropdown` 用它做硬断言）。
+    dd_keep_clicks: u32,
+    /// 菜单栏「视图」里「不收起」项（`MenuClick::Keep`）的点击次数（`--sim-menu` 断言用）。
+    mb_keep_clicks: u32,
     /// --sim-dropdown：**实操统一后的下拉菜单**（选项列表 + 富内容两段；坐标运行时解算）。
     sim_dropdown: bool,
     /// --sim-dropdown：两个触发器的中心（每帧按常量 + 主题尺寸解算）。
@@ -1141,6 +1160,16 @@ struct UiApp {
     dd_input_pt: Option<Vec2>,
     /// --sim-dropdown：富内容面板里**第 1 个菜单项**（"导入图片…"）的中心。
     dd_item_pt: Option<Vec2>,
+    /// --sim-dropdown：富内容面板里**子菜单行「编码」**的中心（Hover 目标）。
+    dd_sub_row_pt: Option<Vec2>,
+    /// --sim-dropdown：富内容面板里「保持打开」（`MenuClick::Keep`）行的中心。
+    dd_keep_row_pt: Option<Vec2>,
+    /// --sim-dropdown：子面板里第 2 项（"UTF-8"）的中心（点击目标）。
+    dd_sub_item1_pt: Option<Vec2>,
+    /// --sim-dropdown：子面板的**屏幕**原点（嵌套窗口 origin 已叠加父面板）。
+    dd_sub_panel: Option<Vec2>,
+    /// --sim-dropdown：子面板**应该**在的原点（= `popup_origin(子菜单行, Right)`）。
+    dd_sub_want: Option<Vec2>,
     /// --sim-dropdown：解算出的两个面板原点（判定"面板该在触发器正下方"）。
     dd_opt_panel: Option<Vec2>,
     dd_file_panel: Option<Vec2>,
@@ -1148,6 +1177,15 @@ struct UiApp {
     /// 由**公开**助手 `popup_origin` 算出 ⇒ 顺带守住"公开助手与引擎几何同源"）。
     dd_opt_want: Option<Vec2>,
     dd_file_want: Option<Vec2>,
+    /// --sim-weight-modal：**实操字体对话框里的字重下拉** —— 守护"真的能选其他档位"
+    /// （曾经失效：选中的索引只进局部变量、等"确定"才写回 ⇒ 每帧被重置，
+    /// 勾/触发文字永远回到旧档位；`--sim-dropdown` 走的是 `Sel::One`，覆盖不到
+    /// `combo_at` 这条 `Sel::Opt` 老入口）。
+    sim_weight_modal: bool,
+    /// --sim-weight-modal：下拉触发器 / 下拉第 1 行 / 对话框「确定」的点击点（录制时解算）。
+    wm_trigger_pt: Option<Vec2>,
+    wm_row0_pt: Option<Vec2>,
+    wm_ok_pt: Option<Vec2>,
     /// --sim-menu：**实操菜单栏**（坐标运行时解算，不写死像素）。
     sim_menu: bool,
     /// --sim-resize：脚本化拖拽**右下角缩放柄**（验"宽高同调"与"不允许拖拽就不出柄"）。
@@ -1269,18 +1307,29 @@ impl UiApp {
             import_image_path: None,
             menu_filter: String::new(),
             dd_opt_idx: 1,
-            dd_enc_idx: 0,
+            dd_sub_idx: None,
             dd_item_clicks: 0,
+            dd_keep_clicks: 0,
+            mb_keep_clicks: 0,
             sim_dropdown: false,
             dd_opt_pt: None,
             dd_file_pt: None,
             dd_opt_row0_pt: None,
             dd_input_pt: None,
             dd_item_pt: None,
+            dd_sub_row_pt: None,
+            dd_keep_row_pt: None,
+            dd_sub_item1_pt: None,
+            dd_sub_panel: None,
+            dd_sub_want: None,
             dd_opt_panel: None,
             dd_file_panel: None,
             dd_opt_want: None,
             dd_file_want: None,
+            sim_weight_modal: false,
+            wm_trigger_pt: None,
+            wm_row0_pt: None,
+            wm_ok_pt: None,
             sim_menu: false,
             sim_resize: false,
             sim_resize_pt: None,
@@ -1569,6 +1618,12 @@ impl App for UiApp {
                 self.theme_tuner.open = false;
                 self.windows.win_a_open = false;
             }
+            // `--sim-weight-modal`：脚本自己打开字体对话框（并重置字重草稿，
+            // 与「字体…」按钮按下时同一条路）。
+            if self.sim_weight_modal {
+                self.top.font_weight_draft = self.top.font_weight;
+                self.top.font_modal_open = true;
+            }
         }
         // ── 调试：脚本化鼠标（`--sim-picker`）──────────────────────
         // 复现"打开取色面板 → 在面板里拖/点"：面板路径（SV 平面 / 色相条 / 通道滑块 /
@@ -1732,7 +1787,10 @@ impl App for UiApp {
             let btn = (row - 2.0).max(12.0);
             let origin = (self.windows.win_a_pos * scale).round();
             let right = origin.x + 220.0 * scale + pad; // 行右缘 = 内容右缘
-            let cy = origin.y + pad + row * 0.5;
+            // **标题行贴窗口顶边**（引擎侧 `window_title_bar` 把内容光标抬到 y=0）
+            // ⇒ 按钮中心线 = 窗口顶 + row/2（**不再**加 `pad`）。
+            // ⚠ 这一行就是"条贴顶"的脚本级回归：忘了改会点到 `pad` 以下 ⇒ `[FAIL]`。
+            let cy = origin.y + row * 0.5;
             let close_p = Vec2::new(right - btn * 0.5, cy);
             let fold_p = Vec2::new(right - btn * 1.5 - gap, cy);
             let away = Vec2::new(1800.0, 1050.0);
@@ -1843,18 +1901,22 @@ impl App for UiApp {
         }
         // ── 调试：脚本化鼠标（`--sim-dropdown`）────────────────────
         // 行程（坐标由上一帧录制时解算：触发器按常量 + 主题尺寸，面板行按**面板窗口原点**
-        // + `popup_padding` / `item_h` —— 与引擎同源，不写死像素）：
+        // + `popup_padding` / `popup_gap` / `item_h` —— 与引擎同源，不写死像素）：
         //   ① 10..15 点选项下拉触发器 → 菜单打开
         //   ② 22..25 点第 1 个选项（"简单"）→ 选中 + 自动收起
         //   ③ 40..45 点富内容下拉触发器 → 菜单打开
         //   ④ 52..55 点菜单里**第 1 行的文本输入** → 聚焦（"菜单内又是 UiAdd"的实证）
-        //   ⑤ 62..65 点第 1 个菜单项（"导入图片…"）→ 执行 + 自动收起
+        //   ⑤ 60..70 **只悬停**子菜单行「编码」→ 子面板在**行右侧**展开、父 popup 保留
+        //   ⑥ 74..77 点子面板里的"UTF-8" → **整条链**（子 + 父）收起
+        //   ⑦ 88..93 重开富内容下拉 → 100..103 点「保持打开」项 → **popup 保留**
         if self.sim_dropdown {
             let opt = self.dd_opt_pt.unwrap_or(Vec2::ZERO);
             let file = self.dd_file_pt.unwrap_or(Vec2::ZERO);
             let row0 = self.dd_opt_row0_pt.unwrap_or(opt);
             let input = self.dd_input_pt.unwrap_or(file);
-            let item = self.dd_item_pt.unwrap_or(file);
+            let sub_row = self.dd_sub_row_pt.unwrap_or(file);
+            let sub_item1 = self.dd_sub_item1_pt.unwrap_or(sub_row);
+            let keep_row = self.dd_keep_row_pt.unwrap_or(file);
             match f.frames() {
                 10..=11 => f.debug_inject_mouse(opt, false),
                 12..=13 => f.debug_inject_mouse(opt, true),
@@ -1866,8 +1928,35 @@ impl App for UiApp {
                 44..=45 => f.debug_inject_mouse(file, false), // ③ 开
                 52..=53 => f.debug_inject_mouse(input, true), // ④ 聚焦菜单里的文本输入
                 54..=55 => f.debug_inject_mouse(input, false),
-                62..=63 => f.debug_inject_mouse(item, true), // ⑤ 点菜单项
-                64..=65 => f.debug_inject_mouse(item, false),
+                // ⑤ **只移动、不按下**：Hover 就应当展开子菜单（每帧注入 ⇒ 悬停保持）
+                60..=70 => f.debug_inject_mouse(sub_row, false),
+                72..=73 => f.debug_inject_mouse(sub_item1, false),
+                74..=75 => f.debug_inject_mouse(sub_item1, true), // ⑥ 点子菜单里的项
+                76..=77 => f.debug_inject_mouse(sub_item1, false),
+                88..=89 => f.debug_inject_mouse(file, false),
+                90..=91 => f.debug_inject_mouse(file, true), // ⑦ 重开
+                92..=93 => f.debug_inject_mouse(file, false),
+                100..=101 => f.debug_inject_mouse(keep_row, true), // ⑧ 点「保持打开」
+                102..=103 => f.debug_inject_mouse(keep_row, false),
+                _ => {}
+            }
+        }
+        // ── 调试：脚本化鼠标（`--sim-weight-modal`）────────────────
+        // 行程：① 点开字重下拉 → ② 点第 1 档（"细 300"）→ ③ 点「确定」提交。
+        // 坐标由上一帧录制时解算（对话框原点/尺寸来自 `debug_dump`，行偏移用主题尺寸 +
+        // **公开**助手 `popup_origin` / `popup_padding` / `item_h`）。
+        if self.sim_weight_modal {
+            let trigger = self.wm_trigger_pt.unwrap_or(Vec2::ZERO);
+            let row0 = self.wm_row0_pt.unwrap_or(trigger);
+            let ok = self.wm_ok_pt.unwrap_or(trigger);
+            match f.frames() {
+                10..=11 => f.debug_inject_mouse(trigger, false),
+                12..=13 => f.debug_inject_mouse(trigger, true),
+                14..=15 => f.debug_inject_mouse(trigger, false), // ① 开下拉
+                22..=23 => f.debug_inject_mouse(row0, true),     // ② 选"细 300"
+                24..=25 => f.debug_inject_mouse(row0, false),
+                40..=41 => f.debug_inject_mouse(ok, true), // ③ 确定（提交草稿）
+                42..=43 => f.debug_inject_mouse(ok, false),
                 _ => {}
             }
         }
@@ -2165,10 +2254,19 @@ impl App for UiApp {
                 });
                 bar.menu("视图", |m| {
                     m.item_checked("主题调节窗口", &mut self.theme_tuner.open);
-                    m.item_checked("窗口 A 显示", &mut self.windows.win_a_open);
+                    // **责任链写法**（与上面 `item_checked` 等价，两种都留着当对照）：
+                    // `Item::new(..).checked(..)` = 勾选项、点击即收起。
+                    m.item(Item::new("窗口 A 显示").checked(&mut self.windows.win_a_open));
                     // 收起状态是**应用自己的 bool**：菜单能收起窗口，标题栏按钮也能
                     // （`shrink(show, &mut bool)` 里 `show = false` 正是给这种用法留的）。
                     m.item_checked("窗口 A 收起", &mut self.windows.win_a_collapsed);
+                    // **点击行为 flag**：这一项点完**保留 popup**（连续点几次都行）。
+                    if m.item(
+                        Item::new(&format!("不收起（已点 {} 次）", self.mb_keep_clicks))
+                            .click_behavior(MenuClick::Keep),
+                    ) {
+                        self.mb_keep_clicks += 1;
+                    }
                     m.separator();
                     m.caption("密度");
                     m.row(|r| {
@@ -2204,17 +2302,30 @@ impl App for UiApp {
                 )
                 .width(DROPDOWN_W),
             );
-            // 子下拉的标题文字先取出来（闭包里同时要 `&mut self.dd_enc_idx`，
-            // 在同一闭包里读 `self.dd_enc_idx` 会与那个可变借用冲突）。
-            let enc_label = ENCODINGS[self.dd_enc_idx.min(2) as usize];
             ui.add_at(
                 DROPDOWN_FILE_POS,
                 Dropdown::new("dd_file", "文件名过滤")
                     .width(DROPDOWN_W)
                     .menu(|m| {
                         // ↓ 这几行就是「**菜单内又可以 `UiAdd::add`**」：
-                        //   文本输入（普通控件）/ 分割线 / 菜单项 / **再嵌一个下拉**。
+                        //   文本输入（普通控件）/ **子菜单** / 责任链菜单项 / 分割线。
                         m.text_input("dd_filter", &mut self.menu_filter);
+                        // **Submenu**（新菜单项控件）：普通项样式 + 右侧 ▸，
+                        // **Hover** 时在原 popup **右侧**展开；点击它**不收起**父 popup。
+                        m.item(Item::new("编码").submenu(|s| {
+                            for (i, enc) in ENCODINGS.iter().enumerate() {
+                                if s.item(Item::new(enc)) {
+                                    self.dd_sub_idx = Some(i);
+                                }
+                            }
+                        }));
+                        // 点击行为 flag：点完**保留** popup（"点了还要继续操作"的项）。
+                        if m.item(
+                            Item::new(&format!("保持打开（已点 {} 次）", self.dd_keep_clicks))
+                                .click_behavior(MenuClick::Keep),
+                        ) {
+                            self.dd_keep_clicks += 1;
+                        }
                         m.separator();
                         if m.item("导入图片…") {
                             self.dd_item_clicks += 1;
@@ -2224,17 +2335,6 @@ impl App for UiApp {
                             self.dd_item_clicks += 1;
                             self.top.import_request = Some(ImportKind::Font);
                         }
-                        m.separator();
-                        // **子菜单**：菜单里 `add` 一个下拉，面板开在触发器**右侧**。
-                        m.add(
-                            Dropdown::options(
-                                "dd_enc",
-                                enc_label,
-                                &mut self.dd_enc_idx,
-                                &ENCODINGS,
-                            )
-                            .side(PopupSide::Right),
-                        );
                     }),
             );
             // `--sim-dropdown`：坐标解算（**本帧录制后**已知面板在哪；注入只能经 `Frame`
@@ -2259,6 +2359,7 @@ impl App for UiApp {
                 // 面板内第一行的原点 = 面板原点 + 内边距 + 边框（公开助手，与引擎同源）。
                 let inset = popup_padding(&t) + t.panel.border_w;
                 let ih = item_h(fs);
+                let menu_gap = popup_gap(scale);
                 if let Some(p) = dump.windows.iter().find(|p| p.id == "dd_opt::popup") {
                     self.dd_opt_panel = Some(p.origin);
                     self.dd_opt_row0_pt = Some(Vec2::new(
@@ -2268,18 +2369,44 @@ impl App for UiApp {
                 }
                 if let Some(p) = dump.windows.iter().find(|p| p.id == "dd_file::popup") {
                     self.dd_file_panel = Some(p.origin);
-                    // 富内容菜单第 1 行 = 文本输入（高 `InputStyle::height`）……
-                    self.dd_input_pt = Some(Vec2::new(
-                        p.origin.x + inset + 20.0,
-                        p.origin.y + inset + t.input.height * 0.5,
-                    ));
-                    // ……接着是分割线（厚 + 上下留白），再才是第 1 个菜单项，
-                    // 行与行之间还有一个 `Theme::gap`。
+                    // 富内容菜单的**行序与示例录制顺序同源**：
+                    // ① 文本输入 ② **子菜单「编码」** ③ 「保持打开」(Keep) ④ 分割线 ⑤⑥ 两个导入项
+                    let x = p.origin.x + inset + 20.0;
+                    let y0 = p.origin.y + inset;
+                    self.dd_input_pt = Some(Vec2::new(x, y0 + t.input.height * 0.5));
+                    // ② 子菜单行（Hover 展开的目标）
+                    let y_sub = y0 + t.input.height + menu_gap;
+                    self.dd_sub_row_pt = Some(Vec2::new(x, y_sub + ih * 0.5));
+                    // 子面板**应该**在的原点 = `popup_origin(行矩形, Right)`（公开助手）。
+                    let row_rect = Rect::new(
+                        p.origin.x + inset,
+                        y_sub,
+                        (p.size.x - inset * 2.0).max(0.0),
+                        ih,
+                    );
+                    self.dd_sub_want = Some(popup_origin(row_rect, PopupSide::Right));
+                    // ③ Keep 项
+                    self.dd_keep_row_pt =
+                        Some(Vec2::new(x, y_sub + ih + menu_gap + ih * 0.5));
+                    // ④ 分割线 → ⑤ 第 1 个导入项（行距 = `popup_gap`，与引擎同源）
                     let sep_h = t.divider.thickness + t.divider.margin * 2.0;
                     self.dd_item_pt = Some(Vec2::new(
-                        p.origin.x + inset + 20.0,
-                        p.origin.y + inset + t.input.height + t.gap + sep_h + t.gap + ih * 0.5,
+                        x,
+                        y_sub + ih + menu_gap + ih + menu_gap + sep_h + menu_gap + ih * 0.5,
                     ));
+                    // 子菜单面板（**嵌套窗口**：`origin` 相对**父窗口** ⇒ 必须叠加父面板原点）；
+                    // 它的第 2 行（"UTF-8"）是仿真点击目标。
+                    if let Some(q) = dump
+                        .windows
+                        .iter()
+                        .find(|q| q.id.ends_with("item::编码::sub"))
+                    {
+                        let abs = p.origin + q.origin;
+                        let m_inset = popup_padding(&t) + t.panel.border_w;
+                        self.dd_sub_panel = Some(abs);
+                        self.dd_sub_item1_pt =
+                            Some(Vec2::new(abs.x + m_inset + 20.0, abs.y + m_inset + ih + menu_gap + ih * 0.5));
+                    }
                 }
             }
             // `--sim-resize`：坐标解算（窗口原点 + 结算尺寸 = 右下角；柄是那个角上的方块）。
@@ -2387,6 +2514,9 @@ impl App for UiApp {
                 let open = ui.state().combo_open().map(|s| s.to_owned());
                 let dump = ui.debug_dump();
                 let at = |id: &str| dump.windows.iter().find(|p| p.id == id).map(|p| p.origin);
+                // 嵌套浮层的 id 带父窗口前缀（`<父面板>/item::编码::sub`）⇒ 按**后缀**匹配。
+                let seen_suffix =
+                    |suffix: &str| dump.windows.iter().any(|p| p.id.ends_with(suffix));
                 let near = |got: Option<Vec2>, want: Option<Vec2>| match (got, want) {
                     (Some(g), Some(w)) => (g.x - w.x).abs() < 2.0 && (g.y - w.y).abs() < 2.0,
                     _ => false,
@@ -2446,15 +2576,49 @@ impl App for UiApp {
                         );
                     }
                     72 => {
-                        let n = self.dd_item_clicks;
-                        let gone = at("dd_file::popup").is_none();
-                        let ok = n == 1 && open.is_none() && gone;
+                        // ⑤ **只悬停**子菜单行 ⇒ 子面板在**行右侧**展开，且**父 popup 仍在**
+                        // （曾经的做法——菜单里嵌 `Dropdown`——会把 `combo_open` 覆盖掉，
+                        // 症状是"点一下整条 popup 消失"）。
+                        let (got, want) = (self.dd_sub_panel, self.dd_sub_want);
+                        let sub_seen = seen_suffix("item::编码::sub");
+                        let ok = sub_seen
+                            && near(got, want)
+                            && open.as_deref() == Some("dd_file");
                         eprintln!(
-                            "sim-dropdown: ⑤ 菜单项点击次数={n}（期望 1）combo_open={open:?} 面板消失={gone} {}",
+                            "sim-dropdown: ⑤ 子面板原点={got:?} 期望={want:?} 面板在 dump={sub_seen} combo_open={open:?} {}",
                             if ok {
-                                "[OK] 点菜单项 ⇒ 执行 + 自动收起"
+                                "[OK] Hover 在 item 右边展开子菜单，且父 popup 不消失"
                             } else {
-                                "[FAIL] 菜单项没执行 / 没收起"
+                                "[FAIL] 子菜单没展开 / 位置不对 / 父 popup 被关掉"
+                            }
+                        );
+                    }
+                    84 => {
+                        // ⑥ 点子菜单里的项 ⇒ 应用状态变了 + **整条链**（子 + 父）收起。
+                        let idx = self.dd_sub_idx;
+                        let sub_gone = !seen_suffix("item::编码::sub");
+                        let file_gone = at("dd_file::popup").is_none();
+                        let ok = idx == Some(1) && open.is_none() && sub_gone && file_gone;
+                        eprintln!(
+                            "sim-dropdown: ⑥ 子菜单选中={idx:?}（期望 Some(1)=UTF-8）combo_open={open:?} 子面板消失={sub_gone} 父面板消失={file_gone} {}",
+                            if ok {
+                                "[OK] 点子菜单项 ⇒ 执行 + 整条链一起收起"
+                            } else {
+                                "[FAIL] 子菜单项没执行 / 没收起整条链"
+                            }
+                        );
+                    }
+                    112 => {
+                        // ⑦ 点「保持打开」（`MenuClick::Keep`）⇒ 应用计数 + **popup 保留**。
+                        let n = self.dd_keep_clicks;
+                        let still = at("dd_file::popup").is_some();
+                        let ok = n == 1 && open.as_deref() == Some("dd_file") && still;
+                        eprintln!(
+                            "sim-dropdown: ⑦ Keep 项点击次数={n}（期望 1）combo_open={open:?} 面板还在={still} {}",
+                            if ok {
+                                "[OK] 点\"保留 popup\"的项 ⇒ 执行 + 不收起"
+                            } else {
+                                "[FAIL] Keep 项没执行 / 被收起了"
                             }
                         );
                     }
@@ -2465,6 +2629,114 @@ impl App for UiApp {
             // 字体 Modal（**帧末录制**：modal 的 z 每帧重写为当前最大，最后录制才能保证
             // 不被本帧后录的窗口盖住——见 `modal_at` 文档）。
             self.top.show_font_modal(&mut ui);
+
+            // `--sim-weight-modal`：坐标解算（**modal 录完之后**，窗口原点/尺寸已在 dump 里）。
+            // 对话框内容行（垂直栈 + `Theme::gap`）：① 说明 label ② 字体名输入框
+            // ③ **字重下拉触发器**；底部是「确定 / 取消」行（取消最右、确定在它左边一个 gap）。
+            if self.sim_weight_modal {
+                let dump = ui.debug_dump();
+                let t = ui.theme().clone();
+                let (fs, pad, fam) = (t.button.font_size, t.button.padding, t.button.font_family.clone());
+                if let Some(p) = dump.windows.iter().find(|w| w.id == "font_modal") {
+                    let inset = t.panel.padding + t.panel.border_w;
+                    // ⚠ 说明 label 会在内容宽内**折行**（这里是两行）——必须按 `text_size_wrap`
+                    // 量（与引擎同一套折行测量），否则少算一行、点到的就是下一行的输入框。
+                    // 折行宽 = `Frame::fixed_avail_w` = 固定宽 − 2×pad_total；而窗口结算宽
+                    // `p.size.x` = 固定宽 + 2×pad_total ⇒ 折行宽 = `p.size.x − 4×inset`。
+                    let label_h = ui
+                        .text_size_wrap(
+                            "字体切换：输入字体名预览，确定生效（空 = 默认）",
+                            t.label.font_size,
+                            t.label.font_family.as_deref(),
+                            (p.size.x - inset * 4.0).max(0.0),
+                        )
+                        .y;
+                    // ③ 触发器：内容第 3 行（+5px 落在行内——触发器高约 2×padding.y+字号）。
+                    self.wm_trigger_pt = Some(Vec2::new(
+                        p.origin.x + inset + 10.0,
+                        p.origin.y + inset + label_h + t.gap + t.input.height + t.gap + 5.0,
+                    ));
+                    // 底部按钮行：「取消」最右，「确定」在它左边一个 gap（宽度按文字实测）。
+                    let ok_w = ui.text_size("确定", fs, fam.as_deref()).x + pad.x * 2.0;
+                    let cancel_w = ui.text_size("取消", fs, fam.as_deref()).x + pad.x * 2.0;
+                    let btn_h = pad.y * 2.0 + ui.text_size("确定", fs, fam.as_deref()).y;
+                    self.wm_ok_pt = Some(Vec2::new(
+                        p.origin.x + p.size.x - inset - cancel_w - t.gap - ok_w * 0.5,
+                        p.origin.y + p.size.y - inset - btn_h * 0.5,
+                    ));
+                }
+                // 下拉第 1 行（面板出现后才知道它在哪）：面板原点来自 dump，
+                // 行内偏移用**公开**助手 `popup_padding` / `item_h`。
+                if let Some(q) = dump
+                    .windows
+                    .iter()
+                    .find(|w| w.id.ends_with("font_modal_weight::popup"))
+                {
+                    let m_inset = popup_padding(&t) + t.panel.border_w;
+                    let ih = item_h(fs);
+                    // ⚠ `UiWindowInfo::origin` 对**嵌套浮层**是**相对其直接容器**的原点
+                    // （顶点管线"减去本窗口 origin、提交时再加回来"，所以那时才成立）——
+                    // 对话框里的下拉必须**加上对话框原点**才是屏幕坐标（实测：dump 里
+                    // 是 (14,162)，屏幕上是 (704,492)）。顶层窗口两者相同。
+                    let modal_origin = dump
+                        .windows
+                        .iter()
+                        .find(|w| w.id == "font_modal")
+                        .map(|w| w.origin)
+                        .unwrap_or(Vec2::ZERO);
+                    let abs = modal_origin + q.origin;
+                    self.wm_row0_pt =
+                        Some(Vec2::new(abs.x + m_inset + 10.0, abs.y + m_inset + ih * 0.5));
+                }
+            }
+
+            // `--sim-weight-modal` 判定（在 modal 录制**之后**读状态）。
+            // ① 点下拉第 1 档（"细 300"）⇒ **草稿**必须已经变了（曾经失效 bug），
+            //    而**已应用**字重不动（草稿语义：确定才提交）；
+            // ② 点「确定」⇒ 草稿提交到已应用值，对话框关闭。
+            if self.sim_weight_modal {
+                match sim_frame {
+                    30 => {
+                        let draft = self.top.font_weight_draft;
+                        let applied = self.top.font_weight;
+                        let open = ui.state().combo_open().map(|s| s.to_owned());
+                        // ⚠ 断言**第 1 档**（`FONT_WEIGHT_CHOICES[0]`）而不是写死 300：
+                        // 档位表是应用可见的公共常量（现在九档 100…900），写死数值会让
+                        // "加一档"这种改动把脚本变成假失败。
+                        let first = FONT_WEIGHT_CHOICES[0];
+                        let ok = draft == first && draft != applied && open.is_none();
+                        eprintln!(
+                            "sim-weight-modal: ① 草稿={}（期望 {} = 第 1 档）已应用={}（期望 {}）combo_open={open:?} {}",
+                            draft.0,
+                            first.0,
+                            applied.0,
+                            Weight::NORMAL.0,
+                            if ok {
+                                "[OK] 字重下拉真的选中了其他档位（草稿已改、尚未提交）"
+                            } else {
+                                "[FAIL] 下拉选了没生效（草稿没变 / 提前提交 / 没收起）"
+                            }
+                        );
+                    }
+                    50 => {
+                        let applied = self.top.font_weight;
+                        let still_open = self.top.font_modal_open;
+                        let first = FONT_WEIGHT_CHOICES[0];
+                        let ok = applied == first && !still_open;
+                        eprintln!(
+                            "sim-weight-modal: ② 已应用字重={}（期望 {}）对话框还开着={still_open} {}",
+                            applied.0,
+                            first.0,
+                            if ok {
+                                "[OK] 确定后字重提交到应用状态（主题随之重建）"
+                            } else {
+                                "[FAIL] 字重没提交 / 对话框没关"
+                            }
+                        );
+                    }
+                    _ => {}
+                }
+            }
 
             // `--sim-overlap` / `--sim-click`：读**本帧**两类遮挡拦截计数——必须在
             // 全部模块录制之后（早读只会看到前半帧）。
@@ -2805,6 +3077,7 @@ fn main() -> Result<(), RunError> {
     app.sim_import = parse_str_arg(&args, "--sim-import");
     app.sim_menu = args.iter().any(|a| a == "--sim-menu");
     app.sim_dropdown = args.iter().any(|a| a == "--sim-dropdown");
+    app.sim_weight_modal = args.iter().any(|a| a == "--sim-weight-modal");
     app.sim_resize = args.iter().any(|a| a == "--sim-resize");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args

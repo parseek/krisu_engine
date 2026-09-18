@@ -250,22 +250,53 @@ fn update(&mut self, ctx: &mut Ctx) {
   | 面板宽度每帧都在变 / 变成一百万宽 | 首帧就请求了"极宽"（1e6）。必须**首帧自然宽**、第 2 帧起用 `prev` 定宽：`RJ_MENU_TRACE=1` 看 `prev=None → Some(226) → Some(240)`（最后应稳定） |
   | 菜单里再嵌的下拉一点就把外层菜单关了 | "点外"判定没排除**任意 `WIN_TOPMOST` 浮层**（`Ui::window_under_mouse()` 的 z） |
 
-- **"下拉菜单点不开 / 选项点了不选中 / 菜单里的文本输入拿不到焦点"**：用 `--sim-dropdown`
-  （五段，全 `[OK]` 即通路正常）。坐标**运行时解算**：触发器按常量位置 + `Dropdown::width` +
-  主题尺寸；面板内行按**面板窗口原点** + **公开助手** `popup_padding` / `item_h`：
+- **"下拉菜单点不开 / 选项点了不选中 / 菜单里的文本输入拿不到焦点 / 子菜单一点就整条消失"**：
+  用 `--sim-dropdown`（**7 段，全 `[OK]` 即通路正常**）。坐标**运行时解算**：触发器按常量位置 +
+  `Dropdown::width` + 主题尺寸；面板内行按**面板窗口原点** + **公开助手** `popup_padding` /
+  `popup_gap` / `item_h`：
 
   ```
-  cargo run -p eg260818UI -- --sim-dropdown --frames 90
+  cargo run -p eg260818UI -- --sim-dropdown --frames 130
   sim-dropdown: ① combo_open=Some("dd_opt")（期望 dd_opt）面板原点=Some(Vec2(990.0, 59.0)) 期望=Some(Vec2(990.0, 59.0)) [OK] 点触发器开下拉（面板在触发器正下方）
   sim-dropdown: ② 选中索引=0（期望 0）combo_open=None 面板消失=true [OK] 点选项 ⇒ 选中 + 自动收起
   sim-dropdown: ③ 富内容下拉 combo_open=Some("dd_file")（期望 dd_file）面板原点=Some(Vec2(1290.0, 59.0)) 期望=Some(Vec2(1290.0, 59.0)) [OK] 同一个控件也能开富内容菜单
   sim-dropdown: ④ text_focus=Some("dd_file::popup/dd_filter") [OK] 菜单里的文本输入真的可聚焦（菜单内又是 UiAdd）
-  sim-dropdown: ⑤ 菜单项点击次数=1（期望 1）combo_open=None 面板消失=true [OK] 点菜单项 ⇒ 执行 + 自动收起
+  sim-dropdown: ⑤ 子面板原点=Some(Vec2(1557.0, 107.0)) 期望=Some(Vec2(1557.0, 107.0)) 面板在 dump=true combo_open=Some("dd_file") [OK] Hover 在 item 右边展开子菜单，且父 popup 不消失
+  sim-dropdown: ⑥ 子菜单选中=Some(1)（期望 Some(1)=UTF-8）combo_open=None 子面板消失=true 父面板消失=true [OK] 点子菜单项 ⇒ 执行 + 整条链一起收起
+  sim-dropdown: ⑦ Keep 项点击次数=1（期望 1）combo_open=Some("dd_file") 面板还在=true [OK] 点"保留 popup"的项 ⇒ 执行 + 不收起
   ```
+
+  典型失败与成因：
+
+  | 症状 | 成因 |
+  |---|---|
+  | **子菜单点一下就整条 popup 消失** | 菜单里嵌的是 `Dropdown`：它点击时写 `UiState::combo_open`，而那是**父下拉**的槽位 ⇒ 父 popup 当帧被判"没开"。正解 = **`Item::submenu(..)` / `m.submenu(..)`**（Hover 展开，状态挂**行自己**的 `WidgetState::submenu_open`） |
+  | 子菜单位置不对 / 和父面板一样宽 | 方位必须 `PopupSide::Right`（`popup_origin(行, Right)`）；面板最小宽用 `ComboStyle::item_min_w`，**别用行宽**（行宽 = 父面板内容宽） |
+  | 鼠标进子面板后子菜单就收起 | "保持"判定要按**窗口子树**（`state.window_rects` 绝对矩形 + `id_in_window_tree` 的 `/` 边界前缀），只看本行面板会漏掉更深一层 |
+  | 子面板在 `debug_dump` 里查不到 | 同一帧多个 `WIN_TOPMOST` 浮层 **z 相同**，dump 旧实现按 z 键遍历（只留最后一个）。现已按**本帧录制过的窗口 ID** 列 |
+  | 嵌套浮层的坐标差一个外层原点 | `UiWindowInfo::origin` 是**相对直接容器**的原点（顶层窗口才 = 屏幕坐标）：对话框里的下拉、下拉里的子菜单都要**叠加外层窗口原点** |
 
   ⚠ 两个易踩点：`UiState::combo_open()` 记的是**控件（触发器）的绝对 ID**（不是面板窗口 id——
   面板是它加 `::popup`）；面板里点不动时先看**这个像素命中的是谁**（`RJ_HIT_TRACE=1`）——
   win=0 内容会被任何窗口盖住（脚本因此先把自己的窗口收起来）。
+
+- **"字重选不中 / 换了字重预览不变"**：`--sim-weight-modal`（字体对话框路径）与
+  `RJ_FONT_TRACE=1`（**预览用的字重** + 样本实测宽）：
+
+  ```
+  cargo run -p eg260818UI -- --sim-weight-modal --frames 130
+  sim-weight-modal: ① 草稿=100（期望 100 = 第 1 档）已应用=400（期望 400）combo_open=None [OK] 字重下拉真的选中了其他档位（草稿已改、尚未提交）
+  sim-weight-modal: ② 已应用字重=100（期望 100）对话框还开着=false [OK] 确定后字重提交到应用状态（主题随之重建）
+
+  RJ_FONT_TRACE=1 … → font[preview] weight=400（草稿）size=42 样本宽=392.0 …
+                       font[preview] weight=100（草稿）size=42 样本宽=381.0 …
+  ```
+
+  ①的失败形态曾是"草稿永远回到旧档位"（选中的索引只进**局部变量**、等「确定」才写回，而局部
+  变量每帧重置）⇒ 正解是**选中那一帧就写回 `*weight`（草稿）**；
+  ②的失败形态曾是"预览不跟字重"⇒ 预览必须**用草稿字重排版**（临时代换 `Theme::font_weight`
+  再还原，测高与绘制用同一个值）。档位表是公共常量 `FONT_WEIGHT_CHOICES`（**九档 100…900**），
+  脚本按 `FONT_WEIGHT_CHOICES[0]` 断言而不是写死数值 —— 加档不会让脚本变成假失败。
 
   `RJ_MENU_TRACE=1`（引擎侧）打印下拉面板每一行的矩形与"宽度是否已固定"：
 

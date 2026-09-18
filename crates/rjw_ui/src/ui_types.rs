@@ -162,6 +162,13 @@ pub struct WindowOptions {
     /// （`.width(..)` 仍作为布局固定宽生效，菜单 / 下拉浮层就是这么用的）；
     /// `axes = Resize::Both` ⇒ 右下角柄**宽高同调**（高度跨帧持久）。
     pub resize: Option<(bool, Resize)>,
+    /// **内容子项间距**（[`WindowBuilder::gap`](crate::WindowBuilder::gap)；`None` = 用
+    /// [`Theme::gap`](crate::Theme::gap)）。
+    ///
+    /// 有了它，**下拉 / 菜单这类"内容行紧挨着"的浮层**才能拿到比主题更紧的行距
+    /// （见 [`crate::widgets::menu::popup_gap`]）——否则每一行之间都空出一个 `Theme::gap`
+    /// （用户实测：菜单项之间的空位太大）。
+    pub gap: Option<Size<f32>>,
 }
 
 impl Default for WindowOptions {
@@ -174,6 +181,7 @@ impl Default for WindowOptions {
             style: None,
             clamp: WindowClamp::Screen,
             resize: None,
+            gap: None,
         }
     }
 }

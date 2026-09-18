@@ -92,3 +92,12 @@ ISSUE:
 * ✅ **下拉面板只有一套实现**（`widgets::menu::popup_show`）：菜单栏与 `Dropdown` 共用（哨兵 z + 锁定位置 + 无缩放柄 + 面板样式 + 宽度收敛 + 点外/Esc/点项收起）；`Ui::combo_at` 退化成糖（签名 / 行为不变，`FontModal` 照旧用）；`UiState::combo_open()` 与 `menu_open()` 对称可读
 * ✅ 新增"点在任意 `WIN_TOPMOST` 浮层上不收起"（**子菜单**不被外层菜单误关）；公开几何助手 `item_h` / `popup_padding` / `popup_origin`（脚本算坐标与引擎同源）
 * ✅ `--sim-dropdown` 五段实测全 `[OK]`：① 点触发器开下拉且面板原点 = `popup_origin(触发器, Below)`（实测 `(990,59)`）；② 点选项 ⇒ `dd_opt_idx=0` + 自动收起 + 面板消失；③ 富内容下拉同样开（`(1290,59)`）；④ `text_focus=dd_file::popup/dd_filter` ⇒ **菜单里的文本输入真可聚焦**；⑤ 点菜单项 ⇒ 计数 =1 + 自动收起
+* ✅ **菜单项责任链 `Item`**（`m.item(Item::new("…").click_behavior(..))`；`From<&str>` 让旧写法 `m.item("文本")` 继续可用）：`.click_behavior(MenuClick::{Close,Keep})` = **点击行为 flag**（点完收起 / **保留 popup**）、`.checked(&mut bool)` = 勾选项（方框 + 点击翻转）、`.submenu(|s| ..)` = **子菜单（Submenu）**
+* ✅ **`Submenu`（新类 item 控件）**：普通项样式 + 右侧 ▸，**Hover 在 item 右边**（`PopupSide::Right`）展开、**点击不收起**（`MenuClick` 对它无效）、鼠标进子面板保持（**窗口子树**判定：`window_rects` 绝对矩形 + `/` 边界前缀）、子面板里点项 ⇒ **整条链**（子 + 父）收起；状态**行自持**（`WidgetState::submenu_open`，不碰 `combo_open` —— 早期"菜单里嵌 `Dropdown`"就是被它覆盖 ⇒ "点一下整条 popup 消失"）；层级不限
+* ✅ `--sim-dropdown` 扩到 **7 段**（⑤ 只悬停 ⇒ 子面板原点 = `popup_origin(行, Right)` 且**父 popup 不消失**；⑥ 点子菜单项 ⇒ 整条链收起；⑦ 点 `Keep` 项 ⇒ **popup 保留**），全 `[OK]`
+* ✅ 修：**同一帧多个 `WIN_TOPMOST` 浮层时 `debug_dump` 漏掉嵌套浮层**（`win_ids` / `win_origins` 按 **z** 键，z 相同只留最后一个）⇒ dump 改按**本帧录制过的窗口 ID** 列 + 新增按 id 的 `UiState::window_origins`；渲染本就正确（采集减、提交加用同一个 z 键值）
+* ✅ 修：**`UiWindowInfo::origin` 文档**（对**嵌套窗口**是"相对直接容器"的原点，顶层窗口才 = 屏幕坐标；算屏幕坐标要逐层叠加）——`--sim-weight-modal` 踩出来的真陷阱
+* ✅ 修：**字重下拉选不中任何其他档位**（选中的索引只进局部变量、等「确定」才写回 ⇒ 每帧重置）⇒ 选中那一帧就写回草稿 `*weight`；`FontModal::weight` 明确为**草稿**（应用侧 `font_weight_draft` 与 `font_weight` 分开：打开拷入 / 确定提交 / 取消丢弃）；`--sim-weight-modal` 两段实测全 `[OK]`（草稿 100 而应用值仍 400 → 确定后 100）
+* ✅ **字体预览体现字重**（"字重无法在预览中体现"）：预览用**草稿字重**排版（临时代换 `Theme::font_weight`，测高与绘制同值，画完还原）；`RJ_FONT_TRACE=1` 实测 `weight=400 样本宽=392.0` → `weight=100 样本宽=381.0`
+* ✅ 字重档位扩到**九档 100…900**（`FONT_WEIGHT_CHOICES`；单测名 / 注释 / 文档同步）
+* ✅ **标题栏贴顶**（图一"可以往上抬"）：标题行录在**窗口顶边**（`y = 0`），条高从 `pad_total + row_h` 变成 **`title_bar_h(row_h)` = 一行**（纯函数 + 单测），下面的内容与窗口高度各少一个 `pad_total`；⚠ 条只是**背景装饰、不裁剪内容**（标题 / ▲ / ✕ 允许**比条高**）；实测收起态窗口 `358×67 → 358×53`，`--sim-chrome` 的按钮 y 公式同步去掉 `pad`（忘改即点空 ⇒ `[FAIL]`，脚本自带回归）
