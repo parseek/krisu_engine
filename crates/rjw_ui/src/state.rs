@@ -123,8 +123,19 @@ pub struct UiStats {
     pub collect_us: f64,
     /// 缓存命中 → 提交列表组装（顶点克隆）耗时（µs）。
     pub clone_us: f64,
-    /// 提交（ordered 排序 + quads）耗时（µs）。
+    /// 提交（ordered 排序 + quads）耗时（µs）= [`Self::submit_asm_us`] + [`Self::submit_flush_us`]。
     pub submit_us: f64,
+    /// **提交·装配**（`submit_quads` 前半：`ordered` 组装 + 排序 + 切段 + 段内顶点拼接）耗时（µs）。
+    ///
+    /// 这一半是 `rjw_ui` **自己**的账（纯 CPU 顶点搬运），与后半（交后端）分开，
+    /// 才能回答"这 0.3ms 该算 UI 还是算渲染器"。
+    pub submit_asm_us: f64,
+    /// **提交·交后端**（`flush_seg` 循环：窗口变换 / batch scissor / `UiBackend::submit`）耗时（µs）。
+    ///
+    /// 真实后端（`rjw_krusie::Render2dUiBackend`）在这里调 `mesh_indexed`——**顶点进
+    /// `rjw_2d_render` 暂存缓冲的那次拷贝**就发生在这一段里，故它是"UI 提交 vs 渲染器
+    /// 吸收"的**唯一分界**。
+    pub submit_flush_us: f64,
     /// `Ui::finish` 总耗时（µs）。
     pub finish_us: f64,
     /// **各段开场**（`UiInit::build()`：懒开场 + 冻结输入快照 + 装载帧级事实 + 建根容器）

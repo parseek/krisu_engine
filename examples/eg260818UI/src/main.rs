@@ -1549,6 +1549,11 @@ struct PerfAgg {
     collect_us: f64,
     clone_us: f64,
     submit_ui_us: f64,
+    /// `submit` 的**两笔账**：`asm` = UI 自己装配（组装/排序/切段/段内拼接顶点），
+    /// `flush` = 交后端（`flush_seg` → `UiBackend::submit`，真实后端在这里把顶点拷进
+    /// `rjw_2d_render` 暂存）。`asm + flush = submit`；两者之比回答"这 0.3ms 该算谁"。
+    submit_asm_us: f64,
+    submit_flush_us: f64,
     cmds: u64,
     wins: u64,
     hits: u64,
@@ -1585,6 +1590,8 @@ impl PerfAgg {
             collect_us: 0.0,
             clone_us: 0.0,
             submit_ui_us: 0.0,
+            submit_asm_us: 0.0,
+            submit_flush_us: 0.0,
             cmds: 0,
             wins: 0,
             hits: 0,
@@ -1623,6 +1630,8 @@ impl PerfAgg {
         self.collect_us += s.collect_us;
         self.clone_us += s.clone_us;
         self.submit_ui_us += s.submit_us;
+        self.submit_asm_us += s.submit_asm_us;
+        self.submit_flush_us += s.submit_flush_us;
         self.cmds += s.cmd_count as u64;
         self.wins += s.win_count as u64;
         self.hits += s.cache_hits as u64;
@@ -1645,7 +1654,8 @@ impl PerfAgg {
         println!(
             "[perf] fps={fps:.0} frame={:.2}ms ui={ui_ms:.2}ms (prologue={prologue_ms:.2} \
              record={record_ms:.2} finish={finish_ms:.2}) \
-             | ui: sort={:.1}us sig={:.1}us collect={:.1}us clone={:.1}us submit={:.1}us \
+             | ui: sort={:.1}us sig={:.1}us collect={:.1}us clone={:.1}us \
+               submit={:.1}us(asm={:.1} flush={:.1}) \
              | render: total={:.2}ms begin={:.1}us encode={:.1}us submit={:.1}us present={:.1}us \
              | cmds={:.0} wins={:.0} cache_hit={:.1} cache_miss={:.1} clip_batches={:.0} \
              segs={:.0} verts={:.0} tris={:.0}",
@@ -1655,6 +1665,8 @@ impl PerfAgg {
             self.collect_us / n,
             self.clone_us / n,
             self.submit_ui_us / n,
+            self.submit_asm_us / n,
+            self.submit_flush_us / n,
             self.render_us / n / 1000.0,
             self.begin_us / n,
             self.encode_us / n,

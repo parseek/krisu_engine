@@ -2083,18 +2083,29 @@ UiDraw.clip（绝对屏幕坐标）
 `clip_batches=11`、`segs=39`（1 个严格窗口 + 若干文本框盒 + 滚动可视区），
 `cmds/wins/cache_*` 与改动前逐位一致——即"裁剪改道"没有带来额外几何重建。
 
-### 18.21 提交期优化（①–⑤；⑥ GPU 持久缓冲不做）
+### 18.21 提交期优化（①–⑤′；⑥ GPU 持久缓冲不做）
+
+> **决策记录**：⑥（GPU 持久缓冲）不做。下一刀不是"再抠一次 memcpy"，而是**缓存提交
+> 计划而非几何碎片**（把合并/切段从每帧搬到缓存填充时）——理由、实测数据与取舍见
+> [`UI_ARCHITECTURE.md`](UI_ARCHITECTURE.md) §6。
 
 | # | 做法 | 效果（实测） |
 |---|---|---|
 | ① | **签名去绝对化**：`cmd_sig_hash` 哈希 `rect − anchor` / `clip − anchor`（与"缓存里存的是窗口局部顶点"同口径） | 拖动窗口从"**每帧 1 次整窗 MISS**"（`RJ_CACHE_TRACE`：f22…f61 每帧一条 `MISS win`）变成**稳态 0 MISS**（只剩 f1 冷启动 7 条）。`--sim-drag` 实测 |
 | ② | **scratch 复用**：`submit_quads` 的 `ordered`（待提交段列表）与 `seg_elems`（段内元素序集合）住 `UiState`，每帧 `clear()` 复用 | 去掉每帧 1 个 `Vec` + 每段 1 个 `BTreeSet` 的分配（演示 `segs=39`/帧） |
-| ③ | ~~单组段直接 move 几何~~ **已撤销** | 省一次 `append` 拷贝，但会让单组段的几何在某些路径上凭空少一份（实测把 `--sim-dropdown` 的子菜单面板整块弄丢）⇒ 收益不值风险，保留 append 版本 |
-| ④ | **签名瘦身**：环境裁剪以量化 `i32` 四元组入签名（4 次整型写入）；文本只哈希**自身软裁剪**（环境层已上移到 batch scissor） | `sig_us` 未见增长（57–60µs，与改动前同档） |
+| ③ | **单组段直接 move 几何**：`run.quads == 1` 时 `mem::take` 该条几何，省一次 `append` | 省一次全量拷贝（多条段仍走 `append`）。⚠ 曾一度撤销：当时 `--sim-dropdown` 子菜单面板整块丢失，**误判为它的锅**——真因是同期"裁剪层绝对/局部空间不一致"（见 §18.22 坑 1）。空间修正后重新启用，全部 `--sim-*` 通过 |
+| ④ | **签名瘦身**：环境裁剪以量化 `i32` 四元组入签名（4 次整型写入）；文本只哈希**自身软裁剪**（环境层已上移到 batch scissor） | `sig_us` 未见增长（57–61µs，与改动前同档） |
 | ⑤ | **`[perf]` 计数**：`UiStats` 增 `clip_batches / seg_count / vert_count / tri_count`，示例 `[perf]` 打印 `clip_batches= segs= verts= tris=` | `segs` = "scissor 让 draw 变多"的直接度量；`verts/tris` = 这一帧镶嵌了多少 |
+| ⑤' | **`submit` 拆两笔账**：`UiStats::submit_asm_us`（UI 自己装配：组装/排序/切段/段内拼接）+ `submit_flush_us`（`flush_seg` → `UiBackend::submit`，真实后端在这里把顶点拷进渲染器暂存） | **不拆这两笔就无法判断那 0.3ms 该算谁**。实测 `submit=283µs(asm=166 flush=117)`——上一轮把整块当成"一次拷贝"就是这么来的 |
 
-> 现场看 `[perf]` 稳态：`cmds=381 wins=7 cache_hit=13 cache_miss=0 clip_batches=11
-> segs=40 verts=23736 tris=31621`。
+> 现场看 `[perf]` 稳态（520 帧，后 3 个 120 帧滑窗）：
+> `cmds=384 wins=7 cache_hit=14.0 cache_miss=0.0 clip_batches=11 segs=40 verts=23988 tris=31913`
+> ＋
+> `sort=26.7us sig=61.4us collect=2.7us clone=168.9us submit=289.3us(asm=164.8 flush=124.5)`
+> ⇒ `finish=570µs`，其中 `clone + asm = 334µs（59%）`是 `rjw_ui` 自己的顶点搬运。
+>
+> **成本模型、拷贝链（C1–C4）与下一步的结构性方案见
+> [`UI_ARCHITECTURE.md`](UI_ARCHITECTURE.md)。**
 
 ### 18.22 剔除（culling）：分配 → 被裁掉 → 直接 return
 

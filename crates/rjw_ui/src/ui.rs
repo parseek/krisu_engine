@@ -3585,7 +3585,9 @@ impl<'a> Ui<'a> {
         // ── 提交：**尽力而为的窗口合批**（`submit_quads`：ordered 排序 + 连续运行切段 +
         //    每段一次 `quads(..).color(tint)`；窗口级 FX 应用在段实例上，顶点缓存不变）──
         let layer_base = self.base_layer;
-        let submit_us = self.submit_quads(backend, cached, &mut quads, layer_base);
+        let (submit_asm_us, submit_flush_us) =
+            self.submit_quads(backend, cached, &mut quads, layer_base);
+        let submit_us = submit_asm_us + submit_flush_us;
 
         // ── Debug 叠加（DebugDraw / debug_layout 描边 / 焦点描边）────────────
         // 在**全部 UI 内容之后**提交（`submit_debug`：合并 debug_queue 与布局描边、
@@ -3603,6 +3605,8 @@ impl<'a> Ui<'a> {
         acc.collect_us += stats.collect_us;
         acc.clone_us += stats.clone_us;
         acc.submit_us += submit_us;
+        acc.submit_asm_us += submit_asm_us;
+        acc.submit_flush_us += submit_flush_us;
         acc.finish_us += t_finish.elapsed().as_secs_f64() * 1e6;
         // 记录 IME 组合状态（供下一帧退格判定，见 text_input_at）
         self.state.ime_composing =
@@ -3927,14 +3931,19 @@ impl<'a> Ui<'a> {
     /// （`(win, 元素序, 图形/文字组, 纹理)`），按 `(win, tex)` 的**连续运行**切段，每段一次
     /// `quads(..).color(tint)`（单一窗口 transform + 窗口 tint）→ Render2D 一次 draw_indexed 合批。
     /// 不同窗口 / 不同纹理（层级需保序）或超 `MAX_UI_SEG_VERTS` 时切段；窗口级 FX
-    /// （tint + transform override）应用在段实例上（顶点缓存不变）。返回本阶段耗时（µs）。
+    /// （tint + transform override）应用在段实例上（顶点缓存不变）。
+    ///
+    /// 返回 `(装配 µs, 交后端 µs)`：前者是 `rjw_ui` 自己的顶点搬运（组装 / 排序 / 切段 /
+    /// 段内 `append`），后者是 [`Self::flush_seg`] 循环（含 `UiBackend::submit`——真实后端
+    /// 在这里把顶点拷进 `rjw_2d_render` 暂存）。两笔账必须分开记，否则无法判断
+    /// "提交这 0.3ms 是 UI 花掉的还是渲染器吸收的"（见 [`crate::UiStats::submit_asm_us`]）。
     fn submit_quads(
         &mut self,
         backend: &mut dyn UiBackend,
         cached: Vec<CachedQuad>,
         quads: &mut QuadCollector,
         layer_base: f64,
-    ) -> f64 {
+    ) -> (f64, f64) {
         let t_submit = Instant::now();
         // ② **复用 scratch 缓冲**（住 `UiState`，跨帧保留容量）：本帧的"待提交段"列表与
         // "段内元素序集合"都不再每帧新建（`segs` 段 × 每段一个 `BTreeSet` 的分配）。
@@ -3962,6 +3971,9 @@ impl<'a> Ui<'a> {
             ordered.iter().map(|q| (q.0, q.3, q.4, q.5.verts.len())),
             MAX_UI_SEG_VERTS,
         );
+        // 「装配」= 到切段为止（组装 + 排序 + 切段）——纯 UI 自己的账。
+        let mut asm_us = t_submit.elapsed().as_secs_f64() * 1e6;
+        let mut flush_total = 0.0f64;
         let mut next = 0usize;
         // ③' **复用同一个 `Geom` scratch**（每帧 1 次分配，而不是每段 1 次）：
         // `seg` 只是一份"本段顶点/索引"的临时容器，`flush_seg` 会把它 move 进批次，
@@ -3970,6 +3982,8 @@ impl<'a> Ui<'a> {
         // 再 `std::mem::take` 出来。
         let mut scratch_seg = Geom::default();
         for run in runs {
+            // 段内顶点搬运（`mem::take` 或 `append` 拷贝）算「装配」——是 UI 自己的 memcpy。
+            let t_seg = Instant::now();
             let seg = if run.quads == 1 {
                 // 单组：直接 move（省一次 `append` 全量拷贝）——只影响本帧这一份 `ordered`
                 // 条目（`ordered` 是本帧的 scratch，move 走即空）。
@@ -3993,7 +4007,9 @@ impl<'a> Ui<'a> {
             // 段统计（`[perf] segs=/verts=/tris=`）：**段数 = draw call 候选数**，
             // 顶点/三角数是"这一帧到底镶嵌了多少"的直接度量。
             let (sv, st) = (seg.verts.len() as u32, seg.tris.len() as u32);
+            asm_us += t_seg.elapsed().as_secs_f64() * 1e6;
             let emitted = !seg.is_empty();
+            let t_flush = Instant::now();
             self.flush_seg(
                 backend,
                 layer_base,
@@ -4003,6 +4019,7 @@ impl<'a> Ui<'a> {
                 run.clip,
                 n,
             );
+            flush_total += t_flush.elapsed().as_secs_f64() * 1e6;
             if emitted {
                 let acc = &mut self.state.frame_state.stats;
                 acc.seg_count = acc.seg_count.saturating_add(1);
@@ -4013,7 +4030,7 @@ impl<'a> Ui<'a> {
         // ② 归还 scratch（容量留到下一帧；元素里的 `Geom` 已 move/丢弃，不影响复用）。
         self.state.scratch_ordered = ordered;
         self.state.scratch_elems = seg_elems;
-        t_submit.elapsed().as_secs_f64() * 1e6
+        (asm_us, flush_total)
     }
 
     /// **冲刷一个窗口段**：把累计的几何段作为 [`UiBatch`] 提交（单一窗口的
