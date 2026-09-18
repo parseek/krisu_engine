@@ -1647,7 +1647,7 @@ impl PerfAgg {
              record={record_ms:.2} finish={finish_ms:.2}) \
              | ui: sort={:.1}us sig={:.1}us collect={:.1}us clone={:.1}us submit={:.1}us \
              | render: total={:.2}ms begin={:.1}us encode={:.1}us submit={:.1}us present={:.1}us \
-             | cmds={:.0} wins={:.0} cache_hit={:.0} cache_miss={:.0} clip_batches={:.0} \
+             | cmds={:.0} wins={:.0} cache_hit={:.1} cache_miss={:.1} clip_batches={:.0} \
              segs={:.0} verts={:.0} tris={:.0}",
             self.frame_us / n / 1000.0,
             self.sort_us / n,

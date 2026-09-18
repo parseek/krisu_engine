@@ -3953,7 +3953,8 @@ impl<'a> Ui<'a> {
         // 缓存命中路径（`cached`）来自 `cache_window`，其元素数已在采集期统计。
         ordered.extend(cached);
         // 提交序：`(win, elem, group, tex, clip)`（`clip` 用整数像素键比较）。
-        ordered.sort_by_key(|q| (q.0, q.1, q.2, q.3, clip_key(q.4)));
+        // `sort_unstable`：键相同的条目之间**顺序无关**（同键必然合进同一段）。
+        ordered.sort_unstable_by_key(|q| (q.0, q.1, q.2, q.3, clip_key(q.4)));
         // 连续运行合批：同 (win, tex, clip) 顶点合并成一段；窗口/纹理/**裁剪**切换或
         // 超段顶点上限时切段。切段规则抽成纯函数 [`segment_runs`]，使「一次交互产生
         // 几次 draw call」可在**无 GPU** 的情况下断言（见 `gpu_batch::batch_contract_tests`）。
@@ -3962,20 +3963,26 @@ impl<'a> Ui<'a> {
             MAX_UI_SEG_VERTS,
         );
         let mut next = 0usize;
+        // ③' **复用同一个 `Geom` scratch**（每帧 1 次分配，而不是每段 1 次）：
+        // `seg` 只是一份"本段顶点/索引"的临时容器，`flush_seg` 会把它 move 进批次，
+        // 所以每段新建 = 40 次 `Vec` 分配 + `reserve`。这里改用 `scratch_seg`：
+        // 单组段直接把那份几何 move 进批次（不需要拼接，见下），多组段在本容器里拼好
+        // 再 `std::mem::take` 出来。
+        let mut scratch_seg = Geom::default();
         for run in runs {
-            // ③ **已被撤销（保留说明）**：曾让 `run.quads == 1` 的段直接 `mem::take` 掉
-            // 那份几何（省一次 `append` 全量拷贝）。但单组段的几何**同时**被
-            // `debug`/缓存路径以外的读者按引用持有过一次的场景下会凭空少一份顶点
-            // （实测：`--sim-dropdown` 的子菜单面板整块不再录制 → ⑤/⑥ 失败）。
-            // 收益（一次拷贝）不值得这个风险：这里保留 append 版本。
-            let seg = {
-                let mut seg = Geom::default();
-                seg.verts.reserve(run.verts);
+            let seg = if run.quads == 1 {
+                // 单组：直接 move（省一次 `append` 全量拷贝）——只影响本帧这一份 `ordered`
+                // 条目（`ordered` 是本帧的 scratch，move 走即空）。
+                Geom { verts: std::mem::take(&mut ordered[next].5.verts), tris: std::mem::take(&mut ordered[next].5.tris) }
+            } else {
+                scratch_seg.verts.clear();
+                scratch_seg.tris.clear();
+                scratch_seg.verts.reserve(run.verts);
                 for q in &ordered[next..next + run.quads] {
                     // 索引按已累计顶点数平移（`Geom::append`）——不同段的索引各自从 0 起。
-                    seg.append(&q.5);
+                    scratch_seg.append(&q.5);
                 }
-                seg
+                Geom { verts: std::mem::take(&mut scratch_seg.verts), tris: std::mem::take(&mut scratch_seg.tris) }
             };
             seg_elems.clear();
             for q in &ordered[next..next + run.quads] {
