@@ -268,6 +268,29 @@ pub(crate) fn fully_outside(rect: Rect, clip: Option<Rect>) -> bool {
     }
 }
 
+/// **文本命令的可见窗口**（绝对逻辑坐标）：文本剔除**必须**用它，而不是命令的 `rect`。
+///
+/// `rect` = 该文本命令的**排版锚点矩形**（`UiDraw::rect`）；`soft_clip` = 命令自带的
+/// 软裁剪层（[`DrawKind::Text::clip`]，**相对** `rect` 的坐标，与 `draw_text_quads` 同口径）。
+///
+/// ⚠ **为什么不能用 `rect`**：文本命令的 `rect` 宽/高取的是**容器盒**的尺寸，不是墨迹范围
+/// （单行输入框宽 = 框内宽 `content_w`、多行高 = 框高 `rect.h`），而内容会随滚动**平移**
+/// （`text_dx = -text_scroll` / `rect.y - scroll_y`）⇒ 滚过一定距离后 `rect` 整个滑出盒子，
+/// 拿它判"全外"会把**明明可见**的整条文本剔掉（实测：单行输入框横向滚过 `padding + content_w`
+/// 后文字整块消失，`culled_text` 0 → 1）。软裁剪层相反——它**锚在盒子上**（调用方用
+/// `scroll - padding` / `+scroll` 做了补偿），恒等于可见窗口。
+///
+/// `soft_clip = None`（无软裁剪、内容自洽，如按钮文字）⇒ 退回 `rect`（旧行为）；
+/// 空软裁剪 ⇒ 返回零矩形 ⇒ 必剔。⚠ 这里**不与 `rect` 求交**：墨迹本来就可以超出锚点矩形
+/// （正是滚动的情形），求交会把可见窗口又缩回盒外 ⇒ 白修。
+#[inline]
+pub(crate) fn text_visible_rect(rect: Rect, soft_clip: Option<Rect>) -> Rect {
+    match soft_clip {
+        Some(c) => Rect::new(rect.x + c.x, rect.y + c.y, c.w, c.h),
+        None => rect,
+    }
+}
+
 /// `finish` 顶点缓存各阶段**累计**（µs / 计数）：拆出的缓存/提交子函数共享一个
 /// `&mut CacheStats` 累加，`finish` 末尾统一写入 `UiStats`（示例/诊断读取）。
 #[derive(Default)]
@@ -1172,5 +1195,89 @@ mod batch_contract_tests {
             assert!((a[i] - b[i]).abs() < 1e-4, "裁剪后左边界应为 50% 混色，实际 {a:?}");
         }
         assert_eq!(c[1], Color::BLUE, "裁剪后右边界仍是右端色");
+    }
+
+    // ─── 文本剔除：可见窗口（`text_visible_rect` + `fully_outside`）───────────
+    //
+    // 这组把用户报的 BUG 变成断言：**单行输入框滚过头后文字整块消失**。
+    // 现场（`--sim-text-cull` 实测）：`res_input` 框内宽 ≈ 336 物理像素，
+    // `text_scroll` 推到 1000 ⇒ 文本命令的 `rect`（宽 = 框内宽）**整个滑到框左边**，
+    // 用 `rect` 判"全外" ⇒ 整条文本被剔除（`culled_text` 0 → 1、顶点掉一截）。
+
+    /// 滚出框的编辑器文本**不得**被剔除：可见窗口取软裁剪层（锚在框上）。
+    #[test]
+    fn scrolled_editor_text_is_not_culled() {
+        use super::{fully_outside, text_visible_rect};
+        use rjw_transform::Rect;
+        // 框（= 环境层 = 软裁剪层的绝对位置）：x 100..460。
+        let box_clip = Rect::new(100.0, 50.0, 360.0, 40.0);
+        // 滚到 1000px：rect = 框内左缘 - 1000，宽 = 框内宽（336）⇒ 整个落在框左边。
+        let rect = Rect::new(100.0 + 6.0 - 1000.0, 50.0, 336.0, 40.0);
+        // 软裁剪相对 rect：`clip = (scroll - padding, 0, rect.w, rect.h)` ⇒ 绝对 = 框。
+        let soft = Rect::new(1000.0 - 6.0, 0.0, 360.0, 40.0);
+        assert!(
+            fully_outside(rect, Some(box_clip)),
+            "前提：拿 rect 判会误剔（这就是修前的行为）"
+        );
+        let visible = text_visible_rect(rect, Some(soft));
+        assert_eq!(visible, box_clip, "可见窗口 = 软裁剪层的绝对位置（锚在框上）");
+        assert!(
+            !fully_outside(visible, Some(box_clip)),
+            "修正后：滚到中段的文本必须仍然可见（不得被剔除）"
+        );
+    }
+
+    /// 同一条不变量在**纵向**（多行 `text_area` 滚过一屏）同样成立。
+    #[test]
+    fn scrolled_multiline_text_is_not_culled() {
+        use super::{fully_outside, text_visible_rect};
+        use rjw_transform::Rect;
+        let box_clip = Rect::new(20.0, 200.0, 240.0, 75.0);
+        // 滚到 500px：rect.y = 框内顶 - 500，高 = 框高（75）⇒ 整个落在框上方。
+        let rect = Rect::new(20.0 + 6.0, 200.0 + 4.0 - 500.0, 228.0, 75.0);
+        // 软裁剪相对 rect：`clip = (-padding, scroll, rect.w, rect.h)` ⇒ 绝对 = 框。
+        let soft = Rect::new(-6.0, 500.0, 240.0, 75.0);
+        assert!(fully_outside(rect, Some(box_clip)), "前提：拿 rect 判会误剔");
+        let visible = text_visible_rect(rect, Some(soft));
+        assert!(!fully_outside(visible, Some(box_clip)), "纵向滚过头同样不得剔除");
+    }
+
+    /// 无软裁剪 ⇒ 退回 `rect`（旧行为：按钮文字等"内容自洽"文本）。
+    #[test]
+    fn text_without_soft_clip_falls_back_to_rect() {
+        use super::text_visible_rect;
+        use rjw_transform::Rect;
+        let rect = Rect::new(10.0, 20.0, 30.0, 40.0);
+        assert_eq!(text_visible_rect(rect, None), rect);
+    }
+
+    /// 软裁剪**整个**在环境层之外 ⇒ 该剔（`--sim-*` 里滚动列表的条目文字就是这种合法剔除）。
+    #[test]
+    fn text_whose_soft_clip_left_the_viewport_is_culled() {
+        use super::{fully_outside, text_visible_rect};
+        use rjw_transform::Rect;
+        let viewport = Rect::new(0.0, 0.0, 300.0, 200.0);
+        // 列表项滚到视口下方：它自己的框在视口外。
+        let rect = Rect::new(0.0, 900.0, 300.0, 40.0);
+        let soft = Rect::new(0.0, 0.0, 300.0, 40.0);
+        let visible = text_visible_rect(rect, Some(soft));
+        assert!(
+            fully_outside(visible, Some(viewport)),
+            "框整体滚出视口的文本仍应被剔除（阶段 5 的收益不能丢）"
+        );
+    }
+
+    /// 空软裁剪 ⇒ **零面积可见窗口**（`draw_text_quads` 的逐字形求交据此丢弃全部字形，
+    /// 一个四边形都不会产生）。
+    ///
+    /// ⚠ 这里**不**断言"被剔除"：`fully_outside` 走 `Rect::intersects`（闭区间），零面积
+    /// 矩形落在裁剪层内也算"相交"——这是全仓一致的口径（所有命令都如此），不为此加特例；
+    /// 代价只是这一帧多走一次逐字形循环（零顶点产物）。
+    #[test]
+    fn empty_soft_clip_yields_zero_area_window() {
+        use super::text_visible_rect;
+        use rjw_transform::Rect;
+        let visible = text_visible_rect(Rect::new(5.0, 5.0, 50.0, 20.0), Some(Rect::ZERO));
+        assert_eq!(visible, Rect::new(5.0, 5.0, 0.0, 0.0), "零面积 ⇒ 逐字形全丢");
     }
 }

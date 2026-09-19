@@ -54,6 +54,44 @@ use rjw_krusie::ui::{
 mod overlap;
 use overlap::OverlapDemo;
 
+
+fn main() -> Result<(), RunError> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut app = UiApp::new();
+    app.windows.win_a_pos = parse_pos_arg(&args, "--win-a", app.windows.win_a_pos);
+    app.windows.win_b_pos = parse_pos_arg(&args, "--win-b", app.windows.win_b_pos);
+    app.auto_drag = args.iter().any(|a| a == "--auto-drag");
+    app.script_pos = args.iter().any(|a| a == "--script-pos");
+    app.ui_dump = args.iter().any(|a| a == "--ui-dump");
+    app.sim_drag = args.iter().any(|a| a == "--sim-drag");
+    app.sim_picker = args.iter().any(|a| a == "--sim-picker");
+    app.sim_overlap = args.iter().any(|a| a == "--sim-overlap");
+    app.sim_cover = args.iter().any(|a| a == "--sim-cover");
+    app.sim_chrome = args.iter().any(|a| a == "--sim-chrome");
+    app.sim_weight = args.iter().any(|a| a == "--sim-weight");
+    app.sim_shadow = args.iter().any(|a| a == "--sim-shadow");
+    app.sim_clip = args.iter().any(|a| a == "--sim-clip");
+    app.sim_zorder = args.iter().any(|a| a == "--sim-zorder");
+    app.sim_text_cull = args.iter().any(|a| a == "--sim-text-cull");
+    app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
+    app.sim_import = parse_str_arg(&args, "--sim-import");
+    app.theme_file = parse_str_arg(&args, "--theme");
+    app.sim_theme = parse_str_arg(&args, "--sim-theme");
+    app.sim_menu = args.iter().any(|a| a == "--sim-menu");
+    app.sim_dropdown = args.iter().any(|a| a == "--sim-dropdown");
+    app.sim_weight_modal = args.iter().any(|a| a == "--sim-weight-modal");
+    app.sim_resize = args.iter().any(|a| a == "--sim-resize");
+    app.windows.sim_chrome = app.sim_chrome;
+    app.sim_click = args
+        .iter()
+        .any(|a| a == "--sim-click")
+        .then(|| parse_pos_arg(&args, "--sim-click", Vec2::ZERO));
+    app.image_file = parse_str_arg(&args, "--image");
+    app.font_file = parse_str_arg(&args, "--font-file");
+    run(app)
+}
+
+
 /// **菜单栏位置**（逻辑像素，左上角）：录制与 `--sim-menu` 的坐标解算共用同一常量
 /// —— 挪栏不用改脚本（写死像素的脚本一挪就点空）。
 const MENUBAR_POS: Vec2 = Vec2::new(90.0, 12.0);
@@ -66,6 +104,13 @@ const NAME_PANEL_POS: Vec2 = Vec2::new(430.0, 12.0);
 /// "FPS / 点击次数"两个标签上——那正是"面板底色被更早录制的 win=0 内容穿透"的现场。
 /// 值按**物理像素**给（注入与面板命中都在物理空间），脚本不做二次 DPI 换算。
 const ZORDER_PANEL_DST: Vec2 = Vec2::new(30.0, 18.0);
+
+/// `--sim-text-cull` 用的长文本（重复若干次 ⇒ 全文宽远大于输入框内宽）。
+const TEXT_CULL_LONG: &str = "滚过头就不见了？这段刻意写得很长，用来复现单行输入框的水平滚动。";
+/// `--sim-text-cull` 把 `text_scroll` 推到的位置（物理像素）：**远大于框内宽**
+/// （`res_input` 内容宽 ≈ 336、`win_b_input` ≈ 510）而**远小于全文宽**（≈ 30 字 × 8 遍），
+/// 即用户按 End / 把视图拖到中段时合法会到达的状态。
+const TEXT_CULL_SCROLL: f32 = 1000.0;
 
 /// **统一后的「按钮下拉菜单」演示位置**（逻辑像素，左上角；与菜单栏同一行、在其右侧）：
 /// 录制与 `--sim-dropdown` 的坐标解算**共用同一常量**（同理：脚本不写死像素）。
@@ -1178,6 +1223,21 @@ struct UiApp {
     /// 绘制序本身由 `RJ_ORDER_TRACE=1` 的 `order[...]` 行核对（引擎侧证据，
     /// 应用侧读不到"谁画在谁上面"）。
     sim_zorder: bool,
+    /// --sim-text-cull：**复现「单行输入框滚过头文字消失」**（用户报的 BUG）。
+    ///
+    /// 现场：把 `res_input` / `win_b_input` 绑的 `win_b_note` 换成长串，再把该控件的
+    /// `text_scroll` 直接推到远超框内宽、但仍远小于全文宽的位置（= 用户按 End / 拖到中段时
+    /// **合法会到达**的状态）⇒ 修前整条文本命令被兜底剔除（`culled_text` 涨、`verts` 掉一截），
+    /// 修后两者都不变。见 `docs/DEBUGGING.md` §8.4。
+    sim_text_cull: bool,
+    /// --sim-text-cull：**未滚动**那一帧的 `verts`（帧 N 读到的是 N-1 的统计）。
+    cull_verts_before: Option<u32>,
+    /// --sim-text-cull：**滚到中段**那一帧的 `verts`。
+    cull_verts_after: Option<u32>,
+    /// --sim-text-cull：同两帧的 `culled_text`（被兜底剔除的文本命令条数）——
+    /// 比 `verts` 更直接：修前"滚到中段"那一帧应 ≥ 1，修后两帧都为 0/不变。
+    cull_text_before: Option<u32>,
+    cull_text_after: Option<u32>,
     /// --sim-zorder：第 100 帧读到的 `name_panel` 位置（判定"真的拖动了"）。
     zorder_panel: Option<Vec2>,
     /// --sim-zorder：翻页**之前**点列表得到的选中项号（判定"同一屏幕点选了更后面的条目"）。
@@ -1546,6 +1606,11 @@ impl UiApp {
             theme_file: None,
             sim_theme: None,
             sim_zorder: false,
+            sim_text_cull: false,
+            cull_verts_before: None,
+            cull_verts_after: None,
+            cull_text_before: None,
+            cull_text_after: None,
             zorder_panel: None,
             zorder_sel_before: None,
             perf: PerfAgg::new(),
@@ -1599,6 +1664,10 @@ struct PerfAgg {
     /// 与 `segs`（`UiBatch` 数 = 批次候选数）配对照：阶段 9 起提交计划按单元缓存，
     /// `segs` 会略涨，但相邻同状态批次在 `Render2D` 里合成一个动态段 ⇒ `draw_ops` 不涨。
     draw_ops: u64,
+    /// 本帧被**兜底剔除**的**文本命令**条数（`UiStats::culled_text`）。**含合法剔除**
+    /// （滚出可视区的列表条目文字），所以不是"必须 0"；`--sim-text-cull` 用它 + `verts`
+    /// 一起判"输入框滚到末尾后文字是不是整块没了"。
+    culled_text: u64,
 }
 
 /// 每多少帧打印一次 [perf] 统计（165Hz 下约 0.7 秒一次）。
@@ -1633,6 +1702,7 @@ impl PerfAgg {
             verts: 0,
             tris: 0,
             draw_ops: 0,
+            culled_text: 0,
         }
     }
 
@@ -1673,6 +1743,7 @@ impl PerfAgg {
         self.segs += s.seg_count as u64;
         self.verts += s.vert_count as u64;
         self.tris += s.tri_count as u64;
+        self.culled_text += s.culled_text as u64;
     }
 
     /// 打印近 N 帧均值（ms / µs）后清零。
@@ -1691,7 +1762,7 @@ impl PerfAgg {
                submit={:.1}us(asm={:.1} flush={:.1}) \
              | render: total={:.2}ms begin={:.1}us encode={:.1}us submit={:.1}us present={:.1}us \
              | cmds={:.0} wins={:.0} cache_hit={:.1} cache_miss={:.1} clip_batches={:.0} \
-             segs={:.0} draw_ops={:.0} verts={:.0} tris={:.0}",
+             segs={:.0} draw_ops={:.0} culled_text={:.0} verts={:.0} tris={:.0}",
             self.frame_us / n / 1000.0,
             self.sort_us / n,
             self.sig_us / n,
@@ -1712,6 +1783,7 @@ impl PerfAgg {
             self.clip_batches as f64 / n,
             self.segs as f64 / n,
             self.draw_ops as f64 / n,
+            self.culled_text as f64 / n,
             self.verts as f64 / n,
             self.tris as f64 / n,
         );
@@ -2599,6 +2671,39 @@ impl App for UiApp {
             if self.sim_zorder && sim_frame == 100 {
                 self.zorder_panel = ui.state().panel_pos.get("name_panel").copied();
             }
+            // ── `--sim-text-cull`：**单行输入框滚过头文字消失**（用户报的 BUG）──
+            // 摆现场（第 20 帧起换成 8 遍长文本；30 字 × 8 ≈ 全文宽远大于框内宽）：
+            //   ① 第 22 帧读**未滚动**那一帧的 `verts`（帧 N 读到的是 N-1 的统计）；
+            //   ② 第 24 帧把该控件的 `text_scroll` 推到 `TEXT_CULL_SCROLL`
+            //      （引擎只在"滚轮 / 光标跟随"时改写它，脚本直接置位 = 等价于把视图
+            //      拖到中段；取值**远大于框内宽、远小于全文宽**，是合法可达状态）；
+            //   ③ 第 26 帧读**滚到中段**那一帧的 `verts`。
+            // 修前：整条文本命令被 `collect_cmds` 的兜底剔除丢掉 ⇒ `verts` 掉一截
+            // （`culled_text` 也会涨）；修后两者都不变。判定见下面的 `sim-text-cull:` 行。
+            if self.sim_text_cull {
+                if sim_frame == 20 {
+                    self.windows.win_b_note = TEXT_CULL_LONG.repeat(8);
+                }
+                if sim_frame == 24 {
+                    // 绝对 id 前缀由窗口决定（`win_b/res_input`）⇒ 按后缀找，不写死前缀。
+                    if let Some((_, ws)) = ui
+                        .state_mut()
+                        .widgets
+                        .iter_mut()
+                        .find(|(id, _)| id.as_str().ends_with("res_input"))
+                    {
+                        ws.text_scroll = TEXT_CULL_SCROLL;
+                    }
+                }
+                if sim_frame == 22 {
+                    self.cull_verts_before = Some(ui.state().stats.vert_count);
+                    self.cull_text_before = Some(ui.state().stats.culled_text);
+                }
+                if sim_frame == 26 {
+                    self.cull_verts_after = Some(ui.state().stats.vert_count);
+                    self.cull_text_after = Some(ui.state().stats.culled_text);
+                }
+            }
             // 段收尾：提交本段到 UI 层自己的 `Render2D`；`f` 的借用到此结束。
             ui.finish();
         }
@@ -2722,7 +2827,8 @@ impl App for UiApp {
                         // **Hover** 时在原 popup **右侧**展开；点击它**不收起**父 popup。
                         m.item(Item::new("编码").submenu(|s| {
                             for (i, enc) in ENCODINGS.iter().enumerate() {
-                                if s.item(Item::new(enc)) {
+                                let mut checked = i == self.dd_sub_idx.unwrap_or(0);
+                                if s.item(Item::new(enc).checked(&mut checked)) {
                                     self.dd_sub_idx = Some(i);
                                 }
                             }
@@ -3354,6 +3460,32 @@ impl App for UiApp {
                 }
             );
         }
+        // --sim-text-cull 判定：滚到中段后**文字仍在提交**。
+        // 判据 = 两帧的 `verts` 基本不变（修前会掉掉整条文本的顶点）；容差 24 覆盖
+        // "光标随视图滚出框而被合法剔除"（`Caret` 是图形命令，本来就不该计入文本剔除）。
+        if self.sim_text_cull && f.frames() == 30 {
+            let (b, a) = (
+                self.cull_verts_before.unwrap_or(0),
+                self.cull_verts_after.unwrap_or(0),
+            );
+            let (cb, ca) = (
+                self.cull_text_before.unwrap_or(0),
+                self.cull_text_after.unwrap_or(0),
+            );
+            eprintln!(
+                "sim-text-cull: 未滚动 verts={b} culled_text={cb} → 滚到 {TEXT_CULL_SCROLL:.0}px 后 \
+                 verts={a} culled_text={ca}（verts 差 {}）",
+                b as i64 - a as i64
+            );
+            eprintln!(
+                "sim-text-cull: {}",
+                if a + 24 >= b && ca <= cb {
+                    "[OK] 滚过头后整条文本仍在提交（未被兜底剔除）"
+                } else {
+                    "[FAIL] 滚到中段后文本被整条剔除（顶点数掉了一截 / culled_text 涨了）"
+                }
+            );
+        }
         // --sim-click：打印"这一像素的归属"证据（点中了几个控件 + 谁被遮挡拦下）。
         // 背包格子（`inventory`）相邻格的**共享边**是最典型的用例：修复前点在边上会
         // **两个格子一起切换**，修复后只有画在后面的那个生效。
@@ -3511,41 +3643,6 @@ fn parse_str_arg(args: &[String], key: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1))
         .filter(|v| !v.starts_with("--"))
         .cloned()
-}
-
-fn main() -> Result<(), RunError> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut app = UiApp::new();
-    app.windows.win_a_pos = parse_pos_arg(&args, "--win-a", app.windows.win_a_pos);
-    app.windows.win_b_pos = parse_pos_arg(&args, "--win-b", app.windows.win_b_pos);
-    app.auto_drag = args.iter().any(|a| a == "--auto-drag");
-    app.script_pos = args.iter().any(|a| a == "--script-pos");
-    app.ui_dump = args.iter().any(|a| a == "--ui-dump");
-    app.sim_drag = args.iter().any(|a| a == "--sim-drag");
-    app.sim_picker = args.iter().any(|a| a == "--sim-picker");
-    app.sim_overlap = args.iter().any(|a| a == "--sim-overlap");
-    app.sim_cover = args.iter().any(|a| a == "--sim-cover");
-    app.sim_chrome = args.iter().any(|a| a == "--sim-chrome");
-    app.sim_weight = args.iter().any(|a| a == "--sim-weight");
-    app.sim_shadow = args.iter().any(|a| a == "--sim-shadow");
-    app.sim_clip = args.iter().any(|a| a == "--sim-clip");
-    app.sim_zorder = args.iter().any(|a| a == "--sim-zorder");
-    app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
-    app.sim_import = parse_str_arg(&args, "--sim-import");
-    app.theme_file = parse_str_arg(&args, "--theme");
-    app.sim_theme = parse_str_arg(&args, "--sim-theme");
-    app.sim_menu = args.iter().any(|a| a == "--sim-menu");
-    app.sim_dropdown = args.iter().any(|a| a == "--sim-dropdown");
-    app.sim_weight_modal = args.iter().any(|a| a == "--sim-weight-modal");
-    app.sim_resize = args.iter().any(|a| a == "--sim-resize");
-    app.windows.sim_chrome = app.sim_chrome;
-    app.sim_click = args
-        .iter()
-        .any(|a| a == "--sim-click")
-        .then(|| parse_pos_arg(&args, "--sim-click", Vec2::ZERO));
-    app.image_file = parse_str_arg(&args, "--image");
-    app.font_file = parse_str_arg(&args, "--font-file");
-    run(app)
 }
 
 /// 重置 UI 状态并恢复默认选中"普通"难度。

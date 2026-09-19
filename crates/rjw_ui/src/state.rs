@@ -112,6 +112,12 @@ pub struct UiStats {
     /// 缓存命中时它们与原顶点数相同，但 `collect_us` 会明显下降）。
     pub vert_count: u32,
     pub tri_count: u32,
+    /// 本帧被**兜底剔除**掉的**文本命令**条数（`collect_cmds` 里 `DrawKind::Text` 判"全外"）。
+    ///
+    /// 诊断口径：**包含合法的剔除**（滚动列表里滚出可视区的条目文字、列表外的标签），
+    /// 所以它不是"必须是 0"的哨兵；用来回答"这一帧的文字是不是被整块剔掉了"——
+    /// 例如 `--sim-text-cull` 里"输入框滚到末尾后文字消失"那一类。
+    pub culled_text: u32,
     /// 窗口顶点缓存命中 / 未命中次数。
     pub cache_hits: u32,
     pub cache_misses: u32,

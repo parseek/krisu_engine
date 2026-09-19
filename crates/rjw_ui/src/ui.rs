@@ -49,7 +49,7 @@ use crate::draw::{
 use crate::gpu_batch::{
     BatchPlan, CacheSlot, CacheStats, CachedQuad, Geom, QuadCollector, SubmitUnit, clip_rect,
     cmd_sig_hash, debug_layout_outline, fully_outside, line_row_at_y,
-    resample_gradient_local, safe_line_slice, segment_runs, vertex_p3u2c4,
+    resample_gradient_local, safe_line_slice, segment_runs, text_visible_rect, vertex_p3u2c4,
 };
 use crate::edit::{
     byte_to_char, caret_at_visual_click, caret_index_by_width, char_to_byte, insert_char_at,
@@ -4365,9 +4365,19 @@ impl<'a> Ui<'a> {
                         p.h + (*blur + offset.y.abs()) * 2.0,
                     )
                 }
+                // ⚠ 文本的 `rect` 是**排版锚点矩形**（宽/高 = 容器盒），内容却随滚动平移
+                // ⇒ 必须用**可见窗口**（软裁剪层，锚在盒子上）判，见 `text_visible_rect`。
+                // 用 `rect` 会把"滚过头但明明可见"的整条文本剔掉（用户报的 BUG）。
+                DrawKind::Text { clip, .. } => {
+                    text_visible_rect(snap_rect(&d.rect), clip.map(|c| snap_rect(&c)))
+                }
                 _ => snap_rect(&d.rect),
             };
             if fully_outside(cull_rect, clip_abs) {
+                if matches!(d.kind, DrawKind::Text { .. }) {
+                    let acc = &mut self.state.frame_state.stats;
+                    acc.culled_text = acc.culled_text.saturating_add(1);
+                }
                 continue;
             }
             match &d.kind {
@@ -6653,7 +6663,11 @@ impl Ui<'_> {
             seq,
             win,
             elem,
-            Rect::new(content_rect.x + text_dx, content_rect.y, content_w, rect.h),
+            // ⚠ 命令矩形 = **墨迹范围**（宽取全文宽 `text_w`，不是框内宽 `content_w`）：
+            // `draw_text_quads` 只用它的 x/y（对齐锚点 + 软裁剪的相对基准），所以观感不变；
+            // 但"排版矩形 = 墨迹范围"这条不变量让**兜底剔除**与 `debug_layout` 描边都正确
+            // （见 `gpu_batch::text_visible_rect` 的文档：框宽会让滚过头的文本被误剔）。
+            Rect::new(content_rect.x + text_dx, content_rect.y, text_w, rect.h),
             Arc::from(draw_text),
             style.font_size,
             style.fg,
@@ -7221,11 +7235,15 @@ impl Ui<'_> {
             seq,
             win,
             elem,
+            // ⚠ 命令矩形 = **墨迹范围**（高取全文高 `content_h`，不是框高 `rect.h`）：
+            // `draw_text_quads` 只用它的 x/y（对齐锚点 + 软裁剪的相对基准），观感不变；
+            // 但"排版矩形 = 墨迹范围"让**兜底剔除**正确（框高会让纵向滚过头的文本被误剔，
+            // 见 `gpu_batch::text_visible_rect`）。
             Rect::new(
                 content_rect.x + text_dx,
                 content_rect.y - scroll,
                 content_w,
-                rect.h,
+                content_h,
             ),
             Arc::from(draw_text),
             style.font_size,
