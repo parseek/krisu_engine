@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "krusie 应用级持久：UiState 帧生命周期",
+    "output": "docs/diagrams/ui-state-lifecycle.html",
+    "viewBox": [980, 600],
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "frame-loop", "label": "一帧的闭环", "focus": ["boot", "begin", "record", "end", "finish"], "note": "相位列即顺序：应用持有 state，引擎每帧开场、分段录制、收尾提交。" },
+      { "id": "memory", "label": "跨帧记忆", "focus": ["record", "memory"], "note": "控件状态、窗口位置、尺寸、滚动、浮层开关都写回应用持有的 UiState。" },
+      { "id": "reset", "label": "总清与重开", "focus": ["reset", "boot"], "note": "reset 清空全部记忆后重新开场；窗口关闭只是本帧不录。" }
+    ]
+  },
+  "lanes": [
+    { "id": "main", "label": "帧生命周期（引擎每帧一次）" },
+    { "id": "memory", "label": "跨帧记忆" },
+    { "id": "exceptions", "label": "总清与重开" }
+  ],
+  "states": [
+    { "id": "boot", "type": "start", "label": "应用持有 UiState", "sublabel": "UiState::new()", "lane": "main", "col": 0, "step": "01", "tag": "入口" },
+    { "id": "begin", "type": "active", "label": "begin_frame()", "sublabel": "命中区翻页", "lane": "main", "col": 1, "step": "02", "tag": "每帧一次" },
+    { "id": "record", "type": "active", "label": "分段录制", "sublabel": "segment 1..N", "lane": "main", "col": 2, "step": "03", "tag": "录制" },
+    { "id": "end", "type": "active", "label": "end_frame()", "sublabel": "帧级暂存关场", "lane": "main", "col": 3, "step": "04", "tag": "收尾" },
+    { "id": "finish", "type": "success", "label": "finish()", "sublabel": "几何缓存 · stats", "lane": "main", "col": 4, "step": "05", "tag": "呈现" },
+    { "id": "memory", "type": "neutral", "label": "跨帧持久状态", "sublabel": "widgets · panel_pos", "lane": "memory", "col": 2, "tag": "记忆" },
+    { "id": "reset", "type": "failure", "label": "UiState::reset()", "sublabel": "清空全部记忆", "lane": "exceptions", "col": 0, "tag": "可恢复" }
+  ],
+  "transitions": [
+    { "id": "record-memory", "from": "record", "to": "memory", "label": "跨帧读写" },
+    { "id": "record-reset", "from": "record", "to": "reset", "label": "重置" },
+    { "id": "reset-boot", "from": "reset", "to": "boot", "label": "清空后重新开场", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "三层归属",
+      "items": [
+        "应用级持久 UiState：应用 new() 持有，跨帧跨段（一个 state 可对应多个 Ui）",
+        "帧级暂存 UiFrameState：每帧 begin 重建 ⇒ pos_handler / size_handler 必须每帧注册",
+        "一段即弃：painter 命令队列 / 容器帧栈 / place_once / any_pressed"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "跨帧记忆都存什么",
+      "items": [
+        "控件状态 widgets（按绝对 id：caret / sel_anchor / scroll / checked / value）",
+        "窗口：panel_pos（拖拽）· auto_pos（引擎级联）· window_z / window_rects",
+        "其余：sizes / panel_sizes · scrolls · combo_open / menu_open · text_buffers 排版缓存"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "关窗 ≠ 清空",
+      "items": [
+        "close_button 的 *open = false 只是本帧整窗不录：既不画也不占遮挡矩形",
+        "窗口状态与位置仍在 UiState 里 ⇒ 重开即恢复原样",
+        "只有 reset 才是总清（示例里的 R 重开），并且清完重新从开场走"
+      ]
+    }
+  ]
+}
