@@ -142,6 +142,7 @@ pub enum Resize {
 /// **窗口选项**（`Ui::window` / `WindowBuilder` 的数据载体，可独立构造/复用）。
 ///
 /// - `pos`：窗口左上角（[`Position`]：逻辑/物理，相对当前容器内容原点；顶层 = 屏幕原点）；
+///   **`None`（默认）= 引擎自动分配**（Win32 `CW_USEDEFAULT` 语义，见下）；
 /// - `width`：`Some` = 固定宽（[`Size<f32>`]：逻辑/物理，高度自动，右下角可鼠标缩放，
 ///   跨帧持久）；`None` = 自动宽（内容自然结算）；
 /// - `level`：点击是否置顶（默认 [`Level::Topmost`]）；
@@ -152,7 +153,9 @@ pub enum Resize {
 ///   （**有 `.width(..)` 就能横向拖** —— 见 [`WindowBuilder::resize`](crate::WindowBuilder::resize)）。
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
-    pub pos: Position,
+    /// 窗口左上角；**`None`（默认）= 引擎自动分配**（级联 + 跨帧记忆，Win32
+    /// `CW_USEDEFAULT` 语义；见 [`WindowBuilder::pos`](crate::WindowBuilder::pos)）。
+    pub pos: Option<Position>,
     pub width: Option<Size<f32>>,
     pub level: Level,
     pub placement: Placement,
@@ -174,7 +177,8 @@ pub struct WindowOptions {
 impl Default for WindowOptions {
     fn default() -> Self {
         Self {
-            pos: Position::Logical(Vec2::ZERO),
+            // `None` = **引擎自动分配位置**（CW_USEDEFAULT 语义；见 `Ui::window` 文档）。
+            pos: None,
             width: None,
             level: Level::Topmost,
             placement: Placement::Expand,

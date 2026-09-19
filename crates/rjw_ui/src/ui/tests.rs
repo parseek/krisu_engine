@@ -775,25 +775,52 @@ fn anchor_pos_covers_all_corners_and_clamps() {
 }
 
 #[test]
+fn auto_window_pos_cascades_then_remembers() {
+    use std::collections::HashMap;
+    let mut map: HashMap<IdAbsolute<'static>, Vec2> = HashMap::new();
+    let mut next = 0u32;
+    let vp = Vec2::new(1920.0, 1080.0);
+    // ① 首个窗口 = 左上留边；第二、三个逐级右下偏移（Win32 层叠）。
+    let a = auto_pos_take(&mut map, &mut next, &IdAbsolute::from("win_a"), vp, 1.0);
+    let b = auto_pos_take(&mut map, &mut next, &IdAbsolute::from("win_b"), vp, 1.0);
+    assert_eq!(a, Vec2::new(16.0, 16.0));
+    assert_eq!(b, a + Vec2::splat(AUTO_POS_STEP));
+    // ② **跨帧稳定**：再问同一个 id 拿到同一个位置（不会顺着级联继续往下漂）。
+    let a2 = auto_pos_take(&mut map, &mut next, &IdAbsolute::from("win_a"), vp, 1.0);
+    assert_eq!(a2, a);
+    assert_eq!(next, 2, "重复询问不消耗槽位");
+    // ③ 回绕：槽位越界后取模回到可用范围内（不会跑出屏幕）。
+    let far = auto_pos_slot(10_000, vp, 1.0);
+    assert!(far.x >= 16.0 && far.x <= vp.x - 16.0, "x 在视口内: {far:?}");
+    assert!(far.y >= 16.0 && far.y <= vp.y - 16.0, "y 在视口内: {far:?}");
+    // ④ 小视口：跨度至少一格，不 panic / 不产生 NaN。
+    let tiny = auto_pos_slot(3, Vec2::new(10.0, 10.0), 1.0);
+    assert!(tiny.x.is_finite() && tiny.y.is_finite() && tiny.x >= 16.0);
+    // ⑤ DPI：步长与留边都按 scale 放大（内部全物理像素）。
+    let hd = auto_pos_slot(1, Vec2::new(3840.0, 2160.0), 2.0);
+    assert_eq!(hd, Vec2::new(16.0 * 2.0, 16.0 * 2.0) + Vec2::splat(AUTO_POS_STEP * 2.0));
+}
+
+#[test]
 fn container_builder_options_defaults_and_overrides() {
     // 窗口责任链选项默认值 = 旧 `window_at` 语义（自动宽 / 置顶 / Expand 不裁剪 /
     // 全局主题）。
     let o = WindowOptions::default();
-    assert_eq!(o.pos, Position::Logical(Vec2::ZERO));
+    assert_eq!(o.pos, None, "默认位置 = 引擎自动分配（CW_USEDEFAULT 语义）");
     assert_eq!(o.width, None);
     assert_eq!(o.level, Level::Topmost, "默认点击置顶");
     assert_eq!(o.placement, Placement::Expand, "默认 Expand 语义（不裁剪）");
     assert!(o.style.is_none(), "默认跟随全局 Theme::panel");
     // 覆盖组合 = 固定宽 + Level::Normal + Placement::Clip + 逐窗口样式。
     let o2 = WindowOptions {
-        pos: Position::Logical(Vec2::new(10.0, 20.0)),
+        pos: Some(Position::Logical(Vec2::new(10.0, 20.0))),
         width: Some(Size::Logical(300.0)),
         level: Level::Normal,
         placement: Placement::Clip,
         style: Some(PanelStyle::default().with_radius(8.0)),
         ..WindowOptions::default()
     };
-    assert_eq!(o2.pos, Position::Logical(Vec2::new(10.0, 20.0)));
+    assert_eq!(o2.pos, Some(Position::Logical(Vec2::new(10.0, 20.0))));
     assert_eq!(o2.width, Some(Size::Logical(300.0)));
     assert_eq!(o2.level, Level::Normal);
     assert_eq!(o2.placement, Placement::Clip);

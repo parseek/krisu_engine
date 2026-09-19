@@ -339,6 +339,15 @@ pub struct UiState {
     pub radio_groups: HashMap<String, IdAbsolute<'static>>,
     /// 可拖拽面板 / 窗口：**绝对 ID** → 左上角位置（屏幕逻辑像素，跨帧持久）。
     pub panel_pos: HashMap<IdAbsolute<'static>, Vec2>,
+    /// **引擎自动分配的窗口位置**（`CW_USEDEFAULT` 语义）：没写 `.pos()` 的窗口
+    /// 按首次出现顺序级联，分配结果记在这里 ⇒ **跨帧稳定**（不会每帧顺级联漂）。
+    ///
+    /// 优先级低于 [`Self::panel_pos`]（用户拖过就停在用户放置处）；[`Self::reset`]
+    /// 连它一起清空 ⇒ "重开"后重新从第一个槽位开始级联。
+    pub auto_pos: HashMap<IdAbsolute<'static>, Vec2>,
+    /// 自动位置的**下一个级联槽位序号**（[`Self::auto_pos`] 配套；单调递增，
+    /// 因此关掉再开一个窗口不会跟别人抢同一个槽位）。
+    pub(crate) auto_next: u32,
     /// **窗口 z-order**：窗口 **绝对 ID** → z 值（越大越靠上；点击窗口置顶 = z+1）。
     /// 窗口命令按 z 升序绘制（焦点窗口最后画 → 最上层）。
     pub window_z: HashMap<IdAbsolute<'static>, u32>,
@@ -597,6 +606,8 @@ impl UiState {
         self.radio_groups.clear();
         self.grid_cells.clear();
         self.panel_pos.clear();
+        self.auto_pos.clear();
+        self.auto_next = 0;
         self.panel_sizes.clear();
         self.window_z.clear();
         self.window_rects.clear();

@@ -323,6 +323,45 @@ impl<'a> UiInit<'a> {
     }
 }
 
+/// **自动窗口位置（`CW_USEDEFAULT`）的级联步长**（**逻辑**像素）：没写 `.pos()` 的
+/// 窗口按首次出现顺序，每级右下偏移这么多（同 Win32 的层叠窗口）。
+pub const AUTO_POS_STEP: f32 = 28.0;
+
+/// **自动窗口位置**：第 `n` 个未指定 `.pos()` 的窗口落在哪（纯函数，可单测）。
+///
+/// 策略 = Win32 层叠：从 `(margin, margin)` 起每级右下偏移 [`AUTO_POS_STEP`]（× `scale`
+/// 换算物理），越过视口右下可用范围时**回绕**（取模）——窗口再多也不会全跑出屏幕。
+/// `viewport` = 客户区**物理**尺寸（内部一律物理），`margin` 留出窗口标题可点的边距。
+fn auto_pos_slot(n: u32, viewport: Vec2, scale: f32) -> Vec2 {
+    let margin = 16.0 * scale;
+    let step = AUTO_POS_STEP * scale;
+    // 可用级联跨度：至少一格（视口比一格还小时就不回绕，够用即可）。
+    let span = Vec2::new(
+        (viewport.x - margin * 2.0 - step).max(step),
+        (viewport.y - margin * 2.0 - step).max(step),
+    );
+    let d = n as f32 * step;
+    Vec2::new(margin + d % span.x, margin + d % span.y)
+}
+
+/// **取 / 分配自动位置**（纯函数，可单测）：`id` 已有记录 ⇒ 返回记录值（**跨帧稳定**，
+/// 不会每帧顺着级联往下漂）；否则分配下一个槽位并记进 `map`，`next` 自增。
+fn auto_pos_take(
+    map: &mut std::collections::HashMap<IdAbsolute<'static>, Vec2>,
+    next: &mut u32,
+    id: &IdAbsolute<'_>,
+    viewport: Vec2,
+    scale: f32,
+) -> Vec2 {
+    if let Some(p) = map.get(id.as_str()) {
+        return *p;
+    }
+    let p = auto_pos_slot(*next, viewport, scale);
+    *next += 1;
+    map.insert(id.to_static(), p);
+    p
+}
+
 /// 窗口/面板**位置责任链**一环：
 /// - [`PosLink::Script`]：应用注册的脚本/动画/布局处理器（见 [`Ui::pos_handler`]；
 ///   **`'static` 闭包**——可捕获拥有值 / `Copy` 值 / `Arc`，需要共享可变状态时用
@@ -2650,6 +2689,22 @@ impl<'a> Ui<'a> {
     #[inline]
     fn resolve_pos(&self, id: &IdAbsolute<'_>, pos: Vec2) -> Vec2 {
         resolve_pos_link(&self.pos_chain, &self.state.panel_pos, id, pos)
+    }
+
+    /// **自动窗口位置**（Win32 `CW_USEDEFAULT` 语义）：没写 `.pos()` 的窗口由引擎
+    /// 按**首次出现顺序**级联分配（见 [`auto_pos_slot`]），并记进
+    /// [`UiState::auto_pos`] 跨帧稳定。
+    ///
+    /// 优先级：`pos_handler` 脚本 > 用户拖拽（[`UiState::panel_pos`]）> **本自动位置**
+    /// ——自动位置只是"初值"，拖过之后停在用户放置处（`reset()` 会连同记录一起清空）。
+    fn auto_window_pos(&mut self, id: &IdAbsolute<'_>, viewport: Vec2, scale: f32) -> Vec2 {
+        auto_pos_take(
+            &mut self.state.auto_pos,
+            &mut self.state.auto_next,
+            id,
+            viewport,
+            scale,
+        )
     }
 
     /// **尺寸责任链**：注册可调尺寸控件（[`Self::resizable_text_area_at`] /
@@ -5558,9 +5613,14 @@ impl WindowChrome<'_> {
 
 impl<'ui, 'a> WindowBuilder<'ui, 'a> {
     /// 窗口左上角（[`Position`]：`Logical`（默认，× scale）/ `Physical` 原样；
-    /// 相对当前容器内容原点，默认 `Logical(0,0)`）。
+    /// 相对当前容器内容原点）。
+    ///
+    /// **不调本方法 = 引擎自动分配位置**（Win32 `CW_USEDEFAULT` 语义）：
+    /// 按窗口**首次出现顺序**级联（默认每级右下 `AUTO_POS_STEP` 逻辑像素），
+    /// 位置**跨帧记忆**于 [`UiState::auto_pos`]（不会每帧漂移），用户拖过之后
+    /// 停在用户放置处（拖拽态优先于自动位置）。
     pub fn pos(mut self, p: impl Into<Position>) -> Self {
-        self.o.pos = p.into();
+        self.o.pos = Some(p.into());
         self
     }
     /// 固定宽（[`Size<f32>`]：`Logical`（默认，× scale）/ `Physical` 原样；高度自动，
@@ -5652,7 +5712,15 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
             return Vec2::ZERO;
         }
         // API 边界换算：Logical → Physical（内部布局/绘制全物理）。
-        let pos = o.pos.to_physical(ui.scale);
+        // **没写 `.pos()`** ⇒ 引擎分配位置（CW_USEDEFAULT 语义，见 [`Self::auto_window_pos`]）。
+        let pos = match o.pos {
+            Some(p) => p.to_physical(ui.scale),
+            None => {
+                let abs = ui.id_for(id).to_static();
+                let (vw, vh) = ui.window_physical_size();
+                ui.auto_window_pos(&abs, Vec2::new(vw as f32, vh as f32), ui.scale)
+            }
+        };
         let width = o.width.map(|w| w.to_physical(ui.scale));
         let content_gap = o.gap.map(|g| g.to_physical(ui.scale));
         // 枚举 → 内部两个开关（公开面不再出现裸布尔）。
