@@ -18,7 +18,7 @@ use rjw_transform::Rect;
 use crate::draw::{CornerRadius, Icon, Position, Size};
 use crate::hit::update_drag;
 use crate::id::IdAbsolute;
-use crate::{FocusKind, Response, Ui, UiCursor, Widget};
+use crate::{FocusKind, Response, TextEditor, Ui, UiCursor, Widget};
 
 /// **右侧拖拽调值手柄的宽度**（物理像素）。
 ///
@@ -147,15 +147,6 @@ impl Widget for NumberInput<'_> {
             );
         }
         let text_rect = Rect::new(rect.x, rect.y, (rect.w - GRIP_W).max(0.0), rect.h);
-        // 文本框**只圆左侧两角**：右侧要与手柄拼成一条直边，否则它自己的圆角会在
-        // 手柄左缘处留下一个缺口（"两个方块错位"的观感就是这么来的）。
-        let in_radius = ui.theme.input.radius;
-        ui.text_input_corners(CornerRadius {
-            tl: in_radius.tl,
-            tr: 0.0,
-            br: 0.0,
-            bl: in_radius.bl,
-        });
         let drag_id = IdAbsolute::owned(format!("{}::grip", id_for.as_str()));
         // 手柄是**独立可交互区**（不与文本框重叠）→ 传自己的 id 参与控件级遮挡判定。
         let grip_hit = ui.hit_abs(&drag_id, &grip);
@@ -274,8 +265,22 @@ impl Widget for NumberInput<'_> {
         if grip_hit || dragging {
             ui.set_cursor(UiCursor::EwResize);
         }
-        // 文本框：打字写入 edit_text，随后屏蔽非数字输入并解析回数值
-        ui.text_input_at(self.id /* 内部处理 id_for */, text_rect, edit_text);
+        // 文本框：打字写入 edit_text，随后屏蔽非数字输入并解析回数值。
+        // 文本框**只圆左侧两角**（右侧与手柄拼成一条直边，否则文本框自己的圆角会在
+        // 手柄左缘留下缺口）：经 [`TextEditor::radius`] 逐控件覆盖圆角——
+        // `Size::Physical`（主题圆角在 `Theme::build` 已预乘 scale，不能再乘一次）。
+        let in_radius = ui.theme.input.radius;
+        let panel_radius = CornerRadius {
+            tl: in_radius.tl,
+            tr: 0.0,
+            br: 0.0,
+            bl: in_radius.bl,
+        };
+        ui.add(
+            TextEditor::new(self.id /* 内部处理 id_for */, edit_text)
+                .at(text_rect)
+                .radius(Size::Physical(panel_radius)),
+        );
         edit_text.retain(|c| c.is_ascii_digit() || c == '-' || c == '.' || c == '+' || c == ' ');
         // 输入模式：**仅首次聚焦时全选**（之后可正常用鼠标部分选择文本；
         // 失焦后 focused_prev 复位，下次聚焦再全选）。

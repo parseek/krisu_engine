@@ -288,7 +288,6 @@ impl<'a> UiInit<'a> {
             any_pressed: false,
             overlay_depth: 0,
             press_claimed: false,
-            next_input_corners: None,
             drag_panel: None,
             win_press_top: None,
             win_origins: std::collections::HashMap::new(),
@@ -490,10 +489,6 @@ pub struct Ui<'a> {
     /// 输入框/TextArea 在按下响应时置位，`window_at` / `panel_impl` 据此**不建立**
     /// 拖拽基准——从输入框上拖拽 = 选择文本，而不是拖动窗口。
     press_claimed: bool,
-    /// **一次性**覆盖下一个输入框面板的圆角（[`Self::text_input_corners`] 写入、
-    /// `text_input_at` 读后即清）。`NumberInput` 靠它让文本框只圆左侧两角，
-    /// 与右侧拖拽手柄拼成一条直边。
-    next_input_corners: Option<CornerRadius>,
     /// 当前拖拽中的面板 / 窗口 **绝对 ID**（拖动期间抑制子控件交互）。
     drag_panel: Option<IdAbsolute<'static>>,
     /// 本帧按下命中的**最上层窗口**（重叠点击裁决：只让最高 z 窗口拖拽与置顶）。
@@ -6349,16 +6344,6 @@ impl Ui<'_> {
         crate::widgets::Widget::ui(crate::widgets::TextEditor::new(id, value).at(rect), self);
     }
 
-    /// **一次性**覆盖下一个输入框面板的圆角（下一次 [`Self::text_input_at`] 读后即清）。
-    ///
-    /// 给"文本框要和别的东西拼成一条直边"的场景用——内置 `NumberInput` 让文本框
-    /// 只圆**左侧**两角，右侧与拖拽手柄拼平（否则文本框自己的圆角会在手柄左缘
-    /// 留下一个缺口）。普通调用方不需要它（也可以改用
-    /// [`crate::widgets::TextEditor::radius`]）。
-    pub(crate) fn text_input_corners(&mut self, radius: CornerRadius) {
-        self.next_input_corners = Some(radius);
-    }
-
     /// **单行文本编辑核心**（[`crate::widgets::TextEditor`] 的实现；调用方请用
     /// [`Self::text_input_at`] / [`UiAdd::text_input`]）。
     ///
@@ -6367,8 +6352,6 @@ impl Ui<'_> {
     /// - **文本选择**：按住拖拽选择（`WidgetState::sel_anchor`），选择优先于窗口/面板拖拽
     ///   （按下时置位 `press_claimed`）；Ctrl+C/V/X 复制/粘贴/剪切；选择后打字/退格替换选择；
     /// - **IME 组合候选移入浮动提示框**：组合串（preedit）画在输入框下方浮动小框中（不再占行内）。
-    ///
-    /// 读 [`Self::text_input_corners`] 写入的一次性圆角覆盖。
     pub(crate) fn text_input_core(&mut self, id: &str, rect: Rect, value: &mut String) {
         let id_for = self.id_for(id);
         self.note_placed(rect);
@@ -6532,9 +6515,9 @@ impl Ui<'_> {
         let saved_clip = self.painter.q.clip;
         self.painter.q.clip = clip_for_view(saved_clip, box_clip, ViewMode::Clip);
         // 背景 + 边框（radius > 0 走圆角双层矩形）。
-        // 圆角可以被**一次性**覆盖（[`Self::text_input_corners`]）——`NumberInput` 靠它让
-        // 文本框只圆左侧两角，从而与右侧拖拽手柄拼成一条直边。
-        let panel_radius = self.next_input_corners.take().unwrap_or(style.radius);
+        // 圆角来自 `style.radius`（主题值，或 [`crate::widgets::TextEditor::radius`] 的
+        // 逐控件覆盖——`NumberInput` 靠它只圆左侧两角，与右侧拖拽手柄拼成直边）。
+        let panel_radius = style.radius;
         self.push_panel_like(rect, style.bg, border, style.border_w, panel_radius, elem);
         let content_w = (rect.w - style.padding_x * 2.0).max(0.0);
         let content_rect = Rect::new(rect.x + style.padding_x, rect.y, content_w, rect.h);
