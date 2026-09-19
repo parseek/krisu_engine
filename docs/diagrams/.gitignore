@@ -1,0 +1,10 @@
+# 本目录只入库**可编辑源**（`*.lifecycle.json` / `*.architecture.json` …）。
+# Archify 的成品与回执**不入库**（成品约 600+ KB 自包含 HTML）：
+#   *.html / *.visual-check.json / *.png
+# 需要成品时按需重渲（skill 根目录下执行）：
+#   node bin/archify.mjs deliver lifecycle \
+#     docs/diagrams/ui-state-lifecycle.lifecycle.json \
+#     <输出路径>.html --quality showcase --json
+*.html
+*.visual-check.json
+*.png
