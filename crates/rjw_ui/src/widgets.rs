@@ -303,6 +303,7 @@ mod label;
 pub mod menu;
 mod numberinput;
 mod slider;
+mod texteditor;
 pub(crate) mod title_button;
 /// **菜单栏**（横向触发器 + 闭包下拉面板；状态在 `UiState.menu_open`）。
 pub mod menubar;
@@ -327,6 +328,7 @@ pub use segmented::Segmented;
 pub use label::Label;
 pub use numberinput::{GRIP_W, NumberInput};
 pub use slider::{Slider, SliderValue};
+pub use texteditor::TextEditor;
 
 // ─── 统一响应 ───────────────────────────────────────────────────
 

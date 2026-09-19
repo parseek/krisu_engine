@@ -5144,12 +5144,15 @@ pub trait UiAdd<'a> {
     /// **多行文本输入框**（占光标；默认约 200×90，可 `text_area_at` 显式尺寸）。
     /// Enter 换行、↑/↓ 跨行、Home/End 行首尾；自动换行 + 垂直滚动；选择/复制/
     /// 粘贴/剪切（Ctrl+C/V/X）；IME 支持。返回 `()`（内容写回 `value`）。
+    ///
+    /// 属性（尺寸 / 缩放柄 / 样式 / 不自动换行）请用责任链
+    /// [`crate::widgets::TextEditor`]（本方法 = `ui.add(TextEditor::new(id, value).multiline())`）。
     fn text_area(&mut self, id: &str, value: &mut String) {
         let ui = self.ui_mut();
-        let style = ui.theme.input.clone();
-        let w = style.min_w.max(200.0);
-        let rect = ui.child_rect(w, 90.0, Child::Expand);
-        ui.text_area_at(id, rect, value);
+        crate::widgets::Widget::ui(
+            crate::widgets::TextEditor::new(id, value).multiline(),
+            ui,
+        );
     }
 
     /// **多行文本输入框**（显式 `Rect`）。
@@ -5162,10 +5165,10 @@ pub trait UiAdd<'a> {
     /// 与 [`UiAdd::text_area`] 一致。
     fn text_area_nw(&mut self, id: &str, value: &mut String) {
         let ui = self.ui_mut();
-        let style = ui.theme.input.clone();
-        let w = style.min_w.max(200.0);
-        let rect = ui.child_rect(w, 90.0, Child::Expand);
-        ui.text_area_at_nw(id, rect, value);
+        crate::widgets::Widget::ui(
+            crate::widgets::TextEditor::new(id, value).multiline().no_wrap(),
+            ui,
+        );
     }
 
     /// **多行文本输入框（不自动换行）**（显式 `Rect`）。
@@ -5305,12 +5308,12 @@ pub trait UiAdd<'a> {
     }
 
     /// 文本输入框（内容写入 `value`；自动尺寸：高度固定，宽度取样式最小宽）。
+    ///
+    /// 等价 `ui.add(TextEditor::new(id, value))`——宽 / 高 / 缩放柄 / 样式请用
+    /// [`crate::widgets::TextEditor`] 责任链。
     fn text_input(&mut self, id: &str, value: &mut String) {
         let ui = self.ui_mut();
-        let style = ui.theme.input.clone();
-        let size = Vec2::new(style.min_w, style.height);
-        let rect = ui.child_rect(size.x, size.y, Child::Expand);
-        ui.text_input_at(id, rect, value);
+        crate::widgets::Widget::ui(crate::widgets::TextEditor::new(id, value), ui);
     }
 
     /// 显式尺寸文本输入框（逃生舱）。
@@ -6264,7 +6267,7 @@ impl Ui<'_> {
         // 尺寸责任链解析宽度（脚本/布局/用户拖拽覆盖），高度固定 = 传入 rect 高。
         let w = self.resolve_size(&id_for, Vec2::new(rect.w, rect.h)).x.max(min_w);
         let input_rect = Rect::new(rect.x, rect.y, w, rect.h);
-        self.text_input_at(id, input_rect, value);
+        self.text_input_core(id, input_rect, value);
         if resize != Resize::None {
             let style = self.theme.input.clone();
             let hw = 14.0_f32;
@@ -6308,7 +6311,7 @@ impl Ui<'_> {
         let id_for = self.id_for(id);
         let resolved = self.resolve_size(&id_for, Vec2::new(rect.w, rect.h));
         let area_rect = Rect::new(rect.x, rect.y, resolved.x.max(min.x), resolved.y.max(min.y));
-        self.text_area_at(id, area_rect, value);
+        self.text_area_impl(id, area_rect, value, true);
         if resize != Resize::None {
             let style = self.theme.input.clone();
             let hw = 14.0_f32;
@@ -6337,7 +6340,27 @@ impl Ui<'_> {
         }
     }
 
-    /// 文本输入框（显式 rect，**单行**）。
+    /// **单行文本输入框**（显式 `rect`）——[`crate::widgets::TextEditor`] 的薄封装。
+    ///
+    /// 需要宽 / 高 / 缩放柄 / 字号等属性时直接用责任链
+    /// [`crate::widgets::TextEditor`]（本方法等价 `TextEditor::new(id, value).at(rect)`）。
+    /// 编辑能力见 [`Self::text_input_core`]。
+    pub fn text_input_at(&mut self, id: &str, rect: Rect, value: &mut String) {
+        crate::widgets::Widget::ui(crate::widgets::TextEditor::new(id, value).at(rect), self);
+    }
+
+    /// **一次性**覆盖下一个输入框面板的圆角（下一次 [`Self::text_input_at`] 读后即清）。
+    ///
+    /// 给"文本框要和别的东西拼成一条直边"的场景用——内置 `NumberInput` 让文本框
+    /// 只圆**左侧**两角，右侧与拖拽手柄拼平（否则文本框自己的圆角会在手柄左缘
+    /// 留下一个缺口）。普通调用方不需要它（也可以改用
+    /// [`crate::widgets::TextEditor::radius`]）。
+    pub(crate) fn text_input_corners(&mut self, radius: CornerRadius) {
+        self.next_input_corners = Some(radius);
+    }
+
+    /// **单行文本编辑核心**（[`crate::widgets::TextEditor`] 的实现；调用方请用
+    /// [`Self::text_input_at`] / [`UiAdd::text_input`]）。
     ///
     /// 增强能力：
     /// - **超长文本滚动跟随光标**：文本超出内容区时左移，光标始终可见（`WidgetState::text_scroll`）；
@@ -6345,16 +6368,8 @@ impl Ui<'_> {
     ///   （按下时置位 `press_claimed`）；Ctrl+C/V/X 复制/粘贴/剪切；选择后打字/退格替换选择；
     /// - **IME 组合候选移入浮动提示框**：组合串（preedit）画在输入框下方浮动小框中（不再占行内）。
     ///
-    /// **一次性**覆盖下一个输入框面板的圆角（下一次 [`Self::text_input_at`] 读后即清）。
-    ///
-    /// 给"文本框要和别的东西拼成一条直边"的场景用——内置 `NumberInput` 让文本框
-    /// 只圆**左侧**两角，右侧与拖拽手柄拼平（否则文本框自己的圆角会在手柄左缘
-    /// 留下一个缺口）。普通调用方不需要它。
-    pub(crate) fn text_input_corners(&mut self, radius: CornerRadius) {
-        self.next_input_corners = Some(radius);
-    }
-
-    pub fn text_input_at(&mut self, id: &str, rect: Rect, value: &mut String) {
+    /// 读 [`Self::text_input_corners`] 写入的一次性圆角覆盖。
+    pub(crate) fn text_input_core(&mut self, id: &str, rect: Rect, value: &mut String) {
         let id_for = self.id_for(id);
         self.note_placed(rect);
         let hit = self.hit_abs(&id_for, &rect);
@@ -6740,7 +6755,28 @@ impl Ui<'_> {
         self.painter.q.clip = saved_clip;
     }
 
-    /// 多行文本输入框（显式 rect，**TextArea**）。
+    /// **多行文本输入框（自动换行，显式 `rect`）**——[`crate::widgets::TextEditor`] 的薄封装。
+    ///
+    /// 等价 `TextEditor::new(id, value).at(rect).multiline()`；宽 / 高 / 缩放柄 / 字号等
+    /// 属性请用责任链。编辑能力见 [`Self::text_area_impl`]。
+    pub fn text_area_at(&mut self, id: &str, rect: Rect, value: &mut String) {
+        crate::widgets::Widget::ui(
+            crate::widgets::TextEditor::new(id, value).at(rect).multiline(),
+            self,
+        );
+    }
+
+    /// **多行文本输入框（不自动换行，显式 `rect`）**——等价
+    /// `TextEditor::new(id, value).at(rect).multiline().no_wrap()`。
+    pub fn text_area_at_nw(&mut self, id: &str, rect: Rect, value: &mut String) {
+        crate::widgets::Widget::ui(
+            crate::widgets::TextEditor::new(id, value).at(rect).multiline().no_wrap(),
+            self,
+        );
+    }
+
+    /// **多行文本编辑核心**（[`crate::widgets::TextEditor`] 的实现；调用方请用
+    /// [`Self::text_area_at`] / [`Self::text_area_at_nw`] / [`UiAdd::text_area`]）。
     ///
     /// - **编辑**：Enter 换行、↑/↓ 跨**视觉行**（保持列）、Home/End 行首/行尾、
     ///   ←/→ 字符移动、Backspace/Delete、选择替换；Esc 失焦；
@@ -6753,21 +6789,8 @@ impl Ui<'_> {
     ///
     /// 自动换行模式（`wrap = true`）：行宽 = 内容区宽，超出自动换行，仅垂直滚动。
     /// 不自动换行模式（`wrap = false`）：行宽不限（显式 `\n` 分行），**水平滚动**
-    /// 跟随光标（同单行输入框），垂直滚动不变。对应公开入口
-    /// [`Self::text_area_at`]（换行）/ [`Self::text_area_at_nw`]（不换行）。
-    pub fn text_area_at(&mut self, id: &str, rect: Rect, value: &mut String) {
-        self.text_area_impl(id, rect, value, true)
-    }
-
-    /// **多行文本输入框（不自动换行）**：同 [`Self::text_area_at`]，但行宽不限
-    /// （显式 `\n` 分行），超出内容区**水平滚动**跟随光标（光标右侧保留 8 逻辑像素）；
-    /// 垂直滚动/选择/IME 与换行模式一致。
-    pub fn text_area_at_nw(&mut self, id: &str, rect: Rect, value: &mut String) {
-        self.text_area_impl(id, rect, value, false)
-    }
-
-    /// 多行文本输入框公共实现（`wrap`：是否按内容区宽自动换行；`false` = 水平滚动）。
-    fn text_area_impl(&mut self, id: &str, rect: Rect, value: &mut String, wrap: bool) {
+    /// 跟随光标（同单行输入框），垂直滚动不变。
+    pub(crate) fn text_area_impl(&mut self, id: &str, rect: Rect, value: &mut String, wrap: bool) {
         let id_for = self.id_for(id);
 
         self.note_placed(rect);

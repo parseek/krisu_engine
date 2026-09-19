@@ -197,7 +197,7 @@ pub use widgets::{
     Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, Dropdown,
     FONT_WEIGHT_CHOICES, FontModal, GRIP_W, Item, Label, MENU_GAP, MenuBar, MenuClick, MenuContent,
     MenuCtx, MenuFn, NumberInput, PopupSide, Response, Segmented, Sense, Slider, SliderValue,
-    Widget, WidgetId, color_hex, format_color, format_f, format_u8, ink_on, item_h, luma,
+    TextEditor, Widget, WidgetId, color_hex, format_color, format_f, format_u8, ink_on, item_h, luma,
     parse_color, parse_hex, popup_gap, popup_origin, popup_padding, weight_label,
 };
 
