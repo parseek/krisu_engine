@@ -261,6 +261,22 @@ pub fn sel_range(anchor: Option<usize>, caret: usize) -> Option<(usize, usize)> 
     }
 }
 
+/// **选择高亮的墨迹宽**（纯函数，单行 / 多行共用）：高亮块只覆盖**选中文字本身**
+/// 的宽度 `ink_w`（= 选区终点前缀宽 − 起点前缀宽）。
+///
+/// 只有 `ink_w <= 0`（**空行** / 零宽选区）才用 `space_w`（一个空格宽）兜底——
+/// 否则 `w == 0` 的高亮块会被调用方丢弃，选区里的空行就**完全看不见**。
+///
+/// ⚠ 曾经**无条件**加 `space_w`（注释写作"行尾提示：选区延伸到行尾外一格"）：
+/// 结果每次选中到行尾 / 全选，高亮都会比文字多出一个空格宽的蓝块——用户视角就是
+/// "选择高亮多出来的空格"（2026-08 反馈：「蓝色东西可以去掉这多出来的空格吗」，
+/// 蓝色 = `Theme::input.sel_bg`）。选区**跨行**时的行尾提示已由"下一行也有高亮"
+/// 表达，不需要行内多留一格。
+#[inline]
+pub fn selection_highlight_w(ink_w: f32, space_w: f32) -> f32 {
+    if ink_w > 0.0 { ink_w } else { space_w }
+}
+
 /// 是否 CJK 字符（汉字区 + 常见中文标点）：双击时 CJK **单字成词**（不合并）。
 #[inline]
 fn is_cjk_char(c: char) -> bool {
@@ -594,6 +610,16 @@ mod tests {
         assert_eq!(selected_text("abcdef", Some(1), 4), "bcd");
         assert_eq!(selected_text("abcdef", None, 2), "");
         assert_eq!(selected_text("你好世界", Some(1), 3), "好世");
+    }
+
+    #[test]
+    fn selection_highlight_covers_ink_only() {
+        // 选中文字本身 → 高亮宽 = 墨迹宽（**不多留一格**：曾经 +space_w，看着像多余的蓝块）。
+        assert_eq!(selection_highlight_w(42.0, 7.0), 42.0);
+        assert_eq!(selection_highlight_w(0.5, 7.0), 0.5, "极窄选区也不放大");
+        // 空行 / 零宽选区 → 用一格宽兜底，否则空行会被 `w == 0` 丢掉、选区里看不见。
+        assert_eq!(selection_highlight_w(0.0, 7.0), 7.0);
+        assert_eq!(selection_highlight_w(-3.0, 7.0), 7.0, "负宽（反向归一化残留）= 空行");
     }
 
     #[test]

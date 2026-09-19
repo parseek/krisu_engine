@@ -6605,7 +6605,8 @@ impl Ui<'_> {
             self.state.widgets.get(id_for.as_str()).and_then(|w| w.sel_anchor),
             caret,
         ) {
-            // **行尾提示**：高亮向右多留一个空格宽度（选择延伸到行尾之外一格）。
+            // 选择高亮（**只覆盖选中文字本身**；空行用一格宽兜底，见
+            // [`crate::edit::selection_highlight_w`]）。
             let space_w = self
                 .text_size(" ", style.font_size, style.font_family.as_deref())
                 .x;
@@ -6620,7 +6621,7 @@ impl Ui<'_> {
             let sel_rect = Rect::new(
                 content_rect.x + lo_x + text_dx,
                 content_rect.y + 3.0,
-                (hi_x - lo_x).max(0.0) + space_w,
+                crate::edit::selection_highlight_w(hi_x - lo_x, space_w),
                 (content_rect.h - 6.0).max(0.0),
             );
             if sel_rect.w > 0.0 && sel_rect.h > 0.0 {
@@ -7219,10 +7220,10 @@ impl Ui<'_> {
                 let x1 = self
                     .text_size(&value[ls..c1b], style.font_size, style.font_family.as_deref())
                     .x;
-                // **行尾 / 空行提示**：高亮向右多留一个空格宽度——整行被选时延伸到
-                // 行尾之外；**空行**（x0==x1，原逻辑 `c1b<=c0b` 直接跳过）也给一个
-                // 空格宽的高亮块，标出该空行已在选中范围内。
-                let sel_w = (x1 - x0).max(0.0) + space_w;
+                // **只覆盖选中文字本身**；空行（x0==x1，原逻辑 `c1b<=c0b` 直接跳过）
+                // 用一格宽兜底，标出该空行已在选中范围内（见
+                // [`crate::edit::selection_highlight_w`]）。
+                let sel_w = crate::edit::selection_highlight_w(x1 - x0, space_w);
                 // y 随垂直滚动上移（-scroll/scale）；clip = 输入框强制层（选择高亮
                 // 受裁剪，不溢出输入框 / 外层滚动容器）。
                 // 行顶用真实 `VisualLine.top`（与文本行网格一致，长文本不漂移）。
