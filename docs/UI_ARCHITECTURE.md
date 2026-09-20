@@ -152,8 +152,10 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 > `Theme::menubar: MenubarStyle`（栏底 / 触发器 / 竖分割线；不再借用 `Theme::button`——借用
 > 会让菜单条看起来像一排按钮）。窗口外框的收起状态也支持**引擎托管**：
 > `.collapsible(show, None)` ⇒ 状态进 `UiState::collapsed`（应用用
-> `UiState::{is_collapsed, set_collapsed, toggle_collapsed}` 读写）。几处都是**加** API、
-> 没有新增"第三条入口"。
+> `UiState::{is_collapsed, set_collapsed, toggle_collapsed}` 读写）。**`NumberInput` 也泛型化**
+> 到 `T: SliderValue`（与 `Slider` 同一套类型；`SliderValue` 只新增**带默认实现**的方法 ⇒
+> 外部自定义实现不破），拖拽数学改 `f64` + 十进制格点吸附（详见 `NumberInput` 模块文档）。
+> 几处都是**加** API、没有新增"第三条入口"。
 
 ### 5.2 文本框没有搬进 `widgets/`
 `ui.rs` 里 `text_input_at` + `text_area_impl` 约 **1000 行**（含 IME 候选框、选择、

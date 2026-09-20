@@ -22,15 +22,46 @@ use glam::Vec2;
 use crate::ui::Ui;
 use super::{Response, Widget};
 
-/// **滑块可用的数值类型**（滑块内部一律用 `f32` 做拖拽数学）。
+/// **滑块 / 数字输入框可用的数值类型**。
+///
+/// 滑块内部一律用 `f32` 做拖拽数学（与渲染 / 命中同单位）；**数字输入框**内部用 `f64`
+/// （它的精度要求更高：`step = 0.01` 配 `1000` 这种组合在 `f32` 里已经丢位，见
+/// [`crate::NumberInput`]）。
 ///
 /// 已为 `f32` / `f64` / `i8..i64` / `isize` / `u8..u64` / `usize` 实现。自定义类型
-/// （定点数 / 角度包装等）也可实现：给出到 `f32` 的映射与回写规则即可。
+/// （定点数 / 角度包装等）也可实现：**只需**给出 [`Self::to_f32`] 与 [`Self::from_f32`]，
+/// 其余方法都有默认实现（默认走 `f32` 中转；想保住双精度 / 整数语义就覆盖
+/// [`Self::to_f64`] / [`Self::from_f64`] / [`Self::parse_text`] / [`Self::fmt_text`]）。
 pub trait SliderValue: Copy {
     /// 转 `f32`（滑条内部单位）。
     fn to_f32(self) -> f32;
     /// 从 `f32` 收回。**整数类型在此四舍五入**——这是"整数滑条一格一格跳"的来源。
     fn from_f32(v: f32) -> Self;
+    /// 转 `f64`（**数字输入框**的拖拽 / 吸附数学用它；默认经 `f32` 中转）。
+    fn to_f64(self) -> f64 {
+        f64::from(self.to_f32())
+    }
+    /// 从 `f64` 收回（默认经 `f32` 中转；整数在[`Self::from_f32`] 里四舍五入）。
+    fn from_f64(v: f64) -> Self {
+        Self::from_f32(v as f32)
+    }
+    /// 是**整数类型**吗（决定显示无小数、默认步进 = 1、输入只收整数文本）。默认 `false`。
+    fn is_integral() -> bool {
+        false
+    }
+    /// 默认拖拽步进（浮点 `0.1` = 拖 10px ±1；整数 `1`）。
+    fn default_step() -> Self {
+        Self::from_f64(0.1)
+    }
+    /// 解析用户输入（默认按 `f32` 解析后走 [`Self::from_f32`]；`f64` / 整数各自覆盖，
+    /// 免得大值 / 高精度在手打时被 `f32` 截断）。
+    fn parse_text(s: &str) -> Option<Self> {
+        s.trim().parse::<f32>().ok().map(Self::from_f32)
+    }
+    /// 按 `decimals` 位小数显示（整数类型覆盖为无小数）。
+    fn fmt_text(self, decimals: usize) -> String {
+        format!("{:.*}", decimals, self.to_f64())
+    }
 }
 
 impl SliderValue for f32 {
@@ -53,9 +84,24 @@ impl SliderValue for f64 {
     fn from_f32(v: f32) -> Self {
         v as f64
     }
+    /// ⚠ **覆盖**默认实现：`f64` 直接进出，不走 `f32` 中转（否则数字输入框的手打 /
+    /// 吸附会在 `f32` 上丢位）。
+    #[inline]
+    fn to_f64(self) -> f64 {
+        self
+    }
+    #[inline]
+    fn from_f64(v: f64) -> Self {
+        v
+    }
+    #[inline]
+    fn parse_text(s: &str) -> Option<Self> {
+        s.trim().parse::<f64>().ok()
+    }
 }
 
-/// 整数类型统一实现：`to_f32` 直接转，`from_f32` **四舍五入**（滑条步进 = 1）。
+/// 整数类型统一实现：`to_f32` 直接转，`from_f32` / `from_f64` **四舍五入**（步进 = 1），
+/// 显示无小数、默认步进 1、解析走自身（大整数不经过 `f32`）。
 macro_rules! slider_int {
     ($($t:ty),* $(,)?) => {$(
         impl SliderValue for $t {
@@ -66,7 +112,34 @@ macro_rules! slider_int {
             #[inline]
             fn from_f32(v: f32) -> Self {
                 // `round` 后再转：半整数朝远离 0 的方向（与 `f32::round` 一致）。
+                // `as` 在浮点→整数是**饱和转换**（越界夹到类型边界，NaN → 0）。
                 v.round() as $t
+            }
+            /// ⚠ **覆盖**默认实现：`f64` 直接四舍五入进类型，不走 `f32` 中转
+            /// （`f32` 只有 24 位有效位，`1e15` 这种整数会被毁掉）。
+            #[inline]
+            fn from_f64(v: f64) -> Self {
+                v.round() as $t
+            }
+            #[inline]
+            fn to_f64(self) -> f64 {
+                self as f64
+            }
+            #[inline]
+            fn is_integral() -> bool {
+                true
+            }
+            #[inline]
+            fn default_step() -> Self {
+                1
+            }
+            #[inline]
+            fn parse_text(s: &str) -> Option<Self> {
+                s.trim().parse::<$t>().ok()
+            }
+            #[inline]
+            fn fmt_text(self, _decimals: usize) -> String {
+                format!("{self}")
             }
         }
     )*};
@@ -193,5 +266,61 @@ mod tests {
     fn integer_types_convert_in() {
         assert_eq!(<u64 as SliderValue>::to_f32(1_000_000), 1.0e6);
         assert_eq!(<i8 as SliderValue>::to_f32(-100), -100.0);
+    }
+
+    /// **整数类型覆盖了 `f64` 直通**（默认实现会经 `f32` 中转，`1e15` 会被毁掉）：
+    /// 这条守着"数字输入框接大整数不丢位"。
+    #[test]
+    fn integer_types_round_trip_large_values_through_f64() {
+        assert_eq!(<i64 as SliderValue>::from_f64(1.0e15), 1_000_000_000_000_000);
+        assert_eq!(<i64 as SliderValue>::to_f64(1_000_000_000_000_000), 1.0e15);
+        // 若走 f32 中转：`1e15 as f32` = 999999986991104 ⇒ 差近 1300 万。
+        assert_ne!(<i64 as SliderValue>::from_f32(1.0e15), 1_000_000_000_000_000);
+        // 越界是**饱和**（不是 UB / 回绕）。
+        assert_eq!(<u8 as SliderValue>::from_f64(300.0), 255);
+        assert_eq!(<i8 as SliderValue>::from_f64(-300.0), -128);
+    }
+
+    /// 整数：显示无小数、默认步进 1、解析只收整数文本；`f64`：解析保精度。
+    #[test]
+    fn text_helpers_follow_the_type() {
+        assert!(<i32 as SliderValue>::is_integral());
+        assert!(!<f32 as SliderValue>::is_integral());
+        assert!(!<f64 as SliderValue>::is_integral());
+        assert_eq!(<u32 as SliderValue>::default_step(), 1);
+        assert_eq!(<f32 as SliderValue>::default_step(), 0.1);
+        assert_eq!(<i32 as SliderValue>::parse_text(" -42 "), Some(-42));
+        assert_eq!(<i32 as SliderValue>::parse_text("3.5"), None, "整数不收小数");
+        assert_eq!(<u32 as SliderValue>::parse_text("-1"), None, "无符号不收负号");
+        assert_eq!(<i32 as SliderValue>::fmt_text(-7, 3), "-7", "整数不带小数");
+        // `f64` 走自己的解析（默认实现按 `f32` 解析会把低位截掉）。
+        let long = "0.30000000000000004";
+        assert_eq!(<f64 as SliderValue>::parse_text(long), long.parse::<f64>().ok());
+        assert_ne!(
+            <f64 as SliderValue>::parse_text(long),
+            long.parse::<f32>().ok().map(f64::from),
+            "别退回 f32 解析"
+        );
+    }
+
+    /// **自定义类型只需给两个方法**（其余走默认实现）——保证这次给 trait 加默认方法
+    /// 不会破坏外部实现。
+    #[test]
+    fn custom_types_need_only_the_two_conversions() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        struct Half(i32);
+        impl SliderValue for Half {
+            fn to_f32(self) -> f32 {
+                self.0 as f32 * 0.5
+            }
+            fn from_f32(v: f32) -> Self {
+                Half((v * 2.0).round() as i32)
+            }
+        }
+        assert_eq!(Half(3).to_f64(), 1.5, "默认 f64 走 f32 中转");
+        assert_eq!(Half::from_f64(2.0), Half(4));
+        assert!(!Half::is_integral());
+        assert_eq!(Half::parse_text("1.5"), Some(Half(3)), "默认按 f32 解析");
+        assert_eq!(Half(3).fmt_text(2), "1.50");
     }
 }

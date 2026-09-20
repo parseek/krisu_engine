@@ -3480,14 +3480,19 @@ impl App for UiApp {
         if self.sim_tuner && f.frames() == 24 {
             let r = self.theme_tuner.radius;
             self.tuner_probe = Some(r);
-            let ok = (r - 18.0).abs() <= 1.0 && (panel_radius.tl - r).abs() < 1.0;
+            // **精度断言用严格相等**：数字条内部按 `step` 的十进制位数回写（`step = 0.5`
+            // ⇒ 1 位小数），所以 `8.0 + 20px × 0.5` 必须**正好**是 `18.0`——不是"约 18"。
+            // 这条把"吸附 / 十进制取整"钉死：若把 `round_decimals` 去掉（只 `(v/step).round()*step`），
+            // `0.5` 在二进制里可精确表示 ⇒ 仍然相等；若把 `f64` 数学退回 `f32`，
+            // 在这个量级还看不出来（`step = 0.1` 才会）——所以另有 `numberinput` 单测守 f32 失准。
+            let ok = r == 18.0 && (panel_radius.tl - r).abs() < f32::EPSILON;
             eprintln!(
-                "sim-tuner: 拖数字条后 radius={r:.1}（期望 ~18 = 8 + 20px × step 0.5）· 主题圆角 tl={:.1} {}",
+                "sim-tuner: 拖数字条后 radius={r:?}（期望**精确** 18.0 = 8 + 20px × step 0.5）· 主题圆角 tl={:.1} {}",
                 panel_radius.tl,
                 if ok {
-                    "[OK] 数字条能改值，且进了主题"
+                    "[OK] 数字条能改值（且精确落在 step 格点上），并进了主题"
                 } else {
-                    "[FAIL] 数字条没改值（点空 / 手柄不响应）或没进主题"
+                    "[FAIL] 数字条没改值（点空 / 手柄不响应）/ 没进主题 / 值没吸到格点"
                 }
             );
         }

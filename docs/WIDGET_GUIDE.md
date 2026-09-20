@@ -258,7 +258,12 @@ if ui.add(TagButton::new("t1", "标签").bg(Color::ORANGE)).clicked() { … }
 
 - ~~`Slider` / `NumberInput` 的 builder 化~~（已完成：`widget::Slider` 支持 `drag_sensitivity`
   / `shift_speed` / `ctrl_speed`；`NumberInput::new(id, &mut value)` 内部管理显示文本，
-  支持 `.step()` / `.shift_speed()` / `.ctrl_speed()`）；
+  支持 `.range()` / `.step()` / `.shift_speed()` / `.ctrl_speed()`）；
+- ~~`NumberInput` 泛型化~~（已完成：与 `Slider` **同一套 `T: SliderValue`** —— `f32` 默认 /
+  `f64` / 全部整数类型，由 `&mut T` 推断；整数：默认步进 1、无小数显示、只收整数文本、
+  边界饱和。**精度四条**：内部数学用 `f64`；拖动吸附到 `step` 格点后**按十进制位数取整**
+  （`v == 0.1` 这类比较成立）；**先吸附再 clamp**；**拖动吸附、打字不吸附且如实显示**。
+  细节见 `rjw_ui::NumberInput` 的模块文档 + `docs/API_REFERENCE.md`）；
 - `TextInput` / `TextArea` / `Combo` 的 builder 化（同样走 `*_at_styled`）；
 - `Response` 扩展（如滑块新值 `Option<f32>`、`drag_delta`）；
 - widget 级 `disabled` / `tooltip` 等通用属性。
