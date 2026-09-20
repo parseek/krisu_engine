@@ -136,7 +136,32 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 
 ---
 
-## 5. 结构欠账（与性能无关，但决定可维护性）
+## 5. 结构欠账与硬规矩（与性能无关，但决定可维护性）
+
+### 5.0 单位纪律（规矩，不是欠账；API 实现者必读）
+`Size<T>` / `Position<T>`（`draw.rs`）把"逻辑像素 / 物理像素"搬到**类型里**，但**编译器
+不区分两者**——`Logical` 被当成物理像素用只是静默错位。所以这里有一条**必须遵守**的纪律
+（正典在 `Size` 的 rustdoc；内置控件与用户自定义控件同一套）：
+
+1. **解释必须显式**：把带单位值变成数值（布局 / 命中 / 绘制）只能用
+   `to_physical(scale)` 或 `match`，且**紧邻**参数解包：`let w = w.into().to_physical(scale);`。
+   禁止 `let w = w.into(); … w.0`（读 `.0` 时单位就丢了）。
+2. **构造必须指名单位**：实现体内造值写 `Size::Logical(..)` / `Size::Physical(..)`，
+   不许 `220.0.into()`。**主题值 / 跨帧持久化值 / 已乘过 DPI 的值一律 `Physical`**
+   ——`Theme` 在 `Ui` 内部已被 DPI 预乘，控件复用主题值时必须显式声明物理像素。
+3. **转发是唯一例外**：收 `impl Into<Size<..>>` / 存 `Option<Size<..>>` 的 setter 可以
+   `Some(s.into())` 原样存调用者的选择（例如 `Button::font_size` 存 `Option<Size<f32>>`，
+   到 `resolve()` 才 `to_physical`）。除此之外实现体内不出现隐式糖。
+
+`From<f32>` / `From<Vec2>`（⇒ `Logical`）**保留**：它是给**调用点**的源码兼容糖
+（`width(220.0)`、`radius(6.0)`），不是实现者的工具。它成立的前提是上面三条被遵守——
+糖只负责"调用点少写几个字"，单位解释一律发生在 API 边界。
+
+**兑现方式（本轮的证据）**：`crates/rjw_ui/src` 现有 **70 处** `to_physical` 全在边界
+（`ui.rs` 33 / `painter/prim.rs` 8 / `widgets/*` 18 / `draw.rs` 定义与单测）；**没有**任何
+`Size::from(..)`；`Size<..>` / `Position<..>` 类型的字段**全部**是 builder 的
+`Option<Size<..>>`（转发例外），内部状态（`UiState` / `UiFrameState`）**不存单位**——
+一律物理像素。新控件照 `WIDGET_GUIDE.md` §3 的写法写即自动合规。
 
 ### 5.1 两套控件 API 并存
 `widgets/`（17 文件 3.7k 行，`Widget::ui` 单方法协议）与 `ui.rs[5646..]` 的遗留

@@ -937,6 +937,14 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 `rounded_rect_at` / `gradient_rect_at` 同样带单位（`pos` → `Position`，`max_w` / `size` /
 `view_size` / `total_h` / `w` / `radius` → `Size`）。
 
+> **实现者规则（写控件 / 扩展 API 的人必读）**：`From<f32>` / `From<Vec2>`（⇒ `Logical`）
+> 是给**调用点**的糖。任何 API 函数（内置或自定义）的**函数体内部必须显式使用
+> `Logical` / `Physical`**——解释用 `to_physical(scale)` 或 `match`（紧邻参数解包），
+> 造值写 `Size::Logical(..)` / `Size::Physical(..)`（主题值 / 持久化值一律 `Physical`）；
+> 只有 builder setter 的"原样转发"允许隐式。正典见
+> [`Size`](crate::draw::Size) 的「单位纪律」rustdoc 与
+> `docs/UI_ARCHITECTURE.md` §5.0。
+
 | 入口 | 链 | 语义 |
 |---|---|---|
 | `ui.window(id)` | `.pos(..)`（**不调 = 引擎自动级联**，Win32 `CW_USEDEFAULT` 语义：按首次出现顺序右下偏移 28 逻辑像素，越界回绕；结果持久于 `UiState::auto_pos`，用户拖拽优先） `.width(w)` `.gap(Size)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` **`.resize(allow, axes)`** `.title(&str)` `.close_button(&mut bool)` **`.collapsible(bool, Option<&mut bool>)`** `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；`.gap` = **内容子项行距**（不调 = `Theme::gap`；下拉 / 菜单浮层用 `Physical(popup_gap(scale))` 拿"逻辑 1px"的紧行距）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**拖拽缩放** `.resize(allow: bool, axes: Resize)`：`allow = false` ⇒ 不画柄也不响应拖拽（`.width` 仍是布局固定宽）；`Resize::Both` ⇒ 宽高同调（高度持久于 `UiState::window_heights`，**并自动裁剪内容**）；**不调** = 旧行为（有 `.width` 才能横向拖）。**外框**（标题栏 / × / 收起）见下 |

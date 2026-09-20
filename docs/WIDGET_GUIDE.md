@@ -92,7 +92,13 @@ ui.add_at(Vec2::new(400.0, 40.0), Label::new("HUD"));
 | `ui.allocate_sense(id, size, sense)` | 申请 + **一次收交互** | — |
 
 - 尺寸一律是**物理像素 `Vec2`**（与"`Theme` 已预乘、内部全物理像素"一致）；要写逻辑
-  单位先 `Size::Logical(x).to_physical(ui.scale())`；
+  单位**必须**显式换算 `Size::Logical(x).to_physical(ui.scale())`（正典：`Size` 的
+  「单位纪律」rustdoc）；
+- **单位纪律（自定义控件同样适用）**：收 `impl Into<Size<..>>` / `Option<Size<..>>`
+  的 setter 可以原样转发（`self.font_size = Some(s.into())`），但**解释必须显式**——
+  在画 / 量 / 命中的地方 `to_physical(scale)` 或 `match`，**禁止**先 `into()` 再读 `.0`
+  （那是无声把逻辑当物理）；实现体内造值只写 `Size::Logical(..)` / `Size::Physical(..)`，
+  主题值 / 持久化值一律 `Physical`；
 - **min/max 尺寸**：`apply_constraints(desired, c)` 后交给 `allocate`（不再有 trait 钩子）；
 - 拖拽缩放：`Ui::resize_handle(id, handle, current, min, cursor)` 通用原语 +
   `UiState::sizes` 持久尺寸（`ui.window(id).width(w)` 宽度缩放即基于它）。

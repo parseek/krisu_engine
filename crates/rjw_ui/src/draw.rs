@@ -87,6 +87,58 @@ impl Metric<f32> {
 /// 换算在 **API 边界**进行一次（[`Size::to_physical`]），Ui 内部以物理像素为单位
 /// （布局 / 命中 / 绘制零 scale 换算）。`Logical` 换算会**取整**（`(v×scale).round()`，
 /// 保布局整数不变量）。
+///
+/// # 单位纪律（API 实现者必读；**内置控件与用户自定义控件同一套规矩**）
+///
+/// `Logical` / `Physical` 是**调用点的选择**；写进实现体后必须**显式**对待它。
+/// 违反本纪律**不会编译失败**——只会静默错位（漏乘 / 多乘 `scale`），所以它是纪律而不是类型。
+/// 三条：
+///
+/// 1. **解释必须显式**：把带单位值变成数值（布局 / 命中 / 绘制）时，只能用
+///    [`to_physical(scale)`](Size::to_physical) 或 `match`，而且要**紧邻**参数解包：
+///    `let w = w.into().to_physical(scale);`。禁止 `let w = w.into(); … w.0`
+///    ——读 `.0` 的那一刻单位就丢了（默认 `Logical` 被当成物理像素用）。
+/// 2. **构造必须指名单位**：函数体内造值一律写 `Size::Logical(..)` / `Size::Physical(..)`，
+///    不得用隐式糖（`220.0.into()`）。**主题值 / 跨帧持久化值 / 已经乘过 DPI 的值一律
+///    `Physical`**：`Theme` 在 `Ui` 内部就已被 DPI 预乘，控件复用主题值时必须显式声明
+///    "这是物理像素"（见 `Button::resolve` 里 `.map(|s| s.to_physical(scale))` 与
+///    `unwrap_or(base.font_size)` 的对照）。
+/// 3. **转发是唯一的例外**：签名收 `impl Into<Size<..>>` / 存 `Option<Size<..>>` 的 setter
+///    可以 `self.font_size = Some(s.into());` 把**调用者的选择**原样存起来——这里不做单位
+///    解释，解释推迟到第 1 条的边界（`Button::font_size` 存 `Option<Size<f32>>`，
+///    `resolve()` 处才 `to_physical`）。除此之外实现体内不出现隐式糖。
+///
+/// 明确的物理像素值也可以在**调用点**写 `Size::Physical(..)`（如 `Size::Physical(16.0)`
+/// 的字号）；反过来，`From<f32>` / `From<Vec2>`（⇒ `Logical`）只是给调用点的源码兼容
+/// **糖**（`width(220.0)`），不是实现者的工具——它成立的前提正是上面三条被遵守。
+///
+/// ```
+/// # use rjw_ui::draw::Size;
+/// // ✅ 边界显式换算（Ui 内部一律物理像素）
+/// fn width(v: impl Into<Size<f32>>, scale: f32) -> f32 {
+///     let v = v.into().to_physical(scale);
+///     v.max(0.0)
+/// }
+/// // ✅ 显式 match：逻辑 / 物理各自处理（栏宽那种要立刻拿到数值的场景）
+/// fn exact(v: impl Into<Size<f32>>, scale: f32) -> f32 {
+///     match v.into() {
+///         Size::Logical(x) => x * scale,
+///         Size::Physical(x) => x,
+///     }
+/// }
+/// # let _ = (width(220.0, 1.5), exact(Size::Physical(8.0), 1.5));
+/// ```
+///
+/// ```compile_fail
+/// # use rjw_ui::draw::Size;
+/// // ⛔ 只收显式单位的方法**不收裸数字**：这正是"单位必须在实现体可见"的机器可查锚点。
+/// //    （裸数字只对 `impl Into<Size<f32>>` 这类调用点糖生效；若哪天有人把签名放宽成
+/// //    `impl Into<..>`，本 doctest 会失效并提醒同步代码与文档。）
+/// fn only_explicit(w: Size<f32>) -> f32 {
+///     w.to_physical(1.5)
+/// }
+/// only_explicit(220.0);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Size<T> {
     /// 逻辑像素（× scale 换算为物理，取整）。
@@ -310,6 +362,7 @@ impl Default for Size<Vec2> {
     }
 }
 
+/// 调用点糖（裸数字 ⇒ **逻辑像素**）。**实现体内部禁止使用**：见 [`Size`] 的「单位纪律」。
 impl From<f32> for Size<f32> {
     #[inline]
     fn from(v: f32) -> Self {
@@ -317,6 +370,7 @@ impl From<f32> for Size<f32> {
     }
 }
 
+/// 调用点糖（裸 `Vec2` ⇒ **逻辑像素**）。**实现体内部禁止使用**：见 [`Size`] 的「单位纪律」。
 impl From<Vec2> for Size<Vec2> {
     #[inline]
     fn from(v: Vec2) -> Self {
@@ -326,6 +380,7 @@ impl From<Vec2> for Size<Vec2> {
 
 /// `Size<CornerRadius>` 的构造糖：`Button::radius(6.0)` / `radius(CornerRadius { .. })`
 /// 都按**逻辑像素**处理（需物理像素时显式 `Size::Physical(..)`）。
+/// **实现体内部禁止使用**：见 [`Size`] 的「单位纪律」。
 impl From<CornerRadius> for Size<CornerRadius> {
     #[inline]
     fn from(v: CornerRadius) -> Self {
@@ -333,6 +388,8 @@ impl From<CornerRadius> for Size<CornerRadius> {
     }
 }
 
+/// 调用点糖（裸数字 ⇒ 逻辑像素的**四角同值**圆角）。**实现体内部禁止使用**：
+/// 见 [`Size`] 的「单位纪律」。
 impl From<f32> for Size<CornerRadius> {
     #[inline]
     fn from(v: f32) -> Self {
@@ -342,6 +399,9 @@ impl From<f32> for Size<CornerRadius> {
 
 /// **带单位的位置**（公开 API 参数，默认 `Vec2`）：`Position` / `Position<Vec2>`。
 /// 语义与换算同 [`Size`]（[`Position::to_physical`]）；`From<Vec2>` 默认 [`Position::Logical`]。
+///
+/// 单位纪律与 [`Size`] 的「单位纪律」**同一套**（解释显式 / 构造指名 / 只允许转发这一种隐式）：
+/// API 实现体内把位置变成数值时用 `to_physical(scale)` 或 `match`，禁止靠默认 `Logical` 猜。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Position<T = Vec2> {
     Logical(T),
@@ -374,6 +434,7 @@ impl Default for Position {
     }
 }
 
+/// 调用点糖（裸 `Vec2` ⇒ **逻辑像素**）。**实现体内部禁止使用**：见 [`Position`] 的单位纪律。
 impl From<Vec2> for Position {
     #[inline]
     fn from(v: Vec2) -> Self {
@@ -381,6 +442,7 @@ impl From<Vec2> for Position {
     }
 }
 
+/// 调用点糖（裸数字 ⇒ **逻辑像素**）。**实现体内部禁止使用**：见 [`Position`] 的单位纪律。
 impl From<f32> for Position<f32> {
     #[inline]
     fn from(v: f32) -> Self {

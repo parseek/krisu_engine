@@ -2425,7 +2425,10 @@ pub trait Widget {
 1. `Vec2 → Size::Logical` 的隐式换算：首次实现让 `allocate` 收 `impl Into<Size<Vec2>>`，
    于是 `scale = 1.5` 下**每个控件又乘了一次 DPI**（所有窗口尺寸 +50%、标题栏按钮点空、
    下拉面板下移 20px）。`--sim-chrome` / `--sim-dropdown` 当场抓住；现在签名只收 `Vec2`
-   并注明"物理像素"。
+   并注明"物理像素"。**这条坑现在有纪律兜着**：`From<f32>` / `From<Vec2>` ⇒ `Logical` 只
+   对**调用点**生效，API **实现体内部必须显式**用 `Logical` / `Physical`（正典见 `Size` 的
+   「单位纪律」rustdoc / `docs/UI_ARCHITECTURE.md` §5.0）——"再乘一次 DPI"正是该纪律第 2 条
+   （构造必须指名单位）要防的事。
 2. `Divider` 曾被我改成 `DisableAutoExpansion`（"装饰件不撑大父级"听起来对，但旧代码是
    默认 Expand）：固定宽窗口的高度少掉分隔线那一块 ⇒ 窗口尺寸整块变掉。**行为一致性优先于
    命名直觉**。

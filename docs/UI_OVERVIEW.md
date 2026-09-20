@@ -64,8 +64,11 @@
 - **对外 API 全是逻辑像素**（`scale_factor` 传入物理/逻辑比）。坐标约定：屏幕左上角原点、
   Y+ 向下。
 - **内部计算一律物理像素**：渲染取整（`snap_rect`）、命中、滚动偏移都在物理侧，DPI 只在
-  API 边界换算一次。对外若提供"物理/逻辑可选"参数，用 `draw::Metric<T>`（`Physical` /
-  `Logical`，`to_physical(scale)`）。
+  API 边界换算一次。对外若提供"物理/逻辑可选"参数，用
+  [`draw::Size<T>`](crate::draw::Size) / [`draw::Position<T>`](crate::draw::Position)
+  （`Physical` / `Logical`，`to_physical(scale)`；`From<f32>` / `From<Vec2>` ⇒ `Logical`）。
+  ⚠ **单位纪律**：那两个 `From` 只是调用点糖，API 实现体内部必须显式用
+  `Logical` / `Physical`（详见 `Size` 的 rustdoc 与 `docs/UI_ARCHITECTURE.md` §5.0）。
 - 世界坐标：UI 是**屏幕固定**的（不随世界相机旋转/缩放）。`finish` 只接收
   [`rjw_transform::Viewport`]（大小 + 位置），不需要 `Camera2D`（它留给世界渲染）。
 
