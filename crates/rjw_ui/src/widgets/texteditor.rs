@@ -60,7 +60,7 @@ use crate::ui::{Resize, Ui};
 /// | 属性 | 方法 | 说明 |
 /// |---|---|---|
 /// | 矩形 | [`at`](Self::at) | 显式 `Rect`（绝对定位，不占容器光标） |
-/// | 尺寸 | [`width`](Self::width) / [`height`](Self::height) | 自动申请时的宽 / 高（默认：单行 `min_w`×`height`；多行 `max(min_w,200)`×`90`） |
+/// | 尺寸 | [`width`](Self::width) / [`height`](Self::height) | 自动申请时的宽 / 高（默认：单行 `min_w`×`height`；多行 `max(min_w,200)`×`90`，**逻辑像素**） |
 /// | 下限 / 上限 | [`min_size`](Self::min_size) / [`max_size`](Self::max_size) | 申请尺寸的 clamp（**物理像素**） |
 /// | 多行 | [`multiline`](Self::multiline) | `Enter` 换行 / `↑↓` 跨行 / 垂直滚动 |
 /// | 换行 | [`no_wrap`](Self::no_wrap) | 多行**不自动换行**（横向滚动跟随光标） |
@@ -317,7 +317,13 @@ impl<'a> TextEditor<'a> {
     fn allocate_rect(&self, ui: &mut Ui, style: &InputStyle) -> Rect {
         let scale = ui.scale();
         let (dw, dh) = if self.multiline {
-            (style.min_w.max(200.0), 90.0)
+            // ⚠ 必须 `× scale`：`style.*` 已经是**物理像素**（主题在下传前被 DPI 预乘），
+            // 而这两个默认值是**逻辑像素**——混用会让不同 DPI 下默认尺寸不一致
+            // （150% 下曾是 90 物理像素 = 60 逻辑像素，比文档写的 90 逻辑像素小 1/3）。
+            (
+                style.min_w.max(MULTILINE_DEF_W * scale),
+                MULTILINE_DEF_H * scale,
+            )
         } else {
             (style.min_w, style.height)
         };
@@ -376,6 +382,12 @@ impl Widget for TextEditor<'_> {
 }
 
 // ─── 尺寸解算（纯函数，可单测） ─────────────────────────────────
+
+/// 多行编辑器**默认宽**（**逻辑像素**；`allocate_rect` 里 × scale ⇒ 物理像素）。
+const MULTILINE_DEF_W: f32 = 200.0;
+
+/// 多行编辑器**默认高**（**逻辑像素**；同 [`MULTILINE_DEF_W`]）。
+const MULTILINE_DEF_H: f32 = 90.0;
 
 /// **开了 `.resize(..)` 且没调 `.min_size(..)` 时的默认下限**（物理像素）：
 /// 最小宽 = [`InputStyle::min_w`]，最小高 = [`InputStyle::height`]（**一行文字的标准高**，

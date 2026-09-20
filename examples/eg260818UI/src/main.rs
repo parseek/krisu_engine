@@ -138,6 +138,11 @@ const NAME_PANEL_POS: Vec2 = Vec2::new(430.0, 12.0);
 /// 值按**物理像素**给（注入与面板命中都在物理空间），脚本不做二次 DPI 换算。
 const ZORDER_PANEL_DST: Vec2 = Vec2::new(30.0, 18.0);
 
+/// **滚动列表的几何**（逻辑像素，左上角 + 尺寸）：录制（`list_at`）与 `--sim-zorder`
+/// 的坐标解算共用同一常量——列表挪位置 / 改尺寸时脚本自动跟随。
+const LIST_POS: Vec2 = Vec2::new(880.0, 130.0);
+const LIST_SIZE: Vec2 = Vec2::new(240.0, 300.0);
+
 /// `--sim-text-cull` 用的长文本（重复若干次 ⇒ 全文宽远大于输入框内宽）。
 const TEXT_CULL_LONG: &str = "滚过头就不见了？这段刻意写得很长，用来复现单行输入框的水平滚动。";
 /// `--sim-text-cull` 把 `text_scroll` 推到的位置（物理像素）：**远大于框内宽**
@@ -829,8 +834,8 @@ impl RightPanel {
         );
         // 滚动容器演示：可滚动选择列表（list_at：滚轮 / 滚动条 + 选中态）。
         let sel = ui.list_at(
-            Vec2::new(880.0, 130.0),
-            Vec2::new(240.0, 300.0),
+            LIST_POS,
+            LIST_SIZE,
             "list_demo",
             40,
             self.list_sel,
@@ -1378,6 +1383,9 @@ struct UiApp {
     /// --sim-resize：**冻结**的拖拽目标点（柄会随窗口长大而移动；目标点若每帧重算，
     /// 鼠标就被"追着拖"，位移每帧累加——脚本自己会变成 bug 源）。
     sim_resize_to: Option<Vec2>,
+    /// --sim-zorder：列表里"点得到"的两个屏幕点 `(行, 滚动条条带)`（每帧从几何解算：
+    /// `win_b` 下缘 + 8，并夹进列表可视区——写死会被长高后的 `win_b` 盖住 ⇒ 点空）。
+    sim_zorder_pts: Option<(Vec2, Vec2)>,
     /// --sim-menu：解算出的「视图」触发器中心（**每帧都算**：栏位置只跟主题有关）。
     menu_trigger_pt: Option<Vec2>,
     /// --sim-menu：下拉里第一个菜单项中心（**菜单展开后**才知道下拉窗口在哪）。
@@ -1647,6 +1655,7 @@ impl UiApp {
             sim_resize_size: None,
             sim_resize_after: None,
             sim_resize_to: None,
+            sim_zorder_pts: None,
             menu_trigger_pt: None,
             menu_item_pt: None,
             menu_panel: None,
@@ -2180,11 +2189,15 @@ impl App for UiApp {
             let pad = (th.panel.padding + th.panel.border_w) * scale;
             let from = NAME_PANEL_POS * scale + Vec2::splat(pad * 0.5);
             let to = ZORDER_PANEL_DST + Vec2::splat(pad * 0.5);
-            // 列表滚动条**条带**中心（物理）：可视区 = (880,130) 逻辑 + 240×300 逻辑；
-            // 条带 = 右缘 SCROLLBAR_W(14) 物理像素。取 y 在 win_b 下缘之下（不被窗口遮挡）。
-            let strip = Vec2::new((880.0 + 240.0) * scale - 7.0, 620.0);
-            // 列表里的一个固定屏幕点（同一物理点，翻页前后各点一次）。
-            let row = Vec2::new(890.0 * scale, 600.0);
+            // 列表里的两个固定屏幕点（**同一物理点**，翻页前后各点一次）：
+            // 行 = 列表内左缘 + 10、条带 = 列表右缘 − 7（`SCROLLBAR_W` 的中心）。
+            // ⚠ **都由几何解算**（见段 2 的 `--sim-zorder` 解算块）：写死的 y 会被
+            // "内容变高后"的 `win_b` 盖住 —— 那时点下去命中的是 `win_b` 的文本框，
+            // 行点击选不中、条带点击翻不了页（`TextEditor` 默认尺寸按 DPI 修正后踩过）。
+            let (row, strip) = self.sim_zorder_pts.unwrap_or((
+                Vec2::new((LIST_POS.x + 10.0) * scale, 620.0),
+                Vec2::new((LIST_POS.x + LIST_SIZE.x) * scale - 7.0, 620.0),
+            ));
             match n {
                 // ① 拖动玩家名面板（按下帧先无条件建立基准，位移 ≥ 3px 才激活）。
                 20 => f.debug_inject_mouse(from, true),
@@ -3035,6 +3048,29 @@ impl App for UiApp {
                     }
                 }
             }
+            // `--sim-zorder`：列表里"点得到"的点必须**从几何解算**——
+            // 列表下方邻接的 `win_b` 会随内容长高（`TextEditor` 默认尺寸按 DPI 修正后
+            // 就长高了一截），写死的 y 会被它盖住 ⇒ 点下去命中 `win_b` 的文本框：
+            // 行点击选不中、条带点击翻不了页。取"`win_b` 下缘 + 8"夹进列表可视区；
+            // x 分别取列表内左缘 + 10（行）与右缘 − 7（滚动条条带中心）。
+            if self.sim_zorder {
+                let dump = ui.debug_dump();
+                let scale = ui.scale();
+                let top = LIST_POS.y * scale;
+                let bottom = (LIST_POS.y + LIST_SIZE.y) * scale;
+                let win_b_bottom = dump
+                    .windows
+                    .iter()
+                    .find(|w| w.id == "win_b")
+                    .map(|w| w.origin.y + w.size.y);
+                let y = win_b_bottom
+                    .map_or(top + 8.0, |b| (b + 8.0).max(top + 8.0))
+                    .min(bottom - 8.0);
+                self.sim_zorder_pts = Some((
+                    Vec2::new((LIST_POS.x + 10.0) * scale, y),
+                    Vec2::new((LIST_POS.x + LIST_SIZE.x) * scale - 7.0, y),
+                ));
+            }
             // `--sim-menu`：坐标解算（**本帧录制后**已知栏在哪、下拉面板在哪）——
             // 注入只能经 `Frame` 且在段之前，所以这里只算、段外下一帧注（同 `--sim-tuner`）。
             if self.sim_menu {
@@ -3581,8 +3617,9 @@ impl App for UiApp {
             let after = self.right.list_sel;
             let scrolled = before.zip(after).is_some_and(|(b, a)| a > b);
             eprintln!(
-                "sim-zorder: 面板拖动后={:?}（目标={ZORDER_PANEL_DST:?}）列表选中 {before:?} → {after:?} {}",
+                "sim-zorder: 面板拖动后={:?}（目标={ZORDER_PANEL_DST:?}）列表点={:?} 选中 {before:?} → {after:?} {}",
                 self.zorder_panel,
+                self.sim_zorder_pts,
                 if moved && scrolled {
                     "[OK] 面板压到标签上 + 滚动条翻页后同一屏幕点选到更后面的条目"
                 } else {
