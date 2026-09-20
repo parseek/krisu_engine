@@ -87,6 +87,12 @@ impl Painter {
         elem: u32,
     ) {
         let seq = self.next_seq();
+        // **播放头必须追上**：`push_panel_img_cmds` 用 `seq` / `seq + 1` / `seq + 2`
+        // （背景刷 / 背景图 / 边框），而 `next_seq()` 只推进了 1 ⇒ 不补的话下一条命令会
+        // 拿到**重复序号**（`place` 归一化按 `seq` 切分 ⇒ 同一容器被拆进两个排序空间），
+        // 并且 `Ui::begin_top_placement` 的"播放头 = 已分配最大序号"不变量会被打破
+        // （显式 `debug_assert`；实测由 `menu_bar` 的容器入口先踩到）。
+        let last = seq + if img.is_some() { 2 } else { 1 };
         let (depth, win, clip) = (self.q.depth, self.q.cur_win, self.q.clip);
         push_panel_img_cmds(
             &mut self.q.queue,
@@ -97,6 +103,7 @@ impl Painter {
             border_w,
             radius.into(),
         );
+        self.q.advance_seq_to(last);
     }
 
     /// **顶点色软阴影**（`elem = 0`：画在本体之下、内容之下）。
@@ -244,6 +251,37 @@ mod tests {
         // seq 递增保证同 elem 内层次 = 刷 → 图 → 边框
         let seqs: Vec<u32> = p.commands().iter().map(|d| d.seq).collect();
         assert!(seqs.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    /// **面板推了 3 条命令（`seq` / `+1` / `+2`）后播放头必须追上**：否则下一条命令拿到
+    /// **重复序号**（`place` 归一化按 `seq` 切分 ⇒ 同一容器被拆进两个排序空间），并且
+    /// `Ui::begin_top_placement` 的"播放头 = 已分配最大序号"不变量直接失败。
+    /// 实测现场：带背景图的窗口录完之后，`menu_bar` 的容器入口 `debug_assert` 炸了。
+    #[test]
+    fn panel_with_image_advances_the_seq_playhead() {
+        let mut p = Painter::new(1.0);
+        p.panel_img_elem(
+            rect(),
+            Color::BLACK,
+            Some(ImageBg::new(7, Vec2::new(32.0, 32.0))),
+            Color::WHITE,
+            1.0,
+            0.0,
+            0,
+        );
+        let last = p.commands().iter().map(|d| d.seq).max().unwrap_or(0);
+        assert_eq!(p.q.seq, last, "播放头 = 已分配的最大序号（{last}）");
+        // 再取号：不许与任何已入队命令重复。
+        let next = p.next_seq();
+        assert!(
+            p.commands().iter().all(|d| d.seq != next),
+            "序号不能重复（next={next}）"
+        );
+        // 没有背景图时只推 2 条，同样要追上。
+        let mut p = Painter::new(1.0);
+        p.panel_img_elem(rect(), Color::BLACK, None, Color::WHITE, 1.0, 0.0, 0);
+        let last = p.commands().iter().map(|d| d.seq).max().unwrap_or(0);
+        assert_eq!(p.q.seq, last);
     }
 
     /// `clipped` 只影响块内的命令，块外恢复（配 `Painter::clip` 读回）。

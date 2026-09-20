@@ -44,6 +44,19 @@ impl DrawQueue {
         self.seq + 1
     }
 
+    /// **把播放头抬到 `n`**（只增不减）。
+    ///
+    /// 给"一次调用里推多条命令、序号是 `seq + k`"的入口用（[`Painter::panel_img_elem`]
+    /// 就是：背景刷 / 背景图 / 边框用了 `seq` / `seq + 1` / `seq + 2`，而 `next_seq()`
+    /// 只推进了 1）。不补的后果是**下一条命令拿到重复序号**：`place` 归一化按 `seq` 切分
+    /// ⇒ 同一个容器的命令被拆进两个排序空间（闪烁 / 序不稳），而且
+    /// [`Ui::begin_top_placement`](crate::Ui) 的"播放头 = 已分配的最大序号"不变量会被打破
+    /// （它是显式 `debug_assert`，实测由 `menu_bar` 的容器入口先踩到）。
+    #[inline]
+    pub(crate) fn advance_seq_to(&mut self, n: u32) {
+        self.seq = self.seq.max(n);
+    }
+
     /// 录制一条绘制命令（`elem` 由调用方给：`0` = 容器装饰层，画在本容器元素之下）。
     #[inline]
     pub(crate) fn push(&mut self, kind: DrawKind, rect: Rect, elem: u32) {
@@ -116,5 +129,17 @@ mod tests {
         assert_eq!(taken.len(), 2);
         assert!(q.is_empty(), "取走后队列为空");
         assert_eq!(q.elem_hint(), 3, "播放头保留 ⇒ 同深度后续命令 seq 不重号");
+    }
+
+    /// `advance_seq_to` **只增不减**（补号用；回退会让后续命令重号）。
+    #[test]
+    fn advance_seq_to_never_rewinds() {
+        let mut q = DrawQueue::default();
+        q.advance_seq_to(5);
+        assert_eq!(q.elem_hint(), 6);
+        q.advance_seq_to(3);
+        assert_eq!(q.elem_hint(), 6, "不能回退");
+        q.advance_seq_to(9);
+        assert_eq!(q.elem_hint(), 10);
     }
 }
