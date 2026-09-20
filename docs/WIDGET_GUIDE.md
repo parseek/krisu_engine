@@ -73,6 +73,7 @@ ui.add_at(Vec2::new(400.0, 40.0), Label::new("HUD"));
 | `Button` | `Button::new(id, label)` | `color` `bg` `bg_hover` `bg_pressed` `border` `border_w` `radius` `padding` `font_size` `font_family` |
 | `Checkbox` | `Checkbox::new(id, label, checked)` | `color` `box_border` `checked_fill` `font_size` `font_family` |
 | `Divider` | `Divider::new()` / `.horizontal()` / `.vertical()` | `axis(DividerAxis)` `color` `thickness` `margin`（占光标分割线）。**水平**（默认）：宽 = 容器可用宽，行高 = 线厚 + 2×留白；**竖直**（`vertical()`，`row`/菜单栏里用）：宽 = 线厚 + 2×留白、高 = **一行**（`Theme::row_h`），线在占位矩形里垂直居中、长度 = 高 − 2×留白 |
+| `TextEditor` | `TextEditor::new(id, &mut String)` | `multiline()` `no_wrap()` `resize(Resize)` `width` `height` `min_size` `max_size`（**物理像素**）`font_size` `font_family` `text_color` `caret_color` `selection_color` `preedit_color` `background` `border` `border_focus` `border_w` `radius` `padding_x`；`at(rect)` = 绝对定位。**开了 `.resize(..)` 时**：默认尺寸 = 单行 `min_w×height` / 多行 `max(min_w,200)×90`（**逻辑像素**）、下限默认 = `(min_w, height)`（一行文字标准高，拖不到 0）、尺寸跨帧持久于 `UiState::sizes`；自动申请会**先问尺寸责任链**（`Ui::resolved_size`）⇒ 拖大后容器与后续控件跟着长 |
 
 **Label 溢出策略**（Resizable 窗口缩窄）：默认在父级可用宽内**自动换行**；
 `.ellipsis()` 切换为单行"…"省略。Button / 勾选 / 下拉的文本超出分配矩形时

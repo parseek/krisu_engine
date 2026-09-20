@@ -173,6 +173,11 @@ impl<'a> TextEditor<'a> {
     }
 
     /// 申请尺寸**下限**（物理像素；`resize` 时同时是拖拽下限）。
+    ///
+    /// **不调 = 主题下限**（`Vec2::new(InputStyle::min_w, InputStyle::height)` =
+    /// 最小宽 + **一行文字的标准高**，与 [`Theme::row_h`](crate::Theme::row_h) 同一套
+    /// 标准）——只有开了 `.resize(..)` 才生效。没有这条默认值就能把输入框拖到 0
+    /// 并被 [`UiState::sizes`](crate::UiState::sizes) 持久下来。
     pub fn min_size(mut self, min: Vec2) -> Self {
         self.min_size = Some(min);
         self
@@ -304,6 +309,11 @@ impl<'a> TextEditor<'a> {
     /// （与 [`UiAdd::text_input`](crate::ui::UiAdd::text_input) /
     /// [`UiAdd::text_area`](crate::ui::UiAdd::text_area) 一致），再套 `.width` / `.height`
     /// 覆盖与 `.min_size` / `.max_size` 约束。
+    ///
+    /// ⚠ 开了 `.resize(..)` 时**必须先问尺寸责任链**（[`Ui::resolved_size`]）：上一帧
+    /// 拖出来的尺寸存在 [`UiState::sizes`](crate::UiState::sizes)，不并进申请尺寸就会出现
+    /// "画的是拖大的框、申请的却是默认尺寸"——窗口不跟着长、**下面的控件不动**、而
+    /// 框自己溢出父级（用户报的"下面的控件不会跟着下去"）。
     fn allocate_rect(&self, ui: &mut Ui, style: &InputStyle) -> Rect {
         let scale = ui.scale();
         let (dw, dh) = if self.multiline {
@@ -311,17 +321,25 @@ impl<'a> TextEditor<'a> {
         } else {
             (style.min_w, style.height)
         };
-        let mut size = Vec2::new(
+        let default = Vec2::new(
             self.width.map_or(dw, |w| w.to_physical(scale)),
             self.height.map_or(dh, |h| h.to_physical(scale)),
         );
-        if let Some(min) = self.min_size {
-            size = size.max(min);
-        }
-        if let Some(max) = self.max_size {
-            size = size.min(max);
-        }
+        // 责任链 / 用户拖拽持久值：只有可缩放控件才有那条跨帧记录。
+        let persisted = (self.resize != Resize::None).then(|| ui.resolved_size(self.id, default));
+        let size = resolve_editor_size(
+            default,
+            self.min_size.or_else(|| self.resize_min(style)),
+            self.max_size,
+            persisted,
+        );
         ui.allocate(size)
+    }
+
+    /// **本控件的尺寸下限**（物理像素）：显式 `.min_size(..)` 优先，否则给了
+    /// `.resize(..)` 就用主题下限（[`default_min`]），不可缩放时无下限。
+    fn resize_min(&self, style: &InputStyle) -> Option<Vec2> {
+        (self.resize != Resize::None).then(|| default_min(style))
     }
 }
 
@@ -339,7 +357,9 @@ impl Widget for TextEditor<'_> {
         let saved = std::mem::replace(&mut ui.theme.input, style);
         if self.resize != Resize::None {
             // 缩放柄路径：尺寸责任链 + 拖拽（核心只负责绘制文本）。
-            let min = self.min_size.unwrap_or(Vec2::ZERO);
+            // 下限与 `allocate_rect` **同源**（都不调 `.min_size` ⇒ 主题下限：
+            // 最小宽 + 一行文字高）——两处不一致就会"申请尺寸有下限、拖拽却能拖到 0"。
+            let min = self.min_size.unwrap_or_else(|| default_min(&ui.theme.input));
             if self.multiline {
                 ui.resizable_text_area_at(self.id, rect, self.value, min, self.resize);
             } else {
@@ -352,5 +372,110 @@ impl Widget for TextEditor<'_> {
         }
         ui.theme.input = saved;
         Response { rect, ..Default::default() }
+    }
+}
+
+// ─── 尺寸解算（纯函数，可单测） ─────────────────────────────────
+
+/// **开了 `.resize(..)` 且没调 `.min_size(..)` 时的默认下限**（物理像素）：
+/// 最小宽 = [`InputStyle::min_w`]，最小高 = [`InputStyle::height`]（**一行文字的标准高**，
+/// 与 `Theme::row_h` 同一套标准）。
+fn default_min(style: &InputStyle) -> Vec2 {
+    Vec2::new(style.min_w, style.height)
+}
+
+/// **尺寸解算**（纯函数）：默认（已含 `.width/.height` 覆盖）→ 责任链 / 用户拖拽持久值
+/// → 压 `max` → 抬 `min`。
+///
+/// 顺序理由：
+/// - 持久值必须**在** `min/max` 之间自由取值（拖大拖小都生效）；
+/// - `min/max` 是**声明式约束**，不能被持久值绕过；
+/// - `max` 先于 `min` ⇒ `min > max` 时 **min 胜**，与
+///   [`apply_constraints`](crate::widgets::apply_constraints) 的口径一致。
+fn resolve_editor_size(
+    default: Vec2,
+    min: Option<Vec2>,
+    max: Option<Vec2>,
+    persisted: Option<Vec2>,
+) -> Vec2 {
+    let mut size = persisted.unwrap_or(default);
+    if let Some(m) = max {
+        size = size.min(m);
+    }
+    if let Some(m) = min {
+        size = size.max(m);
+    }
+    size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn style() -> InputStyle {
+        // 150% DPI 下的典型值（主题在 `Ui` 内已被 DPI 预乘）。
+        InputStyle {
+            min_w: 210.0,
+            height: 39.0,
+            ..InputStyle::default()
+        }
+    }
+
+    #[test]
+    fn default_min_is_min_width_and_one_line_height() {
+        assert_eq!(default_min(&style()), Vec2::new(210.0, 39.0));
+    }
+
+    #[test]
+    fn persisted_size_wins_over_default() {
+        let got = resolve_editor_size(
+            Vec2::new(300.0, 135.0),
+            None,
+            None,
+            Some(Vec2::new(600.0, 400.0)),
+        );
+        assert_eq!(got, Vec2::new(600.0, 400.0), "拖大的尺寸必须原样进申请尺寸");
+    }
+
+    #[test]
+    fn min_and_max_clamp_the_persisted_size() {
+        let min = Vec2::new(210.0, 39.0);
+        let max = Vec2::new(800.0, 600.0);
+        // 拖到比下限还小（例如历史遗留的 0×0）⇒ 抬到下限。
+        let small = resolve_editor_size(
+            Vec2::new(300.0, 135.0),
+            Some(min),
+            Some(max),
+            Some(Vec2::ZERO),
+        );
+        assert_eq!(small, min, "持久值不能被允许突破下限（拖到 0 的旧值也要被抬回来）");
+        // 超过上限 ⇒ 压到上限。
+        let big = resolve_editor_size(
+            Vec2::new(300.0, 135.0),
+            Some(min),
+            Some(max),
+            Some(Vec2::new(4000.0, 4000.0)),
+        );
+        assert_eq!(big, max);
+    }
+
+    #[test]
+    fn min_wins_when_min_exceeds_max() {
+        // 与 `apply_constraints` 同一口径：先压 max 再抬 min ⇒ min 胜。
+        let got = resolve_editor_size(
+            Vec2::new(100.0, 100.0),
+            Some(Vec2::new(400.0, 400.0)),
+            Some(Vec2::new(200.0, 200.0)),
+            None,
+        );
+        assert_eq!(got, Vec2::new(400.0, 400.0));
+    }
+
+    #[test]
+    fn no_persisted_no_constraints_keeps_default() {
+        assert_eq!(
+            resolve_editor_size(Vec2::new(300.0, 135.0), None, None, None),
+            Vec2::new(300.0, 135.0)
+        );
     }
 }

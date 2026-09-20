@@ -179,6 +179,13 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 > 2. 搬运提交里**只允许出现 `use` / 路径 / 位置变化**，行为改动单独提交——这样
 >    15 个 sim 的数值断言就是"零行为变化"的证据。
 >
+> **本轮进展（A：TextEditor 行为修复）**：`TextEditor::allocate_rect` 过去只算默认尺寸，
+> 而绘制用的尺寸由尺寸责任链解出（`resizable_text_*` 内部）⇒ **申请尺寸 ≠ 绘制尺寸**：
+> 拖大后窗口不跟着长、后面的控件不动、框溢出父级。修法是公开 `Ui::resolved_size`
+> （与既有的 `Ui::resize_handle` 配对：一个读、一个写）并让自动申请**先问责任链**；
+> 同时把 `.resize(..)` 的默认下限从 `Vec2::ZERO` 改成 `(InputStyle::min_w,
+> InputStyle::height)`（一行文字标准高，与 `Theme::row_h` 同一套标准）⇒ 拖不到 0。
+>
 > **本轮进展（P2a 切片 1）**：`button_at` / `button_at_styled` → `widgets/button.rs`，
 > `combo` / `combo_at` → `widgets/dropdown.rs`；为此公开 `Ui::note_placed`
 > （"显式 rect 也要算进容器尺寸"，自定义控件同样需要）。`ui.rs` **7901 → 7805 行**；

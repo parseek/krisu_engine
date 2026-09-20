@@ -1012,6 +1012,8 @@ impl Ui {
     fn interact(&mut self, id: &IdAbsolute<'_>, rect: Rect, sense: Sense) -> Response;
     // 显式 rect 的控件（`*_at` 老 API）与自定义控件：绝对放置也要算进容器尺寸
     fn note_placed(&mut self, rect: Rect);
+    // 可拖拽缩放控件：把跨帧持久尺寸（责任链 → 用户拖拽值）并进本帧申请尺寸
+    fn resolved_size(&mut self, id: &str, fallback: Vec2) -> Vec2;
 }
 
 pub struct Sense { pub hover: bool, pub click: bool, pub drag: bool, pub focus: Option<FocusKind> }
@@ -1034,6 +1036,10 @@ impl Sense {
 - `Ui::note_placed(rect)`：**显式 rect** 的控件（`button_at` / `radio_at` /
   `text_input_at` …）录完要点一次，让"画在容器外"这件事**要么让容器长大、要么被
   `Clip` 裁掉**；自定义控件若自己算矩形（不经 `allocate*`）也必须点一次。
+- `Ui::resolved_size(id, fallback)`：**可拖拽缩放**控件的"当前尺寸"，与
+  `Ui::resize_handle` 配对（前者读、后者写）。要在 `ui()` 里**申请之前**调用它，
+  否则会出现"画的是拖大的框、申请的却是默认尺寸"——容器不长、后续控件不动、
+  框溢出父级（`TextEditor` 踩过；正确写法见该方法的 rustdoc 示例）。
 - 膨胀语义是**申请方式**：`Expansion::{UnlimitedExpansion(默认), LimitedInParent(压到 avail_w), DisableAutoExpansion(不撑大父级)}`；
   min/max 用 `apply_constraints(desired, c)` 自己应用。
 - `add_at(pos, w)`：给 `Ui` 打**一次性放置覆盖**，控件的第一次申请消费它（**只在第一次**；

@@ -2728,6 +2728,34 @@ impl<'a> Ui<'a> {
         resolve_size_link(&self.size_chain, &self.state.sizes, id, fallback)
     }
 
+    /// **解析可调尺寸控件的**当前**尺寸**（尺寸责任链 → 用户拖拽持久值
+    /// [`UiState::sizes`] → `fallback`）——**控件作者公开面**。
+    ///
+    /// 与 [`Self::resize_handle`] 配对使用：`resize_handle` 负责**改**尺寸（拖拽 +
+    /// 写持久值），本方法负责**读**它。自定义"可拖拽缩放"控件必须在 `ui()` 里
+    /// **申请之前**调用它，把上一帧的持久尺寸并进本帧的申请尺寸——否则会出现
+    /// "画的是拖大的框、申请的却是默认尺寸"：容器不跟着长、后面的控件不动，
+    /// 而框本身溢出父级（`TextEditor` 就踩过这条）。
+    ///
+    /// ```no_run
+    /// # use glam::Vec2;
+    /// # use rjw_ui::{Ui, Resize};
+    /// # fn demo(ui: &mut Ui, id: &str, value: &mut String) {
+    /// // ① 想好默认尺寸（物理像素）
+    /// let want = Vec2::new(240.0, 60.0);
+    /// // ② 责任链 / 用户拖拽值优先
+    /// let size = ui.resolved_size(id, want);
+    /// // ③ 用解析后的尺寸申请（容器尺寸随它走）
+    /// let rect = ui.allocate(size);
+    /// // ④ 交给 `resize_handle` 拖拽（`current` 传解析后的尺寸）
+    /// # let _ = (rect, Resize::Both);
+    /// # }
+    /// ```
+    pub fn resolved_size(&mut self, id: &str, fallback: Vec2) -> Vec2 {
+        let abs = self.id_for(id);
+        self.resolve_size(&abs, fallback)
+    }
+
     /// 面板：背景 + 边框 + 内容垂直堆叠（pack Top）；尺寸自动包裹内容。
     pub fn panel_at(
         &mut self,
