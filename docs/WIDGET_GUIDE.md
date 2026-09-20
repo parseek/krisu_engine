@@ -72,7 +72,7 @@ ui.add_at(Vec2::new(400.0, 40.0), Label::new("HUD"));
 | `Label` | `Label::new(text)` | `color` `font_size` `font_family` `wrap(max_w)` `ellipsis()`（超出可用宽以"…"省略） |
 | `Button` | `Button::new(id, label)` | `color` `bg` `bg_hover` `bg_pressed` `border` `border_w` `radius` `padding` `font_size` `font_family` |
 | `Checkbox` | `Checkbox::new(id, label, checked)` | `color` `box_border` `checked_fill` `font_size` `font_family` |
-| `Divider` | `Divider::new()` | `color` `thickness` `margin`（占光标分割线；宽 = 容器可用宽） |
+| `Divider` | `Divider::new()` / `.horizontal()` / `.vertical()` | `axis(DividerAxis)` `color` `thickness` `margin`（占光标分割线）。**水平**（默认）：宽 = 容器可用宽，行高 = 线厚 + 2×留白；**竖直**（`vertical()`，`row`/菜单栏里用）：宽 = 线厚 + 2×留白、高 = **一行**（`Theme::row_h`），线在占位矩形里垂直居中、长度 = 高 − 2×留白 |
 
 **Label 溢出策略**（Resizable 窗口缩窄）：默认在父级可用宽内**自动换行**；
 `.ellipsis()` 切换为单行"…"省略。Button / 勾选 / 下拉的文本超出分配矩形时

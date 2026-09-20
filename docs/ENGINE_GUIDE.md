@@ -1700,43 +1700,59 @@ cargo run -p eg260818UI -- --sim-chrome --frames 100   # 真的去点 ⌃ / ×�
 > 因此点按钮的**上半部**（`row_h * 0.25`，y < 723）绕开柄，把"按钮路径"与"柄路径"分开验证；
 > 修柄 / 按钮重叠另案。
 
-### 18.13 菜单栏（menu_bar）
+### 18.13 菜单栏（menu_bar）= **一行 + 全宽背景**
 
-横向一排触发器 + 点开的**下拉面板**，面板内容是**闭包上下文**（与窗口同一套 API）：
+菜单栏的**本质是 `row`**（`PackSide::Left`）多了一条**覆盖整栏宽度的背景**（可以是一整块
+面板 / 整个屏幕）；里面既能放**菜单触发器**，也能放**任何控件**——按钮 / 标签 / 文本输入 /
+分割线（含**竖向分割线**）。`MenuBar` `Deref` 到 `Pack` ⇒ `UiAdd` 的方法直接可用
+（与 `MenuCtx` `Deref` 到 `Window` 同一套模式）。菜单点开后是**下拉面板**，内容同样是
+**闭包上下文**（`item` / `item_checked` / `caption` / `separator`，并 `Deref` 到 `Window`）：
 
 ```rust
-use rjw_ui::{Ui, UiAdd};   // `UiAdd` 让 `m.label` / `m.row` / `m.text_input` 可用
+use rjw_ui::{Ui, UiAdd, Divider, Size};   // `UiAdd` 让 `bar.label` / `bar.button` / `bar.add` 可用
 
-ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {      // 位置 = 栏左上角（顶层 = 屏幕坐标）
+ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {   // 位置 = 栏左上角（顶层 = 屏幕坐标）
+    bar.width(Size::Physical(Vec2::new(screen_w, 0.0)));   // 背景铺满整屏（不调 = 自然宽）
     bar.menu("文件", |m| {
         m.caption("文件名过滤");                        // 纯文本行（不可点）
         m.text_input("menu_filter", &mut self.filter);  // 菜单里也能放**文本输入**
-        m.separator();                                  // 分割线
+        m.separator();                                  // 菜单内的水平分割线
         if m.item("导入图片…") { /* 点完自动收起 */ }
-        if m.item("保存") { }
     });
+    bar.separator_v();                                 // ← **竖向分割线**（栏内分组）
     bar.menu("视图", |m| {
         m.item_checked("窗口 A 显示", &mut self.show_a); // 带勾选：点击翻转 `&mut bool`
         m.row(|r| {                                     // **横向排版**（`Deref` 到 `Window`）
             if r.button("d0", "紧凑").clicked() { }
-            if r.button("d1", "标准").clicked() { }
         });
     });
+    bar.add(Divider::new().vertical());                 // ← 等价写法（`separator_v()` 就是它）
+    bar.label("状态：就绪");                             // ← 栏里放**任何控件**都行
 });
 ```
 
 | 行为 | 机制 |
 |---|---|
+| **栏 = 一行** | `Ui::menu_bar` 内部 `container(pos, Frame::new_stack(PackSide::Left, gap, 0.0))` + `force_h_all(row_h)` ⇒ 触发器 / 竖分割线 / 塞进来的控件**同一个行高**；内边距 0 ⇒ 第一个触发器正好从 `pos` 起（`--sim-menu` 的坐标解算按这个口径） |
+| **全宽背景** | 子项录**完之后**再 `push_panel_like(栏矩形, …, elem = 0)`：按 `(win, depth, elem, seq)` 压在**同深度已有的底层绘制之上**、所有控件之下（子项在容器里 depth + 1）。默认 `Palette::surface_raised` + `Theme::panel` 的边框 / 圆角（与窗口标题栏通条同一套默认），链式可覆盖：`bg` / `border` / `border_w` / `radius` / `width`。⚠ 它**不**盖在普通窗口（`win > 0`）之上 |
+| **栏宽** | `bar.width(..)` 只决定**背景铺多宽**（不 clamp 子项）；右推某块用 `bar.min_size(剩余宽, 0.0); bar.label("")`（与标题栏同一招）。栏**不占父容器光标**（浮在顶层） |
 | 展开状态 | `UiState::menu_open`（**触发器绝对 ID**；与 `combo_open` 分开存——同一时刻只该有一个菜单开着，而下拉框属于某个控件） |
-| 点另一个触发器 | 切换（旧的关、新的开）；再点自己 = 收起 |
+| 点另一个触发器 | 切换（旧的关、新的开）；再点自己 = 收起（走 `action`，**优先于**收起规则） |
 | 点菜单项 | **执行 + 自动收起**（`item` / `item_checked` 内部把 `close` 标志交给栏） |
-| 点栏外 | 收起（栏外 = 既不在触发器上、也不在下拉面板矩形内） |
+| **点栏外** | 收起（栏外 = 既不在**栏矩形**内、也不在下拉面板矩形内、也不在触发器上）——纯函数 `widgets::menubar::menu_bar_should_close`，逐组合单测 |
+| 点栏内空白 / 竖分割线 / 栏里的别的控件 | **不收起**（"栏 = 一行容器"带来的语义；旧实现只认"落在某个触发器上"，会误关） |
 | **Esc** | 收起。应用自己的 Esc 语义先看 `UiState::menu_open()`（菜单开着那一帧别抢） |
 | 下拉面板 | 一个 [`Level::Normal`] + **`WindowClamp::Locked`** + **`.resize(false, Resize::None)`** 的浮层窗口（点它不置顶、**拖不动、也没有缩放柄**），且 z 落在**浮层区间**（`WIN_TOPMOST` 基址 + 嵌套层数，见 §18.15「分层 z」） |
+| 触发器交互 | `allocate_sense(.., Sense::DRAG)`：占光标 + 命中 + 按下认领一次做完（按下不会被外层当成拖拽基准），触发器矩形与旧版**逐像素相同**（外宽 = 文本实测宽 + `ButtonStyle::padding.x × 2`，高 = `row_h`） |
 
 > 面板的**录制 / 样式 / 宽度 / 关闭规则**全在 [`crate::widgets::menu`]（`menu::popup_show`）——
-> 与 [`Dropdown`](crate::Dropdown) **同一套实现**，本模块只负责"横向一排触发器 + 栏的判定"。
+> 与 [`Dropdown`](crate::Dropdown) **同一套实现**，本模块只负责"横向一行 + 栏的判定"。
 > 下面那些排版 / 锁位约定因此对**两者同时成立**（改动只在 `menu.rs` 一处）。
+
+> ⚠ **下拉面板现在是"嵌套窗口"**（录在栏容器里 ⇒ dump 的 `origin` 相对**直接容器**）：
+> 用 `debug_dump()` 算屏幕坐标时必须叠加**栏原点**（`p.origin + bar`）。不叠加就会点到栏外
+> ⇒ 菜单当场收起（实测症状：`--sim-menu` 报"菜单没开 / 菜单项没执行"）。这是 dump 的既有
+> 语义（嵌套窗口 origin 相对直接容器），`--sim-dropdown` 里子菜单那一段也一样要叠加。
 
 > ⚠ **下拉面板必须锁位置**（`WindowClamp::Locked`）：它是个窗口，默认可拖——拖走之后
 > 面板与触发器脱节，而**命中判定按窗口走**，视觉却跑别处（"控件严重错位"）。
@@ -1754,24 +1770,27 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {      // 位置 = 栏左上角�
 >    首帧必须请求**自然宽**，否则 1e6 的请求会把自然尺寸撑成一百万、面板宽度再也收不回来。
 >    内容宽 = `max(上一帧面板宽, 最小面板宽) − 2 × (内边距 + 边框)`（第 2 帧即收敛；
 >    `RJ_MENU_TRACE=1` 可看到 `prev=None → Some(226) → Some(240)` 这条收敛轨迹）。
-> 3. **分割线自己画**，不用 [`Divider`](crate::Divider)：`Divider` 的宽 = `avail_w()`，
->    而**自动宽**窗口里那是 `None` ⇒ 退回固定 120 ⇒ 线又短又不在该在的位置
+> 3. **菜单内的分割线自己画**，不用 [`Divider`](crate::Divider) 的水平模式：`Divider` 的宽 =
+>    `avail_w()`，而**自动宽**窗口里那是 `None` ⇒ 退回固定 120 ⇒ 线又短又不在该在的位置
 >    （用户实测："Menu 分割线错位"）。自己画时请求"极宽"由窗口 clamp ⇒ 恒等于内容宽。
+>    ⚠ 与第 2 条相反：**栏里**（`row` 里）的竖分割线该用 `Divider::vertical()` —— 那里宽度是
+>    自然量（线厚 + 2×留白），高度由行强制，没有"可用宽"问题。
 >
 > `caption` 另外做了层级区分：字号 ×0.85 + `Palette::text_muted`（一眼看出是分组标题、
 > 不是可点的项）；勾选标记是**方框**（`[☐]/[☑]`，画在菜单项**内容里**、方框列恒留位 ⇒
 > 勾选与否文字都对齐），勾选时填 `CheckboxStyle::checked_fill` + 矢量勾号。
-> 面板左内边距只留 `item_pad_x`（用户要的"小边距"）——方框不占内边距，所以小边距下
-> 也不会被裁掉。
 >
 > 面板 z 用了哨兵，所以**菜单栏录在哪里都盖得住别人**（不必强求录在各窗口之后）。
-> 排查通道：`RJ_MENU_TRACE=1` 打印每个下拉内容的行矩形（`x/y/w/h`）——
-> 正确时三者必须同 `x`、同 `w`（实测：`item/separator/caption` 全 `x=8 w=224`，
-> DPI 1.5；**关键是三者相同，不是具体数值**）。
+> 排查通道：`RJ_MENU_TRACE=1` 打印**栏矩形 + 收起判定事实**（
+> `menu[bar menubar] content=(252,39) bar=(135,18 252x39) on_trigger=… on_bar=… down_outside=…
+> item_clicked=… esc=… popup=… close=…`）与每个下拉内容的行矩形（`item/separator/caption`
+> 必须同 `x` 同 `w`，实测 `x=8 w=224`，DPI 1.5）。
 
-**验证**：`--sim-menu`（点「视图」触发器 → 菜单打开；再点第一个菜单项 → 勾选翻转 +
-菜单自动收起，打印引擎状态与应用状态），引擎侧不变量由
-`state::tests::menu_open_is_readable_and_cleared_by_reset` 守着（读得到 + `reset` 清空）。
+**验证**：`--sim-menu` 三段——① 点「视图」触发器 → 菜单打开 → 点第一个菜单项 → 勾选翻转 +
+菜单自动收起；② 在面板空白处按住拖 600+px → 面板原点不变（`Locked`）；③ **点栏内空白** →
+菜单**仍开着**（`on_bar` 语义）。引擎侧不变量由
+`state::tests::menu_open_is_readable_and_cleared_by_reset`（读得到 + `reset` 清空）与
+`widgets::menubar::tests::close_rules_cover_every_combination`（收起规则逐组合）守着。
 
 ### 18.14 分段按钮组（`Segmented`）与"边框归零"的兜底
 

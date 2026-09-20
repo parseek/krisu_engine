@@ -25,6 +25,8 @@ UI模块的需求：
 * ✅ 对于 Resizable 窗口，缩小宽度后，Label 等**所有控件**需要处理超过框后字符（Label 默认在父级可用宽内**自动换行**、`.ellipsis()` 显式“…”省略；Button/勾选/下拉文本自动省略；`ui.window(id)` 默认 `Placement::Expand` 语义，`Placement::Clip` 严格裁剪）
 * ✅ 文本框双击“扩散式”选择（双击选中“词”——CJK 单字成词/空白分隔/字母数字连续段；按住拖拽按词边界扩散）
 * ✅ 分割线（`p.divider()` 占光标 / `ui.divider_at` / `Divider` widget；`Theme.divider` 样式）
+* ✅ **竖向分割线**（菜单栏 / 工具栏里分组用）：`Divider::vertical()`（+ `DividerAxis` / `.axis(..)`、`.horizontal()` 显式写法）——宽 = 线厚 + 2×留白、高 = **一行**（`Theme::row_h`），线在占位矩形里垂直居中、长度 = 高 − 2×留白；落笔矩形抽成纯函数 `widgets::divider::divider_line` + 3 个单测（水平居中 / 竖直居中与夹取 / 方向 builder 只改方向）；`MenuBar::separator_v()` 是它的便利写法
+* ✅ 修：**面板背景图用了 `seq + 1` / `seq + 2` 但播放头只推进 1**（`Painter::panel_img_elem` 调 `push_panel_img_cmds` 推"刷 / 图 / 边框"三条）：下一条命令会拿到**重复序号**，`place` 归一化按 `seq` 切分 ⇒ 同一容器被拆进两个排序空间，且 `Ui::begin_top_placement` 的"播放头 = 已分配最大序号"`debug_assert` 直接失败（实测：带背景图的窗口录完后，`menu_bar` 的容器入口把它踩炸）。修法：`DrawQueue::advance_seq_to`（只增不减）按实际用掉的最大序号补齐；单测 `advance_seq_to_never_rewinds` + `panel_with_image_advances_the_seq_playhead`
 * 
 * ✅ 部分代码可以合并简化、抽象化、责任拆分（**View 沙箱** `crates/rjw_ui/src/view.rs`：裁剪分层（强制层/软层）+ 可用宽度 + 命中过滤，ScrollView/文本框/严格窗口共用；`edit.rs` 收纳纯文本逻辑：`apply_frame_edits` 编辑状态机 / `caret_horiz` / `word_range` / `ellipsize` / 剪贴板，单行/多行去重；`Metric<T>` 物理/逻辑单位包装，内部计算一律物理像素；`resize_handle` 通用拖拽缩放原语）
 
@@ -76,6 +78,7 @@ ISSUE:
 * ✅ 主题调节窗口：每根滑杆后跟 `NumberInput`（Slider 后 NumberInput；`--sim-tuner` 实测拖数字条手柄 radius 8→18、拖滑杆 →0，主题圆角同步）
 * ✅ 数字条手柄宽度公开为 `rjw_ui::GRIP_W`（脚本算坐标不再写死 20；`RJ_NUM_TRACE=1` 打印矩形切分 + 拖拽状态机）
 * ✅ 菜单栏（`Ui::menu_bar` 横向触发器 + **闭包下拉面板**：`MenuCtx` 提供 `item` / `item_checked` / `caption` / `separator` 并 `Deref` 到 `Window` ⇒ 文本输入 / 分割线 / 按钮 / 横向排版都能放；展开状态 `UiState::menu_open`，点项 / 点栏外 / Esc 收起；下拉面板 `WindowClamp::Locked` + `WIN_TOPMOST`（**拖不动、恒在最上**）、内容与菜单项文字列对齐；示例三菜单「文件/视图/帮助」，**左侧竖排主菜单保留**；`--sim-menu` 两阶段实测；**面板实现与 `Dropdown` 共用**——见下条）
+* ✅ **菜单栏 = 一行 + 全宽背景**（"菜单栏本质：row，只不过是有一个宽度覆盖整个面板/屏幕的背景，对此也可以塞进其他控件，包括竖向分割线"）：`Ui::menu_bar` 改为 `container(pos, Frame::new_stack(Left, gap, 0.0))` + `force_h_all(row_h)`（一行、行高一致、第一个触发器仍从 `pos` 起 ⇒ 触发器矩形与旧版逐像素相同）；`MenuBar` **`Deref` 到 `Pack`** ⇒ `bar.add/button/label/text_input/divider/min_size` 全部可用，新增 `width`（背景铺多宽）/`bg`/`border`/`border_w`/`radius` 链式覆盖 + `separator_v()`；背景在子项**之后**以 `elem = 0` 录（压在同深度底层之上、控件之下）；**点栏内空白 / 竖分割线 / 栏里别的控件不再收起菜单**（纯函数 `menu_bar_should_close` + 逐组合单测，旧实现只认"落在触发器上"）；demo 栏铺满整屏 + 两条竖分割线 + 状态标签；⚠ 下拉面板变成**嵌套窗口** ⇒ dump 的 `origin` 要叠加栏原点（`--sim-menu` 两处解算同步）；`--sim-menu` 新增第 3 段"点栏内空白菜单仍开"实测 `[OK]`
 * ✅ 分段按钮组 `Segmented`（互斥选项**拼在一起**：相邻段共享边、只有外侧角圆、选中段高亮；段间分隔线与 `border_w` 解耦，边框归零也分得开；`--sim-tuner` 阶段 3 点段实测 `preset=2` + 角点单测）
 * ✅ `border_w = 0` 的可见性兜底（未勾选 `Checkbox` 改画实心底——否则勾选框整个消失、看起来"控件严重错位"）
 * ✅ 修：`FontModal` 一帧被录两次（面板 + 文本画两遍 = "文本输入重复"；现在有 `modal_recorded` 帧内断言守着）

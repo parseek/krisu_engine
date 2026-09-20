@@ -3282,14 +3282,21 @@ impl<'a> Ui<'a> {
 
     /// **菜单栏**（横向；见 [`crate::widgets::MenuBar`] 的模块文档与用法示例）。
     ///
-    /// `pos` 是栏左上角（带单位，顶层放置时即屏幕坐标）；`f` 里逐个 `bar.menu(label, |m| ..)`
-    /// 加菜单，下拉面板内容用闭包写（`item` / `item_checked` / `caption` / `separator`，
-    /// 并 `Deref` 到 [`Window`] ⇒ 文本输入 / 分割线 / 按钮 / 横向排版都能放）。返回栏尺寸。
+    /// **本质 = 一行（`row`）+ 一条覆盖整栏宽度的背景**：
+    /// `f` 里 `bar.menu(label, |m| ..)` 加菜单（下拉面板内容用闭包写：`item` /
+    /// `item_checked` / `caption` / `separator`，并 `Deref` 到 [`Window`] ⇒ 文本输入 /
+    /// 分割线 / 按钮 / 横向排版都能放）；[`MenuBar`](crate::widgets::MenuBar) 又 `Deref` 到
+    /// [`Pack`] ⇒ `bar.add(..)` / `bar.button(..)` / `bar.label(..)` / `bar.text_input(..)`
+    /// / `bar.separator_v()`（**竖向分割线**）都能直接放进栏里。返回栏尺寸。
     ///
+    /// - `pos` 是栏左上角（带单位，顶层放置时即屏幕坐标）；栏**不占父容器光标**（浮在顶层）；
+    /// - `bar.width(..)` = 背景铺多宽（不调 = 子项撑多大就多大，如整条屏幕宽）；
     /// - 展开状态跨帧持久于 [`UiState::menu_open`]（触发器的**绝对 ID**）；
-    /// - **同一时刻只有一个菜单开着**；点菜单项 / 点栏外 / Esc 都会收起；
+    /// - **同一时刻只有一个菜单开着**；点菜单项 / 点**栏外** / Esc 都会收起——
+    ///   点栏内空白 / 栏里的竖分割线或别的控件**不会**收起（纯函数
+    ///   `widgets::menubar::menu_bar_should_close`，逐组合单测）；
     /// - 下拉面板是 [`Level::Normal`] 浮层窗口 —— 想让它盖住别的窗口就把菜单栏录在
-    ///   **各窗口之后**（窗口 z 在首次录制时按 `max+1` 分配）。
+    ///   **各窗口之后**（窗口 z 在首次录制时按 `max+1` 分配）。背景同理只压同 `win` 的底层。
     pub fn menu_bar(
         &mut self,
         id: &str,
@@ -3298,12 +3305,66 @@ impl<'a> Ui<'a> {
     ) -> Vec2 {
         let pos = pos.into().to_physical(self.scale);
         let open = self.state.menu_open.as_ref().map(|s| s.as_str().to_owned());
-        let mut bar = crate::widgets::MenuBar::new(self, id, pos, open);
-        f(&mut bar);
-        let (size, action) = bar.finish();
-        if let Some(a) = action {
-            // `None` = 收起；`Some(id)` = 展开到该触发器。
-            self.state.menu_open = a.map(IdAbsolute::owned);
+        // **栏 = 一行**：`PackSide::Left` + 内边距 0（第一个触发器正好从 `pos` 起，
+        // `--sim-menu` 的坐标解算与 `MENUBAR_POS` 都按这个口径），`force_h_all(row_h)`
+        // ⇒ 触发器 / 竖分割线 / 塞进来的按钮同一个行高。
+        let mut facts = None;
+        let (size, _) = self.container(
+            pos,
+            Frame::new_stack(PackSide::Left, self.theme.gap, 0.0),
+            |ctx| {
+                // 重借用：`Pack` 要**拿走**一个 `&mut Ui`（`MenuBar` 靠 `Deref` 到它拿 `UiAdd`），
+                // 而 `ctx` 只是 `&mut ContainerCtx` ⇒ 借用 `*ctx.ui`（生命周期到闭包结束，
+                // `bar.finish()` 就地消费，不逃出闭包）。
+                let ui: &mut Ui<'_> = &mut *ctx.ui;
+                let row_h = ui.theme.row_h;
+                if let Some(fr) = ui.frames.last_mut() {
+                    fr.set_force_h_all(row_h);
+                }
+                let mut bar = crate::widgets::MenuBar::new(Pack::new(ui), id, open);
+                f(&mut bar);
+                facts = Some(bar.finish());
+            },
+        );
+        let facts = facts.expect("menu_bar: 闭包总是执行");
+        // 栏矩形（**父容器局部**，与 `mouse_local()` 同一坐标系）：宽 = `bar.width(..)` 或内容宽。
+        let bar_rect = Rect::new(pos.x, pos.y, facts.width.unwrap_or(size.x), size.y);
+        let on_bar = hit_test(&bar_rect, self.mouse_local());
+        let close = crate::widgets::menubar::menu_bar_should_close(
+            facts.item_clicked,
+            facts.down_outside,
+            facts.on_trigger,
+            on_bar,
+            facts.esc,
+        );
+        if std::env::var_os("RJ_MENU_TRACE").is_some() {
+            eprintln!(
+                "menu[bar {id}] content=({:.0},{:.0}) bar=({:.0},{:.0} {:.0}x{:.0}) on_trigger={} \
+                 on_bar={on_bar} down_outside={} item_clicked={} esc={} popup={:?} close={close}",
+                facts.content.x,
+                facts.content.y,
+                bar_rect.x,
+                bar_rect.y,
+                bar_rect.w,
+                bar_rect.h,
+                facts.on_trigger,
+                facts.down_outside,
+                facts.item_clicked,
+                facts.esc,
+                facts.popup,
+            );
+        }
+        // 展开 / 收起：`action`（本帧点了触发器 = 切换）优先；否则按收起规则。
+        self.state.menu_open = match (facts.action, close) {
+            (Some(a), _) => a.map(IdAbsolute::owned),
+            (None, true) => None,
+            (None, false) => self.state.menu_open.clone(),
+        };
+        // **全宽背景**：在子项**之后**录（`elem = 0`，但 seq 更大）⇒ 压在同深度底层绘制之上、
+        // 所有控件之下（子项在 `container` 里 depth + 1 ⇒ 天然画在它之上）。
+        if bar_rect.w > 0.0 && bar_rect.h > 0.0 {
+            let bg = facts.bg;
+            self.push_panel_like(bar_rect, bg.bg, bg.border, bg.border_w, bg.radius, 0);
         }
         size
     }
@@ -5433,6 +5494,17 @@ impl<'ui, 'a> UiAdd<'a> for Panel<'ui, 'a> {
 /// pack 容器（无背景，纯布局）。
 pub struct Pack<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
+}
+impl<'ui, 'a> Pack<'ui, 'a> {
+    /// **在容器闭包里构造**（组合控件 / 骨架用；应用侧要 pack 走 [`UiAdd::row`]）。
+    ///
+    /// 唯一用户是 [`Ui::menu_bar`]：它把"一行 + 全宽背景"的栏做成
+    /// `ui.container(pos, Frame::new_stack(PackSide::Left, gap, 0.0), ..)` 里的这个 `Pack`，
+    /// 再交给 [`crate::widgets::MenuBar`]（后者 `Deref` 到 `Pack`，于是 `bar.add(..)` /
+    /// `bar.button(..)` / `bar.label(..)` / `bar.text_input(..)` 全部直接可用）。
+    pub(crate) fn new(ui: &'ui mut Ui<'a>) -> Self {
+        Self { ui }
+    }
 }
 impl<'ui, 'a> UiAdd<'a> for Pack<'ui, 'a> {
     fn ui_mut(&mut self) -> &mut Ui<'a> {

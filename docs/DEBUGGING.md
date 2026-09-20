@@ -283,26 +283,30 @@ fn update(&mut self, ctx: &mut Ctx) {
   `ui/tests.rs::overlay_z_bands_by_nesting_depth`。"是否在浮层上"用区间判定
   `is_overlay_z(z)`，别写 `z == WIN_TOPMOST`。
 
-- **"菜单栏点了没反应 / 菜单项点了菜单不收"**：示例的 `--sim-menu` 脚本化走两阶段
-  （点「视图」触发器 → 点下拉里第一个菜单项），坐标同样**运行时解算**（触发器按主题
-  尺寸算、菜单项按**下拉窗口原点**算，见 `update` 里那段注释）：
+- **"菜单栏点了没反应 / 菜单项点了菜单不收"**：示例的 `--sim-menu` 脚本化走**三段**
+  （① 点「视图」触发器 → 点下拉里第一个菜单项；② 面板空白处按住拖走 ⇒ 面板不许动；
+  ③ 点**栏内空白** ⇒ 菜单必须**仍开着**），坐标同样**运行时解算**（触发器按主题尺寸算、
+  菜单项按**下拉窗口原点**算，见 `update` 里那段注释）：
 
   ```
-  cargo run -p eg260818UI -- --sim-menu --frames 62
+  cargo run -p eg260818UI -- --sim-menu --frames 90
   sim-menu: menu_open=None · 主题调节窗口=关 [OK] 点触发器开菜单 + 点菜单项执行并自动收起
-  sim-menu: 面板原点=Some(Vec2(105.0, 59.0)) · 期望=Some(Vec2(105.0, 59.0)) · 菜单仍开=true · 拖拽后没跑位=true [OK] 菜单面板不会被拖动
+  sim-menu: 面板原点=Some(Vec2(245.0, 59.0)) · 期望=Some(Vec2(245.0, 59.0)) · 菜单仍开=true · 拖拽后没跑位=true [OK] 菜单面板不会被拖动
+  sim-menu: 点栏内空白后 menu_open=true [OK] 点栏内空白不收起菜单
   ```
 
-  判定同时看**引擎状态**（`UiState::menu_open` 必须已收起）与**应用状态**
-  （菜单项真的改了 `theme_tuner.open`）；阶段 2 在**面板空白处按住拖 600+px**，
-  面板原点必须不变（`WindowClamp::Locked`）。三个典型失败：
+  判定同时看**引擎状态**（`UiState::menu_open`）与**应用状态**（菜单项真的改了
+  `theme_tuner.open`）；阶段 2 在**面板空白处按住拖 600+px**，面板原点必须不变
+  （`WindowClamp::Locked`）。典型失败：
 
   | 症状 | 成因 |
   |---|---|
-  | 触发器点不着 | 坐标错（栏位置 / 触发器宽 = 文字宽 + `button.padding.x`）；`RJ_HIT_TRACE=1` 看这个像素命中谁（`menubar::视图` / `menubar::视图/item::…`） |
+  | 触发器点不着 | 坐标错（栏位置 / 触发器宽 = 文字宽 + `button.padding.x`；**栏里若有竖分割线，触发器 x 还要加上 `线厚 + 2×留白 + gap`**）；`RJ_HIT_TRACE=1` 看这个像素命中谁（`menubar::视图` / `menubar::视图/item::…`） |
+  | **菜单打不开、随后"点栏内空白把菜单关了"** | 下拉面板现在是**嵌套窗口**（录在栏容器里）⇒ `debug_dump()` 的 `origin` **相对栏**，脚本算屏幕坐标漏了叠加栏原点 ⇒ 点到栏外，菜单当场收起（连锁症状：后面每段判定都错位） |
   | 菜单开着但点菜单项后不收 | `MenuCtx` 的 `close` 标志没被读回（`popup_show` → `PopupResult::item_clicked`）⇒ `MenuBar::finish()` 不会写 `menu_open = None` |
   | 阶段 2 `[FAIL] 面板被拖走了` | 下拉面板漏了 `WindowClamp::Locked`（**A/B 实测**：去掉后原点被拖到 x=1682）⇒ 面板与触发器脱节，命中按窗口走、视觉跑别处（"控件严重错位"） |
-  | **分割线又短又偏 / 标题与菜单项错列** | 面板内边距与菜单项起排不一致（内边距 = `menu::popup_padding(theme)` = `item_pad_x`；勾选**框**在项**内容里**）；或分割线用了 `Divider`（它的宽 = `avail_w()`，**自动宽**窗口里是 `None` ⇒ 退回固定 120）。`RJ_MENU_TRACE=1` 一跑就知道：正确时 `item` / `separator` / `caption` 三者**同 `x` 同 `w`**（实测 `x=8 w=224`，DPI 1.5） |
+  | 阶段 3 `[FAIL] 点栏内空白把菜单关了` | "栏"的判定退化成"只认触发器"（旧行为）⇒ 得按**栏矩形**判（`menu_bar_should_close(.., on_bar, ..)`；栏矩形 = `pos + (bar.width 或内容宽)`）。`RJ_MENU_TRACE=1` 打印 `on_bar=`，一眼看出按下有没有算进栏内 |
+  | **分割线又短又偏 / 标题与菜单项错列** | 面板内边距与菜单项起排不一致（内边距 = `menu::popup_padding(theme)` = `item_pad_x`；勾选**框**在项**内容里**）；或在**自动宽**下拉面板里用了 `Divider` 的**水平**模式（宽 = `avail_w()` = `None` ⇒ 退回固定 120）。⚠ 反过来：**栏里**（`row` 里）的竖分割线就该用 `Divider::vertical()`。`RJ_MENU_TRACE=1` 一跑就知道：正确时 `item` / `separator` / `caption` 三者**同 `x` 同 `w`**（实测 `x=8 w=224`，DPI 1.5） |
   | 下拉被别的窗口压住 | 面板 z 没走 `WIN_TOPMOST` 哨兵（走哨兵后与录制顺序无关） |
   | 面板宽度每帧都在变 / 变成一百万宽 | 首帧就请求了"极宽"（1e6）。必须**首帧自然宽**、第 2 帧起用 `prev` 定宽：`RJ_MENU_TRACE=1` 看 `prev=None → Some(226) → Some(240)`（最后应稳定） |
   | 菜单里再嵌的下拉一点就把外层菜单关了 | "点外"判定没排除**任意 `WIN_TOPMOST` 浮层**（`Ui::window_under_mouse()` 的 z） |
@@ -591,6 +595,16 @@ $env:RJ_ORDER_TRACE="150"; cargo run -p eg260818UI -- --frames 200 --sim-zorder 
 2. `scrollbar` 直接写队列时**两条命令只取了一次 `next_seq()`** ⇒ 序号重复；`place` 按
    `seq` 归一化，重复序号跨放置边界时同样拆容器。现在每条命令各取一次号，并在
    `begin_top_placement` 加 `debug_assert` 把"播放头落后"变成显式失败。
+3. **同类的第三种写法**：`Painter::panel_img_elem` 一次调用推**三条**命令
+   （背景刷 / 背景图 / 边框），序号用 `seq` / `seq + 1` / `seq + 2` —— 播放头只推进了 1
+   ⇒ 下一条命令**重号**（`place` 拆容器），并且上面的 `debug_assert` 会**立刻炸**。
+   实测现场：带**背景图**的窗口录完之后，`menu_bar` 新的容器入口把它踩了出来
+   （`thread 'main' panicked … seq 播放头落后于已入队命令`）。
+   修法：`DrawQueue::advance_seq_to(n)`（只增不减）按实际用掉的最大序号补齐 ——
+   **凡是"一次调用推多条命令"的入口都要补**；配单测
+   `panel_with_image_advances_the_seq_playhead`（"播放头 = 已分配最大序号" + 不重号）。
+   **教训**：把不变量写成 `debug_assert` 的收益就在这里 —— 一个 3 年前就存在的重号，
+   被新代码一条不变量检查当场抓住，而不是"偶尔闪一帧"。
 
 **教训**：排序键缺一维时，症状不是"顺序乱了"，而是"**看起来像闪烁**"（内容在动的地方
 一闪一闪）。这类问题**不要靠截图猜**：先问"这帧的绘制序是什么"，再拿引擎自己的提交序

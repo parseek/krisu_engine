@@ -46,7 +46,7 @@ use rjw_krusie::prelude::*;
 use rjw_krusie::ui::{
     ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, Dropdown, FONT_WEIGHT_CHOICES,
     FontModal, GRIP_W, GripShape, GripStyle, IdAbsolute, Item, Label, MenuClick, Palette, PopupSide,
-    Position, Segmented, ShadowStyle, Weight, item_h, popup_gap, popup_origin, popup_padding,
+    Position, Segmented, ShadowStyle, Size, Weight, item_h, popup_gap, popup_origin, popup_padding,
     weight_label,
 };
 
@@ -1340,6 +1340,9 @@ struct UiApp {
     menu_panel: Option<(Vec2, Vec2)>,
     /// --sim-menu：下拉面板**应该**在的原点（= 触发器左下 + 2px；由主题尺寸算出）。
     menu_want_origin: Option<Vec2>,
+    /// --sim-menu：**栏内空白**处的点（栏覆盖整屏 ⇒ 该点一定在栏矩形内、且不在任何
+    /// 触发器 / 控件上）——用来验证"点栏内空白**不**收起菜单"（`on_bar` 语义）。
+    menu_bar_blank_pt: Option<Vec2>,
     /// 「被遮挡控件仍被触发」复现器。
     cover: CoverDemo,
     /// `--sim-cover` 段 A 结束时的认领次数（段 B 不许再涨）。
@@ -1602,6 +1605,7 @@ impl UiApp {
             menu_item_pt: None,
             menu_panel: None,
             menu_want_origin: None,
+            menu_bar_blank_pt: None,
             weight_probe: None,
             cover: CoverDemo::default(),
             cover_starts_after_a: 0,
@@ -2292,6 +2296,7 @@ impl App for UiApp {
         if self.sim_menu {
             let trigger = self.menu_trigger_pt.unwrap_or(Vec2::ZERO);
             let item = self.menu_item_pt.unwrap_or(trigger);
+            let bar_blank = self.menu_bar_blank_pt.unwrap_or(trigger);
             // 阶段 2 用：**面板里"没有控件"的地方**（标题行左侧的空白——菜单项只占上半，
             // 密度标题只从勾选列起排）⇒ 在那里按下会落到"窗口本体"，正是"拖菜单"的入口。
             // 拖到面板**右侧外面**松手（不会点到任何菜单项）。
@@ -2317,6 +2322,11 @@ impl App for UiApp {
                 46..=47 => f.debug_inject_mouse(grab, true),
                 48..=52 => f.debug_inject_mouse(aside, true),
                 53..=54 => f.debug_inject_mouse(aside, false),
+                // 阶段 3：菜单**还开着**（阶段 2 没有关它）⇒ 直接**点栏内空白**
+                // （不是触发器、也不是下拉面板）：菜单必须**仍开着**（`on_bar` 语义；
+                // 旧实现只认"落在某个触发器上"，点栏里空白会误关）。
+                64..=65 => f.debug_inject_mouse(bar_blank, true),
+                66..=67 => f.debug_inject_mouse(bar_blank, false),
                 _ => {}
             }
         }
@@ -2737,7 +2747,13 @@ impl App for UiApp {
             // - 「视图」：**带勾选的菜单项**（窗口显隐 / 收起，直接绑应用自己的 `&mut bool`）
             //   + 标题行 + **横向排版**（密度三档按钮 —— `MenuCtx` 解引用到 `Window`）；
             // - 「帮助」：纯文本行（操作提示）。
+            //
+            // **栏 = 一行 + 全宽背景**：`bar.width(..)` 把背景铺满整个屏幕；菜单之间用
+            // **竖向分割线**（`bar.separator_v()`）分组；菜单之后还能塞**任何控件**
+            // （这里放一个状态标签）—— `MenuBar` 解引用到 `Pack` ⇒ `UiAdd` 的方法都能用。
+            let screen_w = ui.window_physical_size().0 as f32;
             let menu_size = ui.menu_bar("menubar", MENUBAR_POS, |bar| {
+                bar.width(Size::Physical(Vec2::new(screen_w, 0.0)));
                 bar.menu("文件", |m| {
                     m.caption("文件名过滤（菜单里也能放文本输入）");
                     m.text_input("menu_filter", &mut self.menu_filter);
@@ -2756,6 +2772,9 @@ impl App for UiApp {
                         exit_requested = true;
                     }
                 });
+                // **竖向分割线**（栏内分组）：栏就是一行 ⇒ 竖线 = `Divider::vertical()`，
+                // `separator_v()` 是它的便利写法（`bar.add(Divider::new().vertical())` 等价）。
+                bar.separator_v();
                 bar.menu("视图", |m| {
                     m.item_checked("主题调节窗口", &mut self.theme_tuner.open);
                     // **责任链写法**（与上面 `item_checked` 等价，两种都留着当对照）：
@@ -2783,6 +2802,7 @@ impl App for UiApp {
                         }
                     });
                 });
+                bar.separator_v();
                 bar.menu("帮助", |m| {
                     m.caption("操作提示");
                     m.separator();
@@ -2790,6 +2810,10 @@ impl App for UiApp {
                     m.label("Tab 遍历焦点 · Enter / Space 激活");
                     m.label("Esc 先关菜单，再按才退出");
                 });
+                // **栏里放非菜单控件**：栏本质就是一行，标签 / 按钮 / 输入框都能塞
+                // （点它们**不会**关菜单 —— 见 `menu_bar_should_close` 的 `on_bar`）。
+                bar.separator_v();
+                bar.label("状态：就绪");
             });
             debug_assert!(menu_size.x > 0.0, "菜单栏至少有宽度");
 
@@ -2961,31 +2985,50 @@ impl App for UiApp {
             // 注入只能经 `Frame` 且在段之前，所以这里只算、段外下一帧注（同 `--sim-tuner`）。
             if self.sim_menu {
                 let dump = ui.debug_dump();
-                let (fs, pad_x, row_h, gap) = {
+                let (fs, pad_x, row_h, gap, sep_w) = {
                     let t = ui.theme();
-                    (t.button.font_size, t.button.padding.x, t.row_h, t.gap)
+                    (
+                        t.button.font_size,
+                        t.button.padding.x,
+                        t.row_h,
+                        t.gap,
+                        t.divider.thickness + t.divider.margin * 2.0,
+                    )
                 };
                 // 触发器：「视图」是第 2 个（三个都是两个字 ⇒ 等宽）；栏位置取常量
                 // `MENUBAR_POS`（逻辑 → 物理，与录制同源）——挪栏不用改脚本。
+                // ⚠ demo 的栏是 `[文件][竖线][视图][竖线][帮助][竖线][状态标签]`
+                // ⇒ 「视图」前面还隔着**一条竖分割线**（占位宽 = `sep_w`）+ 一个 `gap`。
                 let bar = (MENUBAR_POS * scale).round();
                 let tw = ui.text_size("视图", fs, None).x;
                 let w = tw + pad_x * 2.0;
-                let trigger_rect = Rect::new(bar.x + (w + gap), bar.y, w, row_h);
+                let trigger_rect = Rect::new(bar.x + w + gap + sep_w + gap, bar.y, w, row_h);
                 self.menu_trigger_pt =
                     Some(Vec2::new(trigger_rect.x + w * 0.5, trigger_rect.y + row_h * 0.5));
                 // 下拉原点（引擎里的 `pos = (t.x, t.y + h + 2)`，见 `MenuBar::popup`）。
                 self.menu_want_origin =
                     Some(Vec2::new(trigger_rect.x, trigger_rect.y + row_h + 2.0));
+                // 阶段 3 用：**栏内空白**（栏覆盖整屏 ⇒ 右侧远处必在栏矩形内，且那里
+                // 没有任何触发器 / 控件）——验"点栏内空白不收起菜单"。
+                self.menu_bar_blank_pt = Some(Vec2::new(
+                    bar.x + ui.window_physical_size().0 as f32 * 0.6,
+                    bar.y + row_h * 0.5,
+                ));
                 // 下拉里**第一个菜单项**：注意面板左内边距 = `item_pad_x`（勾选方框画在
                 // 菜单项**内容里**，不占内边距）+ 边框 ⇒ 第一项从内容原点起，不是面板顶边。
                 let item_h = (fs * 1.3).round() + 2.0;
                 let top_pad = ui.theme().combo.item_pad_x + ui.theme().panel.border_w;
                 if let Some(p) = dump.windows.iter().find(|p| p.id == "menubar::视图") {
+                    // ⚠ **下拉面板是嵌套窗口**（菜单栏现在是"一行容器"，面板录在栏里）：
+                    // dump 的 `origin` 相对**直接容器** ⇒ 必须叠加栏原点（`MENUBAR_POS`）
+                    // 才是屏幕坐标。不叠加就会点到栏外 ⇒ 菜单当场收起（实测症状：
+                    // "菜单没开 / 菜单项没执行"）。
+                    let abs = bar + p.origin;
                     self.menu_item_pt = Some(Vec2::new(
-                        p.origin.x + top_pad + 20.0,
-                        p.origin.y + top_pad + item_h * 0.5,
+                        abs.x + top_pad + 20.0,
+                        abs.y + top_pad + item_h * 0.5,
                     ));
-                    self.menu_panel = Some((p.origin, p.size));
+                    self.menu_panel = Some((abs, p.size));
                 } else {
                     self.menu_panel = None;
                 }
@@ -3013,11 +3056,14 @@ impl App for UiApp {
             if self.sim_menu && sim_frame == 58 {
                 let open = ui.state().menu_open().is_some();
                 let dump = ui.debug_dump();
+                // ⚠ 面板是**嵌套窗口**（录在"一行容器"里）⇒ dump 的 `origin` 相对栏原点，
+                // 屏幕坐标要叠加 `MENUBAR_POS`（与 `menu_want_origin` 同一坐标系才可比）。
+                let bar = (MENUBAR_POS * scale).round();
                 let got = dump
                     .windows
                     .iter()
                     .find(|p| p.id == "menubar::视图")
-                    .map(|p| p.origin);
+                    .map(|p| bar + p.origin);
                 let stayed = match (got, self.menu_want_origin) {
                     (Some(g), Some(w)) => (g.x - w.x).abs() < 2.0 && (g.y - w.y).abs() < 2.0,
                     _ => false,
@@ -3029,6 +3075,20 @@ impl App for UiApp {
                         "[OK] 菜单面板不会被拖动"
                     } else {
                         "[FAIL] 面板被拖走了 / 菜单意外关闭"
+                    }
+                );
+            }
+
+            // 阶段 3 判定：**点栏内空白不收起菜单**（"栏 = 一行容器"的 `on_bar` 语义；
+            // 旧实现只认"按下落在某个触发器上" ⇒ 点栏里的空白 / 竖分割线 / 别的控件都会误关）。
+            if self.sim_menu && sim_frame == 72 {
+                let open = ui.state().menu_open().is_some();
+                eprintln!(
+                    "sim-menu: 点栏内空白后 menu_open={open} {}",
+                    if open {
+                        "[OK] 点栏内空白不收起菜单"
+                    } else {
+                        "[FAIL] 点栏内空白把菜单关了"
                     }
                 );
             }
