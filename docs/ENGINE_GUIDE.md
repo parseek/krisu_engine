@@ -1583,7 +1583,7 @@ ui.window("win_a")
     .pos(vec2(560.0, 240.0))
     .width(220.0)
     .title("窗口 A")              // 标题栏（不调 = 完全没有栏）
-    .close_button(&mut open)      // 右上角 ×（点击 ⇒ *open = false）
+    .close_button(&mut open)      // 右上角 ×（**贴窗口外框右缘**，点击 ⇒ *open = false）
     .shrink(true, &mut folded)    // 右上角 ⌃（show = 是否画按钮；点击 ⇒ *folded 取反）
     .show(|w| {
         w.label("内容（收起时整块跳过）");
@@ -1599,17 +1599,24 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 | **标题行贴窗口顶边** | 录标题行**之前**把内容光标抬到 `y = 0`（x 保持内容左缘）⇒ 标题 / ▲ / ✕ **上移一个 `pad_total`**，下一个内容行自然落在「条下沿 + `gap`」——即**下面的内容与窗口高度各少一个 `pad_total`**（用户实测："可以往上抬"） |
 | 通条底色 + 分隔线 | 整窗宽矩形，高 = `title_bar_h(row_h)` = **一行**（`title_bar_h` 是纯函数、可单测），底边那条就是面板边框色的 1px 分隔线；圆角取面板**上面两角**，与面板边框**连续**（不会"标题栏把上边框啃掉"）。⚠ 条只是**背景装饰、不裁剪内容**：标题 / ▲ / ✕（边长 `row_h - 2`）允许**比条高再高一点**（用户明确要求） |
 | 标题栏空白处仍可拖窗 | 只有 `×` / `⌃` 上的按下会 `claim_press()`（与滑块 / 滚动条同一机制）——点按钮不会顺带把窗口拖走 |
+| **caption 按钮贴窗口外框右缘（Windows 风格）** | 按钮**不在"行"里排**，而是用 `Ui::add_at` **绝对定位在窗口外框坐标系**（窗口帧局部 `(0,0)` = 外框左上角）⇒ 簇右缘 = **外框右缘 − `TITLE_BUTTON_INSET`（0）**、`y = 0`、高 `row_h`。落点由纯函数 `ui.rs::title_bar_layout`（可单测）解算（见下）；`✕` 恒在**最右**（顺序 `[⌃][✕]`）。⚠ 旧实现把按钮当行内子项、用 `spacer = 内容宽 − 标题宽` 推到**内容**右缘 ⇒ 永远差 `pad + 4`（实测 win_a @150% DPI：✕ 右缘 340 / 外框 358 ⇒ 偏左 18px），且 spacer 随文本测量漂 |
+| 贴外缘 + 圆角要一起处理 | 最右按钮的**右上角取面板右上圆角**（`TitleIconButton::corners(..)`）⇒ 贴外缘时不会方角戳出圆角轮廓（Windows 11 的 caption 高亮同样跟窗口圆角走）；没开 `.style(radius)` 时面板圆角 0 = 纯直角贴角 |
+| 自动宽窗口 | 没有 `.width()` 就没有"外框右缘"可贴 ⇒ 簇**跟随标题**（`cluster_x = pad + title_w + gap`），外框宽由内容推导（与旧版自动宽窗口一致） |
 | `×` 的关闭语义 | `*open = false` 时**整窗短路**：不录制、不写原点 / 尺寸、**不占遮挡矩形**（不会留下"看不见却挡点击"的窗口）；下一帧起彻底消失，**重开是应用的责任** |
 | `shrink(show, collapsed)` | `collapsed` 在录制**开头**读取（点击当帧不变、下一帧生效）；`show = false` 时按钮不画，但 `*collapsed` **照旧生效**——菜单 / 代码可收起展开而不必放按钮 |
 | 按钮是**几何**不是字形 | `Icon::Close` / `ChevronUp` / `ChevronDown`（`TitleIconButton`，只依赖公开 API）⇒ 换字体不会变豆腐块 |
 
-> ⚠ **右对齐要实测标题宽**：按钮行用 `min_size` + 空标签做 spacer（同 `FontModal`）。
-> spacer 若按"内容宽 − 按钮区"算，行总宽会多出 `标题宽 + gap − 4`，两个按钮被整体推出
-> 内容右缘（画到面板外）。所以先 `ui.text_size(..)` 实测标题，再
-> `spacer = 内容宽 − 标题宽 − 按钮区`。同时注意 `Ui::avail_w()` 返回的是
-> `fixed_w − 2×pad`（`Frame::fixed_avail_w`），而子项实际被 clamp 到 `fixed_w`
-> （`layout.rs::fixed_w_clamps_children_and_settles_width`）⇒ 这里要补回 `2×pad` 才是
-> 真正的内容宽。排查开关：`RJ_CHROME_TRACE=1` 打印 `content_w / title_w / spacer / btn`。
+> ⚠ **别再用"内容右缘 + spacer"排 caption 按钮**：那条路上有三个坑，实测各差 `pad`、4px，
+> 还会互相抵消成"看起来差不多"：
+> 1. `Ui::avail_w()` 返回 `fixed_w − 2×pad`（`Frame::fixed_avail_w`），补 `2×pad` 才是**内容宽**；
+> 2. 内容右缘比**外框右缘**又少 `pad`（`Frame::natural_size`：`fixed_w + 2×pad` 才是外框），
+>    旧实现还额外留了 4px 余量 ⇒ ✕ 离窗口右缘 `pad + 4`；
+> 3. spacer 要用**实测标题宽**才算得准，字体 / 字号 / 字重一变就漂。
+> 现在：按钮走 `Ui::add_at` 绝对定位（`title_bar_layout` 纯函数解算 + 单测钉住"簇右缘 =
+> 外框右缘 − inset"），标题留在行里、按 `title_max` 省略号截断。
+> 排查开关：`RJ_CHROME_TRACE=1` 打印**解算结果** ——
+> `chrome[collapsed=false] bar_w=358.0 title_w=62.0 title_max=252.0 shrink=[275.0,0.0 37.0x39.0] close=[321.0,0.0 37.0x39.0] inset=0.0`
+> （断言口径就在这条里：`close.x + close.w == bar_w − inset`）。
 
 **缩放柄令牌**（固定宽窗口右下角那个"拖拽按钮"）：
 
@@ -1661,23 +1668,37 @@ ui.window("popup").width(300.0).resize(false, Resize::None).show(|w| ..); // 固
 - 拖拽基于通用 `resize_handle`（`current` / `min` **两轴都给**），按下即 `claim_press`
   ⇒ 拖柄不会顺带把窗口拖走。
 - **验证**：`--sim-resize`（斜向拖 `img_box_fill` 的柄 +60/+40 ⇒ 结算尺寸
-  `328×97 → 388×137`：两条轴都动，且**变化量正好等于注入位移**——若脚本每帧重算目标点，
+  `328×131 → 388×171`：两条轴都动，且**变化量正好等于注入位移**——若脚本每帧重算目标点，
   会退化成"追着拖"（+180/+223），所以这条断言同时也守着脚本自身）。
 
 **验证**（都不需要人眼看屏幕）：
 
 ```bash
-cargo run -p eg260818UI -- --sim-chrome --frames 100      # 真的去点 ⌃ / ×（坐标由主题 + DPI 解算）
-# sim-chrome: win_a open=true  collapsed=false size=(358,320)   ← 初始
+cargo run -p eg260818UI -- --sim-chrome --frames 100   # 真的去点 ⌃ / ×（坐标从 debug_dump 的 win_a 外框矩形推导）
+# sim-chrome: scale=1.5 ⌃=Vec2(353.5, 714.75) ×=Vec2(399.5, 714.75)  ← 点的是**贴右缘**那格
+# sim-chrome: win_a open=true  collapsed=false size=(358,306)   ← 初始
 # sim-chrome: win_a open=true  collapsed=true  size=(358,53)    ← 点 ⌃：只剩一行标题栏
 # sim-chrome: win_a open=false collapsed=true  size=(0,0)       ← 点 ×：整窗短路
-# sim-chrome: win_a open=true  collapsed=true  size=(358,67)    ← 应用重开
-# sim-chrome: win_a open=true  collapsed=false size=(358,320)   ← 应用展开
+# sim-chrome: win_a open=true  collapsed=true  size=(358,53)    ← 应用重开
+# sim-chrome: win_a open=true  collapsed=false size=(358,306)   ← 应用展开
 ```
 
-`size` 是 `.show(..)` 的返回值（窗口结算尺寸），`pos` 不变即证明**按钮上的按下没有变成
-窗口拖拽**。引擎侧的不变量由 `ui::tests::window_chrome_bar_and_collapse_flags` 守着
+（上面是 150% DPI 的实测值。）`size` 是 `.show(..)` 的返回值（窗口结算尺寸），`pos` 不变、
+五段 `size` 对称即证明**按钮上的按下没有变成窗口拖拽**，也证明按钮右移**没有改变任何窗口
+尺寸**。⚠ 点击点必须**从 dump 的外框矩形推导**（`right = origin.x + size.x`）：写死
+"内容右缘 + pad"那种算法在按钮右移后就点不准了 —— 脚本本身也是这条不变量的回归。
+引擎侧的不变量由 `ui::tests::title_bar_buttons_hug_the_window_outer_right_edge` /
+`title_bar_layout_*` 与 `window_chrome_bar_and_collapse_flags` 守着
 （"空外框不画栏" / "`shrink(false, ..)` 不画栏但状态生效"）。
+
+> ⚠ **收起态里 resize 柄会盖到 caption 按钮上**（既有缺陷，非本轮引入）：窗口只有一行高时，
+> 右下角缩放柄的命中区（`GripStyle::extent()`，本机 150% DPI 实测 `35×35`、起点 `y = 723`）
+> 往左上延伸会覆盖 `×` / `⌃` 所在的一行（✕ 矩形 `(381,705,37,39)`，y 到 744），而柄在
+> `window_impl` 里**先于**按钮判定 ⇒ 点行中心会被柄抢走。`RJ_HIT_TRACE=1` 的实证：
+> `hit[frame 41] win_a::resize OK rect=(383,723,35,35) mouse=(399.5,724.5)`，同时
+> `RJ_CHROME_TRACE` 里 `bar_w` 358 → 357（`window_widths` 被拖了 1px）。`--sim-chrome`
+> 因此点按钮的**上半部**（`row_h * 0.25`，y < 723）绕开柄，把"按钮路径"与"柄路径"分开验证；
+> 修柄 / 按钮重叠另案。
 
 ### 18.13 菜单栏（menu_bar）
 

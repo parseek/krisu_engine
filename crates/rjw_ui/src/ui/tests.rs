@@ -1219,6 +1219,69 @@ fn title_bar_hugs_the_top_and_does_not_clip_content() {
     assert!(btn < title_bar_h(45.0) + 1.0, "按钮可以接近/超过条高");
 }
 
+#[test]
+fn title_bar_buttons_hug_the_window_outer_right_edge() {
+    // **Windows 风格**：固定尺寸窗口的 caption 簇（`[收缩][关闭]`）右缘 = **外框右缘** − inset。
+    // 旧实现把按钮当行内子项，靠 `spacer = 内容宽 − 标题宽` 推到**内容**右缘 ⇒ 永远差
+    // `pad + 4`（实测 win_a @scale1.5：✕ 右缘 340 / 外框 358 ⇒ 偏左 18px）。这条断言是那个
+    // 偏差的守卫：算错了就一定失败（不是"点得到就行"）。
+    let (pad, row_h, gap, inset) = (14.0, 39.0, 9.0, TITLE_BUTTON_INSET);
+    let btn = row_h - 2.0;
+    let l = title_bar_layout(Some(358.0), pad, row_h, gap, true, true, inset, 62.0);
+    let close = l.close.expect("有关闭按钮");
+    assert_eq!(close.x + close.w, 358.0 - inset, "✕ 贴外框右缘");
+    // 收缩在它左边一个按钮 + 一个 gap（顺序：关闭恒在最右）。
+    let shrink = l.shrink.expect("有收缩按钮");
+    assert_eq!(shrink.x + shrink.w + gap, close.x);
+    assert_eq!((close.w, close.h), (btn, row_h));
+    assert_eq!(close.y, 0.0, "按钮贴窗口顶边（Windows 的 caption 观感）");
+    // 标题可用宽 = 簇左缘 − gap − 左内边距（不会压到按钮上）。
+    assert_eq!(l.title_max, shrink.x - gap - pad);
+    assert!(l.title_max > 0.0);
+    assert_eq!(l.bar_w, 358.0, "固定宽窗口的条宽 = 外框宽");
+}
+
+#[test]
+fn title_bar_layout_inset_and_single_button() {
+    let (pad, row_h, gap) = (14.0, 39.0, 9.0);
+    // inset 生效：留给"想在圆角外留一条缝"的开关（`TITLE_BUTTON_INSET` 是唯一入口）。
+    let l = title_bar_layout(Some(358.0), pad, row_h, gap, false, true, 12.0, 0.0);
+    let close = l.close.expect("只有关闭按钮");
+    assert_eq!(close.x + close.w, 358.0 - 12.0);
+    assert!(l.shrink.is_none(), "show_shrink=false ⇒ 不画收缩");
+    // 只有收缩按钮时它自己接最右（只有一个按钮就占 0 号位）。
+    let l = title_bar_layout(Some(358.0), pad, row_h, gap, true, false, 0.0, 0.0);
+    assert!(l.close.is_none());
+    assert_eq!(l.shrink.expect("只有收缩按钮").x, 358.0 - (row_h - 2.0));
+    // 两个都不画：不产生矩形，标题可用宽仍是"到外框右缘"。
+    let l = title_bar_layout(Some(358.0), pad, row_h, gap, false, false, 0.0, 0.0);
+    assert!(l.shrink.is_none() && l.close.is_none());
+    assert_eq!(l.title_max, 358.0 - gap - pad);
+}
+
+#[test]
+fn title_bar_layout_clamps_in_tiny_windows_and_follows_title_when_auto() {
+    let (pad, row_h, gap) = (14.0, 39.0, 9.0);
+    // 窗口比按钮簇还窄：簇左缘夹到 `pad`（按钮不左越内容左缘），标题宽不产生负值
+    // （负宽会让 `max_size` 把标题压成 0，甚至让省略号路径拿到负可用宽）。
+    let l = title_bar_layout(Some(60.0), pad, row_h, gap, true, true, 0.0, 500.0);
+    assert_eq!(l.shrink.expect("有收缩按钮").x, pad);
+    assert_eq!(l.title_max, 0.0);
+    // 自动宽窗口（无 `.width()`）：簇**跟随标题**（与旧版自动宽窗口一致），
+    // 外框宽 = 内容右上角 + 右内边距（与 `Frame::natural_size` / `settle_size` 同口径）。
+    let l = title_bar_layout(None, pad, row_h, gap, true, true, 0.0, 62.0);
+    assert_eq!(l.shrink.expect("有收缩按钮").x, pad + 62.0 + gap, "自动宽：按钮跟在标题后");
+    let close = l.close.expect("有关闭按钮");
+    assert_eq!(l.bar_w, close.x + close.w + pad);
+    // **不变量与 DPI 无关**（输入已是物理像素）：两套尺寸各自都贴右缘。
+    for (bar_w, pad, row_h, gap) in [(358.0, 14.0, 39.0, 9.0), (716.0, 28.0, 78.0, 18.0)] {
+        let l = title_bar_layout(Some(bar_w), pad, row_h, gap, true, true, 0.0, 124.0);
+        let close = l.close.expect("有关闭按钮");
+        assert_eq!(close.x + close.w, bar_w, "bar_w={bar_w} 下也必须贴右缘");
+        assert_eq!(close.h, row_h);
+    }
+}
+
 // ─── 顶层放置序（`z0_place_for_seq`）与提交排序键 ─────────────────────
 //
 // 这一组把用户报告的两个**闪烁**变成断言。症状：可拖动玩家名面板的底色被更早录制的

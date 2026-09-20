@@ -962,6 +962,13 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 `*collapsed` 在录制**开头**读取（点击当帧不变、下一帧生效）；`×` / `⌃` 上的按下会
 **认领**（`claim_press`）⇒ 点按钮不会顺带拖动窗口。
 
+**caption 按钮的位置**（Windows 风格）：`[⌃][✕]` 顺序（`✕` 恒在**最右**）用
+`Ui::add_at` **绝对定位在窗口外框坐标系**——固定尺寸窗口下簇右缘 = **外框右缘** −
+`TITLE_BUTTON_INSET`（0）、`y = 0`、高 `row_h`；最右按钮的右上角**取面板右上圆角**，
+贴外缘时不会戳出圆角。自动宽窗口（不调 `.width(..)`）没有"外框右缘"可贴 ⇒ 簇**跟随标题**。
+落点由纯函数 `ui.rs::title_bar_layout` 解算（单测钉住"贴右缘"）。⚠ 旧版把它当行内子项、
+用 `spacer = 内容宽 − 标题宽` 推到**内容**右缘 ⇒ 离窗口右缘永远差 `pad + 4`（实测 18px）。
+
 选项载体 `WindowOptions` / `PanelOptions`（公开，可独立构造/复用）。容器闭包内经
 `UiAdd::window(id)` / `UiAdd::panel()` 同样可用。
 

@@ -8,8 +8,12 @@
 //!
 //! 按下时 `claim_press()`：标题栏按钮上的按下**不会**被当成"拖窗口"的基准
 //! （与滚动条同一机制，见 `Ui::claim_press`）。
+//!
+//! **落点与尺寸解耦**：本控件的尺寸固定（`row_h - 2` × `row_h`），但落点可以被
+//! `Ui::add_at` 的"一次性放置覆盖"接管 —— 标题栏就是用它把按钮**绝对定位到窗口外框
+//! 右缘**的（见 `ui.rs::window_title_bar` / `title_bar_layout`）。
 
-use crate::draw::{Icon, Position, Size};
+use crate::draw::{CornerRadius, Icon, Position, Size};
 use crate::ui::Ui;
 use crate::widgets::{Response, Sense, Widget};
 use glam::Vec2;
@@ -18,12 +22,21 @@ use glam::Vec2;
 pub(crate) struct TitleIconButton<'a> {
     id: &'a str,
     icon: Icon,
+    /// **背景圆角覆盖**：标题栏最右按钮要接**面板的右上圆角**（贴外缘时方角会戳出
+    /// 圆角轮廓）。`None` = [`Theme::button`](crate::style::Theme::button) 的圆角。
+    corners: Option<CornerRadius>,
 }
 
 impl<'a> TitleIconButton<'a> {
     /// 构造（`id` 用窗口内的相对 id 即可，容器会加前缀）。
     pub(crate) fn new(id: &'a str, icon: Icon) -> Self {
-        Self { id, icon }
+        Self { id, icon, corners: None }
+    }
+
+    /// 背景圆角覆盖（见字段说明）。链式。
+    pub(crate) fn corners(mut self, c: Option<CornerRadius>) -> Self {
+        self.corners = c;
+        self
     }
 }
 
@@ -42,11 +55,12 @@ impl Widget for TitleIconButton<'_> {
         let st = ui.theme().button.clone();
         let bg = st.pick_bg(resp.pressed, resp.hovered);
         let fg = if resp.hovered { st.fg } else { ui.theme().palette.text_muted };
+        let radius = self.corners.unwrap_or(st.radius);
         // 图标居中、留 4px 边距，等比（`icon_at` 内部取居中方块 ⇒ 不会拉扁）。
         // 一个绘制块一个 painter：面板背景与图标各自取当时的 `elem_hint`（与旧写法等价）。
         let d = (rect.w.min(rect.h) - 8.0).max(6.0);
         let p = ui.painter();
-        p.panel(rect, bg, st.border, st.border_w, st.radius);
+        p.panel(rect, bg, st.border, st.border_w, radius);
         p.icon_at(
             Position::Physical(Vec2::new(
                 rect.x + (rect.w - d) * 0.5,

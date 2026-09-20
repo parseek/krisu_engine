@@ -469,6 +469,9 @@ struct Windows {
     last_win_a_size: Vec2,
     /// --sim-chrome：窗口 A 出现过的 `(open, collapsed)` 组合（去重，帧末判定用）。
     chrome_states: Vec<(bool, bool)>,
+    /// --sim-chrome：`(收缩, 关闭)` 按钮中心（**物理像素**；每帧从 `debug_dump` 的
+    /// `win_a` **外框矩形**推导 —— 不写死宽度 / 内容内边距，才能验证"按钮贴外框右缘"）。
+    chrome_pts: Option<(Vec2, Vec2)>,
     /// --sim-chrome：是否打印上面的证据。
     sim_chrome: bool,
 }
@@ -491,6 +494,7 @@ impl Windows {
             win_a_collapsed: false,
             last_win_a_size: Vec2::ZERO,
             chrome_states: Vec::new(),
+            chrome_pts: None,
             sim_chrome: false,
         }
     }
@@ -2199,30 +2203,17 @@ impl App for UiApp {
 
         // ── 调试：脚本化鼠标（`--sim-chrome`）────────────────────
         // **真的去点**标题栏那两个按钮（不是直接翻 flag）：命中 → 按下认领 → 释放结算
-        // 这条完整路径才被验证。坐标由**主题尺寸解算**（不写死像素）：按钮在内容行右端，
-        // 从右往左依次是 × 与 ⌃，边长 `row_h - 2`（同 `TitleIconButton::size`）。
+        // 这条完整路径才被验证。坐标**从上一帧 `debug_dump` 的 `win_a` 外框矩形推导**
+        // （见段 2 里 `chrome_pts` 的解算）：按钮右缘 = 外框右缘 ⇒ 点最外缘那格的中心。
         //
         // 调度（注入只对**下一帧**生效 ⇒ 按下/抬起各留两帧）：
         //   12..13 ↓⌃ / 14..15 ↑⌃（点收起）→ 60 帧由应用重开（等价菜单勾选）
         //   40..41 ↓× / 42..43 ↑×（点关闭）→ 80 帧由应用展开
         if self.sim_chrome {
-            // 尺寸取自**本帧主题**（与下面 `let theme` 同一套输入 ⇒ 值一致）；
-            // `Theme` 在 `Ui` 内才按 DPI 预乘 ⇒ 这里手动乘 `scale`（同 `--sim-picker`）。
-            let th = self
-                .theme_tuner
-                .theme(self.top.font_name(), self.top.font_weight());
-            let (pad, row, gap) =
-                ((th.panel.padding + th.panel.border_w) * scale, th.row_h * scale, th.gap * scale);
-            // 按钮边长 = `row_h - 2`，**减号作用在已缩放的 row_h 上**（同 `TitleIconButton::size`）。
-            let btn = (row - 2.0).max(12.0);
-            let origin = (self.windows.win_a_pos * scale).round();
-            let right = origin.x + 220.0 * scale + pad; // 行右缘 = 内容右缘
-            // **标题行贴窗口顶边**（引擎侧 `window_title_bar` 把内容光标抬到 y=0）
-            // ⇒ 按钮中心线 = 窗口顶 + row/2（**不再**加 `pad`）。
-            // ⚠ 这一行就是"条贴顶"的脚本级回归：忘了改会点到 `pad` 以下 ⇒ `[FAIL]`。
-            let cy = origin.y + row * 0.5;
-            let close_p = Vec2::new(right - btn * 0.5, cy);
-            let fold_p = Vec2::new(right - btn * 1.5 - gap, cy);
+            // 外框矩形口径：`right = origin.x + size.x`、`btn = row_h - 2`（同引擎）。
+            // ⚠ 点的是**最外缘**：这条就是"✕ 贴窗口右缘（Windows 风格）"的脚本级回归
+            // —— 按钮若缩回内容右缘（旧行为，差 `pad + 4`），这两下就落空了。
+            let (fold_p, close_p) = self.windows.chrome_pts.unwrap_or((Vec2::ZERO, Vec2::ZERO));
             let away = Vec2::new(1800.0, 1050.0);
             if f.frames() == 12 {
                 eprintln!("sim-chrome: scale={scale} ⌃={fold_p:?} ×={close_p:?}");
@@ -2939,6 +2930,31 @@ impl App for UiApp {
                             w.origin.y + w.size.y - 8.0 + 40.0,
                         ));
                     }
+                }
+            }
+            // `--sim-chrome`：按钮中心解算（**本帧录制后**从 `win_a` 的**外框矩形**推导）。
+            // 引擎侧按钮右缘 = **外框右缘 − `TITLE_BUTTON_INSET`**（0）⇒ "点最外缘那个按钮的
+            // 中心必须命中 ✕ / ⌃"；点不到就说明按钮没贴右缘（这条脚本 = "贴外缘"的回归守卫）。
+            // ⚠ 旧版这里用 `220*scale + pad`（**内容**右缘）算 —— 那套坐标在按钮右移到外框
+            // 右缘之后就点不准了，所以脚本必须跟着"外框"口径走，而不是继续写死数字。
+            if self.sim_chrome {
+                let dump = ui.debug_dump();
+                if let Some(w) = dump.windows.iter().find(|p| p.id == "win_a") {
+                    let (row_h, gap) = (ui.theme().row_h, ui.theme().gap);
+                    let btn = (row_h - 2.0).max(12.0);
+                    let right = w.origin.x + w.size.x;
+                    // ⚠ 点按钮的**上半部**（不是行中心）：窗口收起时只有一行高，右下角的
+                    // **拖拽缩放柄**会盖到 caption 按钮上，而柄在 `window_impl` 里**先于**
+                    // 按钮判定 ⇒ 点行中心会被柄抢走。`RJ_HIT_TRACE=1` 实测（150% DPI，收起态）：
+                    //   hit[frame 41] win_a::resize OK rect=(383,723,35,35) mouse=(399.5,724.5)
+                    // 而 ✕ 的矩形是 `(381,705,37,39)`（y 到 744）⇒ 柄（y 从 723 起）压住按钮
+                    // 下半，抢走按下并把窗口宽度改了 1px（`RJ_CHROME_TRACE`：`bar_w` 358→357）。
+                    // 那是既有缺陷（柄 / 按钮重叠，另案处理），本脚本只负责验证按钮本身。
+                    let cy = w.origin.y + row_h * 0.25;
+                    self.windows.chrome_pts = Some((
+                        Vec2::new(right - btn * 1.5 - gap, cy),
+                        Vec2::new(right - btn * 0.5, cy),
+                    ));
                 }
             }
             // `--sim-menu`：坐标解算（**本帧录制后**已知栏在哪、下拉面板在哪）——

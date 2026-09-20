@@ -3110,7 +3110,9 @@ impl<'a> Ui<'a> {
         self.with_id(id, |ui| {
             let mut w = Window { ui };
             if chrome.bar_on() {
-                window_title_bar(&mut w, chrome, collapsed, pad_total);
+                // `style.radius` 一并传下去：最右按钮的右上角要取**面板圆角**，
+                // 贴外缘时才能嵌进圆角轮廓（见 `window_title_bar`）。
+                window_title_bar(&mut w, chrome, collapsed, pad_total, style.radius);
             }
             if !collapsed {
                 f(&mut w);
@@ -7466,11 +7468,83 @@ fn title_bar_h(row_h: f32) -> f32 {
     row_h
 }
 
+/// **标题栏按钮贴外缘的内缩**（物理像素；`0` = 贴窗口外框右缘 = Windows 风格）。
+///
+/// 单独提出来当常量、而不是散在算式里：这就是"Windows 风格贴角 / 传统内边距"的
+/// 唯一开关（想留一条缝就改这一个数，`title_bar_layout` 已经参数化）。
+const TITLE_BUTTON_INSET: f32 = 0.0;
+
+/// **标题栏布局解算**（纯函数，可单测；坐标原点 = **窗口外框左上角**）。
+///
+/// 为什么要有这个函数：旧实现把按钮当**行内子项**排，靠 `spacer = 内容宽 − 标题宽`
+/// 把它们推到**内容右缘**——而内容右缘比**窗口外框右缘**整整少一个 `pad`（还有一段
+/// 硬编码的 4px 余量），并且 `spacer` 随标题实测宽变化（字体 / 字号 / 文本测量一变就漂）。
+/// 实测（scale = 1.5 的 `win_a`）：`✕ 右缘 = 340`，外框右缘 `= 358` ⇒ **偏左 18px**，
+/// 而 `18 = pad(14) + 4` 恰好落在面板右上圆角（12 逻辑 = 18 物理）上——巧合掩盖了偏差。
+///
+/// 现在按钮**绝对定位在窗口外框上**（`Ui::add_at`），位置只由本函数解算：
+/// - 固定尺寸窗口（`.width(..)`）：簇右缘 = `bar_w − inset_right` ⇒ **贴外框右缘**；
+/// - 自动宽窗口（无 `.width()`）：簇**跟随标题**（`cluster_x = pad + title_w + gap`）——
+///   宽度由内容决定时没有"外框右缘"可贴（与旧版自动宽窗口的行为一致）；
+/// - 标题可用宽 = 簇左缘 − `gap` − 左内边距（`0` = 没地方放标题，不产生负宽）；
+/// - 簇左缘夹到 `≥ pad`：窗口比按钮还窄时，按钮不左越内容左缘；
+/// - 顺序 `[收缩, 关闭]` ⇒ **关闭在最右**（Windows 语义：✕ 恒在最右上角）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TitleBarLayout {
+    /// 标题可用宽（物理像素；`0` = 不截断成负宽）。
+    title_max: f32,
+    /// 收缩按钮矩形（`None` = 不画）。
+    shrink: Option<Rect>,
+    /// 关闭按钮矩形（`None` = 不画）。
+    close: Option<Rect>,
+    /// 条宽：固定宽窗口 = 外框宽；自动宽窗口 = 由内容推导出的外框宽。
+    bar_w: f32,
+}
+
+fn title_bar_layout(
+    bar_w: Option<f32>,
+    pad: f32,
+    row_h: f32,
+    gap: f32,
+    show_shrink: bool,
+    show_close: bool,
+    inset_right: f32,
+    title_w: f32,
+) -> TitleBarLayout {
+    // 按钮边长与 `TitleIconButton::size` 一致（`row_h - 2`，下限 12）。
+    let btn = (row_h - 2.0).max(12.0);
+    let n = (show_shrink as u32 + show_close as u32) as f32;
+    let cluster_w = if n > 0.0 { n * btn + (n - 1.0) * gap } else { 0.0 };
+    // 簇左缘：固定宽窗口贴外框右缘 − inset；自动宽窗口跟随标题。
+    let cluster_x = match bar_w {
+        Some(w) => (w - inset_right - cluster_w).max(pad),
+        None => pad + title_w + gap,
+    };
+    let at = |i: f32| Rect::new(cluster_x + i * (btn + gap), 0.0, btn, row_h);
+    // 索引 0 = 收缩、1 = 关闭 ⇒ 关闭**最右**（只有一个按钮时它自然占 0 号位）。
+    let (shrink, close) = match (show_shrink, show_close) {
+        (true, true) => (Some(at(0.0)), Some(at(1.0))),
+        (true, false) => (Some(at(0.0)), None),
+        (false, true) => (None, Some(at(0.0))),
+        (false, false) => (None, None),
+    };
+    TitleBarLayout {
+        title_max: (cluster_x - gap - pad).max(0.0),
+        shrink,
+        close,
+        bar_w: bar_w.unwrap_or(cluster_x + cluster_w + pad),
+    }
+}
+
 /// **窗口标题栏**（窗口内容**第一行**）：标题文字 + 右侧"收缩 / 关闭"图标按钮。
 ///
 /// 要素：
 /// - 走 `Window`/`UiAdd::row`（与用户内容同一个 `Frame` 结算）⇒ 窗口高度自然包含标题栏，
 ///   收起时只留它一条；通条底色由 `window_impl` 在 `size` 已知后补画（见那里的注释）；
+/// - **按钮绝对定位在窗口外框上**（[`title_bar_layout`]）：右缘 = 外框右缘 −
+///   [`TITLE_BUTTON_INSET`]（`0` ⇒ Windows 风格的贴顶右角）；最右按钮的**右上角取面板
+///   圆角**，贴外缘时才不会方角戳出圆角轮廓。旧版"行内子项 + spacer"的做法已删除
+///   （它永远差一个 `pad + 4px`，见 `title_bar_layout` 的说明）；
 /// - 按钮是 [`TitleIconButton`]（**几何图标**，不是 `×` / `_` 字形 —— 换字体不变形），
 ///   且按下时 `claim_press()` ⇒ **按按钮不会建立窗口拖拽基准**；标题栏空白处仍可拖窗口；
 /// - 点击效果：关闭 ⇒ `*close = false`（该窗口**下一帧**整体不录）；收缩 ⇒ `*collapsed` 取反
@@ -7480,39 +7554,40 @@ fn window_title_bar(
     chrome: &mut WindowChrome<'_>,
     collapsed: bool,
     pad_total: f32,
+    panel_radius: CornerRadius,
 ) {
     let ui = w.ui_mut();
     let title = chrome.title.unwrap_or("");
     let show_close = chrome.close.is_some();
     let show_shrink = chrome.shrink.as_ref().is_some_and(|(show, _)| *show);
     // 行内尺寸全部取**缩放后**主题（`Ui::theme` 已按 DPI 预乘）。
-    let (gap, row_h, font_size, family) = (
+    let (gap, row_h, font_size, family, btn_radius) = (
         ui.theme.gap,
         ui.theme.row_h,
         ui.theme.label.font_size,
         ui.theme.label.font_family.clone(),
+        ui.theme.button.radius,
     );
-    // 按钮边长与 `TitleIconButton::size` 一致（`row_h - 2`）。
-    let btn = (row_h - 2.0).max(12.0);
-    let n_btn = (show_close as u32 + show_shrink as u32) as f32;
-    // 内容宽：`Ui::avail_w()` 是"固定宽 − 2×pad"（[`Frame::fixed_avail_w`]），而子项实际被
-    // clamp 到**固定宽**（`layout.rs::fixed_w_clamps_children_and_settles_width`）——即真正的
-    // 内容盒比它报的多 2×pad。这里补回来，按钮才贴内容右缘（否则差 2×pad，肉眼可见）。
-    let content_w = ui.avail_w().map(|a| a + pad_total * 2.0);
-    // 标题可用宽 = 内容宽 − 按钮区（含按钮**之间**以及标题与按钮之间的间隙）− 余量 4px。
-    // ⚠ 必须**实测标题宽**：spacer 若按"内容宽 − 按钮区"算，行总宽就会多出
-    // `标题宽 + gap − 4`，按钮被推出内容右缘（画到面板外，虽然仍可点，但视觉错位）。
+    // **外框宽**：`Ui::avail_w()` 是"固定宽 − 2×pad"（[`Frame::fixed_avail_w`]），`+2×pad`
+    // 回到**内容宽**，再 `+2×pad` 才是外框宽（与 `Frame::natural_size` 的固定宽口径一致，
+    // 实测 win_a：`avail_w + 28 = 358` = dump 的 `size.x`）。
+    // `None`（无 `.width()`）= 自动宽窗口：宽度由内容决定，交给纯函数走"跟随标题"那条路。
+    let bar_w = ui
+        .avail_w()
+        .map(|a| a + pad_total * 2.0)
+        .map(|cw| cw + pad_total * 2.0);
     let natural = ui.text_size(title, font_size, family.as_deref()).x;
-    let (title_max, spacer) = match content_w {
-        Some(cw) => {
-            let m = (cw - n_btn * btn - (n_btn + 1.0) * gap - 4.0).max(0.0);
-            (Some(m), m - natural.min(m))
-        }
-        // 自动宽窗口（无 `.width()`）：不设上限、不留 spacer —— 标题 + 按钮就是自然宽
-        // （窗口随内容长）。`avail_w()` 此时为 `None`（内容自然宽度）。
-        None => (None, 0.0),
-    };
-    trace_title_bar(collapsed, content_w, natural, spacer, btn);
+    let layout = title_bar_layout(
+        bar_w,
+        pad_total,
+        row_h,
+        gap,
+        show_shrink,
+        show_close,
+        TITLE_BUTTON_INSET,
+        natural,
+    );
+    trace_title_bar(collapsed, natural, &layout);
 
     let mut close_clicked = false;
     let mut shrink_clicked = false;
@@ -7522,31 +7597,46 @@ fn window_title_bar(
     if let Some(fr) = w.ui_mut().frames.last_mut() {
         fr.cursor.y = 0.0;
     }
+    // **只有标题留在"行"里**：`row` 负责条高（`force_h_all(row_h)`）与标题的垂直居中；
+    // 空标题也照录（它 + `force_h_all` 就是"一行标题栏"的高度来源，否则无标题窗口少一行）。
     w.row(|r| {
-        // 标题：省略号模式 ⇒ 过长时按 `title_max` 截断（不撑宽窗口、不挤走按钮）；
+        // 省略号模式 + 簇左缘的硬上限 ⇒ 过长时截断（不撑宽窗口、不挤走按钮）；
         // 不超长时绘制与普通 `label` 完全一致。
-        if let Some(m) = title_max {
-            r.max_size(m, 0.0);
+        if layout.title_max > 0.0 {
+            r.max_size(layout.title_max, 0.0);
         }
         r.add(crate::widgets::Label::new(title).ellipsis());
-        // 撑开剩余宽 ⇒ 按钮**贴内容右缘**（`min_size` + 空标签 = spacer，见 `FontModal`）。
-        if spacer > 0.0 {
-            r.min_size(spacer, 0.0);
-            r.label("");
-        }
-        if show_shrink {
-            // 收起时显示"展开"箭头（↓），展开时显示"收起"箭头（↑）。
-            let icon = if collapsed { Icon::ChevronDown } else { Icon::ChevronUp };
-            shrink_clicked = r
-                .add(crate::widgets::title_button::TitleIconButton::new("::shrink", icon))
-                .clicked();
-        }
-        if show_close {
-            close_clicked = r
-                .add(crate::widgets::title_button::TitleIconButton::new("::close", Icon::Close))
-                .clicked();
-        }
     });
+    // **按钮绝对定位**：窗口帧局部 `(0, 0)` 就是**外框左上角**（见 `window_impl` 里
+    // `bar = Rect::new(0, 0, size.x, bar_h)` 与末尾统一 `translate(display_pos)`）
+    // ⇒ 落点直接是外框坐标，**不需要任何 pad 补偿**。
+    // `add_at` 走"一次性放置覆盖"，控件本身照旧 `allocate_sense`（尺寸 = `row_h - 2` ×
+    // `row_h`，与解算一致），命中 / 按下认领路径完全不变。
+    // 最右按钮的右上角 = **面板右上圆角**：贴外缘必有部分落在面板圆角区，同半径才嵌进去。
+    let btn_radius_tr = CornerRadius { tr: panel_radius.tr, ..btn_radius };
+    if let Some(rect) = layout.shrink {
+        // 收起时显示"展开"箭头（↓），展开时显示"收起"箭头（↑）。
+        let icon = if collapsed { Icon::ChevronDown } else { Icon::ChevronUp };
+        // 只有"收缩在最右"（= 没画关闭按钮）时它才需要接面板圆角。
+        let corners = if show_close { None } else { Some(btn_radius_tr) };
+        shrink_clicked = w
+            .ui_mut()
+            .add_at(
+                Position::Physical(Vec2::new(rect.x, rect.y)),
+                crate::widgets::title_button::TitleIconButton::new("::shrink", icon).corners(corners),
+            )
+            .clicked();
+    }
+    if let Some(rect) = layout.close {
+        close_clicked = w
+            .ui_mut()
+            .add_at(
+                Position::Physical(Vec2::new(rect.x, rect.y)),
+                crate::widgets::title_button::TitleIconButton::new("::close", Icon::Close)
+                    .corners(Some(btn_radius_tr)),
+            )
+            .clicked();
+    }
     if shrink_clicked && let Some((_, c)) = chrome.shrink.as_mut() {
         **c = !**c;
     }
@@ -7555,22 +7645,25 @@ fn window_title_bar(
     }
 }
 
-/// `RJ_CHROME_TRACE=1`：打印标题栏布局解算（内容宽 / 标题实测宽 / spacer / 按钮边长）。
+/// `RJ_CHROME_TRACE=1`：打印标题栏布局解算（外框宽 / 标题实测宽 / 标题可用宽 / 按钮矩形）。
 ///
-/// 为什么留一个开关而不是删掉临时打印：标题栏的**右对齐**依赖"实测标题宽 + 内容宽"，
-/// 而文本测量随字体 / 字号变化——出问题时第一件事就是看这几个数（`--sim-chrome` 点空
-/// 按钮那次就是靠它定位的：spacer 少了标题宽，按钮整体左移了一个按钮位）。
-fn trace_title_bar(
-    collapsed: bool,
-    content_w: Option<f32>,
-    natural: f32,
-    spacer: f32,
-    btn: f32,
-) {
+/// 为什么留一个开关而不是删掉临时打印：标题栏的**贴右缘**依赖"外框宽 + 实测标题宽"，
+/// 而文本测量随字体 / 字号 / DPI 变化——出问题时第一件事就是看这几个数。
+/// ⚠ 这里打的是**解算结果**（`title_bar_layout` 的输出）而不是中间量：断言口径就是
+/// "按钮右缘 == `bar_w − inset`"，所以打印必须包含**能直接核对这条的矩形**。
+fn trace_title_bar(collapsed: bool, title_w: f32, layout: &TitleBarLayout) {
     if std::env::var_os("RJ_CHROME_TRACE").is_some() {
-        let cw = content_w.map_or("none".to_owned(), |v| format!("{v:.1}"));
+        let r = |o: Option<Rect>| match o {
+            Some(r) => format!("[{:.1},{:.1} {:.1}x{:.1}]", r.x, r.y, r.w, r.h),
+            None => "-".to_owned(),
+        };
         eprintln!(
-            "chrome[collapsed={collapsed}] content_w={cw} title_w={natural:.1} spacer={spacer:.1} btn={btn:.1}"
+            "chrome[collapsed={collapsed}] bar_w={:.1} title_w={title_w:.1} title_max={:.1} \
+             shrink={} close={} inset={TITLE_BUTTON_INSET:.1}",
+            layout.bar_w,
+            layout.title_max,
+            r(layout.shrink),
+            r(layout.close),
         );
     }
 }
