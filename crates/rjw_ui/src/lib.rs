@@ -184,8 +184,8 @@ pub use painter::{DrawQueue, Painter};
 pub use state::{ButtonState, CheckboxState, TextFocus, UiState, UiStats, WidgetState};
 pub use style::{
     Brush, ButtonStyle, CheckboxStyle, ComboStyle, DEFAULT_LINE_SPACING, Density, DividerStyle,
-    FocusStyle, GripShape, GripStyle, InputStyle, LabelStyle, ModalStyle, Palette, PanelStyle,
-    ShadowStyle, SliderStyle, Theme, bevel_raised, bevel_sunken, hgrad, vgrad,
+    FocusStyle, GripShape, GripStyle, InputStyle, LabelStyle, MenubarStyle, ModalStyle, Palette,
+    PanelStyle, ShadowStyle, SliderStyle, Theme, bevel_raised, bevel_sunken, hgrad, vgrad,
 };
 pub use input::{KeyboardSnapshot, MouseSnapshot};
 pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Placement, Resize, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};

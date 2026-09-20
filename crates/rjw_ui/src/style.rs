@@ -237,6 +237,9 @@ pub struct Theme {
     pub checkbox: CheckboxStyle,
     /// **分割线样式**（[`Ui::divider_at`](crate::ui::Ui::divider_at) / 容器 `divider()`）。
     pub divider: DividerStyle,
+    /// **菜单栏样式**（[`Ui::menu_bar`](crate::ui::Ui::menu_bar) 的"一行 + 全宽背景"：
+    /// 栏底 / 触发器 / 竖分割线三组令牌；见 [`MenubarStyle`]）。
+    pub menubar: MenubarStyle,
     /// 调试样式（debug_layout 描边等；DebugDraw 图元的样式 = 每次调用显式传参）。
     pub debug: DebugStyle,
     /// **焦点样式**（键盘导航）：当前焦点控件的描边（`finish` 绘制）。
@@ -433,6 +436,26 @@ impl DividerStyle {
         let m = |v: f32| (v * s).round();
         self.thickness = m(self.thickness);
         self.margin = m(self.margin);
+        self
+    }
+}
+
+impl MenubarStyle {
+    /// 预乘 DPI scale：边框宽 / 圆角 / 内边距 / 间距 / 字号 × s 取整（颜色不变）。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).round();
+        self.border_w = m(self.border_w);
+        self.radius = self.radius.scaled_rounded(s);
+        self.padding = m(self.padding);
+        self.gap = m(self.gap);
+        self.font_size = m(self.font_size);
+        self.trigger_radius = self.trigger_radius.scaled_rounded(s);
+        self.trigger_pad_x = m(self.trigger_pad_x);
+        self.separator_w = m(self.separator_w);
+        self.separator_margin = m(self.separator_margin);
         self
     }
 }
@@ -797,6 +820,25 @@ impl DividerStyle {
     /// 从调色板派生：常规描边色的分割线。
     pub fn themed(p: &Palette) -> Self {
         Self { color: p.border, ..Self::default() }
+    }
+}
+
+impl MenubarStyle {
+    /// 从调色板派生：**抬升的栏底 + 一条底边线 + 纯文字触发器（常态透明）**。
+    ///
+    /// 三态底色用 `surface_hover` / `surface_active`（与按钮同一套"逐级抬升"令牌）——
+    /// 但**常态是透明的**：菜单条不该看起来像一排按钮（见结构体文档）。
+    pub fn themed(p: &Palette) -> Self {
+        Self {
+            bg: p.surface_raised,
+            border: p.border,
+            fg: p.text,
+            trigger_bg: Color::TRANSPARENT,
+            trigger_hover: p.surface_hover,
+            trigger_pressed: p.surface_active,
+            separator: p.border,
+            ..Self::default()
+        }
     }
 }
 
@@ -1254,6 +1296,92 @@ impl Default for DividerStyle {
             color: Color::rgba_u8(150, 150, 150, 255),
             thickness: 1.0,
             margin: 4.0,
+        }
+    }
+}
+
+/// **菜单栏样式**（[`Ui::menu_bar`](crate::ui::Ui::menu_bar) 的"一行 + 全宽背景"用它）。
+///
+/// 为什么**单独一组**而不是复用 [`ButtonStyle`]：菜单栏的观感与按钮**相反**——触发器常态
+/// **没有底色、没有边框**（纯文字 + 圆角悬停高亮，像 Windows / VS Code 的菜单条），而
+/// `ButtonStyle` 是"抬升的小方块"。混用会让菜单栏看起来像**一排按钮**（用户实测反馈：
+/// "图一菜单栏的视觉效果并不美观"）。所以这里把"栏底 / 触发器 / 竖分割线"三组令牌分开。
+///
+/// ```toml
+/// [theme.menubar]
+/// bg = { r = 0.13, g = 0.13, b = 0.15, a = 1.0 }
+/// padding = 4.0
+/// trigger_pad_x = 10.0
+/// trigger_hover = { r = 0.24, g = 0.25, b = 0.28, a = 1.0 }
+/// separator_margin = 6.0
+/// ```
+///
+/// ⚠ **颜色写出 0–1 归一化浮点**（`to_toml` 导出的就是这个形式）。手写 `{ r = 32, g = 34 }`
+/// 这种 0–255 整数会被当成 **>1 的分量**，渲染时被夹到**全白** —— 手写主题的经典坑。
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct MenubarStyle {
+    /// 栏背景（默认 `Palette::surface_raised`）。
+    pub bg: Color,
+    /// **底边分隔线**颜色（默认 `Palette::border`）。
+    pub border: Color,
+    /// 底边分隔线宽（逻辑像素；`0` = 不画）。⚠ 只画**底边**（不是四边环）：通栏菜单条
+    /// 只需要一条"下沿"，画四边会在屏幕边缘出现多余的两条竖线。线画在栏内下沿。
+    pub border_w: f32,
+    /// 栏圆角（逻辑像素；默认 **0 = 通栏直角**）。不参与 [`Theme::with_radius`] 级联
+    /// （通栏条圆角化会露出底下的内容）。
+    pub radius: CornerRadius,
+    /// 栏**内边距**（四边同值，逻辑像素；默认 4）：横向 = 首 / 末子项与栏边的距离；
+    /// 纵向 = 栏比内容高出来的那截（触发器等子项恒为 [`Theme::row_h`] 高）。
+    pub padding: f32,
+    /// 触发器之间的间距（逻辑像素；默认 2 —— 菜单条要**紧**，不是工具栏的 `Theme::gap`）。
+    pub gap: f32,
+    /// 触发器字号（逻辑像素）。
+    pub font_size: f32,
+    /// 触发器字体族（`None` = 系统默认；[`Theme::with_font_family`] 会级联到它）。
+    pub font_family: Option<Arc<str>>,
+    /// 触发器文字色（默认 `Palette::text`）。
+    pub fg: Color,
+    /// 触发器**常态底色**（默认**全透明** ⇒ 看起来是纯文字菜单，而不是一排按钮）。
+    pub trigger_bg: Color,
+    /// 触发器**悬停**底色。
+    pub trigger_hover: Color,
+    /// 触发器**按下 / 当前展开**底色（展开的菜单要一直亮着，见 [`crate::widgets::MenuBar`]）。
+    pub trigger_pressed: Color,
+    /// 触发器圆角（逻辑像素；默认 4 —— 悬停高亮是小圆角块）。
+    pub trigger_radius: CornerRadius,
+    /// 触发器左右内边距（逻辑像素；默认 10）：触发器宽 = 文字实测宽 + 2 × 它。
+    pub trigger_pad_x: f32,
+    /// 竖分割线颜色（默认 `Palette::border`）。
+    pub separator: Color,
+    /// 竖分割线线宽（逻辑像素；默认 1）。
+    pub separator_w: f32,
+    /// 竖分割线两侧留白（逻辑像素；默认 6）：占位宽 = 线宽 + 2 × 它，线长 = 行高 − 2 × 它。
+    pub separator_margin: f32,
+}
+
+impl Default for MenubarStyle {
+    fn default() -> Self {
+        Self {
+            bg: Color::rgba_u8(244, 244, 246, 255),
+            border: Color::rgba_u8(200, 200, 204, 255),
+            border_w: 1.0,
+            radius: CornerRadius::default(),
+            padding: 4.0,
+            gap: 2.0,
+            font_size: 13.0,
+            font_family: None,
+            fg: Color::rgba_u8(28, 28, 30, 255),
+            // **常态透明**：菜单条不是一排按钮（这一条就是"图二观感"的关键）。
+            trigger_bg: Color::TRANSPARENT,
+            trigger_hover: Color::rgba_u8(228, 228, 232, 255),
+            trigger_pressed: Color::rgba_u8(214, 214, 220, 255),
+            trigger_radius: CornerRadius::all(4.0),
+            trigger_pad_x: 10.0,
+            separator: Color::rgba_u8(200, 200, 204, 255),
+            separator_w: 1.0,
+            separator_margin: 6.0,
         }
     }
 }
@@ -1746,6 +1874,7 @@ impl Theme {
             input: InputStyle::themed(p),
             checkbox: CheckboxStyle::themed(p),
             divider: DividerStyle::themed(p),
+            menubar: MenubarStyle::themed(p),
             debug: DebugStyle::themed(p),
             focus: FocusStyle::themed(p),
             modal: ModalStyle::themed(p),
@@ -1835,18 +1964,20 @@ impl Theme {
         self.button.font_family = f.clone();
         self.checkbox.font_family = f.clone();
         self.input.font_family = f.clone();
-        self.combo.font_family = f;
+        self.combo.font_family = f.clone();
+        self.menubar.font_family = f;
         self
     }
 
     /// **全局字号**：级联到全部文本子样式（`label` / `button` / `checkbox` / `input` /
-    /// `combo`）。
+    /// `combo` / `menubar`）。
     pub fn with_font_size(mut self, size: f32) -> Self {
         self.label.font_size = size;
         self.button.font_size = size;
         self.checkbox.font_size = size;
         self.input.font_size = size;
         self.combo.font_size = size;
+        self.menubar.font_size = size;
         self
     }
 
@@ -1872,12 +2003,15 @@ impl Theme {
         self.input.radius = r;
         self.checkbox.radius = r.map(|v| v * 0.5);
         self.combo.menu_radius = r.map(|v| v.min(6.0));
+        // 菜单栏：只级联**触发器**圆角（栏本身是通栏条，圆角恒 0 —— 见 `MenubarStyle::radius`）。
+        self.menubar.trigger_radius = r.map(|v| v.min(6.0));
         self
     }
 
     /// **边框宽度**（逻辑像素；0 = 不画边框）。
     ///
-    /// 级联到全部**有边框**的子样式：`panel` / `button` / `input` / `checkbox`。
+    /// 级联到全部**有边框**的子样式：`panel` / `button` / `input` / `checkbox` /
+    /// `menubar`（栏的**底边线**宽）。
     /// 边框**颜色**不是主题标量而是调色板令牌（[`Palette::border`] 常规 /
     /// [`Palette::border_strong`] 强描边）——换色请改调色板，这样"面板 / 按钮 /
     /// 输入框"的描边深浅关系不会各自漂移。
@@ -1887,6 +2021,7 @@ impl Theme {
         self.button.border_w = w;
         self.input.border_w = w;
         self.checkbox.border_w = w;
+        self.menubar.border_w = w;
         self
     }
 
@@ -2027,6 +2162,22 @@ impl Theme {
         self.divider = s;
         self
     }
+    /// **菜单栏样式**（[`Ui::menu_bar`](crate::ui::Ui::menu_bar)：栏底 / 触发器 / 竖分割线）。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{MenubarStyle, Theme};
+    /// // 整组替换，或只改想要的字段（`..Theme::dark().menubar` 保留其余默认）
+    /// let t = Theme::dark().with_menubar(MenubarStyle {
+    ///     border_w: 0.0,   // 不要底边线
+    ///     padding: 6.0,    // 栏更厚一点
+    ///     ..Theme::dark().menubar
+    /// });
+    /// # let _ = t;
+    /// ```
+    pub fn with_menubar(mut self, s: MenubarStyle) -> Self {
+        self.menubar = s;
+        self
+    }
     pub fn with_focus(mut self, s: FocusStyle) -> Self {
         self.focus = s;
         self
@@ -2063,6 +2214,7 @@ impl Theme {
         self.input = self.input.scaled(s);
         self.checkbox = self.checkbox.scaled(s);
         self.divider = self.divider.scaled(s);
+        self.menubar = self.menubar.scaled(s);
         self.debug = self.debug.scaled(s);
         self.focus = self.focus.scaled(s);
         self.modal = self.modal.scaled(s);
@@ -2089,12 +2241,50 @@ mod tests {
         assert_eq!(t.button.font_family.as_deref(), Some("Microsoft YaHei"));
         assert_eq!(t.checkbox.font_family.as_deref(), Some("Microsoft YaHei"));
         assert_eq!(t.input.font_family.as_deref(), Some("Microsoft YaHei"));
+        // 菜单栏触发器也是"文本子样式"：漏了它就会出现"全局换字体、菜单条还是旧字体"。
+        assert_eq!(t.menubar.font_family.as_deref(), Some("Microsoft YaHei"));
         assert_eq!(t.label.font_size, 16.0);
         assert_eq!(t.button.font_size, 16.0);
         assert_eq!(t.checkbox.font_size, 16.0);
         assert_eq!(t.input.font_size, 16.0);
+        assert_eq!(t.menubar.font_size, 16.0);
         // 无文本子样式不受影响
         assert_eq!(t.slider.track, Theme::dark().slider.track);
+    }
+
+    /// **菜单栏样式**（本轮新增）：从调色板派生（常态底色必须**透明**，否则菜单条变"一排
+    /// 按钮"）、DPI 预乘只动尺寸、全局 `with_border_w` / `with_font_size` 级联到它。
+    #[test]
+    fn menubar_style_themes_scales_and_cascades() {
+        let p = Palette::dark();
+        let t = Theme::themed(&p);
+        assert_eq!(
+            <[f32; 4]>::from(t.menubar.trigger_bg)[3],
+            0.0,
+            "触发器常态底色必须全透明（纯文字菜单条）"
+        );
+        assert_eq!(t.menubar.bg, p.surface_raised);
+        assert_eq!(t.menubar.trigger_hover, p.surface_hover);
+        assert_eq!(t.menubar.trigger_pressed, p.surface_active);
+        assert_eq!(t.menubar.fg, p.text);
+        assert_eq!(t.menubar.border, p.border);
+        assert_eq!(t.menubar.separator, p.border);
+
+        // DPI 预乘：尺寸 × s 取整、颜色不变（`Ui` 内部一律物理像素）。
+        let s = t.clone().scaled(1.5);
+        assert_eq!(s.menubar.padding, (4.0f32 * 1.5).round());
+        assert_eq!(s.menubar.gap, (2.0f32 * 1.5).round());
+        assert_eq!(s.menubar.trigger_pad_x, (10.0f32 * 1.5).round());
+        assert_eq!(s.menubar.separator_margin, (6.0f32 * 1.5).round());
+        assert_eq!(s.menubar.border_w, (1.0f32 * 1.5).round());
+        assert_eq!(s.menubar.bg, t.menubar.bg);
+
+        // 全局级联：`with_border_w(0)` 也必须把菜单条的**底边线**关掉（否则"全局扁平化、
+        // 菜单条还留一条线"）；圆角只级联到**触发器**（栏本身是通栏条，恒 0）。
+        let flat = Theme::dark().with_border_w(0.0).with_radius(8.0);
+        assert_eq!(flat.menubar.border_w, 0.0);
+        assert_eq!(flat.menubar.radius, CornerRadius::default(), "栏圆角恒定（通栏条）");
+        assert_eq!(flat.menubar.trigger_radius, CornerRadius::all(6.0), "触发器取 min(r, 6)");
     }
 
     #[test]

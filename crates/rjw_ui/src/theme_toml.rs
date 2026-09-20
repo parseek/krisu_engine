@@ -265,6 +265,23 @@ mod tests {
         let fresh = Theme::from_toml("gap = 3.0").expect("加载");
         assert_eq!(fresh.gap, 3.0);
         assert_ne!(fresh.feather, 2.5, "from_toml 从 Default 起，不继承当前主题");
+        // **新子样式也要能被手写文件改**（`Theme::menubar` 是本轮新增的独立样式组）：
+        // 只写 `[menubar]` 段 ⇒ 菜单栏变样，其它段完全不动。
+        let mut t = touched();
+        let before_bg = t.menubar.bg;
+        let before_gap = t.gap;
+        t.apply_toml(
+            "[menubar]\ntrigger_bg = { r = 1.0, g = 0.0, b = 0.0, a = 1.0 }\n\
+             trigger_pad_x = 6.0\n[menubar.trigger_radius]\ntl = 2.0\ntr = 2.0\nbr = 2.0\nbl = 2.0",
+        )
+        .expect("菜单栏合并");
+        assert_eq!(t.menubar.trigger_pad_x, 6.0);
+        assert_eq!(t.menubar.trigger_radius, crate::draw::CornerRadius::all(2.0));
+        // ⚠ 颜色是 **0–1 归一化浮点**（导出就是这个形式）：`{ r = 1.0 }` == `rgba_u8(255, ..)`。
+        // （手写 0–255 的整数会被当成 >1 ⇒ 渲染时夹到全白 —— 见 `MenubarStyle` 的文档警告。）
+        assert_eq!(t.menubar.trigger_bg, Color::rgba_u8(255, 0, 0, 255));
+        assert_eq!(t.menubar.bg, before_bg, "没写的菜单栏字段保持原值");
+        assert_eq!(t.gap, before_gap, "别的段不受影响");
     }
 
     #[test]

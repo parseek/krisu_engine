@@ -2772,9 +2772,6 @@ impl App for UiApp {
                         exit_requested = true;
                     }
                 });
-                // **竖向分割线**（栏内分组）：栏就是一行 ⇒ 竖线 = `Divider::vertical()`，
-                // `separator_v()` 是它的便利写法（`bar.add(Divider::new().vertical())` 等价）。
-                bar.separator_v();
                 bar.menu("视图", |m| {
                     m.item_checked("主题调节窗口", &mut self.theme_tuner.open);
                     // **责任链写法**（与上面 `item_checked` 等价，两种都留着当对照）：
@@ -2802,7 +2799,6 @@ impl App for UiApp {
                         }
                     });
                 });
-                bar.separator_v();
                 bar.menu("帮助", |m| {
                     m.caption("操作提示");
                     m.separator();
@@ -2810,8 +2806,9 @@ impl App for UiApp {
                     m.label("Tab 遍历焦点 · Enter / Space 激活");
                     m.label("Esc 先关菜单，再按才退出");
                 });
-                // **栏里放非菜单控件**：栏本质就是一行，标签 / 按钮 / 输入框都能塞
-                // （点它们**不会**关菜单 —— 见 `menu_bar_should_close` 的 `on_bar`）。
+                // **竖分割线 + 非菜单控件**：栏本质就是一行 —— 菜单组与"状态"之间用竖线分开，
+                // 后面再放一个标签。样式走 `Theme::menubar` 的分割线令牌（更短更淡），
+                // 点它们**不会**关菜单（见 `menu_bar_should_close` 的 `on_bar`）。
                 bar.separator_v();
                 bar.label("状态：就绪");
             });
@@ -2985,24 +2982,19 @@ impl App for UiApp {
             // 注入只能经 `Frame` 且在段之前，所以这里只算、段外下一帧注（同 `--sim-tuner`）。
             if self.sim_menu {
                 let dump = ui.debug_dump();
-                let (fs, pad_x, row_h, gap, sep_w) = {
-                    let t = ui.theme();
-                    (
-                        t.button.font_size,
-                        t.button.padding.x,
-                        t.row_h,
-                        t.gap,
-                        t.divider.thickness + t.divider.margin * 2.0,
-                    )
+                // 触发器几何 = `Theme::menubar` 的令牌（字号 / 左右内边距 / 行列间距 / 栏内边距）
+                // —— 与引擎同源，改主题不用改脚本。
+                let (fs, pad_x, row_h, gap, mb_pad) = {
+                    let m = &ui.theme().menubar;
+                    (m.font_size, m.trigger_pad_x, ui.theme().row_h, m.gap, m.padding)
                 };
                 // 触发器：「视图」是第 2 个（三个都是两个字 ⇒ 等宽）；栏位置取常量
                 // `MENUBAR_POS`（逻辑 → 物理，与录制同源）——挪栏不用改脚本。
-                // ⚠ demo 的栏是 `[文件][竖线][视图][竖线][帮助][竖线][状态标签]`
-                // ⇒ 「视图」前面还隔着**一条竖分割线**（占位宽 = `sep_w`）+ 一个 `gap`。
+                // 栏内容 = `[内边距][文件][间距][视图]…` ⇒ 视图 x = 栏 + 内边距 + 触-发器宽 + 间距。
                 let bar = (MENUBAR_POS * scale).round();
                 let tw = ui.text_size("视图", fs, None).x;
                 let w = tw + pad_x * 2.0;
-                let trigger_rect = Rect::new(bar.x + w + gap + sep_w + gap, bar.y, w, row_h);
+                let trigger_rect = Rect::new(bar.x + mb_pad + w + gap, bar.y + mb_pad, w, row_h);
                 self.menu_trigger_pt =
                     Some(Vec2::new(trigger_rect.x + w * 0.5, trigger_rect.y + row_h * 0.5));
                 // 下拉原点（引擎里的 `pos = (t.x, t.y + h + 2)`，见 `MenuBar::popup`）。
@@ -3012,7 +3004,7 @@ impl App for UiApp {
                 // 没有任何触发器 / 控件）——验"点栏内空白不收起菜单"。
                 self.menu_bar_blank_pt = Some(Vec2::new(
                     bar.x + ui.window_physical_size().0 as f32 * 0.6,
-                    bar.y + row_h * 0.5,
+                    bar.y + mb_pad + row_h * 0.5,
                 ));
                 // 下拉里**第一个菜单项**：注意面板左内边距 = `item_pad_x`（勾选方框画在
                 // 菜单项**内容里**，不占内边距）+ 边框 ⇒ 第一项从内容原点起，不是面板顶边。

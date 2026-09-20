@@ -221,16 +221,19 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
 
     /// 加一个菜单：`label` = 栏上的文字，`content` = 展开时下拉面板的内容（闭包上下文）。
     pub fn menu(&mut self, label: &str, content: impl FnOnce(&mut MenuCtx<'_, '_, '_>)) {
-        let (fs, fam, st, row_h) = {
+        // 触发器样式 = **独立的** `Theme::menubar`（不是 `Theme::button`）：菜单条的触发器
+        // 常态**无底色 / 无边框**、只有圆角悬停高亮 —— 用按钮样式会看起来像"一排按钮"
+        // （用户实测反馈）。
+        let (mb, row_h) = {
             let t = &self.pack.ui_mut().theme;
-            (t.button.font_size, t.button.font_family.clone(), t.button.clone(), t.row_h)
+            (t.menubar.clone(), t.row_h)
         };
+        let (fs, fam) = (mb.font_size, mb.font_family.clone());
         let tw = self.pack.ui_mut().text_size(label, fs, fam.as_deref()).x;
-        let w = tw + st.padding.x * 2.0;
+        let w = tw + mb.trigger_pad_x * 2.0;
         let trigger_id = format!("{}::{}", self.id, label);
         // **占光标 + 收交互一次做完**（`Sense::DRAG` ⇒ 触发器上的按下即 `claim_press`，
-        // 与旧版显式 `claim_press()` 等价）：矩形 = 行内自然宽 × 行高，与旧版**逐像素相同**
-        // （`--sim-menu` 的坐标解算与下拉原点都建立在这上面）。
+        // 与旧版显式 `claim_press()` 等价）：矩形 = 行内自然宽 × 行高。
         let (rect, resp) =
             self.pack
                 .ui_mut()
@@ -253,21 +256,29 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
             None => self.open.as_deref() == Some(abs.as_str()),
         };
         // 触发器外观：开着的**一直亮**（按下态底色），否则 hover / 常态。
+        // 常态底色默认**全透明** ⇒ 不推背景命令（少一条命令、也是"纯文字菜单"的观感）。
         let bg = if is_open || resp.pressed {
-            st.bg_pressed
+            mb.trigger_pressed
         } else if resp.hovered {
-            st.bg_hover
+            mb.trigger_hover
         } else {
-            st.bg
+            mb.trigger_bg
         };
-        self.pack
-            .ui_mut()
-            .push_panel_like(rect, bg, st.border, st.border_w, st.radius, 1);
+        if <[f32; 4]>::from(bg)[3] > 0.0 {
+            self.pack.ui_mut().push_panel_like(
+                rect,
+                bg,
+                Color::TRANSPARENT,
+                0.0,
+                mb.trigger_radius,
+                1,
+            );
+        }
         self.pack.ui_mut().push_text_rect(
             rect,
             label,
             fs,
-            st.fg,
+            mb.fg,
             fam,
             TextAlign::Center,
             TextVAlign::Center,
@@ -296,19 +307,28 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
         }
     }
 
-    /// **竖向分割线**（分隔两组菜单 / 控件）：占位宽 = 线厚 + 2×留白、高 = 一行。
+    /// **竖向分割线**（分隔两组菜单 / 控件）：占位宽 = 线宽 + 2×留白、高 = 一行。
     ///
     /// 就是 `bar.add(Divider::new().vertical())`（`Deref` 到 `Pack` ⇒ `add` 本来也能用），
-    /// 单独给一个方法只为**可发现性**：栏里竖分割线是常见需求。
+    /// 单独给一个方法只为**可发现性**；样式取 [`Theme::menubar`](crate::style::Theme::menubar)
+    /// 的分割线令牌（不是 `Theme::divider`：菜单条里的竖线更短、更淡）。
+    /// ⚠ `Size::Physical`：主题**已按 DPI 预乘**，再走 `Size::Logical` 会被乘第二次。
     pub fn separator_v(&mut self) {
-        self.pack.add(crate::widgets::Divider::new().vertical());
+        let mb = self.pack.ui_mut().theme.menubar.clone();
+        self.pack.add(
+            crate::widgets::Divider::new()
+                .vertical()
+                .color(mb.separator)
+                .thickness(Size::Physical(mb.separator_w))
+                .margin(Size::Physical(mb.separator_margin)),
+        );
     }
 
     /// 收尾（由 [`Ui::menu_bar`](crate::Ui::menu_bar) 调用）：返回原始事实 + 背景样式。
     pub(crate) fn finish(mut self) -> MenuBarFacts {
-        let (bg_def, border_def, border_w_def, radius_def) = {
+        let (mb, radius) = {
             let t = &self.pack.ui_mut().theme;
-            (t.palette.surface_raised, t.panel.border, t.panel.border_w, t.panel.radius)
+            (t.menubar.clone(), t.menubar.radius)
         };
         let esc = self.pack.ui_mut().key_down_edge(winit::keyboard::KeyCode::Escape);
         MenuBarFacts {
@@ -321,10 +341,10 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
             popup: self.popup,
             width: self.width,
             bg: MenuBarBg {
-                bg: self.bg.unwrap_or(bg_def),
-                border: self.border.unwrap_or(border_def),
-                border_w: self.border_w.unwrap_or(border_w_def),
-                radius: self.radius.unwrap_or(radius_def),
+                bg: self.bg.unwrap_or(mb.bg),
+                border: self.border.unwrap_or(mb.border),
+                border_w: self.border_w.unwrap_or(mb.border_w),
+                radius: self.radius.unwrap_or(radius),
             },
         }
     }

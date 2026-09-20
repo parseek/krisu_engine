@@ -1719,13 +1719,13 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {   // 位置 = 栏左上角（�
         m.separator();                                  // 菜单内的水平分割线
         if m.item("导入图片…") { /* 点完自动收起 */ }
     });
-    bar.separator_v();                                 // ← **竖向分割线**（栏内分组）
     bar.menu("视图", |m| {
         m.item_checked("窗口 A 显示", &mut self.show_a); // 带勾选：点击翻转 `&mut bool`
         m.row(|r| {                                     // **横向排版**（`Deref` 到 `Window`）
             if r.button("d0", "紧凑").clicked() { }
         });
     });
+    bar.separator_v();                                  // ← **竖向分割线**（菜单组 | 其它）
     bar.add(Divider::new().vertical());                 // ← 等价写法（`separator_v()` 就是它）
     bar.label("状态：就绪");                             // ← 栏里放**任何控件**都行
 });
@@ -1733,8 +1733,9 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {   // 位置 = 栏左上角（�
 
 | 行为 | 机制 |
 |---|---|
-| **栏 = 一行** | `Ui::menu_bar` 内部 `container(pos, Frame::new_stack(PackSide::Left, gap, 0.0))` + `force_h_all(row_h)` ⇒ 触发器 / 竖分割线 / 塞进来的控件**同一个行高**；内边距 0 ⇒ 第一个触发器正好从 `pos` 起（`--sim-menu` 的坐标解算按这个口径） |
-| **全宽背景** | 子项录**完之后**再 `push_panel_like(栏矩形, …, elem = 0)`：按 `(win, depth, elem, seq)` 压在**同深度已有的底层绘制之上**、所有控件之下（子项在容器里 depth + 1）。默认 `Palette::surface_raised` + `Theme::panel` 的边框 / 圆角（与窗口标题栏通条同一套默认），链式可覆盖：`bg` / `border` / `border_w` / `radius` / `width`。⚠ 它**不**盖在普通窗口（`win > 0`）之上 |
+| **栏 = 一行** | `Ui::menu_bar` 内部 `container(pos, Frame::new_stack(PackSide::Left, gap, pad))` + `force_h_all(row_h)` ⇒ 触发器 / 竖分割线 / 塞进来的控件**同一个行高**；`gap` / `pad` 取 `Theme::menubar`（默认 2 / 4）⇒ 第一个触发器从 `pos + pad` 起 |
+| **全宽背景** | 子项录**完之后**再 `push_panel_like(栏矩形, …, elem = 0)`：按 `(win, depth, elem, seq)` 压在**同深度已有的底层绘制之上**、所有控件之下（子项在容器里 depth + 1）。默认取 `Theme::menubar`（`bg` / `border` / `border_w` / `radius`），链式可覆盖：`bg` / `border` / `border_w` / `radius` / `width`。⚠ 它**不**盖在普通窗口（`win > 0`）之上 |
+| **底边线只画底边** | 单独 `push_solid_rect` 栏内下沿那条（**不是**四边环）：通栏条画环会在屏幕边缘多出两条竖线（`Theme::menubar.border_w = 0` 即不画） |
 | **栏宽** | `bar.width(..)` 只决定**背景铺多宽**（不 clamp 子项）；右推某块用 `bar.min_size(剩余宽, 0.0); bar.label("")`（与标题栏同一招）。栏**不占父容器光标**（浮在顶层） |
 | 展开状态 | `UiState::menu_open`（**触发器绝对 ID**；与 `combo_open` 分开存——同一时刻只该有一个菜单开着，而下拉框属于某个控件） |
 | 点另一个触发器 | 切换（旧的关、新的开）；再点自己 = 收起（走 `action`，**优先于**收起规则） |
@@ -1743,7 +1744,46 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {   // 位置 = 栏左上角（�
 | 点栏内空白 / 竖分割线 / 栏里的别的控件 | **不收起**（"栏 = 一行容器"带来的语义；旧实现只认"落在某个触发器上"，会误关） |
 | **Esc** | 收起。应用自己的 Esc 语义先看 `UiState::menu_open()`（菜单开着那一帧别抢） |
 | 下拉面板 | 一个 [`Level::Normal`] + **`WindowClamp::Locked`** + **`.resize(false, Resize::None)`** 的浮层窗口（点它不置顶、**拖不动、也没有缩放柄**），且 z 落在**浮层区间**（`WIN_TOPMOST` 基址 + 嵌套层数，见 §18.15「分层 z」） |
-| 触发器交互 | `allocate_sense(.., Sense::DRAG)`：占光标 + 命中 + 按下认领一次做完（按下不会被外层当成拖拽基准），触发器矩形与旧版**逐像素相同**（外宽 = 文本实测宽 + `ButtonStyle::padding.x × 2`，高 = `row_h`） |
+| 触发器交互 | `allocate_sense(.., Sense::DRAG)`：占光标 + 命中 + 按下认领一次做完（按下不会被外层当成拖拽基准） |
+| 触发器几何 | 宽 = **文字实测宽 + 2 × `Theme::menubar.trigger_pad_x`**，高 = `Theme::row_h`；栏高 = `row_h + 2 × Theme::menubar.padding`；子项间距 = `Theme::menubar.gap`（默认 2 —— 菜单条要**紧**，不是工具栏的 `Theme::gap`） |
+
+**样式令牌**（`Theme::menubar: MenubarStyle`，**独立于 `Theme::button`**）：
+
+| 字段 | 默认 | 语义 |
+|---|---|---|
+| `bg` | `Palette::surface_raised` | 栏背景（铺满 `bar.width(..)` 的整条宽度） |
+| `border` / `border_w` | `Palette::border` / 1.0 | **底边线**（只画底边，不是四边环；`0` = 不画）。线画在栏内下沿 |
+| `radius` | `CornerRadius::default()`（0） | 栏圆角。**不参与 `with_radius` 级联**（通栏条圆角化会露出底下的内容） |
+| `padding` | 4.0 | 栏内边距（**四边同值**）：横向 = 首 / 末子项与栏边的距离；纵向 = 栏比内容高出来的那截 |
+| `gap` | 2.0 | 触发器之间的间距 |
+| `font_size` / `font_family` | 13.0 / `None` | 触发器文本（`with_font_size` / `with_font_family` 会级联到它） |
+| `fg` | `Palette::text` | 触发器文字色 |
+| `trigger_bg` | **全透明** | 触发器**常态**底色 —— **这一条就是"菜单条 ≠ 一排按钮"的关键**：全透明 ⇒ 引擎连背景命令都不推，只有悬停 / 展开时才画圆角高亮 |
+| `trigger_hover` / `trigger_pressed` | `Palette::surface_hover` / `surface_active` | 悬停 / 按下（含"当前展开"）底色 |
+| `trigger_radius` | 4.0（`with_radius` 级联为 `min(r, 6)`） | 触发器高亮圆角 |
+| `trigger_pad_x` | 10.0 | 触发器左右内边距（决定触发器宽） |
+| `separator` / `separator_w` / `separator_margin` | `Palette::border` / 1.0 / 6.0 | 竖分割线颜色 / 线宽 / 两侧留白（`separator_v()` 用它，**不是** `Theme::divider`：菜单条里的竖线更短更淡） |
+
+```rust
+// 换主题：整组替换（或只改想要的字段）
+let theme = Theme::dark().with_menubar(MenubarStyle {
+    border_w: 0.0,                    // 不要底边线
+    trigger_hover: Color::TRANSPARENT, // 连悬停高亮也不要（纯文字）
+    ..Theme::dark().menubar
+});
+```
+```toml
+# 手写主题文件也能单独调它（⚠ 颜色写 0–1 归一化浮点：`{ r = 0.13, ... }`）
+[theme.menubar]
+padding = 6.0
+trigger_pad_x = 12.0
+trigger_hover = { r = 0.24, g = 0.25, b = 0.28, a = 1.0 }
+```
+
+> ⚠ **手写 TOML 的颜色是 0–1 归一化浮点**（`to_toml` 导出的形式）。写 `{ r = 32, g = 34 }`
+> 这种**0–255 整数**会被当成"分量 > 1"⇒ 渲染时被夹到**全白**（不是报错）——这是手写主题的
+> 经典坑，`docs/DEBUGGING.md` 有症状 / 排查。
+
 
 > 面板的**录制 / 样式 / 宽度 / 关闭规则**全在 [`crate::widgets::menu`]（`menu::popup_show`）——
 > 与 [`Dropdown`](crate::Dropdown) **同一套实现**，本模块只负责"横向一行 + 栏的判定"。
@@ -1789,8 +1829,18 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {   // 位置 = 栏左上角（�
 **验证**：`--sim-menu` 三段——① 点「视图」触发器 → 菜单打开 → 点第一个菜单项 → 勾选翻转 +
 菜单自动收起；② 在面板空白处按住拖 600+px → 面板原点不变（`Locked`）；③ **点栏内空白** →
 菜单**仍开着**（`on_bar` 语义）。引擎侧不变量由
-`state::tests::menu_open_is_readable_and_cleared_by_reset`（读得到 + `reset` 清空）与
-`widgets::menubar::tests::close_rules_cover_every_combination`（收起规则逐组合）守着。
+`state::tests::menu_open_is_readable_and_cleared_by_reset`（读得到 + `reset` 清空）、
+`widgets::menubar::tests::close_rules_cover_every_combination`（收起规则逐组合）与
+`style::tests::menubar_style_themes_scales_and_cascades`（主题派生 / DPI / 全局级联）守着。
+实测（DPI 1.5，demo 栏铺满整屏）：
+
+```
+menu[bar menubar] content=(222,39) bar=(135,18 1920x51) on_trigger=… on_bar=… close=…
+sim-menu: 面板原点=Some(Vec2(214.0, 65.0)) · 期望=Some(Vec2(214.0, 65.0)) … [OK] 菜单面板不会被拖动
+sim-menu: 点栏内空白后 menu_open=true [OK] 点栏内空白不收起菜单
+```
+
+（栏宽 1920 = 整屏；栏高 51 = `row_h 39 + 2 × padding 6`；触发器几何 = 文字宽 + `2 × trigger_pad_x 15`。）
 
 ### 18.14 分段按钮组（`Segmented`）与"边框归零"的兜底
 

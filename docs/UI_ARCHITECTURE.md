@@ -148,8 +148,9 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 > **进展（本轮）**：**菜单栏**的触发器交互并入 `widgets` 协议（`allocate_sense` +
 > `Response`，不再手写 `hit_abs` + `update_interact`），且 `MenuBar` 现在 `Deref` 到
 > `Pack` —— 与 `MenuCtx` `Deref` 到 `Window` 同一套模式（栏里能塞 `UiAdd` 的任何控件）。
-> 同时 `Divider` 增加 `axis` / `vertical()`（公开 `DividerAxis`）。两处都是**加** API、
-> 没有新增"第三条入口"。
+> 同时 `Divider` 增加 `axis` / `vertical()`（公开 `DividerAxis`），并新增**独立的主题样式组**
+> `Theme::menubar: MenubarStyle`（栏底 / 触发器 / 竖分割线；不再借用 `Theme::button`——借用
+> 会让菜单条看起来像一排按钮）。几处都是**加** API、没有新增"第三条入口"。
 
 ### 5.2 文本框没有搬进 `widgets/`
 `ui.rs` 里 `text_input_at` + `text_area_impl` 约 **1000 行**（含 IME 候选框、选择、

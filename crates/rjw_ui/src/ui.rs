@@ -3305,13 +3305,14 @@ impl<'a> Ui<'a> {
     ) -> Vec2 {
         let pos = pos.into().to_physical(self.scale);
         let open = self.state.menu_open.as_ref().map(|s| s.as_str().to_owned());
-        // **栏 = 一行**：`PackSide::Left` + 内边距 0（第一个触发器正好从 `pos` 起，
-        // `--sim-menu` 的坐标解算与 `MENUBAR_POS` 都按这个口径），`force_h_all(row_h)`
-        // ⇒ 触发器 / 竖分割线 / 塞进来的按钮同一个行高。
+        // **栏 = 一行**：`PackSide::Left` + `Theme::menubar` 的内边距 / 间距（默认 4 / 2）、
+        // `force_h_all(row_h)` ⇒ 触发器 / 竖分割线 / 塞进来的控件同一个行高。
+        // 内边距为 0 时第一个触发器正好从 `pos` 起（`--sim-menu` 的坐标解算按主题取值）。
+        let (mb_gap, mb_pad) = (self.theme.menubar.gap, self.theme.menubar.padding);
         let mut facts = None;
         let (size, _) = self.container(
             pos,
-            Frame::new_stack(PackSide::Left, self.theme.gap, 0.0),
+            Frame::new_stack(PackSide::Left, mb_gap, mb_pad),
             |ctx| {
                 // 重借用：`Pack` 要**拿走**一个 `&mut Ui`（`MenuBar` 靠 `Deref` 到它拿 `UiAdd`），
                 // 而 `ctx` 只是 `&mut ContainerCtx` ⇒ 借用 `*ctx.ui`（生命周期到闭包结束，
@@ -3362,9 +3363,22 @@ impl<'a> Ui<'a> {
         };
         // **全宽背景**：在子项**之后**录（`elem = 0`，但 seq 更大）⇒ 压在同深度底层绘制之上、
         // 所有控件之下（子项在 `container` 里 depth + 1 ⇒ 天然画在它之上）。
+        // ⚠ 底边线**单独画**（不是四边环）：通栏条只要一条"下沿"，画环会在屏幕边缘多出两条
+        // 竖线；线画在栏内下沿。`bar.border_w(0)` / 主题 `border_w = 0` ⇒ 不画。
         if bar_rect.w > 0.0 && bar_rect.h > 0.0 {
             let bg = facts.bg;
-            self.push_panel_like(bar_rect, bg.bg, bg.border, bg.border_w, bg.radius, 0);
+            self.push_panel_like(bar_rect, bg.bg, Color::TRANSPARENT, 0.0, bg.radius, 0);
+            if bg.border_w > 0.0 {
+                self.push_solid_rect(
+                    Rect::new(
+                        bar_rect.x,
+                        bar_rect.y + bar_rect.h - bg.border_w,
+                        bar_rect.w,
+                        bg.border_w,
+                    ),
+                    bg.border,
+                );
+            }
         }
         size
     }
