@@ -413,6 +413,58 @@ impl<F: MenuContent> Widget for Dropdown<'_, F> {
     }
 }
 
+// ─── `Ui` 的显式 rect 入口（**实现体就近放控件自己的文件**）────────
+
+// 搬运说明（`ui.rs` → `widgets/`，路线图 P2a）：公开路径不变（仍是 `Ui::combo_at` /
+// `Ui::combo`），实现体搬到本文件；`ui.rs` 只保留"引擎"逻辑。参见
+// `widgets/button.rs` 顶部的搬运说明与 `docs/UI_ARCHITECTURE.md` §5.1。
+impl Ui<'_> {
+    /// **下拉框**（显式 rect；`rect` 为相对当前容器 origin 的局部坐标）。
+    ///
+    /// ⚠ 本方法现在是 [`Dropdown`](crate::Dropdown) 的**糖**（只有一套浮层实现，
+    /// 见 [`crate::widgets::menu`]）——新代码请直接用
+    /// `p.add(Dropdown::options(..))`（自动尺寸触发器）或
+    /// `p.add(Dropdown::new(..).menu(|m| ..))`（菜单内容自己写，菜单内又是 `UiAdd`）。
+    ///
+    /// 行为与旧版一致：按钮显示 `current`；点击展开选项浮层；点选项 / 点浮层外 / `Esc`
+    /// 收起；`selected` 为当前选中（选中行画方框勾 + 整行高亮）。
+    /// 返回本帧新选中的索引（`None` = 无选择 / 未展开）。
+    pub fn combo_at(
+        &mut self,
+        id: &str,
+        rect: Rect,
+        current: &str,
+        options: &[String],
+        selected: Option<u32>,
+    ) -> Option<u32> {
+        // 只有"本帧真的点了某一项"才返回 `Some`（`selected` 可能是 `None`，
+        // 也可能被上层夹住；用前后对比而不是"有没有值"）。
+        let mut sel = selected;
+        Dropdown::opt(id, current, &mut sel, options).show_in(self, rect);
+        match sel {
+            Some(i) if Some(i) != selected => Some(i),
+            _ => None,
+        }
+    }
+
+    /// **下拉框**（顶层定位：`pos` 相对当前容器内容原点，绝对定位；尺寸自动）。
+    pub fn combo(
+        &mut self,
+        id: &str,
+        pos: Vec2,
+        current: &str,
+        options: &[String],
+        selected: Option<u32>,
+    ) -> Option<u32> {
+        let style = self.theme().button.clone();
+        let tsize = self.text_size(current, style.font_size, style.font_family.as_deref());
+        let w = (tsize.x + 20.0).max(90.0) + style.padding.x * 2.0;
+        let h = style.padding.y * 2.0 + tsize.y;
+        let rect = Rect::new(pos.x, pos.y, w, h);
+        self.combo_at(id, rect, current, options, selected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1010,6 +1010,8 @@ impl Ui {
     fn allocate_sense_at(&mut self, pos: impl Into<Position>, id: &str, size: Vec2, sense: Sense) -> (Rect, Response);
     // 交互（申请与交互分开时用；`allocate_sense*` 已含这一步）
     fn interact(&mut self, id: &IdAbsolute<'_>, rect: Rect, sense: Sense) -> Response;
+    // 显式 rect 的控件（`*_at` 老 API）与自定义控件：绝对放置也要算进容器尺寸
+    fn note_placed(&mut self, rect: Rect);
 }
 
 pub struct Sense { pub hover: bool, pub click: bool, pub drag: bool, pub focus: Option<FocusKind> }
@@ -1029,6 +1031,9 @@ impl Sense {
 - `Ui::culled(rect) -> bool`：只用 `allocate`（只要矩形）的控件自己判一次可见性，
   等价于 `Response::culled`。**scissor 只省片元**，剔除才省镶嵌/顶点/draw——
   见 `docs/ENGINE_GUIDE.md` §18.22。
+- `Ui::note_placed(rect)`：**显式 rect** 的控件（`button_at` / `radio_at` /
+  `text_input_at` …）录完要点一次，让"画在容器外"这件事**要么让容器长大、要么被
+  `Clip` 裁掉**；自定义控件若自己算矩形（不经 `allocate*`）也必须点一次。
 - 膨胀语义是**申请方式**：`Expansion::{UnlimitedExpansion(默认), LimitedInParent(压到 avail_w), DisableAutoExpansion(不撑大父级)}`；
   min/max 用 `apply_constraints(desired, c)` 自己应用。
 - `add_at(pos, w)`：给 `Ui` 打**一次性放置覆盖**，控件的第一次申请消费它（**只在第一次**；

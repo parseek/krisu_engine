@@ -4,11 +4,15 @@ use std::sync::Arc;
 
 use glam::Vec2;
 use rjw_color::Color;
+use rjw_transform::Rect;
 use crate::draw::Size;
 use crate::draw::CornerRadius;
+use crate::draw::{TextAlign, TextVAlign};
+use crate::focus::FocusKind;
+use crate::state::ButtonState;
 use crate::style::{Brush, ButtonStyle, Theme};
 use crate::ui::Ui;
-use super::{Response, Widget};
+use super::{Response, Sense, Widget};
 
 // ─── Button ─────────────────────────────────────────────────────
 
@@ -143,5 +147,72 @@ impl Widget for Button<'_> {
         // ③ 交互 + 绘制交给显式 rect 入口（键盘激活 / 省略号 / 三态配色都在那里）
         let s = ui.button_at_styled(self.id, rect, self.label, &style);
         Response { rect, ..s.into() }
+    }
+}
+
+// ─── `Ui` 的显式 rect 入口（**实现体就近放控件自己的文件**）────────
+
+// 搬运说明（`ui.rs` → `widgets/`，路线图 P2a）：公开路径**不变**（仍是
+// `Ui::button_at` / `Ui::button_at_styled`），但实现体住在控件自己的文件里——`ui.rs`
+// 只保留"引擎"逻辑（容器 / 布局 / 命中 / 结算）。`impl Ui` 可以写在同 crate 的任何
+// 模块（`Ui` 类型对全 crate 可见）⇒ 不需要在 `ui.rs` 里留一行转发。
+//
+// `widgets` 是 `ui` 的**兄弟模块**，所以这里只能用 `Ui` 的**公开**方法
+// （`note_placed` / `interact` / `push_panel_like` / `ellipsized` / `painter()` /
+// `theme()`），不靠 `pub(crate)` 后门——新增依赖时先想"这是不是控件作者也该有的公开面"。
+impl Ui<'_> {
+    /// 按钮（显式 rect；样式取全局 `Theme::button`）。
+    pub fn button_at(&mut self, id: &str, rect: Rect, label: &str) -> ButtonState {
+        let style = self.theme().button.clone();
+        self.button_at_styled(id, rect, label, &style)
+    }
+
+    /// 按钮（显式 rect + **样式可覆盖**——widget 层 [`Button`] 经此合并主题与逐控件属性；
+    /// [`Self::button_at`] 委托本方法）。
+    ///
+    /// 非公开：样式必须来自 [`Theme`] 或 widget builder，避免"同一种控件两条入口"。
+    pub(crate) fn button_at_styled(
+        &mut self,
+        id: &str,
+        rect: Rect,
+        label: &str,
+        style: &ButtonStyle,
+    ) -> ButtonState {
+        let abs = self.id_for(id);
+        self.note_placed(rect);
+        // 命中 / 焦点链 / 键盘激活 / 跨帧状态机：一句话（`Sense::CLICK` —— 按钮没有拖拽语义，
+        // 所以不 `claim_press`）。
+        let resp = self.interact(&abs, rect, Sense::CLICK.focus(FocusKind::Button));
+        let bg = style.pick_bg(resp.pressed, resp.hovered);
+        let elem = self.elem_hint();
+        // 背景 + 边框（radius > 0 走圆角双层矩形）。
+        self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
+        // 按钮文本自动省略（Resizable 窗口缩窄 / max 约束下不溢出）：
+        // 文本超出可用区（rect 宽 - 水平内边距）→ "…"截断（内容自洽，noclip）。
+        let label_owned = self.ellipsized(
+            label,
+            style.font_size,
+            style.font_family.as_deref(),
+            (rect.w - style.padding.x * 2.0).max(0.0),
+        );
+        let draw_label: String = label_owned.unwrap_or_else(|| label.to_owned());
+        // 文本与背景同 elem（旧写法）：`push_text_rect` 会取更大的 elem ⇒ 文字在上。
+        self.painter().text(
+            rect,
+            &draw_label,
+            style.font_size,
+            style.fg,
+            style.font_family.clone(),
+            TextAlign::Center,
+            TextVAlign::Center,
+            None,
+            None,
+        );
+        ButtonState {
+            hovered: resp.hovered,
+            pressed: resp.pressed,
+            clicked: resp.clicked,
+            released: resp.released,
+        }
     }
 }

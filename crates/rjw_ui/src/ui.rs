@@ -65,7 +65,7 @@ use crate::input::{KeyboardSnapshot, MouseSnapshot};
 use crate::layout::{Child, Frame, PackSide};
 use crate::painter::Painter;
 use crate::state::{ButtonState, CheckboxState, TEXT_BUFFER_CACHE_CAP, UiState, WidgetState};
-use crate::style::{ButtonStyle, CheckboxStyle, GripShape, GripStyle, PanelStyle, Theme};
+use crate::style::{CheckboxStyle, GripShape, GripStyle, PanelStyle, Theme};
 use crate::view::{clip_for_view, ViewCtx, ViewMode};
 
 // ─── 文本编辑辅助（纯函数，可单测） ─────────────────────────────
@@ -1723,8 +1723,12 @@ impl<'a> Ui<'a> {
     /// `label_at`）都调它——这样"把控件放在容器外"这件事**要么让容器长大、要么
     /// 被 `Clip` 裁掉**，不会出现"看得见点得着却不在容器矩形里"的中间态。
     /// 与鼠标无关（布局期调用），故布局不会随鼠标漂移。
+    ///
+    /// **公开理由**（控件作者公开面）：控件核心正在往 `widgets/<name>.rs` 搬，而
+    /// `widgets` 是 `ui` 的**兄弟模块** ⇒ 私有方法对它们不可见。与其开 `pub(crate)`
+    /// 后门，不如把它作为"显式 rect 的控件都该调"的公开原语（自定义控件同理）。
     #[inline]
-    fn note_placed(&mut self, rect: Rect) {
+    pub fn note_placed(&mut self, rect: Rect) {
         if let Some(frame) = self.frames.last_mut() {
             frame.note_content(rect);
         }
@@ -5266,7 +5270,7 @@ pub trait UiAdd<'a> {
         });
         let h = st.thickness + st.margin * 2.0;
         let rect = ui.child_rect(w, h, Child::Expand);
-        ui.divider_at(Vec2::new(rect.x, rect.y), w);
+        ui.divider_at(Position::Physical(Vec2::new(rect.x, rect.y)), Size::Physical(w));
     }
 
     /// **多行文本输入框**（占光标；默认约 200×90，可 `text_area_at` 显式尺寸）。
@@ -5936,106 +5940,6 @@ impl<'ui, 'a> ModalBuilder<'ui, 'a> {
 // ─── 控件实现（Ui 内部方法） ────────────────────────────────────
 
 impl Ui<'_> {
-    /// **下拉框**（显式 rect；`rect` 为相对当前容器 origin 的局部坐标）。
-    ///
-    /// ⚠ 本方法现在是 [`Dropdown`](crate::Dropdown) 的**糖**（只有一套浮层实现，
-    /// 见 [`crate::widgets::menu`]）——新代码请直接用
-    /// `p.add(Dropdown::options(..))`（自动尺寸触发器）或
-    /// `p.add(Dropdown::new(..).menu(|m| ..))`（菜单内容自己写，菜单内又是 `UiAdd`）。
-    ///
-    /// 行为与旧版一致：按钮显示 `current`；点击展开选项浮层；点选项 / 点浮层外 / `Esc`
-    /// 收起；`selected` 为当前选中（选中行画方框勾 + 整行高亮）。
-    /// 返回本帧新选中的索引（`None` = 无选择 / 未展开）。
-    pub fn combo_at(
-        &mut self,
-        id: &str,
-        rect: Rect,
-        current: &str,
-        options: &[String],
-        selected: Option<u32>,
-    ) -> Option<u32> {
-        // 只有"本帧真的点了某一项"才返回 `Some`（`selected` 可能是 `None`，
-        // 也可能被上层夹住；用前后对比而不是"有没有值"）。
-        let mut sel = selected;
-        crate::widgets::Dropdown::opt(id, current, &mut sel, options).show_in(self, rect);
-        match sel {
-            Some(i) if Some(i) != selected => Some(i),
-            _ => None,
-        }
-    }
-
-    /// **下拉框**（顶层定位：`pos` 相对当前容器内容原点，绝对定位；尺寸自动）。
-    pub fn combo(
-        &mut self,
-        id: &str,
-        pos: Vec2,
-        current: &str,
-        options: &[String],
-        selected: Option<u32>,
-    ) -> Option<u32> {
-        let style = self.theme.button.clone();
-        let tsize = self.text_size(current, style.font_size, style.font_family.as_deref());
-        let w = (tsize.x + 20.0).max(90.0) + style.padding.x * 2.0;
-        let h = style.padding.y * 2.0 + tsize.y;
-        let rect = Rect::new(pos.x, pos.y, w, h);
-        self.combo_at(id, rect, current, options, selected)
-    }
-
-    /// 按钮（显式 rect；样式取全局 `Theme::button`）。
-    pub fn button_at(&mut self, id: &str, rect: Rect, label: &str) -> ButtonState {
-        let style = self.theme.button.clone();
-        self.button_at_styled(id, rect, label, &style)
-    }
-
-    /// 按钮（显式 rect + **样式可覆盖**——widget 层 [`crate::widgets::Button`] 经此
-    /// 合并主题与逐控件属性；[`Self::button_at`] 委托本方法）。
-    ///
-    /// 非公开：样式必须来自 [`Theme`] 或 widget builder，避免"同一种控件两条入口"。
-    pub(crate) fn button_at_styled(
-        &mut self,
-        id: &str,
-        rect: Rect,
-        label: &str,
-        style: &ButtonStyle,
-    ) -> ButtonState {
-        let abs = self.id_for(id);
-        self.note_placed(rect);
-        // 命中 / 焦点链 / 键盘激活 / 跨帧状态机：一句话（`Sense::CLICK` —— 按钮没有拖拽语义，
-        // 所以不 `claim_press`）。
-        let resp = self.interact(&abs, rect, crate::widgets::Sense::CLICK.focus(FocusKind::Button));
-        let bg = style.pick_bg(resp.pressed, resp.hovered);
-        let elem = self.elem_hint();
-        // 背景 + 边框（radius > 0 走圆角双层矩形）。
-        self.push_panel_like(rect, bg, style.border, style.border_w, style.radius, elem);
-        // 按钮文本自动省略（Resizable 窗口缩窄 / max 约束下不溢出）：
-        // 文本超出可用区（rect 宽 - 水平内边距）→ "…"截断（内容自洽，noclip）。
-        let label_owned = self.ellipsized(
-            label,
-            style.font_size,
-            style.font_family.as_deref(),
-            (rect.w - style.padding.x * 2.0).max(0.0),
-        );
-        let draw_label: String = label_owned.unwrap_or_else(|| label.to_owned());
-        // 文本与背景同 elem（旧写法）：`push_text_rect` 会取更大的 elem ⇒ 文字在上。
-        self.painter.text(
-            rect,
-            &draw_label,
-            style.font_size,
-            style.fg,
-            style.font_family.clone(),
-            TextAlign::Center,
-            TextVAlign::Center,
-            None,
-            None,
-        );
-        ButtonState {
-            hovered: resp.hovered,
-            pressed: resp.pressed,
-            clicked: resp.clicked,
-            released: resp.released,
-        }
-    }
-
     /// 滑块（显式 rect；拖拽灵敏度 = 1，值随鼠标 1:1）。
     pub fn slider_at(
         &mut self,

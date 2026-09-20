@@ -16,7 +16,7 @@
    ▼
 ┌─ rjw_ui ────────────────────────────────────────────────────────────────┐
 │ ui.rs            Ui：录制 + 布局 + 命中 + 帧级结算 + 提交编排              │
-│                  7467 行 / 125 pub fn / 39 字段                          │
+│                  7805 行 / 123 pub fn / 39 字段                          │
 │ widgets/         Widget::ui 单方法协议 + 属性 builder（17 文件 4.1k 行）  │
 │ ui.rs[5646..]    遗留 *_at 控件（button_at/slider_at/text_input_at/…）     │
 │ layout hit focus edit view id   纯逻辑，不依赖 Ui                         │
@@ -170,7 +170,25 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 一行转发把两边的名字对齐。同一能力有三条入口（`Ui::button` / `Ui::button_at` /
 `widgets::Button`）。
 
-> **进展（本轮）**：**菜单栏**的触发器交互并入 `widgets` 协议（`allocate_sense` +
+> **搬运配方（P2a，已开始执行）**：把遗留核心的实现体**逐块搬进 `widgets/<name>.rs`
+> 的 `impl Ui<'_>` 块**——公开路径不变（`Ui::button_at` 还在），但 `ui.rs` 不再持有
+> 实现；`impl Ui` 可以写在同 crate 任何模块，因此**不需要留一行转发**。
+> 两条硬约束（本轮定的）：
+> 1. 只能用 `Ui` 的**公开**方法（`widgets` 是 `ui` 的兄弟模块，私有字段 / 私有方法
+>    不可见）。缺什么就**扩展公开面**并写清理由，不开 `pub(crate)` 后门；
+> 2. 搬运提交里**只允许出现 `use` / 路径 / 位置变化**，行为改动单独提交——这样
+>    15 个 sim 的数值断言就是"零行为变化"的证据。
+>
+> **本轮进展（P2a 切片 1）**：`button_at` / `button_at_styled` → `widgets/button.rs`，
+> `combo` / `combo_at` → `widgets/dropdown.rs`；为此公开 `Ui::note_placed`
+> （"显式 rect 也要算进容器尺寸"，自定义控件同样需要）。`ui.rs` **7901 → 7805 行**；
+> 15 个 sim 全 `[OK]`（`--sim-*` 数值断言 + smoke，零行为变化）。
+> 剩余：`slider_at_styled` / `slider_at_drag`（需公开 `next_seq` 之类的绘制原语或在
+> `Painter` 上补公开 push）、`checkbox_at_styled` / `radio_at` / `draw_check_common`
+> （深触 `painter.q` 原始队列）、`radio_groups` 读写的语义化 API，最后是
+> `text_input_core` + `text_area_impl`（~1000 行，见 §5.2）。
+
+> **进展（更早）**：**菜单栏**的触发器交互并入 `widgets` 协议（`allocate_sense` +
 > `Response`，不再手写 `hit_abs` + `update_interact`），且 `MenuBar` 现在 `Deref` 到
 > `Pack` —— 与 `MenuCtx` `Deref` 到 `Window` 同一套模式（栏里能塞 `UiAdd` 的任何控件）。
 > 同时 `Divider` 增加 `axis` / `vertical()`（公开 `DividerAxis`），并新增**独立的主题样式组**
