@@ -461,9 +461,9 @@ pub struct UiState {
     /// **诊断**：最近一次按下由哪个窗口接收（`finish::resolve_win_press` 写入；
     /// 即重叠点击时被置顶/可拖拽的**最上层**窗口）。跨帧保留直至下一次按下。
     pub(crate) last_press_window: Option<(IdAbsolute<'static>, u32)>,
-    /// **诊断**：窗口 z → 上一次 inish **实际提交用的平移量**（lush_seg 写）。
+    /// **诊断**：窗口 z → 上一次 Finish **实际提交用的平移量**（Flush_seg 写）。
     ///
-    /// Ui 每帧由 egin 重建，帧内诊断（Ui::debug_dump）常在本帧**录制期**调用，
+    /// Ui 每帧由 Begin 重建，帧内诊断（Ui::debug_dump）常在本帧**录制期**调用，
     /// 故放在跨帧状态里；与 win_origins 对照即可判定"引擎状态 vs 视觉"是否一致。
     pub(crate) debug_submit: HashMap<u32, Vec2>,
     /// **提交期 scratch 缓冲**（每帧复用，免每帧新建 `Vec`）。
@@ -491,6 +491,15 @@ pub struct UiState {
     /// 与 `combo_open` 分开存：菜单栏的展开是"应用级 UI"（同一时刻只该有一个菜单开着），
     /// 而下拉框属于某个控件——混用一个槽会在"菜单开着时点下拉框"上打架。
     pub(crate) menu_open: Option<IdAbsolute<'static>>,
+    /// **引擎托管的"收起"窗口**（[`WindowBuilder::collapsible`](crate::WindowBuilder::collapsible)
+    /// 传 `None` 时用）：**收了**的窗口**绝对 ID** 集合。
+    ///
+    /// 为什么要有它：收起状态本来该由应用自己持有（`Some(&mut bool)`），但"只想让标题栏的
+    /// ⌃ 能收起、应用不必多一个字段"是常见需求 ⇒ 引擎按窗口 id 托管。语义与
+    /// `Some(&mut bool)` **逐帧一致**：点 ⌃ 当帧不变、下一帧生效；应用想读 / 清 / 代码收起
+    /// 就用 [`Self::is_collapsed`] / [`Self::set_collapsed`] / [`Self::toggle_collapsed`]，
+    /// [`Self::reset`] 一并清空。
+    pub collapsed: std::collections::HashSet<IdAbsolute<'static>>,
     /// **颜色选择器的全局跨帧数据**（呈现模式 / 替补输入缓冲 / 展开的面板 / HSV 缓存）。
     ///
     /// 类型定义在**控件自己的模块**里（[`crate::widgets::ColorPickerState`]，见
@@ -626,6 +635,7 @@ impl UiState {
         self.scrolls.clear();
         self.combo_open = None;
         self.menu_open = None;
+        self.collapsed.clear();
         self.color_picker = crate::widgets::ColorPickerState::default();
         self.sizes.clear();
         self.window_fx.clear();
@@ -708,6 +718,34 @@ impl UiState {
     #[inline]
     pub fn menu_open(&self) -> Option<&str> {
         self.menu_open.as_ref().map(|s| s.as_str())
+    }
+
+    /// **窗口是否"收起"**（只留标题栏）：见 [`Self::collapsed`]。
+    ///
+    /// ⚠ `id` 是窗口的**绝对 ID**（顶层窗口 = `.window("win_a")` 里的名字；嵌套容器里会被
+    /// 加前缀，与 [`Self::is_collapsed`] 写入时用的 key 必须一致）。
+    /// 应用自己持有 `Some(&mut bool)` 的窗口**不在这里**——这里只管引擎托管的那些。
+    #[inline]
+    pub fn is_collapsed(&self, id: &str) -> bool {
+        self.collapsed.iter().any(|c| c.as_str() == id)
+    }
+
+    /// **设置某窗口的收起状态**（`collapsed = true` ⇒ 只留标题栏）。链式语义同
+    /// [`Self::collapsed`]：**下一帧**生效（本帧的布局在录制开头就定了）。
+    pub fn set_collapsed(&mut self, id: &str, collapsed: bool) {
+        let key = IdAbsolute::owned(id.to_owned());
+        if collapsed {
+            self.collapsed.insert(key);
+        } else {
+            self.collapsed.remove(&key);
+        }
+    }
+
+    /// **翻转某窗口的收起状态**，返回翻转后的值（点 ⌃ 走的就是它）。
+    pub fn toggle_collapsed(&mut self, id: &str) -> bool {
+        let now = !self.is_collapsed(id);
+        self.set_collapsed(id, now);
+        now
     }
 
     /// **诊断**：上一帧"认领按下后被帧末复核撤销"的次数（见 `Ui::resolve_widget_press`
@@ -823,6 +861,31 @@ mod tests {
         assert_eq!(st.combo_open(), Some("diff_dd::popup"), "读到下拉的绝对 ID");
         st.reset();
         assert_eq!(st.combo_open(), None, "reset 清空下拉展开状态");
+    }
+
+    #[test]
+    fn engine_managed_collapse_is_readable_toggleable_and_cleared_by_reset() {
+        // `WindowBuilder::collapsible(.., None)` 把收起状态交给引擎：应用只读 / 只清。
+        // 三条语义都要钉住：① 未记录 = 不收起；② `set` / `toggle` 生效且**按 id 隔离**；
+        // ③ `reset()` 清空（"R 重开"之后窗口不该还是收着的）。
+        let mut st = UiState::new();
+        assert!(!st.is_collapsed("win_a"), "没记录过 ⇒ 不收起");
+        st.set_collapsed("win_a", true);
+        assert!(st.is_collapsed("win_a"));
+        assert!(!st.is_collapsed("win_b"), "只按自己的绝对 ID 取，互不影响");
+        assert!(!st.toggle_collapsed("win_a"), "翻转 ⇒ 展开，并返回翻转后的值");
+        assert!(!st.is_collapsed("win_a"));
+        assert!(st.toggle_collapsed("win_a"), "再翻转 ⇒ 收起");
+        // 幂等：重复 set 同一个值不出错、也不重复插入。
+        st.set_collapsed("win_a", true);
+        assert!(st.is_collapsed("win_a"));
+        st.set_collapsed("win_a", false);
+        assert!(!st.is_collapsed("win_a"));
+        // `reset` 清空（含集合本身，不只是逐个 remove）。
+        st.set_collapsed("win_a", true);
+        st.set_collapsed("win_b", true);
+        st.reset();
+        assert!(!st.is_collapsed("win_a") && !st.is_collapsed("win_b"), "reset 清空收起状态");
     }
 
     /// **帧级暂存**：一帧开场一次、收尾关场；`UiState::clone` 不带帧内暂存。

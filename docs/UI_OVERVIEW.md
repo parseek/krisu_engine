@@ -147,11 +147,13 @@ TextArea 滚动）；`Expansion::DisableAutoExpansion` = 不撑大父级。
 通用原语，持久于 `UiState.window_widths` / `UiState.sizes`）。`.placement(Placement::Clip)`
 内容严格裁剪（Clip 沙箱）；默认 `.placement(Expand)`（内容自动换行 / 撑高）。
 
-**窗口外框**：`.title(&str)` / `.close_button(&mut bool)` / `.shrink(bool, &mut bool)` 三个
-**独立可选**的外框部件（都不调 = 逐像素等于旧行为）。标题栏是内容**第一行**（窗口高度自然
+**窗口外框**：`.title(&str)` / `.close_button(&mut bool)` / `.collapsible(bool, Option<&mut bool>)`
+三个**独立可选**的外框部件（都不调 = 逐像素等于旧行为）。标题栏是内容**第一行**（窗口高度自然
 包含它，通条底色 `surface_raised` + 面板边框，底边那条即分隔线）；`×` 点击置 `*open = false`
-后**整窗短路**（不录制、不占遮挡矩形），**重开由应用负责**；`shrink(show, collapsed)` 的
-`show = false` 仍尊重 `*collapsed`（菜单/代码收起展开）。按钮是**几何图标**而非字形，且按下
+后**整窗短路**（不录制、不占遮挡矩形），**重开由应用负责**；`collapsible` 的收起状态可以**应用
+持有**（`Some(&mut bool)`；`show = false` 时仍尊重它，菜单/代码可收起展开）或**引擎托管**
+（`None` ⇒ 存 `UiState::collapsed`，点 ⌃ 由引擎翻转，应用用 `UiState::{is_collapsed,
+set_collapsed, toggle_collapsed}` 读写）。按钮是**几何图标**而非字形，且按下
 即 `claim_press` ⇒ 点按钮不会顺带拖动窗口。细节见 `docs/ENGINE_GUIDE.md` §18.12，
 脚本化验证见 `--sim-chrome`（`docs/DEBUGGING.md`）。
 

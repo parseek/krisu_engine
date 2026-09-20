@@ -939,7 +939,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.window(id)` | `.pos(..)`（**不调 = 引擎自动级联**，Win32 `CW_USEDEFAULT` 语义：按首次出现顺序右下偏移 28 逻辑像素，越界回绕；结果持久于 `UiState::auto_pos`，用户拖拽优先） `.width(w)` `.gap(Size)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` **`.resize(allow, axes)`** `.title(&str)` `.close_button(&mut bool)` `.shrink(bool, &mut bool)` `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；`.gap` = **内容子项行距**（不调 = `Theme::gap`；下拉 / 菜单浮层用 `Physical(popup_gap(scale))` 拿"逻辑 1px"的紧行距）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**拖拽缩放** `.resize(allow: bool, axes: Resize)`：`allow = false` ⇒ 不画柄也不响应拖拽（`.width` 仍是布局固定宽）；`Resize::Both` ⇒ 宽高同调（高度持久于 `UiState::window_heights`，**并自动裁剪内容**）；**不调** = 旧行为（有 `.width` 才能横向拖）。**外框**（标题栏 / × / 收起）见下 |
+| `ui.window(id)` | `.pos(..)`（**不调 = 引擎自动级联**，Win32 `CW_USEDEFAULT` 语义：按首次出现顺序右下偏移 28 逻辑像素，越界回绕；结果持久于 `UiState::auto_pos`，用户拖拽优先） `.width(w)` `.gap(Size)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` **`.resize(allow, axes)`** `.title(&str)` `.close_button(&mut bool)` **`.collapsible(bool, Option<&mut bool>)`** `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；`.gap` = **内容子项行距**（不调 = `Theme::gap`；下拉 / 菜单浮层用 `Physical(popup_gap(scale))` 拿"逻辑 1px"的紧行距）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**拖拽缩放** `.resize(allow: bool, axes: Resize)`：`allow = false` ⇒ 不画柄也不响应拖拽（`.width` 仍是布局固定宽）；`Resize::Both` ⇒ 宽高同调（高度持久于 `UiState::window_heights`，**并自动裁剪内容**）；**不调** = 旧行为（有 `.width` 才能横向拖）。**外框**（标题栏 / × / 收起）见下 |
 | `ui.panel()` | `.pos(..)` `.drag(id)` `.style(..)` `.show(\|pp\| ..)` | 面板 = `panel_at` + `drag_panel_at` 统一入口 |
 | `ui.modal(id)` | `.pos(..)` `.width(w)` `.show(\|m\| ..)` | 模态对话框（唯一入口） |
 
@@ -957,7 +957,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 |---|---|---|
 | `.title(t)` | `title(text: &str) -> Self` | 标题文字（过长按省略号截断，不撑宽窗口）；标题栏空白处**仍可拖动窗口**。标题行**贴窗口顶边**（条高 = `title_bar_h(row_h)` = **一行**，纯函数）：下面的内容与窗口高度各少一个 `pad_total`（用户实测"可以往上抬"）；条只是**背景装饰、不裁剪内容** ⇒ 标题 / ▲ / ✕（边长 `row_h - 2`）允许**比条高** |
 | `.close_button(open)` | `close_button(open: &mut bool) -> Self` | 标题栏右侧画 ×；点击把 `*open` 置 `false`。`*open == false` 时**整窗短路**——不录制、不写原点/尺寸、**不占遮挡矩形**（不会留下"看不见却挡点击"的窗口）；重新打开是**应用的责任**（把 `*open` 置回 `true`，如菜单勾选） |
-| `.shrink(show, collapsed)` | `shrink(show: bool, collapsed: &mut bool) -> Self` | `collapsed = true` = 只留标题栏（跳过内容闭包）；点 ⌃ 取反。`show = false` 时**不画按钮**，但 `*collapsed` 照旧生效（由菜单/代码收起展开）——这是两个参数分开的用处 |
+| `.collapsible(show, collapsed)` | `collapsible(show: bool, collapsed: Option<&mut bool>) -> Self` | `show` = 是否画 ⌃ 按钮；收起状态两种所有权：**`Some(&mut bool)`** = 应用持有（点 ⌃ 取反；`show = false` 时按钮不画、但 `*c` **照旧生效** ⇒ 可由菜单 / 代码收起展开），**`None`** = **引擎托管**（状态存 `UiState::collapsed`，按窗口**绝对 ID**；点 ⌃ 由引擎翻转，应用用 `UiState::{is_collapsed, set_collapsed, toggle_collapsed}` 读 / 改，`UiState::reset()` 一并清空）。两种语义都是**点击当帧不变、下一帧生效** |
 
 `*collapsed` 在录制**开头**读取（点击当帧不变、下一帧生效）；`×` / `⌃` 上的按下会
 **认领**（`claim_press`）⇒ 点按钮不会顺带拖动窗口。

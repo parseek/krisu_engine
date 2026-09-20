@@ -217,7 +217,7 @@ fn update(&mut self, ctx: &mut Ctx) {
   `size` 是 `.show(..)` 的返回值，`pos` 全程不变、五段 `size` 对称 ⇒ 按钮上的按下**没有**
   变成窗口拖拽（`claim_press` 生效），且按钮右移**没有**改变任何窗口尺寸。坐标算错时点空的
   典型症状：`size` 只在"点错的那个按钮"的动作上变，或干脆一行都不打。两边都排查：
-  `RJ_CHROME_TRACE=1`（引擎侧打印**解算结果**：`bar_w / title_w / title_max / shrink / close /
+  `RJ_CHROME_TRACE=1`（引擎侧打印**解算结果**：`bar_w / title_w / title_max / collapse / close /
   inset`；断言口径就是 `close.x + close.w == bar_w − inset`）+ `RJ_HIT_TRACE=1`（这个像素
   到底命中谁）。
 

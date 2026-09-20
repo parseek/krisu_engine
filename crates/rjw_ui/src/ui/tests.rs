@@ -1117,43 +1117,63 @@ fn scroll_thumb_respects_minimum_and_roundtrips() {
 
 #[test]
 fn window_chrome_bar_and_collapse_flags() {
-    // **默认零影响**：不调 `.title` / `.close_button` / `.shrink` ⇒ 不画标题栏 ——
+    // **默认零影响**：不调 `.title` / `.close_button` / `.collapsible` ⇒ 不画标题栏 ——
     // 这是"新特性不移动任何既有几何"的机器化保证（截图 / 仿真基线因此不需要更新）。
+    let st = crate::UiState::default();
     let none = WindowChrome::none();
     assert!(!none.bar_on(), "空外框不画标题栏");
-    assert!(!none.collapsed(), "空外框不收起");
+    assert!(!none.collapsed(&st, "w"), "空外框不收起");
     assert_eq!(none.title, None);
 
     // 标题 ⇒ 有栏；单独 `title` 不产生按钮。
     let c = WindowChrome { title: Some("T"), ..WindowChrome::none() };
     assert!(c.bar_on());
-    assert!(c.close.is_none() && c.shrink.is_none());
+    assert!(c.close.is_none() && c.collapsible.is_none());
 
     // `close_button` ⇒ 有栏（只有 × 也是标题栏）。
     let mut open = true;
     let c = WindowChrome { close: Some(&mut open), ..WindowChrome::none() };
     assert!(c.bar_on(), "只有关闭按钮时也要有栏（否则 × 没有落脚处）");
 
-    // `shrink(false, &mut c)`：**不画栏**，但状态照旧生效 —— 菜单/代码收起窗口用。
+    // `collapsible(false, Some(&mut c))`：**不画栏**，但状态照旧生效 —— 菜单/代码收起窗口用。
     let mut collapsed = true;
-    let c = WindowChrome { shrink: Some((false, &mut collapsed)), ..WindowChrome::none() };
+    let c = WindowChrome {
+        collapsible: Some((false, Some(&mut collapsed))),
+        ..WindowChrome::none()
+    };
     assert!(!c.bar_on(), "show=false ⇒ 不画标题栏（按钮不画）");
-    assert!(c.collapsed(), "show=false 时 *collapsed 仍管布局");
-    assert_eq!(c.shrink.as_ref().map(|(s, _)| *s), Some(false));
+    assert!(c.collapsed(&st, "w"), "show=false 时 *collapsed 仍管布局");
+    assert!(!c.show_collapse(), "show=false ⇒ 不画 ⌃");
+    assert_eq!(c.collapsible.as_ref().map(|(s, _)| *s), Some(false));
 
-    // `shrink(true, ..)` ⇒ 有栏 + 收起状态透传。
+    // `collapsible(true, ..)` ⇒ 有栏 + 收起状态透传。
     let mut collapsed2 = true;
-    let c = WindowChrome { shrink: Some((true, &mut collapsed2)), ..WindowChrome::none() };
-    assert!(c.bar_on());
-    assert!(c.collapsed());
+    let c = WindowChrome {
+        collapsible: Some((true, Some(&mut collapsed2))),
+        ..WindowChrome::none()
+    };
+    assert!(c.bar_on() && c.show_collapse());
+    assert!(c.collapsed(&st, "w"));
     // 标题 + 收起按钮 = 典型标题栏（demo 的 win_a 就是这种）。
     let mut c3 = false;
     let c = WindowChrome {
         title: Some("图形"),
-        shrink: Some((true, &mut c3)),
+        collapsible: Some((true, Some(&mut c3))),
         ..WindowChrome::none()
     };
-    assert!(c.bar_on() && !c.collapsed());
+    assert!(c.bar_on() && !c.collapsed(&st, "w"));
+
+    // **`None` = 引擎托管**：状态读 `UiState::collapsed`（按窗口**绝对 ID**）。
+    let mut st = crate::UiState::default();
+    let c = WindowChrome { collapsible: Some((true, None)), ..WindowChrome::none() };
+    assert!(c.bar_on());
+    assert!(!c.collapsed(&st, "win_b"), "引擎里没有记录 ⇒ 不收起");
+    st.set_collapsed("win_b", true);
+    assert!(c.collapsed(&st, "win_b"), "引擎记录为收起 ⇒ 本帧只留标题栏");
+    assert!(!c.collapsed(&st, "win_a"), "只按自己的绝对 ID 取，串不到别的窗口");
+    // `show = false` + `None`：按钮不画，但引擎托管的状态照旧生效（与 `Some` 一致）。
+    let c2 = WindowChrome { collapsible: Some((false, None)), ..WindowChrome::none() };
+    assert!(!c2.bar_on() && c2.collapsed(&st, "win_b"));
 }
 
 #[test]
@@ -1231,7 +1251,7 @@ fn title_bar_buttons_hug_the_window_outer_right_edge() {
     let close = l.close.expect("有关闭按钮");
     assert_eq!(close.x + close.w, 358.0 - inset, "✕ 贴外框右缘");
     // 收缩在它左边一个按钮 + 一个 gap（顺序：关闭恒在最右）。
-    let shrink = l.shrink.expect("有收缩按钮");
+    let shrink = l.collapse.expect("有收缩按钮");
     assert_eq!(shrink.x + shrink.w + gap, close.x);
     assert_eq!((close.w, close.h), (btn, row_h));
     assert_eq!(close.y, 0.0, "按钮贴窗口顶边（Windows 的 caption 观感）");
@@ -1248,14 +1268,14 @@ fn title_bar_layout_inset_and_single_button() {
     let l = title_bar_layout(Some(358.0), pad, row_h, gap, false, true, 12.0, 0.0);
     let close = l.close.expect("只有关闭按钮");
     assert_eq!(close.x + close.w, 358.0 - 12.0);
-    assert!(l.shrink.is_none(), "show_shrink=false ⇒ 不画收缩");
+    assert!(l.collapse.is_none(), "show_collapse=false ⇒ 不画收起");
     // 只有收缩按钮时它自己接最右（只有一个按钮就占 0 号位）。
     let l = title_bar_layout(Some(358.0), pad, row_h, gap, true, false, 0.0, 0.0);
     assert!(l.close.is_none());
-    assert_eq!(l.shrink.expect("只有收缩按钮").x, 358.0 - (row_h - 2.0));
+    assert_eq!(l.collapse.expect("只有收缩按钮").x, 358.0 - (row_h - 2.0));
     // 两个都不画：不产生矩形，标题可用宽仍是"到外框右缘"。
     let l = title_bar_layout(Some(358.0), pad, row_h, gap, false, false, 0.0, 0.0);
-    assert!(l.shrink.is_none() && l.close.is_none());
+    assert!(l.collapse.is_none() && l.close.is_none());
     assert_eq!(l.title_max, 358.0 - gap - pad);
 }
 
@@ -1265,12 +1285,12 @@ fn title_bar_layout_clamps_in_tiny_windows_and_follows_title_when_auto() {
     // 窗口比按钮簇还窄：簇左缘夹到 `pad`（按钮不左越内容左缘），标题宽不产生负值
     // （负宽会让 `max_size` 把标题压成 0，甚至让省略号路径拿到负可用宽）。
     let l = title_bar_layout(Some(60.0), pad, row_h, gap, true, true, 0.0, 500.0);
-    assert_eq!(l.shrink.expect("有收缩按钮").x, pad);
+    assert_eq!(l.collapse.expect("有收缩按钮").x, pad);
     assert_eq!(l.title_max, 0.0);
     // 自动宽窗口（无 `.width()`）：簇**跟随标题**（与旧版自动宽窗口一致），
     // 外框宽 = 内容右上角 + 右内边距（与 `Frame::natural_size` / `settle_size` 同口径）。
     let l = title_bar_layout(None, pad, row_h, gap, true, true, 0.0, 62.0);
-    assert_eq!(l.shrink.expect("有收缩按钮").x, pad + 62.0 + gap, "自动宽：按钮跟在标题后");
+    assert_eq!(l.collapse.expect("有收缩按钮").x, pad + 62.0 + gap, "自动宽：按钮跟在标题后");
     let close = l.close.expect("有关闭按钮");
     assert_eq!(l.bar_w, close.x + close.w + pad);
     // **不变量与 DPI 无关**（输入已是物理像素）：两套尺寸各自都贴右缘。

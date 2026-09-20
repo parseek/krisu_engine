@@ -3106,13 +3106,14 @@ impl<'a> Ui<'a> {
         // 条高不再含上内边距，下面的内容与窗口高度随之各少一个 `pad_total`。
         // ⚠ 条只是**背景装饰、不裁剪内容**：标题 / ▲ / ✕ 可以比条高再高一点（用户要求）。
         let bar_h = if chrome.bar_on() { title_bar_h(self.theme.row_h) } else { 0.0 };
-        let collapsed = chrome.collapsed();
+        let collapsed = chrome.collapsed(self.state, id_for.as_str());
         self.with_id(id, |ui| {
             let mut w = Window { ui };
             if chrome.bar_on() {
                 // `style.radius` 一并传下去：最右按钮的右上角要取**面板圆角**，
                 // 贴外缘时才能嵌进圆角轮廓（见 `window_title_bar`）。
-                window_title_bar(&mut w, chrome, collapsed, pad_total, style.radius);
+                // `id_for`（绝对 ID）也传下去：引擎托管的收起状态（`collapsed: None`）按它存取。
+                window_title_bar(&mut w, chrome, &id_for, collapsed, pad_total, style.radius);
             }
             if !collapsed {
                 f(&mut w);
@@ -3495,7 +3496,7 @@ impl<'a> Ui<'a> {
             o: WindowOptions::default(),
             title: None,
             close: None,
-            shrink: None,
+            collapsible: None,
         }
     }
 
@@ -5654,7 +5655,7 @@ impl std::fmt::Display for UiDebugDump {
 }
 
 /// **窗口责任链 builder**：[`Ui::window`] 返回。选项链式设置（`.pos` / `.width` /
-/// `.level` / `.placement` / `.style` / `.clamp` / `.title` / `.close_button` / `.shrink`）
+/// `.level` / `.placement` / `.style` / `.clamp` / `.title` / `.close_button` / `.collapsible`）
 /// 后以 `.show(f)` 终结执行。
 pub struct WindowBuilder<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
@@ -5664,17 +5665,18 @@ pub struct WindowBuilder<'ui, 'a> {
     title: Option<&'ui str>,
     /// 关闭按钮绑定的开关（点 × ⇒ 置 `false`；为 `false` 时整个窗口不录制）。
     close: Option<&'ui mut bool>,
-    /// 收缩按钮：`(是否画按钮, 收起状态)`。
-    shrink: Option<(bool, &'ui mut bool)>,
+    /// 收起（折叠）按钮：`(是否画按钮, 收起状态)`；状态 `None` = **引擎托管**
+    /// （存 [`UiState::collapsed`]，点 ⌃ 由引擎翻转）。
+    collapsible: Option<(bool, Option<&'ui mut bool>)>,
 }
 
-/// **窗口外框部件**（标题栏 / 关闭 / 收缩）：由 [`WindowBuilder`] 收集后交给
+/// **窗口外框部件**（标题栏 / 关闭 / 收起）：由 [`WindowBuilder`] 收集后交给
 /// `window_impl`。单独成结构体是为了不再往那个已经很长的参数表里加东西。
 pub(crate) struct WindowChrome<'c> {
     pub title: Option<&'c str>,
     pub close: Option<&'c mut bool>,
-    /// `(是否画按钮, 收起状态)`。
-    pub shrink: Option<(bool, &'c mut bool)>,
+    /// `(是否画按钮, 收起状态)`；状态 `None` = **引擎托管**（[`UiState::collapsed`]）。
+    pub collapsible: Option<(bool, Option<&'c mut bool>)>,
     /// **拖拽缩放** `(是否允许拖动, 允许的轴)`；`None` = 旧行为（**有 `.width(..)` 就能横向拖**）。
     pub resize: Option<(bool, Resize)>,
 }
@@ -5682,20 +5684,35 @@ pub(crate) struct WindowChrome<'c> {
 impl WindowChrome<'_> {
     /// 空的窗口外框（无标题栏、无按钮、缩放走旧行为）：modal 这类"已有自己外框"的路径用。
     pub(crate) const fn none() -> WindowChrome<'static> {
-        WindowChrome { title: None, close: None, shrink: None, resize: None }
+        WindowChrome { title: None, close: None, collapsible: None, resize: None }
     }
 
     /// 是否需要**标题栏**：三者都不给 ⇒ 不画（与不启用本特性时逐像素一致）。
     ///
-    /// ⚠ 只给 `shrink(false, &mut c)` 时**不画标题栏**，但 `*c` 照旧生效
+    /// ⚠ 只给 `collapsible(false, None)` 时**不画标题栏**，但收起状态照旧生效
     /// （"按钮不画、状态仍管布局"）——这是两个参数分开的用处。
     fn bar_on(&self) -> bool {
-        self.title.is_some() || self.close.is_some() || self.shrink.as_ref().is_some_and(|(s, _)| *s)
+        self.title.is_some()
+            || self.close.is_some()
+            || self.collapsible.as_ref().is_some_and(|(s, _)| *s)
+    }
+
+    /// 本帧是否画 ⌃ 按钮。
+    fn show_collapse(&self) -> bool {
+        self.collapsible.as_ref().is_some_and(|(s, _)| *s)
     }
 
     /// 本帧是否**收起**（只留标题栏）。
-    fn collapsed(&self) -> bool {
-        self.shrink.as_ref().is_some_and(|(_, c)| **c)
+    ///
+    /// `Some(&mut bool)` = 应用持有；`None` = **引擎托管** ⇒ 读 [`UiState::collapsed`]
+    /// （`abs` = 该窗口的**绝对 ID**）。
+    fn collapsed(&self, state: &UiState, abs: &str) -> bool {
+        self.collapsible
+            .as_ref()
+            .is_some_and(|(_, c)| match c {
+                Some(c) => **c,
+                None => state.is_collapsed(abs),
+            })
     }
 }
 
@@ -5778,20 +5795,41 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
         self.close = Some(open);
         self
     }
-    /// **收缩按钮**（可选）：`show` = 是否画按钮，`collapsed` = 收起状态
+    /// **收起（折叠）按钮**（可选）：`show` = 是否画 ⌃ 按钮，`collapsed` = 收起状态
     /// （`true` = 只留标题栏、跳过内容闭包）。
     ///
-    /// `show = false` 时按钮不画，但 `*collapsed` **照旧生效** —— 于是可以由菜单项 /
-    /// 代码把窗口收起展开，而不必在标题栏上放按钮。点击按钮把 `*collapsed` 取反。
-    pub fn shrink(mut self, show: bool, collapsed: &'ui mut bool) -> Self {
-        self.shrink = Some((show, collapsed));
+    /// 两种所有权：
+    /// - `Some(&mut bool)`：**应用持有**（`show = false` 时按钮不画，但 `*c` 照旧生效 ⇒
+    ///   可由菜单项 / 代码收起展开，而不必在标题栏上放按钮）；点 ⌃ 把 `*c` 取反；
+    /// - `None`：**引擎托管** —— 状态存 [`UiState::collapsed`]（按窗口**绝对 ID**），
+    ///   点 ⌃ 由引擎翻转；应用想读 / 清 / 代码收起就用
+    ///   [`UiState::is_collapsed`] / [`UiState::set_collapsed`] / [`UiState::toggle_collapsed`]，
+    ///   [`UiState::reset`] 一并清空。
+    ///
+    /// 两种语义**逐帧一致**：点击当帧不变、**下一帧**生效（本帧布局在录制开头就定了）。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{Ui, UiAdd, UiState};
+    /// # fn f(ui: &mut Ui) {
+    /// // 应用自己持有：可持久化 / 可与别的状态联动
+    /// let mut folded = false;
+    /// ui.window("a").title("A").collapsible(true, Some(&mut folded)).show(|w| { w.label("…"); });
+    /// // 引擎托管：应用不必多一个字段
+    /// ui.window("b").title("B").collapsible(true, None).show(|w| { w.label("…"); });
+    /// // 代码里也能收起（引擎托管的那些）
+    /// ui.state_mut().set_collapsed("b", true);
+    /// # let _ = &mut folded;
+    /// # }
+    /// ```
+    pub fn collapsible(mut self, show: bool, collapsed: Option<&'ui mut bool>) -> Self {
+        self.collapsible = Some((show, collapsed));
         self
     }
     /// 终结：录制窗口内容并返回窗口结算尺寸（`Vec2`，物理像素）。
     ///
     /// 关闭（`close_button` 绑定的开关为 `false`）时返回 `Vec2::ZERO` 且**不录制任何东西**。
     pub fn show(self, f: impl FnOnce(&mut Window<'_, '_>)) -> Vec2 {
-        let Self { ui, id, o, title, close, shrink } = self;
+        let Self { ui, id, o, title, close, collapsible } = self;
         // **关闭**：整窗短路。放在最前面：连 z 分配 / 位置解析都不做 —— 关闭的窗口
         // 不该在 `UiState` 里留下任何本帧痕迹。
         if let Some(open) = &close
@@ -5814,7 +5852,7 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
         // 枚举 → 内部两个开关（公开面不再出现裸布尔）。
         let topmost = o.level == Level::Topmost;
         let strict = o.placement == Placement::Clip;
-        let mut chrome = WindowChrome { title, close, shrink, resize: o.resize };
+        let mut chrome = WindowChrome { title, close, collapsible, resize: o.resize };
         ui.window_impl(
             id,
             pos,
@@ -7574,13 +7612,13 @@ const TITLE_BUTTON_INSET: f32 = 0.0;
 ///   宽度由内容决定时没有"外框右缘"可贴（与旧版自动宽窗口的行为一致）；
 /// - 标题可用宽 = 簇左缘 − `gap` − 左内边距（`0` = 没地方放标题，不产生负宽）；
 /// - 簇左缘夹到 `≥ pad`：窗口比按钮还窄时，按钮不左越内容左缘；
-/// - 顺序 `[收缩, 关闭]` ⇒ **关闭在最右**（Windows 语义：✕ 恒在最右上角）。
+/// - 顺序 `[收起, 关闭]` ⇒ **关闭在最右**（Windows 语义：✕ 恒在最右上角）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TitleBarLayout {
     /// 标题可用宽（物理像素；`0` = 不截断成负宽）。
     title_max: f32,
-    /// 收缩按钮矩形（`None` = 不画）。
-    shrink: Option<Rect>,
+    /// 收起（⌃）按钮矩形（`None` = 不画）。
+    collapse: Option<Rect>,
     /// 关闭按钮矩形（`None` = 不画）。
     close: Option<Rect>,
     /// 条宽：固定宽窗口 = 外框宽；自动宽窗口 = 由内容推导出的外框宽。
@@ -7592,14 +7630,14 @@ fn title_bar_layout(
     pad: f32,
     row_h: f32,
     gap: f32,
-    show_shrink: bool,
+    show_collapse: bool,
     show_close: bool,
     inset_right: f32,
     title_w: f32,
 ) -> TitleBarLayout {
     // 按钮边长与 `TitleIconButton::size` 一致（`row_h - 2`，下限 12）。
     let btn = (row_h - 2.0).max(12.0);
-    let n = (show_shrink as u32 + show_close as u32) as f32;
+    let n = (show_collapse as u32 + show_close as u32) as f32;
     let cluster_w = if n > 0.0 { n * btn + (n - 1.0) * gap } else { 0.0 };
     // 簇左缘：固定宽窗口贴外框右缘 − inset；自动宽窗口跟随标题。
     let cluster_x = match bar_w {
@@ -7607,8 +7645,8 @@ fn title_bar_layout(
         None => pad + title_w + gap,
     };
     let at = |i: f32| Rect::new(cluster_x + i * (btn + gap), 0.0, btn, row_h);
-    // 索引 0 = 收缩、1 = 关闭 ⇒ 关闭**最右**（只有一个按钮时它自然占 0 号位）。
-    let (shrink, close) = match (show_shrink, show_close) {
+    // 索引 0 = 收起、1 = 关闭 ⇒ 关闭**最右**（只有一个按钮时它自然占 0 号位）。
+    let (collapse, close) = match (show_collapse, show_close) {
         (true, true) => (Some(at(0.0)), Some(at(1.0))),
         (true, false) => (Some(at(0.0)), None),
         (false, true) => (None, Some(at(0.0))),
@@ -7616,13 +7654,13 @@ fn title_bar_layout(
     };
     TitleBarLayout {
         title_max: (cluster_x - gap - pad).max(0.0),
-        shrink,
+        collapse,
         close,
         bar_w: bar_w.unwrap_or(cluster_x + cluster_w + pad),
     }
 }
 
-/// **窗口标题栏**（窗口内容**第一行**）：标题文字 + 右侧"收缩 / 关闭"图标按钮。
+/// **窗口标题栏**（窗口内容**第一行**）：标题文字 + 右侧"收起 / 关闭"图标按钮。
 ///
 /// 要素：
 /// - 走 `Window`/`UiAdd::row`（与用户内容同一个 `Frame` 结算）⇒ 窗口高度自然包含标题栏，
@@ -7633,11 +7671,12 @@ fn title_bar_layout(
 ///   （它永远差一个 `pad + 4px`，见 `title_bar_layout` 的说明）；
 /// - 按钮是 [`TitleIconButton`]（**几何图标**，不是 `×` / `_` 字形 —— 换字体不变形），
 ///   且按下时 `claim_press()` ⇒ **按按钮不会建立窗口拖拽基准**；标题栏空白处仍可拖窗口；
-/// - 点击效果：关闭 ⇒ `*close = false`（该窗口**下一帧**整体不录）；收缩 ⇒ `*collapsed` 取反
-///   （本帧起只录标题栏）。都是 1 帧生效的立即模式语义。
+/// - 点击效果：关闭 ⇒ `*close = false`（该窗口**下一帧**整体不录）；收起 ⇒ 状态取反
+///   （`Some(&mut bool)` 写回应用；`None` 写进 [`UiState::collapsed`]，**下一帧**生效）。
 fn window_title_bar(
     w: &mut Window<'_, '_>,
     chrome: &mut WindowChrome<'_>,
+    abs_id: &IdAbsolute<'_>,
     collapsed: bool,
     pad_total: f32,
     panel_radius: CornerRadius,
@@ -7645,7 +7684,7 @@ fn window_title_bar(
     let ui = w.ui_mut();
     let title = chrome.title.unwrap_or("");
     let show_close = chrome.close.is_some();
-    let show_shrink = chrome.shrink.as_ref().is_some_and(|(show, _)| *show);
+    let show_collapse = chrome.show_collapse();
     // 行内尺寸全部取**缩放后**主题（`Ui::theme` 已按 DPI 预乘）。
     let (gap, row_h, font_size, family, btn_radius) = (
         ui.theme.gap,
@@ -7668,7 +7707,7 @@ fn window_title_bar(
         pad_total,
         row_h,
         gap,
-        show_shrink,
+        show_collapse,
         show_close,
         TITLE_BUTTON_INSET,
         natural,
@@ -7676,7 +7715,7 @@ fn window_title_bar(
     trace_title_bar(collapsed, natural, &layout);
 
     let mut close_clicked = false;
-    let mut shrink_clicked = false;
+    let mut collapse_clicked = false;
     // **标题行贴窗口顶边**：把内容光标临时抬到 `y = 0`（x 保持内容左缘）。
     // `row()` 按该光标放置、并在结算后把光标推进到「条下沿 + gap」⇒ 后续内容自然上移
     // `pad_total`（条高同时从 `pad_total + row_h` 变成 `row_h`，见 [`title_bar_h`]）。
@@ -7700,16 +7739,17 @@ fn window_title_bar(
     // `row_h`，与解算一致），命中 / 按下认领路径完全不变。
     // 最右按钮的右上角 = **面板右上圆角**：贴外缘必有部分落在面板圆角区，同半径才嵌进去。
     let btn_radius_tr = CornerRadius { tr: panel_radius.tr, ..btn_radius };
-    if let Some(rect) = layout.shrink {
+    if let Some(rect) = layout.collapse {
         // 收起时显示"展开"箭头（↓），展开时显示"收起"箭头（↑）。
         let icon = if collapsed { Icon::ChevronDown } else { Icon::ChevronUp };
-        // 只有"收缩在最右"（= 没画关闭按钮）时它才需要接面板圆角。
+        // 只有"收起在最右"（= 没画关闭按钮）时它才需要接面板圆角。
         let corners = if show_close { None } else { Some(btn_radius_tr) };
-        shrink_clicked = w
+        collapse_clicked = w
             .ui_mut()
             .add_at(
                 Position::Physical(Vec2::new(rect.x, rect.y)),
-                crate::widgets::title_button::TitleIconButton::new("::shrink", icon).corners(corners),
+                crate::widgets::title_button::TitleIconButton::new("::collapse", icon)
+                    .corners(corners),
             )
             .clicked();
     }
@@ -7723,8 +7763,15 @@ fn window_title_bar(
             )
             .clicked();
     }
-    if shrink_clicked && let Some((_, c)) = chrome.shrink.as_mut() {
-        **c = !**c;
+    // 收起状态的所有权：`Some(&mut bool)` 写回应用；`None` = **引擎托管**（写
+    // `UiState::collapsed`，键 = 本窗口**绝对 ID**）——两条路都是"下一帧生效"。
+    if collapse_clicked && let Some((_, c)) = chrome.collapsible.as_mut() {
+        match c {
+            Some(c) => **c = !**c,
+            None => {
+                w.ui_mut().state_mut().toggle_collapsed(abs_id.as_str());
+            }
+        }
     }
     if close_clicked && let Some(open) = chrome.close.as_mut() {
         **open = false;
@@ -7745,10 +7792,10 @@ fn trace_title_bar(collapsed: bool, title_w: f32, layout: &TitleBarLayout) {
         };
         eprintln!(
             "chrome[collapsed={collapsed}] bar_w={:.1} title_w={title_w:.1} title_max={:.1} \
-             shrink={} close={} inset={TITLE_BUTTON_INSET:.1}",
+             collapse={} close={} inset={TITLE_BUTTON_INSET:.1}",
             layout.bar_w,
             layout.title_max,
-            r(layout.shrink),
+            r(layout.collapse),
             r(layout.close),
         );
     }

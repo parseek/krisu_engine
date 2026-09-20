@@ -1584,10 +1584,15 @@ ui.window("win_a")
     .width(220.0)
     .title("窗口 A")              // 标题栏（不调 = 完全没有栏）
     .close_button(&mut open)      // 右上角 ×（**贴窗口外框右缘**，点击 ⇒ *open = false）
-    .shrink(true, &mut folded)    // 右上角 ⌃（show = 是否画按钮；点击 ⇒ *folded 取反）
+    .collapsible(true, Some(&mut folded))   // 右上角 ⌃；状态**应用持有**（点击 ⇒ *folded 取反）
     .show(|w| {
         w.label("内容（收起时整块跳过）");
     });
+// 也可以把收起状态**交给引擎托管**（应用不必多一个字段）：
+ui.window("win_b").title("窗口 B").collapsible(true, None).show(|w| { w.label("…"); });
+// 代码里收起 / 读取（引擎托管的那些；键 = 窗口**绝对 ID**）：
+ui.state_mut().set_collapsed("win_b", true);
+let folded = ui.state().is_collapsed("win_b");
 // ⌃ 收起后同一窗口只剩标题栏；× 关掉后**整窗短路**，重开由应用决定：
 if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 ```
@@ -1603,7 +1608,7 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 | 贴外缘 + 圆角要一起处理 | 最右按钮的**右上角取面板右上圆角**（`TitleIconButton::corners(..)`）⇒ 贴外缘时不会方角戳出圆角轮廓（Windows 11 的 caption 高亮同样跟窗口圆角走）；没开 `.style(radius)` 时面板圆角 0 = 纯直角贴角 |
 | 自动宽窗口 | 没有 `.width()` 就没有"外框右缘"可贴 ⇒ 簇**跟随标题**（`cluster_x = pad + title_w + gap`），外框宽由内容推导（与旧版自动宽窗口一致） |
 | `×` 的关闭语义 | `*open = false` 时**整窗短路**：不录制、不写原点 / 尺寸、**不占遮挡矩形**（不会留下"看不见却挡点击"的窗口）；下一帧起彻底消失，**重开是应用的责任** |
-| `shrink(show, collapsed)` | `collapsed` 在录制**开头**读取（点击当帧不变、下一帧生效）；`show = false` 时按钮不画，但 `*collapsed` **照旧生效**——菜单 / 代码可收起展开而不必放按钮 |
+| `collapsible(show, collapsed)` | 收起状态**两种所有权**：`Some(&mut bool)` = 应用持有（`show = false` 时按钮不画，但 `*c` **照旧生效**——菜单 / 代码可收起展开而不必放按钮）；`None` = **引擎托管**（存 `UiState::collapsed`，键 = 窗口**绝对 ID**；点 ⌃ 由引擎翻转；应用用 `UiState::{is_collapsed, set_collapsed, toggle_collapsed}`，`reset()` 一并清空）。状态在录制**开头**读取 ⇒ 两种都是"点击当帧不变、**下一帧**生效" |
 | 按钮是**几何**不是字形 | `Icon::Close` / `ChevronUp` / `ChevronDown`（`TitleIconButton`，只依赖公开 API）⇒ 换字体不会变豆腐块 |
 
 > ⚠ **别再用"内容右缘 + spacer"排 caption 按钮**：那条路上有三个坑，实测各差 `pad`、4px，
@@ -1615,7 +1620,7 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 > 现在：按钮走 `Ui::add_at` 绝对定位（`title_bar_layout` 纯函数解算 + 单测钉住"簇右缘 =
 > 外框右缘 − inset"），标题留在行里、按 `title_max` 省略号截断。
 > 排查开关：`RJ_CHROME_TRACE=1` 打印**解算结果** ——
-> `chrome[collapsed=false] bar_w=358.0 title_w=62.0 title_max=252.0 shrink=[275.0,0.0 37.0x39.0] close=[321.0,0.0 37.0x39.0] inset=0.0`
+> `chrome[collapsed=false] bar_w=358.0 title_w=62.0 title_max=252.0 collapse=[275.0,0.0 37.0x39.0] close=[321.0,0.0 37.0x39.0] inset=0.0`
 > （断言口径就在这条里：`close.x + close.w == bar_w − inset`）。
 
 **缩放柄令牌**（固定宽窗口右下角那个"拖拽按钮"）：
@@ -1689,7 +1694,7 @@ cargo run -p eg260818UI -- --sim-chrome --frames 100   # 真的去点 ⌃ / ×�
 "内容右缘 + pad"那种算法在按钮右移后就点不准了 —— 脚本本身也是这条不变量的回归。
 引擎侧的不变量由 `ui::tests::title_bar_buttons_hug_the_window_outer_right_edge` /
 `title_bar_layout_*` 与 `window_chrome_bar_and_collapse_flags` 守着
-（"空外框不画栏" / "`shrink(false, ..)` 不画栏但状态生效"）。
+（"空外框不画栏" / "`collapsible(false, ..)` 不画栏但状态生效" / "`None` 引擎托管"）。
 
 > ⚠ **收起态里 resize 柄会盖到 caption 按钮上**（既有缺陷，非本轮引入）：窗口只有一行高时，
 > 右下角缩放柄的命中区（`GripStyle::extent()`，本机 150% DPI 实测 `35×35`、起点 `y = 723`）
