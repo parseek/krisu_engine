@@ -1364,16 +1364,24 @@ impl<'a> Ui<'a> {
     /// 递减小方块（历史观感）、`Bars` = 内置矢量图标 [`Icon::Grip`]（三条横线，
     /// 与字体无关）、`Hidden` = 不画。
     pub fn push_resize_grip(&mut self, size: Vec2, grip: &GripStyle) {
+        self.push_resize_grip_at(Rect::new(0.0, 0.0, size.x, size.y), grip);
+    }
+
+    /// 同 [`Self::push_resize_grip`]，但**指定本体矩形**（当前容器局部坐标）：
+    /// 图案画在该矩形的**右下角内侧**——文本输入框（`rect` 不为 `(0,0)`）用它。
+    pub fn push_resize_grip_at(&mut self, rect: Rect, grip: &GripStyle) {
         if !grip.is_visible() {
             return;
         }
+        let (x, y) = (rect.x, rect.y);
+        let (w, h) = (rect.w, rect.h);
         match grip.shape {
             GripShape::Hidden => {}
             GripShape::Squares => {
                 for k in 0..grip.count {
                     let o = grip.step * (k as f32 + 1.0);
                     self.push_solid_rect(
-                        Rect::new(size.x - o, size.y - o, grip.size, grip.size),
+                        Rect::new(x + w - o, y + h - o, grip.size, grip.size),
                         grip.color,
                     );
                 }
@@ -1385,12 +1393,12 @@ impl<'a> Ui<'a> {
                 // （默认 4 逻辑像素），再叠上 `Theme::feather` 的羽化带（默认 1 逻辑像素
                 // ⇒ 每侧 0.5）就把三条糊成一坨（用户实测："三横看起来是斜的一坨"）。
                 // 实心矩形没有羽化，任意尺寸都读得出三条。
-                let w = grip.size * grip.count as f32;
-                let right = size.x - grip.step;
+                let bw = grip.size * grip.count as f32;
+                let right = x + w - grip.step;
                 for k in 0..grip.count {
                     let o = grip.step * (k as f32 + 1.0);
                     self.push_solid_rect(
-                        Rect::new(right - w, size.y - o, w, grip.size),
+                        Rect::new(right - bw, y + h - o, bw, grip.size),
                         grip.color,
                     );
                 }
@@ -1403,7 +1411,7 @@ impl<'a> Ui<'a> {
                 let d = grip.size * grip.count as f32 * 1.5;
                 let m = grip.step;
                 self.icon_at(
-                    Position::Physical(Vec2::new(size.x - d - m, size.y - d - m)),
+                    Position::Physical(Vec2::new(x + w - d - m, y + h - d - m)),
                     Size::Physical(Vec2::splat(d)),
                     Icon::GripDiagonal,
                     grip.color,
@@ -6352,21 +6360,11 @@ impl Ui<'_> {
         ));
     }
 
-    /// 绘制**右下角缩放柄**（拖动框）：3 个小方块对角抓握标记（视觉提示），交互由
-    /// [`Self::resize_handle`] 处理（此处只画标记）。`handle` 为当前容器局部坐标。
-    fn draw_resize_grip(&mut self, handle: Rect, color: Color) {
-        let s = 3.0_f32; // 每个小方块边长（逻辑像素）
-        let inset = 2.0_f32;
-        for k in 0..3u32 {
-            let off = k as f32 * s;
-            let r = Rect::new(
-                handle.x + handle.w - inset - s - off,
-                handle.y + handle.h - inset - s - off,
-                s,
-                s,
-            );
-            self.push_solid_rect(r, color);
-        }
+    /// 绘制**右下角缩放柄**（拖动框；形状 / 颜色 / 尺寸全部来自
+    /// [`InputStyle::grip`](crate::style::InputStyle::grip)，默认三条横线）。
+    /// `rect` 为文本框本体矩形（当前容器局部坐标）；交互由 [`Self::resize_handle`] 处理。
+    fn draw_resize_grip(&mut self, rect: Rect, grip: &GripStyle) {
+        self.push_resize_grip_at(rect, grip);
     }
 
     /// **可调整宽度的文本输入框**（单行）：右下角拖拽改宽度（高度固定），尺寸跨帧
@@ -6410,7 +6408,7 @@ impl Ui<'_> {
                     .sizes
                     .insert(id_for.to_static(), Vec2::new(new.x, input_rect.h));
             }
-            self.draw_resize_grip(handle, style.resize_handle);
+            self.draw_resize_grip(input_rect, &style.grip);
         }
     }
 
@@ -6457,7 +6455,7 @@ impl Ui<'_> {
             ) {
                 self.state.sizes.insert(id_for.to_static(), new);
             }
-            self.draw_resize_grip(handle, style.resize_handle);
+            self.draw_resize_grip(area_rect, &style.grip);
         }
     }
 

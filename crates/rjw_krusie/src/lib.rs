@@ -150,8 +150,8 @@ pub mod prelude {
     pub use crate::ui::{
         Anchor, Brush, Button, Checkbox, Child, ColorFormat, ColorPicker, ColorPickerState,
         CornerRadius, Divider, Icon, ImageBg, ImageFit, Level, NumberInput, PackSide, Palette,
-        Painter, Placement, Resize, Sense, Slider, Theme, Ui, UiAdd, UiState, UiStats, WindowClamp,
-        WindowFx,
+        Painter, Placement, Resize, Sense, Slider, TextEditor, Theme, Ui, UiAdd, UiState, UiStats,
+        WindowClamp, WindowFx,
     };
 
     // ── 瓦片地图（feature = tilemap）──

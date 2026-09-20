@@ -1,6 +1,7 @@
 use std::ops::Not;
 
-use rjw_krusie::{prelude::*, ui::{TextEditor, widgets}};
+// `TextEditor` 现在在 prelude 里（与 `Segmented` 不同——后者仍要显式引 `widgets`）。
+use rjw_krusie::{prelude::*, ui::widgets};
 
 use crate::app;
 
@@ -50,9 +51,11 @@ impl app::Demo for Gallery {
             ui.row(|ui| {
                 ui.label("单行输入框：");
                 ui.text_input("text_sl", input_single_line);
-            }); // row 被限制在单行，使得多行 `TextEditor` 被限制
+            }); // ⚠ row 把子项钉到"一行标准高"（`Theme::row_h`）——多行控件想撑高整行见 row Builder
             ui.label("多行输入框：");
-            ui.add(TextEditor::new("text_ml", input_multi_line).multiline().resize(Resize::Both)); // TextEditor 缩放没有默认最小宽高，且下面的控件不会跟着下去，且不在 prelude 里；默认缩放柄为斜线
+            // 缩放：默认下限 = 一行文字高（拖不到 0）；自动申请会先问尺寸责任链
+            // ⇒ 拖大后窗口与**下面的控件**跟着长；缩放柄形状取 `Theme::input.grip`（默认三条横线）。
+            ui.add(TextEditor::new("text_ml", input_multi_line).multiline().resize(Resize::Both));
             ui.row(|ui| {
                 ui.label("复选框：");
                 ui.checkbox("checkbox", "", *boolean).toggled().then(|| {*boolean = boolean.not()});

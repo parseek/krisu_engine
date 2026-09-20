@@ -155,6 +155,10 @@ impl<'a> TextEditor<'a> {
     /// 右下角**缩放柄**（[`Resize::Horizontal`] 只调宽 / [`Resize::Both`] 宽高同调）。
     /// 尺寸跨帧持久于 [`UiState::sizes`](crate::UiState::sizes)，也受尺寸责任链
     /// （[`Ui::size_handler`](crate::Ui::size_handler)）约束。
+    ///
+    /// **柄的形状 / 颜色 / 尺寸来自主题** [`InputStyle::grip`](crate::style::InputStyle::grip)
+    /// （默认 [`GripShape::Bars`](crate::style::GripShape::Bars) 三条横线；想要经典角落观感
+    /// 就把主题设成 `Diagonal`，`Hidden` 则"不画图案但仍能拖"）。
     pub fn resize(mut self, r: Resize) -> Self {
         self.resize = r;
         self

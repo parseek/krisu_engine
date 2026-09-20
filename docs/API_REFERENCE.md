@@ -1095,7 +1095,7 @@ impl Sense {
 + **`--theme <路径>`**（启动载入；与导入同一条通路）+ `--sim-theme <路径>`（脚本化验证）。
 见 `docs/ENGINE_GUIDE.md` §18.16。
 `LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**/**shadow**/**grip**）、`ButtonStyle`（三态 bg + padding + **radius**）、
-`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius**）、
+`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius** + **grip**：可缩放文本框的柄形状/尺寸/颜色，默认 `GripShape::Bars`、颜色随 `Palette::text_dim`）、
 `CheckboxStyle`（box_size/checked_fill/gap）、`DividerStyle`、`DebugStyle`（layout_outline / layout_outline_width）、
 `FocusStyle`（color / width，键盘导航焦点描边）、`ModalStyle`（dim / size）、
 `ComboStyle`（下拉浮层现代菜单：menu_bg/border/radius/pad_v + item_hover/selected/pad_x/min_w + fg/fg_mark）、

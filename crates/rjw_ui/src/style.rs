@@ -407,6 +407,7 @@ impl InputStyle {
         self.height = m(self.height);
         self.min_w = m(self.min_w);
         self.font_size = m(self.font_size);
+        self.grip = self.grip.scaled(s);
         self
     }
 }
@@ -799,6 +800,10 @@ impl InputStyle {
             preedit: p.text_muted,
             sel_bg: p.selection,
             resize_handle: p.text_dim,
+            grip: GripStyle {
+                color: p.text_dim,
+                ..Self::default().grip
+            },
             ..Self::default()
         }
     }
@@ -1242,6 +1247,14 @@ pub struct InputStyle {
     pub sel_bg: Color,
     /// **缩放柄 / 拖动框颜色**（可调整大小/宽度的文本输入框右下角缩放手柄标记）。
     pub resize_handle: Color,
+    /// **缩放柄的形状 / 尺寸 / 颜色**（可调整大小/宽度的文本输入框；默认
+    /// [`GripShape::Bars`] —— 三条横线，见下）。
+    ///
+    /// 形状取自**主题**（不再写死在引擎里）：`Bars`（默认，横线读得出"这里是可拖的角"）、
+    /// `Diagonal`（经典角落观感，宽高同调时更直观）、`Squares`（历史观感）、
+    /// `Hidden`（不画图案，**命中区照旧** —— 仍能拖）。
+    /// 颜色默认 = [`Self::resize_handle`]（`themed` 里跟随 `Palette::text_dim`）。
+    pub grip: GripStyle,
     pub border_w: f32,
     /// 内容水平内边距。
     pub padding_x: f32,
@@ -1266,6 +1279,14 @@ impl Default for InputStyle {
             preedit: Color::rgba_u8(120, 120, 120, 255),
             sel_bg: Color::rgba_u8(140, 190, 245, 255),
             resize_handle: Color::rgba_u8(120, 130, 150, 255),
+            // 缩放柄默认 = **三条横线**（不是历史上的斜向小方块）：横线在任何尺寸下
+            // 都读得出"右下角可拖"，而斜线/小方块在小方框里会被羽化糊成一坨
+            // （同类教训见 `PanelStyle` 的 `GripShape::Bars` 注释）。
+            grip: GripStyle {
+                shape: GripShape::Bars,
+                color: Color::rgba_u8(120, 130, 150, 255),
+                ..GripStyle::default()
+            },
             border_w: 1.0,
             padding_x: 6.0,
             radius: CornerRadius::default(),
@@ -1710,6 +1731,17 @@ impl InputStyle {
     /// 缩放柄 / 拖动框颜色（可调整大小/宽度的文本输入框）。
     pub fn with_resize_handle(mut self, c: Color) -> Self {
         self.resize_handle = c;
+        self
+    }
+    /// 缩放柄完整样式（形状 / 颜色 / 尺寸 / 个数；见 [`InputStyle::grip`]）。
+    pub fn with_grip(mut self, grip: GripStyle) -> Self {
+        self.grip = grip;
+        self
+    }
+    /// 缩放柄**形状**（`Bars` 默认 / `Diagonal` / `Squares` / `Hidden`——`Hidden` 只是
+    /// 不画图案，命中区照旧 ⇒ 仍能拖）。
+    pub fn with_grip_shape(mut self, shape: GripShape) -> Self {
+        self.grip.shape = shape;
         self
     }
     pub fn with_border_w(mut self, w: f32) -> Self {
@@ -2735,6 +2767,33 @@ mod tests {
         assert!(!panel.clone().with_grip_color(Color::rgba_u8(0, 0, 0, 0)).grip.is_visible());
         // `scaled` 也走 Theme → PanelStyle 这条链（避免只测了子样式、漏了主题预乘）。
         assert_eq!(Theme::dark().scaled(1.5).panel.grip.size, (4.0_f32 * 1.5).round());
+    }
+
+    #[test]
+    fn input_grip_is_themed_and_defaults_to_bars() {
+        // 文本框的缩放柄过去写死在引擎里（"斜向小方块"）、完全无视主题；现在走
+        // `InputStyle::grip`（与窗口柄同一套 `GripShape`）。
+        let p = Palette::dark();
+        let input = InputStyle::themed(&p);
+        assert_eq!(input.grip.shape, GripShape::Bars, "默认三条横线（不是斜线）");
+        assert_eq!(input.grip.color, p.text_dim, "柄色取自调色板");
+        assert_eq!(input.grip.color, input.resize_handle, "与 resize_handle 同色");
+        assert!(input.grip.is_visible());
+        // setter：换形状 / 换整份样式；`Hidden` 只是不画图案（命中区由引擎另给）。
+        assert_eq!(
+            input.clone().with_grip_shape(GripShape::Diagonal).grip.shape,
+            GripShape::Diagonal
+        );
+        assert!(!input.clone().with_grip_shape(GripShape::Hidden).grip.is_visible());
+        assert_eq!(
+            input.clone().with_grip(GripStyle { count: 2, ..GripStyle::default() }).grip.count,
+            2
+        );
+        // `Theme::scaled` 必须把这把柄一起预乘（漏了就是"1.5× 下柄比别的小"）。
+        assert_eq!(
+            Theme::dark().scaled(1.5).input.grip.size,
+            (4.0_f32 * 1.5).round()
+        );
     }
 
     #[test]
