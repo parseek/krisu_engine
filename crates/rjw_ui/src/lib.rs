@@ -194,7 +194,7 @@ pub use view::{ViewCtx, ViewMode};
 /// 应用侧用 [`Theme::with_font_weight`] / [`Weight`] 时不必自己引 `rjw_text`。
 pub use rjw_text::{Stretch, Style, Weight};
 pub use widgets::{
-    Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, Dropdown,
+    Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, DividerAxis, Dropdown,
     FONT_WEIGHT_CHOICES, FontModal, GRIP_W, Item, Label, MENU_GAP, MenuBar, MenuClick, MenuContent,
     MenuCtx, MenuFn, NumberInput, PopupSide, Response, Segmented, Sense, Slider, SliderValue,
     TextEditor, Widget, WidgetId, color_hex, format_color, format_f, format_u8, ink_on, item_h, luma,

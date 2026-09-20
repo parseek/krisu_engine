@@ -316,7 +316,7 @@ pub use colorpicker::{
     ColorFormat, ColorPicker, ColorPickerState, color_hex, format_color, format_f, format_u8,
     ink_on, luma, parse_color, parse_hex,
 };
-pub use divider::Divider;
+pub use divider::{Divider, DividerAxis};
 pub use dropdown::Dropdown;
 pub use fontmodal::{FONT_WEIGHT_CHOICES, FontModal, weight_label};
 pub use menu::{
