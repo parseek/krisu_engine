@@ -8,7 +8,7 @@ pub struct BaseInformation;
 const TITLE: &str = "BaseInformation 基本信息";
 
 impl app::Demo for BaseInformation {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         TITLE
     }
 

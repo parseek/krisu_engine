@@ -8,7 +8,7 @@ pub struct HelloWindow;
 const TITLE: &str = "HelloWindow";
 
 impl app::Demo for HelloWindow {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         TITLE
     }
 

@@ -10,7 +10,7 @@ pub struct ColorPicker {
 const TITLE: &str = "ColorPicker 颜色选择器";
 
 impl app::Demo for ColorPicker {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         TITLE
     }
 

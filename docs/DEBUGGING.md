@@ -6,6 +6,48 @@
 
 ---
 
+## 0. 门禁命令表（每次提交前全跑）
+
+改动**任何** UI 相关代码（含"只改文档/注释"）都跑这套；**红一条就不算过**。覆盖
+"编译 → 静态检查 → 单测 → 交互行为 → 冒烟"五条通路，缺一条就会出现"编译过、行为错"。
+
+```powershell
+# 0) 环境：本机产物不在 ./target
+$env:CARGO_TARGET_DIR = "C:\rust-targets\"
+
+# 1) 编译 / 静态检查 / 单测
+cargo check  --offline --workspace --all-targets          # 期望 0 warning
+cargo clippy --offline -p rjw_ui --all-targets            # 期望 0 warning
+cargo test   --offline --workspace                        # 全绿（rjw_ui 基线：324 lib + 40 doc）
+
+# 2) 交互行为：15 个脚本化仿真（判定打在 stderr，全 [OK] 才算过）
+#    ⚠ 每个 sim 自己打印判定帧，`--frames` 只要"超过最后一个判定帧"；260 覆盖全部（现网最大 240）。
+foreach ($s in "drag","picker","overlap","cover","chrome","weight","shadow","clip",
+              "zorder","text-cull","tuner","menu","dropdown","weight-modal","resize") {
+    cargo run --offline -p eg260818UI -- "--sim-$s" --frames 260
+}
+
+# 3) 冒烟：帧循环跑满 N 帧自动退出
+cargo run --offline -p eg260818UI -- --frames 240   # => krusie smoke: [OK] 240/240
+cargo run --offline -p egUI -- --frames 60          # => krusie smoke: [OK] 60/60
+
+# 4) egUI 单窗口诊断（demo **默认全关** ⇒ 不带 --demo 的冒烟跑的是空屏）
+cargo run --offline -p egUI -- --demo Gallery --ui-dump --frames 60
+```
+
+| 命令 | 守什么 |
+|---|---|
+| `check` / `clippy` / `test` | 公开面没坏、单测期望（几何 / 命中 / 文本 / 主题）没变、无新增告警 |
+| 15 个 `--sim-*` | **交互行为**（拖拽 / 收起 / 遮挡 / 层级 / 裁剪 / 菜单 / 下拉 / 尺寸责任链…）；数值断言写在各 sim 的判定行里 |
+| `--frames N` 冒烟 | 帧循环 / 资源生命周期（present 满 N 帧；退出路径无 panic） |
+| `--demo … --ui-dump` | **指定代码路径真的被跑到**：`--ui-dump` 的窗口行 = 那个 demo 的窗口（`--demo` 打错 ⇒ 打清单 + **非 0 退出**，不静默） |
+
+诊断专用（不进上表）：`--sim-import <图片>` / `--sim-theme <toml>` / `--sim-click X,Y`（配
+`RJ_HIT_TRACE=1`）/ `--auto-drag` / `--script-pos` / `RJ_CHROME_TRACE` / `RJ_MENU_TRACE` /
+`RJ_ORDER_TRACE=<frame>`。各 sim 的**判定口径与现场**见 §2–§5。
+
+---
+
 ## 1. 先看状态：`Ui::debug_dump()` / `Ctx` 事实
 
 引擎把"自己眼里的世界"暴露成可打印结构，**不要靠猜**。
