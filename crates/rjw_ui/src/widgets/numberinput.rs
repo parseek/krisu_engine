@@ -1,9 +1,9 @@
 //! **数字输入框**（组合控件，只依赖公开 API）。
 //!
 //! - **拖拽调值**：按住右侧手柄**水平拖动**（**向右拖 = 增加**），拖到窗口边缘自动
-//!   **warp**（光标跳到对侧继续拖，增量连续），松开结束；手柄悬停/拖拽显示
+//!   **warp**（光标跳到对侧继续拖），松开结束；手柄悬停/拖拽显示
 //!   [`crate::UiCursor::EwResize`]（↔）；**窗口最大化时同样生效**（鼠标无法越出窗口，
-//!   用"边缘检测"触发 warp，指针跳到对侧内侧继续拖）；
+//!   用"边缘检测"触发 warp）；
 //! - **输入模式**：点击文本框 → 禁用拖拽 + **全选** + I 型光标键盘输入；直到失去
 //!   焦点 → 恢复拖拽模式；
 //! - **显示文本内部管理**：[`NumberInput::new`] 只需数值引用——失焦显示由 `value`
@@ -44,6 +44,24 @@
 //! 4. **拖动会吸附、打字不会**：`step` 是**拖动精度**；手打的 `0.37`（`step = 0.1`）原样保留
 //!    （只 clamp 到 `range`），显示上也**如实**显示到"能表示它"的小数位（`0.37`，而不是被
 //!    `step` 的四舍五入糊成 `0.4`）。
+//!
+//! # 绕窗（warp）拖拽：**请求**与**补偿**分开
+//!
+//! 拖到窗口左右边缘时，控件请求把光标挪到对侧内侧（[`Ui::set_cursor_position`]）——
+//! 这样"横向拖很短的距离"也能穿过整个取值范围（窗口最大化时鼠标本来也出不去窗口）。
+//!
+//! ⚠ 关键：`set_cursor_position` 只是**请求**，真正挪动要等 OS 事件（可能晚一两帧，
+//! 也可能不生效）。所以拖拽基准**不能**在请求当帧就平移——那会在"光标还没挪"的几帧里
+//! **每帧再平移一次**，值以"一个窗宽 / 帧"飞走（历史 BUG）。现在的口径：
+//!
+//! 1. **请求**：`mx` 到边缘 ⇒ 请求挪到对侧内侧 `3px`（`mx` 用**客户区物理像素**，与
+//!    [`Ui::mouse_screen`] / winit 的 `set_cursor_position` 同一坐标系）；
+//! 2. **补偿**：下一帧**真的看到**跨窗跳变（`|mx − 请求点| > 半个窗宽`）才把拖拽基准
+//!    平移**同样的量** ⇒ 值严格连续、且只补一次；光标没挪 ⇒ 基准不动 ⇒ 值停在边缘；
+//! 3. 只有"请求过"才会做跳变判定 ⇒ **快速甩鼠标**（单帧大位移）不会被误判成 warp。
+//!
+//! 这一整套状态机是纯函数 [`warp_step`]（4 个单测：请求不动基准 / 光标没挪时冻结 /
+//! 补偿恰好一次 / 端到端序列严格连续）。
 
 use glam::Vec2;
 use rjw_transform::Rect;
@@ -153,6 +171,54 @@ fn clamp_to<T: SliderValue + PartialOrd>(v: T, lo: Option<T>, hi: Option<T>) -> 
         out = hi;
     }
     out
+}
+
+/// **绕窗（warp）到边缘的判定宽度**（客户区物理像素；`mx >= win_w − EDGE` 即"到右边"）。
+const WARP_EDGE: f32 = 1.0;
+/// **绕窗落点内缩**（客户区物理像素）：跳到对侧边缘**内侧** `3px`——跳完就不在边缘了
+/// （不会连着触发），又足够近（继续拖时值连续）。
+const WARP_INSET: f32 = 3.0;
+
+/// [`warp_step`] 的结果。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WarpStep {
+    /// 本帧的拖拽基准（**已把"观察到的跨窗跳变"补偿掉**）。
+    pm: f64,
+    /// 本帧要**请求**的 warp 目标 x（`None` = 不在边缘 / 不请求）。
+    target: Option<f32>,
+    /// 记给下一帧的"请求点"（= 请求时的 `mx`；`None` = 清空）。
+    from: Option<f32>,
+}
+
+/// **绕窗一步**（纯函数，可单测）：绕窗拖拽的**全部状态机**都在这里。
+///
+/// 语义（两条，缺一不可）：
+/// 1. **请求**：鼠标到窗口左 / 右边缘就请求把光标挪到对侧内侧（`target`）——这只是**请求**，
+///    `set_cursor_position` 要等 OS 事件才生效，甚至可能不生效；
+/// 2. **补偿**：只有在**真的观察到**跨窗跳变（`|mx − from| > 半个窗宽`）时，才把拖拽基准
+///    平移**同样的量** ⇒ 值**严格连续**、**不重复补偿**。
+///
+/// ⚠ 为什么不能"请求时顺便补偿"（旧实现）：光标还没挪的那几帧会**每帧再补偿一次** ⇒ 值以
+/// "一个窗宽 / 帧"的速度飞走（实机与仿真都能复现）。另外：只有 `from` 存在时才做跳变判定，
+/// 所以"快速甩鼠标"这种单帧大位移**不会**被误判成 warp。
+fn warp_step(pm: f64, prev_from: Option<f32>, mx: f32, win_w: f32) -> WarpStep {
+    let mut pm = pm;
+    // ① 观察补偿：上一帧请求过 warp，本帧看到"跳到对侧" ⇒ 基准平移同样的量（值不变）。
+    if let Some(from) = prev_from {
+        let jump = mx - from;
+        if jump.abs() > win_w * 0.5 {
+            pm += f64::from(jump);
+        }
+    }
+    // ② 请求：到边缘就把光标挪到对侧**内侧**。只请求、不动基准（挪动了下一帧才补偿）。
+    let target = if mx >= win_w - WARP_EDGE {
+        Some(WARP_INSET)
+    } else if mx <= WARP_EDGE {
+        Some(win_w - WARP_INSET)
+    } else {
+        None
+    };
+    WarpStep { pm, target, from: target.map(|_| mx) }
 }
 
 /// `step` 的**十进制小数位数**（`0.1` → 1、`0.25` → 2、`0.05` → 2、`≥ 1` / `≤ 0` → 0）。
@@ -369,28 +435,29 @@ impl<T: SliderValue + PartialOrd> Widget for NumberInput<'_, T> {
                     ws.press_panel = Some(Vec2::new(0.0, base as f32));
                 }
                 ws.drag_sens = speed;
-                // warp：鼠标到达窗口左右**边缘**即 wrap（而非"越出窗口"）——窗口
-                // **最大化**时鼠标无法越出窗口（窗口填满显示器），越界检测永不触发；
-                // 边缘检测在拖到窗口边缘的瞬间生效。指针跳转到对侧**内侧** `o`（距
-                // 对侧边缘 3px，非边缘 → 跳转后不反复触发，且够近保持连续）；拖拽
-                // 基准同步偏移（增量连续：`v = base + (mx - pm)` 用本帧旧 `pm`）。
-                const EDGE: f32 = 1.0;
-                let o = 3.0;
-                let (warp, new_mx) = if mx >= win_w - EDGE {
-                    (-(win_w - o), o)
-                } else if mx <= EDGE {
-                    (win_w - o, win_w - o)
-                } else {
-                    (0.0, mx)
-                };
-                if warp != 0.0 {
-                    ws.press_mouse = Some(Vec2::new(pm as f32 + warp, 0.0));
-                    warp_to = Some((new_mx, my));
+                // **绕窗（warp）**：鼠标到达窗口左右**边缘**就把光标挪到对侧内侧继续拖
+                // （窗口**最大化**时鼠标无法越出窗口，靠"边缘检测"而不是"越出检测"）。
+                // 全部状态机在 [`warp_step`] 里（请求 + **观察补偿**）：
+                // - **只在真正观察到跨窗跳变时**才平移拖拽基准 ⇒ 值严格连续；
+                // - 光标还没挪（`set_cursor_position` 是请求，OS 事件可能晚到甚至不生效）时
+                //   基准不动 ⇒ 值停在边缘。旧实现在请求当帧就平移基准 ⇒ 那几帧每帧再平移
+                //   一次 ⇒ 值以"一个窗宽 / 帧"飞走（实机与 `--sim-*` 都能复现）。
+                let step_res = warp_step(pm, ws.warp_from, mx, win_w);
+                if step_res.pm != pm {
+                    pm = step_res.pm;
+                    ws.press_mouse = Some(Vec2::new(pm as f32, 0.0));
+                }
+                ws.warp_from = step_res.from;
+                if let Some(nx) = step_res.target {
+                    warp_to = Some((nx, my));
                 }
                 let raw = base + (f64::from(mx) - pm) * step_f * speed_f;
                 let v = snap_clamp(raw, step_f, lo_f, hi_f);
                 *self.value = clamp_to(T::from_f64(v), lo_v, hi_v);
                 *edit_text = display_text(*self.value, self.step);
+            } else {
+                // 松手 / 未拖拽：清掉绕窗的待补偿点（下次拖拽重新开始）。
+                ws.warp_from = None;
             }
         }
         if let Some((nx, ny)) = warp_to {
@@ -594,6 +661,113 @@ mod tests {
         assert_eq!(snap_clamp(3.6, 1.0, None, None), 4.0f64, "整数默认一格一格");
         assert_eq!(<u8 as SliderValue>::from_f64(snap_clamp(300.0, 1.0, None, None)), 255u8);
         assert_eq!(<i32 as SliderValue>::from_f64(snap_clamp(-2.5, 1.0, None, None)), -3i32);
+    }
+
+    // ─── 绕窗（warp）拖拽 ────────────────────────────────────────
+    //
+    // 曾经的 BUG：请求 warp 的**当帧**就平移拖拽基准 ⇒ 光标还没被挪到对侧的那几帧
+    // **每帧再平移一次** ⇒ 值以"一个窗宽 / 帧"飞走（`--sim-*` 与实机都能复现）。
+    // 现在：只**请求**，等**观察到**跨窗跳变才补偿（补偿量与跳变量完全相同）。
+
+    /// 请求 warp：到边缘只**请求**、不动基准；记下请求点给下一帧。
+    #[test]
+    fn warp_requests_at_the_edge_without_moving_the_base() {
+        let (pm, win_w) = (100.0f64, 1920.0f32);
+        // 右边缘：请求跳到左侧内侧 3px。
+        let s = warp_step(pm, None, 1919.0, win_w);
+        assert_eq!(s.pm, pm, "请求阶段不许动基准（这正是旧 BUG）");
+        assert_eq!(s.target, Some(WARP_INSET));
+        assert_eq!(s.from, Some(1919.0), "记下请求点");
+        // 左边缘：请求跳到右侧内侧。
+        let s = warp_step(pm, None, 0.0, win_w);
+        assert_eq!(s.pm, pm);
+        assert_eq!(s.target, Some(win_w - WARP_INSET));
+        assert_eq!(s.from, Some(0.0));
+        // 中间：不请求、也清空待补偿点。
+        let s = warp_step(pm, Some(1919.0), 1000.0, win_w);
+        assert_eq!(s.pm, pm, "没看到跨窗跳变 ⇒ 不补偿");
+        assert_eq!(s.target, None);
+        assert_eq!(s.from, None);
+    }
+
+    /// **光标还没挪**（同一 `mx` 连续几帧）：基准**不动** ⇒ 值停在边缘，不飞走。
+    #[test]
+    fn warp_holds_the_value_while_the_cursor_has_not_moved() {
+        let (pm, win_w) = (100.0f64, 1920.0f32);
+        let mut pm = pm;
+        let mut from = None;
+        // 第 1 帧：到边缘 → 请求。
+        let s = warp_step(pm, from, 1919.0, win_w);
+        (pm, from) = (s.pm, s.from);
+        assert_eq!((pm, s.target), (100.0, Some(WARP_INSET)));
+        // 之后 10 帧光标仍停在 1919（OS 事件还没到 / 不生效）⇒ 基准与值都不变。
+        for i in 0..10 {
+            let s = warp_step(pm, from, 1919.0, win_w);
+            assert_eq!(s.pm, pm, "第 {i} 帧不许再补偿（旧 BUG：这里每帧累加一个窗宽）");
+            (pm, from) = (s.pm, s.from);
+        }
+        assert_eq!(pm, 100.0);
+    }
+
+    /// **真的跳了才补偿**：补偿量 = 跳变量 ⇒ 值**严格连续**（不多不少），且只补一次。
+    #[test]
+    fn warp_compensates_the_observed_jump_exactly_once() {
+        let (pm, win_w) = (100.0f64, 1920.0f32);
+        // 请求点在 1919，下一帧观察到跳到 3 ⇒ `pm += (3 - 1919)`。
+        let s = warp_step(pm, Some(1919.0), 3.0, win_w);
+        assert_eq!(s.pm, pm + 3.0 - 1919.0);
+        assert_eq!(s.target, None, "3 不在边缘 ⇒ 不重复请求");
+        assert_eq!(s.from, None, "补偿过就清空");
+        // 再调一次（已无 from）⇒ 不再补偿。
+        let s2 = warp_step(s.pm, s.from, 4.0, win_w);
+        assert_eq!(s2.pm, s.pm);
+        // 快速甩鼠标（没有待补偿点）⇒ 单帧大位移**不**被当成 warp。
+        let s3 = warp_step(pm, None, 1500.0, win_w);
+        assert_eq!(s3.pm, pm);
+    }
+
+    /// **端到端序列**（用与 `ui()` 相同的公式）：拖到右边缘 → 光标没挪（停 5 帧）→
+    /// 观察到跳到对侧 → 继续右拖。断言：值**单调不减**、边缘处**冻结**、
+    /// 跳变前后**严格相等**、跳完继续涨。
+    #[test]
+    fn warp_drag_sequence_is_monotone_and_continuous() {
+        let win_w = 1920.0f32;
+        let (step, speed, base) = (0.5f64, 1.0f64, 0.0f64);
+        let mut pm = 0.0f64; // 按下时的鼠标 x（客户区）
+        let mut from: Option<f32> = None;
+        let mut last = base;
+        let mut edge_value: Option<f64> = None;
+        let mut after_jump: Option<f64> = None;
+        // 帧序列：走到 1919（边缘）→ 原地停 5 帧 → 跳到 3 → 继续到 20。
+        // 索引：0=100、1=900、2=1919（首碰边缘）、3..=7=1919（光标没挪）、8=3（观察到跳变）、9=5、10=20。
+        let positions: Vec<f32> = [100.0f32, 900.0, 1919.0]
+            .into_iter()
+            .chain(std::iter::repeat_n(1919.0, 5))
+            .chain([3.0f32, 5.0, 20.0])
+            .collect();
+        for (i, mx) in positions.iter().copied().enumerate() {
+            let s = warp_step(pm, from, mx, win_w);
+            (pm, from) = (s.pm, s.from);
+            // 与 `ui()` 里同一套：raw → 吸附（不设 range）。
+            let v = snap_clamp(base + (f64::from(mx) - pm) * step * speed, step, None, None);
+            assert!(v >= last, "第 {i} 帧值回退：{last} → {v}（mx={mx}）");
+            last = v;
+            match i {
+                2 => edge_value = Some(v), // 刚碰到边缘那一帧
+                8 => after_jump = Some(v), // 观察到跳变、补偿后的那一帧
+                9..=10 => {
+                    assert!(
+                        v > after_jump.expect("第 8 帧已记录"),
+                        "跳完必须继续涨（第 {i} 帧 {v}）"
+                    );
+                }
+                _ => {}
+            }
+        }
+        // 边缘值 = 按下点 0 → 1919，每像素 0.5 ⇒ 959.5（吸附到 0.5 的格点）。
+        assert_eq!(edge_value, Some(959.5));
+        // 跳变前后**严格相等**（"补偿量 = 跳变量"的直接结果；旧实现要么飞走、要么差一个边缘宽度）。
+        assert_eq!(after_jump, edge_value, "绕窗后值必须接得上");
     }
 
     /// **拖拽序列**：`step = 0.1` 每像素 +0.1，走 30 步——
