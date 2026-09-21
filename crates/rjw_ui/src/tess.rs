@@ -806,6 +806,13 @@ pub(crate) fn push_rounded_rect_uv(
 ///
 /// 三组带子 `A-B` / `B-C` / `C-D`。`f <= 0` 时只留 `B-C`。
 ///
+/// # 羽化宽度（`feather`）与"边框看起来多粗"
+///
+/// 环带的内外**两条**边界各带 `f/2` 的斜坡 ⇒ 墨迹粗度 = `width + f`。所以 `f` 被夹到
+/// **不超过边框宽度**（`f ≤ width`）：否则 1 物理像素的边框会被画成近 2 像素
+/// （见 [`Theme::feather`](crate::style::Theme::feather) 的 1.2 逻辑像素 × 150% DPI = 1.8
+/// 这个现实取值）。宽边框（`width ≥ f`）不受影响。
+///
 /// # 退化
 ///
 /// - `r_outer == 0`（直角边框）走**四条轴对齐矩形条**的专用路径（16 顶点），
@@ -885,7 +892,12 @@ pub(crate) fn push_rounded_ring(
     // 内半径太小 ⇒ 内角是直角。夹到 0.5px（视觉上与直角无异），避免内圈点重合导致
     // 零面积三角形、以及两级轮廓点数不一致。
     let ri = ro.map(|r| (r - width).max(MIN_AA_RADIUS)).fit(inner_rect.w, inner_rect.h);
-    let f = feather.max(0.0).min(w.min(h) * 0.25);
+    // **羽化带宽不得超过边框本身宽度**：环带的内外两条边界**各**带 f/2 的斜坡 ⇒
+    // 视觉粗度 = `width + f`。f 比 width 还大时，1 物理像素的边框会画出 1.8 像素的墨迹
+    // （用户实测：`border_w 1.0` × 1.5 取整 = 1 物理像素，而 `DEFAULT_FEATHER 1.2` × 1.5
+    // = 1.8 物理像素 ⇒ 看起来 2.8 像素粗）。这与 [`push_convex`] 的"细条羽化夹到半厚以内"
+    // 是同一条规矩：**薄形状的羽化必须 ≤ 它薄的那一维**。
+    let f = feather.max(0.0).min(width).min(w.min(h) * 0.25);
     let half = f * 0.5;
     // 内羽化需要 `ri - half` 仍是有效半径（否则跳过内羽化，只保外羽化）。
     let inner_aa = half > 0.0 && ri.min() - half >= 0.0;
@@ -1560,6 +1572,45 @@ mod tests {
         let ring0 = v[(n + 1) as usize].pos; // 羽化带第 0 个顶点（跳过一个中心点）
         assert!((hard0[0] - ring0[0] - f).abs() < 1e-4, "外环应再向左 {f}px");
         assert!((hard0[1] - ring0[1]).abs() < 1e-4, "外环与内点同 y");
+    }
+
+    #[test]
+    fn ring_feather_is_capped_by_the_border_width() {
+        // 边框的**视觉粗度 = width + f**（内外两条边界各占 f/2 的斜坡）。f 一旦大于
+        // width，1 物理像素的边框就会被画成 1.8 像素的墨迹——用户实测的"边框显得很宽"：
+        // `border_w 1.0 × 1.5 → floor → 1 物理像素`，而 `DEFAULT_FEATHER 1.2 × 1.5 = 1.8`。
+        // 夹到 `f ≤ width` 后墨迹 = 1 + 1 = 2（斜坡各 0.5，仍是标准 AA）。
+        let t = table();
+        let rect = Rect::new(10.0, 10.0, 60.0, 36.0);
+        let feather = 1.8_f32;
+        let width = 1.0_f32;
+        let mut v = Vec::new();
+        let mut tr = Vec::new();
+        push_rounded_ring(&mut v, &mut tr, &t, rect, 8.0.into(), width, feather, Color::RED, TEST_UV);
+        assert!(tr.iter().all(|x| x.len() == 3));
+        let half = width * 0.5; // = min(feather, width) / 2
+        let min_x = v.iter().map(|p| p.pos[0]).fold(f32::INFINITY, f32::min);
+        let max_x = v.iter().map(|p| p.pos[0]).fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (rect.x - min_x - half).abs() < 0.05,
+            "外羽化只该探出 {half}px（实际 {}）—— 夹取没生效就是 1 像素边框被画粗",
+            rect.x - min_x
+        );
+        assert!(
+            (max_x - (rect.max().x + half)).abs() < 0.05,
+            "右边对称（实际探出 {}）",
+            max_x - rect.max().x
+        );
+        // **宽边框不受影响**（f 仍完全生效）：8px 边框 + 1.8 羽化 ⇒ 仍是 0.9px 斜坡。
+        let mut v2 = Vec::new();
+        let mut tr2 = Vec::new();
+        push_rounded_ring(&mut v2, &mut tr2, &t, rect, 8.0.into(), 8.0, feather, Color::RED, TEST_UV);
+        let min_x2 = v2.iter().map(|p| p.pos[0]).fold(f32::INFINITY, f32::min);
+        assert!(
+            (rect.x - min_x2 - feather * 0.5).abs() < 0.05,
+            "宽边框的羽化不该被夹（实际 {}）",
+            rect.x - min_x2
+        );
     }
 
     #[test]

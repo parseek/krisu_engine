@@ -536,7 +536,8 @@ impl QuadCollector {
     /// **CPU 镶嵌的圆角边框（环带）**（图形组；白纹理 + 纯色）。
     ///
     /// `feather` 同 [`crate::tess::RoundedRectSpec::feather`]：边框的**内外两条边界**
-    /// 都会做羽化斜坡。
+    /// 都会做羽化斜坡 ⇒ **视觉粗度 = `width + feather`**，所以镶嵌器把 `feather` 夹到
+    /// 不超过 `width`（见 [`crate::tess::push_rounded_ring`]）——1px 边框不会因为 AA 变粗。
     pub(crate) fn push_rounded_ring(
         &mut self,
         win: u32,
