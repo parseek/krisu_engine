@@ -789,7 +789,9 @@ f.text(|t| {
 | `Ui::end_frame(&mut dyn UiBackend)` | `ui.end_frame(&mut backend)` | **帧收尾**（每帧一次）：输入结算（空白清焦点 / 清一次性边沿 / 窗口按下裁决）/ 焦点导航 + 描边 / 光标定夺 / 统计写回（`UiStats.frame` 每帧 +1、`ui_frame_us` = 开场→收尾）/ 帧级暂存关场 |
 | `UiState::new()` | 应用持有 | 跨帧持久状态容器 |
 | `UiState::begin_frame()` / `frame_open()` | 运行时内部 / 诊断 | 每帧开场一次（帧号 / 命中区翻页 / 帧级暂存清零）；`frame_open()` 判断本帧是否录过 UI |
-| `UiState::reset()` / `remove(id)` | 示例"R 重开" | 清空全部 / 移除单个控件状态 |
+| `UiState::reset()` / `remove(id)` | 示例"R 重开" | 清空全部 / 移除单个控件状态。`reset()` **逐个转调模块 `reset_*()`**（见下），所以"某模块新增字段忘了清"不可能发生 |
+| `UiState` 的 **9 个模块** | `state.frame()` / `.widgets()` / `.windows()` / `.texts()` / `.scrolls()` / `.popups()` / `.hits()` / `.caches()` / `.stats()` | **公开只读视图**（模块化的公开面；内部字段布局与应用解耦）。例：`state.widgets().sizes()`、`state.windows().z(id)`、`state.popups().menu_open()`、`state.hits().occluded_hits()`、`state.scrolls().get(id)`。**写**走语义化方法：`sizes_mut()` / `color_picker_mut()` / `set_menu_open()` / `set_combo_open()` / `close_popups()`（＋既有的 `widget(id)` / `set_collapsed(..)`） |
+| `UiState::reset_frame / reset_widgets / reset_windows / reset_texts / reset_scrolls / reset_popups / reset_hits / reset_caches` | 只清一个模块 | 模块级重置（`reset()` = 逐个调用它们 + 清 `stats`）。⚠ `widget_strs` 曾漏清——由单测 `reset_clears_every_module_after_dirtying` 抓出并修掉 |
 | `UiState::text_focus() -> Option<TextFocus>` | `if ui.state().text_focus().is_none() { /* 快捷键 */ }` | **文本焦点**（只有输入框/多行框持焦点才为 `Some`）；取代旧 `capturing_text()` —— 按钮/滑块的 Tab 焦点不再吞应用快捷键 |
 | `UiState::combo_open() -> Option<&str>` | `if ui.state().combo_open().is_none() && esc { /* 自己的 Esc */ }` | **当前展开的下拉菜单**（[`Dropdown`](crate::Dropdown) 的**控件绝对 ID**；面板窗口 id = 它 + `::popup`）。与 `menu_open()` 对称（两个槽分开存：栏是应用级 UI，下拉属于某个控件）；`reset()` 清空 |
 | `Ui::debug_dump() -> UiDebugDump` | `eprintln!("{}", ui.debug_dump())` | 引擎侧状态快照（每窗口 `id/z/origin/submit/size/drag/press/stored`），单行可 grep；任一段都能调用，帧级暂存跨段共享 ⇒ 后一段能看到前一段录的窗口。⚠ 按**本帧录制过的窗口 ID** 列（不是按 z）：浮层 z = `WIN_TOPMOST` 基址 + **嵌套层数**（子菜单比父面板 +1，`ui::overlay_z`），按 id 列才不会漏掉嵌套浮层；`origin` 是**相对直接容器**的原点（顶层窗口 = 屏幕坐标，**嵌套浮层要叠加外层窗口原点**）。见 [DEBUGGING.md](DEBUGGING.md) §1 |

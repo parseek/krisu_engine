@@ -224,7 +224,7 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 剪贴板、换行、滚动条），是唯一没被提取的控件主体。`edit.rs` 已经把纯逻辑拆干净了，
 但**绘制与交互仍在 `ui.rs` 中央**——这是 `ui.rs` 变胖的最大单一贡献者。
 
-### 5.3 `Ui` 39 字段 / `UiState` 39 字段（其中 20 张 ID 表）
+### 5.3 `Ui` 39 字段 / `UiState` 42 字段（其中 20 张 ID 表）→ **已按模块公开**
 `Ui` 每帧重建，字段是"帧内事实 + 一次性覆盖 + 光标意图 + 责任链"的混合体；
 `UiState` 里 `widgets / radio_groups / panel_pos / window_z / window_rects /
 window_origins / grid_cells / text_buffers / window_quads / z0_quads / scrolls /
@@ -232,6 +232,23 @@ window_widths / window_sizes / window_heights / panel_sizes / sizes / window_fx 
 debug_submit / debug_clip / widget_strs` 共 **20 张以 ID 或 z 为键的表**并存。
 它们的字段注释都在解释"为什么不能用另一张表"（z vs id、帧 vs 跨帧、局部 vs 绝对）——
 文档很完整，但这本身就是**状态空间过大的信号**。
+
+> **进展（C：模块化 + pub 化）**：`UiState` 的 42 个字段现在按关注点分成 **9 个模块**，
+> 以**公开只读视图**的形式对外（`state.frame() / widgets() / windows() / texts() /
+> scrolls() / popups() / hits() / caches()`，外加 `stats()`）；**写**走语义化方法
+> （`sizes_mut()` / `color_picker_mut()` / `set_menu_open()` / `set_combo_open()` /
+> `close_popups()`），不把内部表暴露成 `pub` 字段。
+>
+> 为什么用视图而不是把**存储**拆成 9 个子结构：字段被引擎侧 ~200 处直接访问，拆存储会
+> 牵动每一个调用点，而应用真正需要的是**稳定的公开面**——视图把公开面与内部布局解耦
+> （以后内部怎么挪都不破坏应用），同时**模块边界就是文档边界**。
+>
+> 附带一条**真正的安全性修复**：`reset()` 改为逐个转调 `reset_frame/widgets/windows/
+> texts/scrolls/popups/hits/caches`，于是"某模块新增字段却忘了清"不可能再发生——
+> 新单测 `reset_clears_every_module_after_dirtying`（脏化 8 个模块 → `reset()` → 逐个
+> 模块断言为空）**当场抓出旧 `reset()` 漏清 `widget_strs`**（以及漏清 `debug_submit` /
+> `debug_clip` / `window_widths` / `window_heights` / scratch 缓冲），已一并修掉。
+> 行为零变化：16 个 `--sim-*` 全绿。
 
 ### 5.4 `UiAdd` 的方法表是重复而非抽象
 容器闭包需要 `&mut Ui`，所以 `Panel / Pack / Grid / Window / Scroll / FlexCtx` 各自

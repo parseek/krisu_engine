@@ -618,41 +618,20 @@ impl UiState {
     }
 
     /// 清空全部状态（示例"重开"等场景）。
+    ///
+    /// **逐个模块转调 `reset_*()`**（帧 / 控件 / 窗口 / 文本 / 滚动 / 浮层 / 命中 / 缓存 / 统计）
+    /// ——这样"某个模块新增了字段"只需改那个模块的 `reset_*`，不会再出现
+    /// "新字段忘了在这里清"（以前真修过这类：`widget_strs`）。
     pub fn reset(&mut self) {
-        self.widgets.clear();
-        self.focused = None;
-        self.focused_kind = None;
-        self.radio_groups.clear();
-        self.grid_cells.clear();
-        self.panel_pos.clear();
-        self.auto_pos.clear();
-        self.auto_next = 0;
-        self.panel_sizes.clear();
-        self.window_z.clear();
-        self.window_rects.clear();
-        self.window_origins.clear();
-        self.text_buffers.clear();
-        self.frame = 0;
-        self.ime_composing = false;
-        self.window_quads.clear();
-        self.z0_quads.clear();
-        self.occluded_hits = 0;
-        self.widget_occluded_hits = 0;
-        self.press_cancelled_by_window = 0;
-        self.hit_regions.clear();
-        self.prev_hit_regions.clear();
-        self.last_press_window = None;
-        self.scrolls.clear();
-        self.combo_open = None;
-        self.menu_open = None;
-        self.collapsed.clear();
-        self.color_picker = crate::widgets::ColorPickerState::default();
-        self.sizes.clear();
-        self.window_fx.clear();
+        self.reset_frame();
+        self.reset_widgets();
+        self.reset_windows();
+        self.reset_texts();
+        self.reset_scrolls();
+        self.reset_popups();
+        self.reset_hits();
+        self.reset_caches();
         self.stats = UiStats::default();
-        // **帧级暂存也清**（含 `open = false`）：`reset` 常在**段内**调用（示例"R 重开"），
-        // 若把 `open` 留成 true，下一帧第一段就不再开场（帧号不推进 / 命中区不翻页）。
-        self.frame_state = UiFrameState::default();
     }
 
     /// **文本焦点**（`None` = 当前焦点不是文本控件 / 无焦点）。
@@ -770,6 +749,381 @@ impl UiState {
     }
 }
 
+// ─── `UiState` 的模块视图（公开的模块化入口） ──────────────────────
+//
+// **为什么是"视图"而不是把存储拆成 9 个子结构**：`UiState` 的 42 个字段被引擎侧
+// ~200 处直接访问（`self.state.widgets` 之类），把**存储**拆开会牵动每一个调用点，
+// 而应用真正需要的是**稳定的公开面**。视图把字段按关注点分组暴露（读为主，写走
+// `UiState` 上的 `*_mut` 方法），于是：
+//
+// 1. **公开面稳定** —— 以后内部字段怎么挪（合并 / 拆表 / 换容器）都不破坏应用；
+// 2. **每个模块自带 `reset_*()`**，`UiState::reset()` 逐个调用
+//    ⇒ **新增字段不会再"忘记清"**（这正是以前修过的一类 bug，单测
+//    `reset_clears_every_module_after_dirtying` 守着）；
+// 3. 模块边界就是文档边界（`docs/UI_ARCHITECTURE.md` §5.3）。
+
+/// **帧模块**（[`UiState::frame`]）：帧号 / 帧级暂存（同一帧内多段共享）。
+#[derive(Clone, Copy, Debug)]
+pub struct FrameModule<'a>(pub(crate) &'a UiState);
+
+impl FrameModule<'_> {
+    /// 帧计数（跨帧单调递增；光标闪烁相位用）。
+    #[inline]
+    pub fn frame(&self) -> u64 {
+        self.0.frame
+    }
+    /// 本帧是否已开场（帧级暂存有效；`false` ⇒ 本帧还没录过 UI）。
+    #[inline]
+    pub fn is_open(&self) -> bool {
+        self.0.frame_state.open
+    }
+    /// 本帧当前段号（"ui anywhere" 一帧多段）。
+    #[inline]
+    pub fn segment(&self) -> u32 {
+        self.0.frame_state.segment
+    }
+    /// 本帧**录制过的窗口 ID**（按录制顺序；`debug_dump` 的窗口清单来源）。
+    #[inline]
+    pub fn window_ids(&self) -> &[IdAbsolute<'static>] {
+        &self.0.frame_state.window_ids_seen
+    }
+}
+
+/// **控件模块**（[`UiState::widgets`]）：按绝对 ID 的控件状态 + 尺寸 / 网格 / 焦点 / 单选组。
+#[derive(Clone, Copy, Debug)]
+pub struct WidgetsModule<'a>(pub(crate) &'a UiState);
+
+impl<'a> WidgetsModule<'a> {
+    /// 查某控件的持久状态（`None` = 还没录过）。
+    #[inline]
+    pub fn get(&self, id: &str) -> Option<&'a WidgetState> {
+        self.0.widgets.get(id)
+    }
+    /// 用户拖拽缩放的控件尺寸（[`Ui::resize_handle`](crate::Ui::resize_handle) 写入）。
+    #[inline]
+    pub fn sizes(&self) -> &'a HashMap<IdAbsolute<'static>, Vec2> {
+        &self.0.sizes
+    }
+    /// grid 容器的单元格尺寸缓存。
+    #[inline]
+    pub fn grid_cells(&self) -> &'a HashMap<IdAbsolute<'static>, Vec2> {
+        &self.0.grid_cells
+    }
+    /// 当前键盘焦点（绝对 ID）。
+    #[inline]
+    pub fn focused(&self) -> Option<&'a IdAbsolute<'static>> {
+        self.0.focused.as_ref()
+    }
+    /// 单选组 → 当前选中的控件（绝对 ID）。
+    #[inline]
+    pub fn radio_group(&self, group: &str) -> Option<&'a IdAbsolute<'static>> {
+        self.0.radio_groups.get(group)
+    }
+    /// 某控件登记的字符串上下文（数字输入等；`None` = 没登记）。
+    #[inline]
+    pub fn string(&self, id: &str) -> Option<&'a str> {
+        self.0.widget_strs.get(id).map(String::as_str)
+    }
+}
+
+/// **窗口模块**（[`UiState::windows`]）：位置 / z / 尺寸 / 遮挡矩形 / 特效 / 收起。
+#[derive(Clone, Copy, Debug)]
+pub struct WindowsModule<'a>(pub(crate) &'a UiState);
+
+impl<'a> WindowsModule<'a> {
+    /// **跨帧持久位置**（用户拖过就在这儿；`None` = 从未拖过）。
+    #[inline]
+    pub fn pos(&self, id: &str) -> Option<Vec2> {
+        self.0.panel_pos.get(id).copied()
+    }
+    /// 引擎**自动分配**的位置（没写 `.pos()` 的窗口；跨帧稳定）。
+    #[inline]
+    pub fn auto_pos(&self, id: &str) -> Option<Vec2> {
+        self.0.auto_pos.get(id).copied()
+    }
+    /// 窗口 z（越大越靠上）。
+    #[inline]
+    pub fn z(&self, id: &str) -> Option<u32> {
+        self.0.window_z.get(id).copied()
+    }
+    /// 本帧的**遮挡矩形**（绝对 ID → 矩形；窗口遮挡判定的输入）。
+    #[inline]
+    pub fn rect(&self, id: &str) -> Option<Rect> {
+        self.0.window_rects.get(id).copied()
+    }
+    /// 固定宽窗口的**宽度**（逻辑像素；`window_at_w` 鼠标缩放的持久值）。
+    #[inline]
+    pub fn width(&self, id: &str) -> Option<f32> {
+        self.0.window_widths.get(id).copied()
+    }
+    /// 窗口的**结算尺寸**（物理像素；clamp / 命中用）。
+    #[inline]
+    pub fn size(&self, id: &str) -> Option<Vec2> {
+        self.0.window_sizes.get(id).copied()
+    }
+    /// 整窗特效覆盖（tint / transform override）。
+    #[inline]
+    pub fn fx(&self, id: &str) -> Option<&'a crate::ui::WindowFx> {
+        self.0.window_fx.get(id)
+    }
+}
+
+/// **文本模块**（[`UiState::texts`]）：排版缓存 / IME 组合状态。
+#[derive(Clone, Copy, Debug)]
+pub struct TextsModule<'a>(pub(crate) &'a UiState);
+
+impl TextsModule<'_> {
+    /// 排版缓存里的条目数（诊断：静态文本每帧应命中、条目数应稳定）。
+    #[inline]
+    pub fn cached_layouts(&self) -> usize {
+        self.0.text_buffers.len()
+    }
+    /// 上一帧是否处于 **IME 组合中**（组合中时应用快捷键应让位）。
+    #[inline]
+    pub fn ime_composing(&self) -> bool {
+        self.0.ime_composing
+    }
+}
+
+/// **滚动模块**（[`UiState::scrolls`]）：`scroll_at` 的跨帧偏移与内容高。
+#[derive(Clone, Copy, Debug)]
+pub struct ScrollsModule<'a>(pub(crate) &'a UiState);
+
+impl<'a> ScrollsModule<'a> {
+    /// 某滚动容器的 `(偏移, 内容高)`（绝对 ID 查；跨帧持久）。
+    #[inline]
+    pub fn get(&self, id: &str) -> Option<&'a ScrollState> {
+        self.0.scrolls.get(id)
+    }
+    /// 已登记的滚动容器数。
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.scrolls.len()
+    }
+    /// 是否一个滚动容器都没登记（与 [`Self::len`] 配对，clippy 要求）。
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.scrolls.is_empty()
+    }
+}
+
+/// **浮层模块**（[`UiState::popups`]）：菜单栏 / 下拉框的展开状态 + 取色器全局状态。
+#[derive(Clone, Copy, Debug)]
+pub struct PopupsModule<'a>(pub(crate) &'a UiState);
+
+impl<'a> PopupsModule<'a> {
+    /// 展开的**菜单栏菜单**（触发器绝对 ID；`None` = 全部收起）。
+    #[inline]
+    pub fn menu_open(&self) -> Option<&'a str> {
+        self.0.menu_open.as_ref().map(|s| s.as_str())
+    }
+    /// 展开的**下拉框**（绝对 ID；`None` = 全部收起）。
+    #[inline]
+    pub fn combo_open(&self) -> Option<&'a str> {
+        self.0.combo_open.as_ref().map(|s| s.as_str())
+    }
+    /// **取色器的全局跨帧状态**（呈现模式 / 替补缓冲 / 展开的面板 / HSV 缓存）。
+    #[inline]
+    pub fn color_picker(&self) -> &'a crate::widgets::ColorPickerState {
+        &self.0.color_picker
+    }
+}
+
+/// **命中 / 遮挡模块**（[`UiState::hits`]）：诊断计数 + 命中区登记。
+#[derive(Clone, Copy, Debug)]
+pub struct HitsModule<'a>(pub(crate) &'a UiState);
+
+impl HitsModule<'_> {
+    /// 上一帧**被更高窗口遮挡**而未响应的控件次数（点击穿透拦截）。
+    #[inline]
+    pub fn occluded_hits(&self) -> u32 {
+        self.0.occluded_hits
+    }
+    /// 上一帧**被同窗口内更上层控件遮挡**而未响应的次数（控件级遮挡拦截）。
+    #[inline]
+    pub fn widget_occluded_hits(&self) -> u32 {
+        self.0.widget_occluded_hits
+    }
+    /// 上一帧"认领按下后被帧末复核撤销"的次数（正常应为 0）。
+    #[inline]
+    pub fn press_cancelled_by_window(&self) -> u32 {
+        self.0.press_cancelled_by_window
+    }
+    /// 最近一次按下由哪个窗口接收 `(id, z)`。
+    #[inline]
+    pub fn last_press_window(&self) -> Option<(&str, u32)> {
+        self.0.last_press_window.as_ref().map(|(id, z)| (id.as_str(), *z))
+    }
+    /// 本帧登记的可交互控件命中区数量（诊断）。
+    #[inline]
+    pub fn regions_len(&self) -> usize {
+        self.0.hit_regions.len()
+    }
+}
+
+/// **缓存模块**（[`UiState::caches`]）：几何缓存与提交期 scratch（只给诊断用的计数）。
+#[derive(Clone, Copy, Debug)]
+pub struct CachesModule<'a>(pub(crate) &'a UiState);
+
+impl CachesModule<'_> {
+    /// 某窗口的**提交计划段数**（内容签名命中时复用；`None` = 本帧未缓存）。
+    #[inline]
+    pub fn window_plan_len(&self, id: &str) -> Option<usize> {
+        self.0.window_quads.get(id).map(|(_, p)| p.len())
+    }
+    /// win=0 放置槽的缓存条目数（诊断：应等于本帧的 win=0 放置数）。
+    #[inline]
+    pub fn z0_cached_slots(&self) -> usize {
+        self.0.z0_quads.len()
+    }
+}
+
+impl UiState {
+    /// **帧模块**（帧号 / 帧级暂存）。
+    #[inline]
+    pub fn frame(&self) -> FrameModule<'_> {
+        FrameModule(self)
+    }
+    /// **控件模块**（控件状态 / 尺寸 / 网格 / 焦点 / 单选组）。
+    #[inline]
+    pub fn widgets(&self) -> WidgetsModule<'_> {
+        WidgetsModule(self)
+    }
+    /// **窗口模块**（位置 / z / 尺寸 / 遮挡矩形 / 特效）。
+    #[inline]
+    pub fn windows(&self) -> WindowsModule<'_> {
+        WindowsModule(self)
+    }
+    /// **文本模块**（排版缓存 / IME）。
+    #[inline]
+    pub fn texts(&self) -> TextsModule<'_> {
+        TextsModule(self)
+    }
+    /// **滚动模块**。
+    #[inline]
+    pub fn scrolls(&self) -> ScrollsModule<'_> {
+        ScrollsModule(self)
+    }
+    /// **浮层模块**（菜单 / 下拉 / 取色器）。
+    #[inline]
+    pub fn popups(&self) -> PopupsModule<'_> {
+        PopupsModule(self)
+    }
+    /// **命中 / 遮挡模块**（诊断）。
+    #[inline]
+    pub fn hits(&self) -> HitsModule<'_> {
+        HitsModule(self)
+    }
+    /// **缓存模块**（几何缓存诊断）。
+    #[inline]
+    pub fn caches(&self) -> CachesModule<'_> {
+        CachesModule(self)
+    }
+    /// **性能统计**（`finish` 各阶段耗时；模块视图的等价物是字段 `stats`）。
+    #[inline]
+    pub fn stats(&self) -> &UiStats {
+        &self.stats
+    }
+
+    // ── 模块的**写**入口（读视图不暴露内部表；写走这几个语义化方法）──
+
+    /// **控件尺寸表**（写）：`resize_handle` 与自定义可缩放控件写它。
+    #[inline]
+    pub fn sizes_mut(&mut self) -> &mut HashMap<IdAbsolute<'static>, Vec2> {
+        &mut self.sizes
+    }
+    /// **取色器全局状态**（写）。
+    #[inline]
+    pub fn color_picker_mut(&mut self) -> &mut crate::widgets::ColorPickerState {
+        &mut self.color_picker
+    }
+    /// **强制指定/清除"展开的菜单"**（`None` = 全部收起；应用想接管 `Esc` 时用）。
+    #[inline]
+    pub fn set_menu_open(&mut self, id: Option<IdAbsolute<'static>>) {
+        self.menu_open = id;
+    }
+    /// **强制指定/清除"展开的下拉框"**（同上）。
+    #[inline]
+    pub fn set_combo_open(&mut self, id: Option<IdAbsolute<'static>>) {
+        self.combo_open = id;
+    }
+    /// **收起所有浮层**（菜单 + 下拉；保留取色器状态）。
+    pub fn close_popups(&mut self) {
+        self.menu_open = None;
+        self.combo_open = None;
+    }
+
+    // ── 模块级 `reset_*`（`reset()` 逐个调用 ⇒ 新增字段不会漏清）──
+
+    /// 只清**帧模块**（帧号 + 帧级暂存；`open` 也清 ⇒ 下一帧会重新开场）。
+    pub fn reset_frame(&mut self) {
+        self.frame = 0;
+        self.frame_state = UiFrameState::default();
+    }
+    /// 只清**控件模块**（控件状态 / 焦点 / 单选组 / 网格 / 尺寸 / 字符串上下文）。
+    ///
+    /// ⚠ `widget_strs` 是**补漏**：旧的 `reset()` 手写字段清单里漏了它（字符串上下文会
+    /// 跨 reset 残留）——这条由 `reset_clears_every_module_after_dirtying` 抓出来。
+    pub fn reset_widgets(&mut self) {
+        self.widgets.clear();
+        self.focused = None;
+        self.focused_kind = None;
+        self.radio_groups.clear();
+        self.grid_cells.clear();
+        self.sizes.clear();
+        self.widget_strs.clear();
+    }
+    /// 只清**窗口模块**（位置 / z / 尺寸 / 遮挡矩形 / 特效 / 收起）。
+    pub fn reset_windows(&mut self) {
+        self.panel_pos.clear();
+        self.auto_pos.clear();
+        self.auto_next = 0;
+        self.window_z.clear();
+        self.window_rects.clear();
+        self.window_origins.clear();
+        self.window_widths.clear();
+        self.window_sizes.clear();
+        self.window_heights.clear();
+        self.panel_sizes.clear();
+        self.window_fx.clear();
+        self.collapsed.clear();
+    }
+    /// 只清**文本模块**（排版缓存 / IME 标志）。
+    pub fn reset_texts(&mut self) {
+        self.text_buffers.clear();
+        self.ime_composing = false;
+    }
+    /// 只清**滚动模块**。
+    pub fn reset_scrolls(&mut self) {
+        self.scrolls.clear();
+    }
+    /// 只清**浮层模块**（菜单 / 下拉 / 取色器状态）。
+    pub fn reset_popups(&mut self) {
+        self.menu_open = None;
+        self.combo_open = None;
+        self.color_picker = crate::widgets::ColorPickerState::default();
+    }
+    /// 只清**命中 / 遮挡模块**（计数 + 命中区登记 + 提交期诊断）。
+    pub fn reset_hits(&mut self) {
+        self.occluded_hits = 0;
+        self.widget_occluded_hits = 0;
+        self.press_cancelled_by_window = 0;
+        self.hit_regions.clear();
+        self.prev_hit_regions.clear();
+        self.last_press_window = None;
+        self.debug_submit.clear();
+        self.debug_clip.clear();
+    }
+    /// 只清**缓存模块**（几何缓存 / scratch / 圆角镶嵌表）。
+    pub fn reset_caches(&mut self) {
+        self.window_quads.clear();
+        self.z0_quads.clear();
+        self.scratch_units.clear();
+        self.scratch_ordered.clear();
+        self.tess = crate::tess::TessCache::default();
+    }
+}
+
 /// **文本焦点**（[`UiState::text_focus`] 的产物）：持有焦点的**文本输入控件** id。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextFocus {
@@ -848,6 +1202,127 @@ impl CheckboxState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_clears_every_module_after_dirtying() {
+        // **这条单测的意义**：`reset()` 逐个转调模块 `reset_*()`（帧 / 控件 / 窗口 / 文本 /
+        // 滚动 / 浮层 / 命中 / 缓存）⇒ 任何模块**新增字段却忘了在自己 `reset_*` 里清**
+        // 都会在这里变红。它同时是"模块视图读得到、reset 清得掉"的端到端证明。
+        let mut s = UiState::new();
+        // ① 帧
+        s.frame = 42;
+        s.frame_state.open = true;
+        s.frame_state.window_ids_seen.push(IdAbsolute::owned("w".to_owned()));
+        // ② 控件
+        s.widgets.insert(IdAbsolute::owned("w/btn".to_owned()), WidgetState::default());
+        s.focused = Some(IdAbsolute::owned("w/btn".to_owned()));
+        s.focused_kind = Some(FocusKind::Button);
+        s.radio_groups.insert("g".to_owned(), IdAbsolute::owned("w/r".to_owned()));
+        s.grid_cells.insert(IdAbsolute::owned("w/g".to_owned()), Vec2::new(3.0, 4.0));
+        s.sizes.insert(IdAbsolute::owned("w/e".to_owned()), Vec2::new(5.0, 6.0));
+        s.widget_strs.insert(IdAbsolute::owned("w/n".to_owned()), "ctx".to_owned());
+        // ③ 窗口
+        s.panel_pos.insert(IdAbsolute::owned("w".to_owned()), Vec2::new(1.0, 2.0));
+        s.auto_pos.insert(IdAbsolute::owned("w2".to_owned()), Vec2::new(3.0, 4.0));
+        s.auto_next = 7;
+        s.window_z.insert(IdAbsolute::owned("w".to_owned()), 9);
+        s.window_rects
+            .insert(IdAbsolute::owned("w".to_owned()), Rect::new(0.0, 0.0, 10.0, 10.0));
+        s.window_origins.insert(IdAbsolute::owned("w".to_owned()), Vec2::ZERO);
+        s.window_widths.insert(IdAbsolute::owned("w".to_owned()), 100.0);
+        s.window_sizes.insert(IdAbsolute::owned("w".to_owned()), Vec2::new(10.0, 20.0));
+        s.window_heights.insert(IdAbsolute::owned("w".to_owned()), 200.0);
+        s.panel_sizes.insert(IdAbsolute::owned("w".to_owned()), Vec2::new(4.0, 5.0));
+        s.window_fx.insert(IdAbsolute::owned("w".to_owned()), Default::default());
+        s.collapsed.insert(IdAbsolute::owned("w".to_owned()));
+        // ④ 文本（`text_buffers` 的值需要排版器产物 ⇒ 只脏能构造的 IME 标志；
+        //    表本身的清理由 `reset_texts` 的同一行负责）
+        s.ime_composing = true;
+        // ⑤ 滚动
+        s.scrolls
+            .insert(IdAbsolute::owned("w/list".to_owned()), ScrollState::default());
+        // ⑥ 浮层
+        s.menu_open = Some(IdAbsolute::owned("m".to_owned()));
+        s.combo_open = Some(IdAbsolute::owned("c".to_owned()));
+        // ⑦ 命中 / 遮挡
+        s.occluded_hits = 1;
+        s.widget_occluded_hits = 2;
+        s.press_cancelled_by_window = 3;
+        s.last_press_window = Some((IdAbsolute::owned("w".to_owned()), 1));
+        s.debug_submit.insert(1, Vec2::ZERO);
+        s.debug_clip.insert(1, Rect::new(0.0, 0.0, 1.0, 1.0));
+        // ⑧ 缓存
+        s.z0_quads.insert((0, 0), (0, Vec::new()));
+        s.scratch_units.clear();
+        // ⑨ 统计
+        s.stats.frame = 9;
+
+        // 脏了（读视图能看见）
+        assert_eq!(s.frame().frame(), 42);
+        assert!(s.widgets().get("w/btn").is_some());
+        assert_eq!(s.windows().z("w"), Some(9));
+        assert_eq!(s.scrolls().get("w/list").map(|c| c.content_h), Some(0.0));
+        assert_eq!(s.popups().menu_open(), Some("m"));
+        assert_eq!(s.hits().occluded_hits(), 1);
+        assert_eq!(s.caches().z0_cached_slots(), 1);
+        assert_eq!(s.stats().frame, 9);
+
+        s.reset();
+
+        // 每个模块都必须**空**（新增字段忘了清 ⇒ 这里红）
+        assert_eq!(s.frame().frame(), 0);
+        assert!(!s.frame().is_open());
+        assert!(s.frame().window_ids().is_empty());
+        assert!(s.widgets().get("w/btn").is_none());
+        assert!(s.widgets().focused().is_none());
+        assert!(s.widgets().radio_group("g").is_none());
+        assert!(s.widgets().sizes().is_empty());
+        assert!(s.widgets().grid_cells().is_empty());
+        assert!(s.widgets().string("w/n").is_none());
+        assert!(s.windows().pos("w").is_none());
+        assert!(s.windows().auto_pos("w2").is_none());
+        assert!(s.windows().z("w").is_none());
+        assert!(s.windows().rect("w").is_none());
+        assert!(s.windows().width("w").is_none());
+        assert!(s.windows().size("w").is_none());
+        assert!(s.windows().fx("w").is_none());
+        assert!(!s.is_collapsed("w"));
+        assert!(!s.texts().ime_composing());
+        assert_eq!(s.texts().cached_layouts(), 0);
+        assert!(s.scrolls().get("w/list").is_none());
+        assert_eq!(s.scrolls().len(), 0);
+        assert_eq!(s.popups().menu_open(), None);
+        assert_eq!(s.popups().combo_open(), None);
+        assert_eq!(s.hits().occluded_hits(), 0);
+        assert_eq!(s.hits().widget_occluded_hits(), 0);
+        assert_eq!(s.hits().press_cancelled_by_window(), 0);
+        assert!(s.hits().last_press_window().is_none());
+        assert_eq!(s.hits().regions_len(), 0);
+        assert_eq!(s.caches().z0_cached_slots(), 0);
+        assert_eq!(s.caches().window_plan_len("w"), None);
+        assert_eq!(s.stats().frame, 0);
+    }
+
+    #[test]
+    fn module_writes_go_through_the_targeted_mut_methods() {
+        // 读视图是只读的；**写**走语义化方法（不暴露内部表）——这里钉住三个最常用入口。
+        let mut s = UiState::new();
+        s.sizes_mut()
+            .insert(IdAbsolute::owned("w/ta".to_owned()), Vec2::new(300.0, 135.0));
+        assert_eq!(s.widgets().sizes().get("w/ta"), Some(&Vec2::new(300.0, 135.0)));
+        s.set_menu_open(Some(IdAbsolute::owned("m".to_owned())));
+        s.set_combo_open(Some(IdAbsolute::owned("c".to_owned())));
+        assert_eq!(s.popups().menu_open(), Some("m"));
+        s.close_popups();
+        assert_eq!(s.popups().menu_open(), None);
+        assert_eq!(s.popups().combo_open(), None);
+        // 取色器的"当前展开面板"是 `Option<IdAbsolute>`（同一时刻只有一个面板）。
+        s.color_picker_mut().open = Some(IdAbsolute::owned("cp".to_owned()));
+        assert_eq!(
+            s.popups().color_picker().open.as_ref().map(|i| i.as_str()),
+            Some("cp")
+        );
+    }
 
     #[test]
     fn menu_open_is_readable_and_cleared_by_reset() {
