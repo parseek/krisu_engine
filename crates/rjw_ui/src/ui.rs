@@ -1950,7 +1950,18 @@ impl<'a> Ui<'a> {
     /// 容器包装（`Panel` / `Pack` / `Grid` / `Window` / `Scroll` / `FlexCtx`）经
     /// [`UiAdd`] 提供同样的 `add` / `add_at` 与全部便捷方法（`p.button` / `p.label` 等）。
     pub fn add(&mut self, w: impl crate::widgets::Widget) -> crate::widgets::Response {
-        w.ui(self)
+        // 尺寸类（`Widget::size_class`）：在 `ui()` 之前交给当前 frame —— 水平行据此
+        // 决定"单行钉标准高 / 多行可撑高"（见 `crate::widgets::SizeClass`）。
+        if let Some(f) = self.frames.last_mut() {
+            f.set_next_class(w.size_class());
+        }
+        let resp = w.ui(self);
+        // 兜底清掉：控件可能一次 `child_rect` 都没走（`add_at` 的绝对定位 / 自绘控件），
+        // 留着会让**下一个**子项拿到错的尺寸类。
+        if let Some(f) = self.frames.last_mut() {
+            f.set_next_class(crate::widgets::SizeClass::SingleLine);
+        }
+        resp
     }
 
     /// **绝对定位放置控件**（`pos` 相对当前容器内容原点；**不占光标**）。
@@ -1966,9 +1977,15 @@ impl<'a> Ui<'a> {
         w: impl crate::widgets::Widget,
     ) -> crate::widgets::Response {
         self.place_once = Some(pos.into().to_physical(self.scale));
+        if let Some(f) = self.frames.last_mut() {
+            f.set_next_class(w.size_class());
+        }
         let resp = w.ui(self);
         // 兜底清掉（控件可能一次申请都没做）。
         self.place_once = None;
+        if let Some(f) = self.frames.last_mut() {
+            f.set_next_class(crate::widgets::SizeClass::SingleLine);
+        }
         resp
     }
 
@@ -5268,28 +5285,31 @@ pub trait UiAdd<'a> {
 
     /// **水平行容器**（占光标）：子项按 [`PackSide::Left`] 水平堆叠
     /// （`{Label} {Input} {Button}` 排列），整体在父容器（垂直 pack 等）中**占一行**：
-    /// 宽 = 子项结算、撑大父级。**行内所有子项强制等高**（[`Theme::row_h`]，
-    /// 含单行情况的多行文本框/TextArea——多行内容走垂直滚动）——各自内容垂直居中
-    /// → 文字中心线对齐（近似基线，Label 不再偏上）。
+    /// 宽 = 子项结算、撑大父级。
+    ///
+    /// **行高**（= 默认形态的 `row_builder`）：
+    /// - **单行子项**（[`crate::widgets::SizeClass::SingleLine`]，默认）被**钉到标准行高**
+    ///   [`Theme::row_h`]，各自内容垂直居中 → 文字中心线对齐（Label 不偏上）；
+    /// - **多行子项**（`TextEditor::multiline()`）以标准行高为**下限**，可以**撑高整行**；
+    /// - 子项**左上角对齐、沿 X 推进**；行高随最高的子项长。
+    ///
+    /// 要自定义行高上下限 / 间距 / 内边距用 [`Self::row_builder`]。
     fn row(&mut self, f: impl FnOnce(&mut Pack<'_, '_>)) -> Vec2 {
-        let ui = self.ui_mut();
-        let origin = ui.cursor_pos();
-        let gap = ui.theme.gap;
-        let row_h = ui.theme.row_h;
-        let (size, _) = ui.container(
-            origin,
-            Frame::new_stack(PackSide::Left, gap, 0.0),
-            |ctx| {
-                ctx.ui.frames.last_mut().expect("row frame").set_force_h_all(row_h);
-                let mut p = Pack { ui: ctx.ui };
-                f(&mut p);
-            },
-        );
-        // 结算后补记父容器光标（占一行）。
-        if let Some(fr) = ui.frames.last_mut() {
-            fr.place_external(size);
-        }
-        size
+        self.row_builder().show(f)
+    }
+
+    /// **水平行 Builder**（占光标）：`row(f)` 的可配置形态——行高下限 / 上限 / 子项间距 /
+    /// 行内边距，最后 `.show(|r| ..)` 执行并返回结算尺寸（见 [`crate::RowBuilder`]）。
+    ///
+    /// ```ignore
+    /// // ⚠ `ignore`：`rjw_ui` 的 doctest 里拿不到"容器"——应用侧是
+    /// // `Frame::ui()` 给的 `UiSession`（它实现本 trait），`Ui` 自身不实现 `UiAdd`
+    /// // （所以这里不能用 `&mut Ui` 调 trait 方法）。行为验收见 `--sim-ta-resize`。
+    /// ui.row_builder().height(60.0).show(|r| { r.label("高一行"); });
+    /// ui.row_builder().min_h(60.0).max_h(200.0).pad(6.0).gap(12.0).show(|r| { r.label("…"); });
+    /// ```
+    fn row_builder(&mut self) -> RowBuilder<'_, 'a> {
+        RowBuilder { ui: self.ui_mut(), min_h: None, max_h: None, gap: None, pad: 0.0 }
     }
 
     /// **分割线**（占光标）：容器内占一行（高 = 线厚 + 上下留白），水平线宽 =
@@ -5970,6 +5990,81 @@ impl<'ui, 'a> ModalBuilder<'ui, 'a> {
         let pos = pos.to_physical(ui.scale);
         let width = width.map(|w| w.to_physical(ui.scale));
         ui.modal_impl(id, pos, width, f)
+    }
+}
+
+// ─── 水平行 Builder ─────────────────────────────────────────────
+
+/// **水平行责任链 builder**：[`UiAdd::row_builder`](crate::UiAdd::row_builder) 返回。
+///
+/// `row(f)` 等价于"默认形态"：`min_h = Theme::row_h`、无上限、`gap = Theme::gap`、无内边距。
+/// 链式设置后用 `.show(|r| ..)` 终结（闭包内拿到 [`Pack`]，与 `row` 一致）。
+///
+/// 语义（与 [`crate::widgets::SizeClass`] 配合）：
+/// - `min_h` 同时是**单行子项的标准高**（被钉住）与**行高下限**；多行子项以它为下限、
+///   可把行撑高；
+/// - `max_h` 是**行高上限**（超出的子项照录，内容溢出可见）；`min_h > max_h` 时 min 胜；
+/// - 子项**左上角对齐、沿 X 推进**，间距 = `gap`，整体内缩 `pad`。
+pub struct RowBuilder<'ui, 'a> {
+    ui: &'ui mut Ui<'a>,
+    min_h: Option<Size<f32>>,
+    max_h: Option<Size<f32>>,
+    gap: Option<Size<f32>>,
+    pad: f32,
+}
+
+impl<'ui, 'a> RowBuilder<'ui, 'a> {
+    /// **行高下限**（[`Size<f32>`]：`Logical`（默认）/ `Physical`）——同时也是单行子项的
+    /// 标准高（不调 = [`Theme::row_h`](crate::Theme::row_h)）。
+    pub fn min_h(mut self, h: impl Into<Size<f32>>) -> Self {
+        self.min_h = Some(h.into());
+        self
+    }
+
+    /// **行高上限**（多行子项撑高到此为止；不调 = 不限）。
+    pub fn max_h(mut self, h: impl Into<Size<f32>>) -> Self {
+        self.max_h = Some(h.into());
+        self
+    }
+
+    /// **固定行高**（= `min_h(h).max_h(h)`）：单行子项钉到 `h`、多行子项也被夹到 `h`。
+    pub fn height(self, h: impl Into<Size<f32>>) -> Self {
+        let h = h.into();
+        self.min_h(h).max_h(h)
+    }
+
+    /// 子项间距（不调 = [`Theme::gap`](crate::Theme::gap)）。
+    pub fn gap(mut self, g: impl Into<Size<f32>>) -> Self {
+        self.gap = Some(g.into());
+        self
+    }
+
+    /// 行**内边距**（物理像素；每侧都留这么多；默认 0）。
+    pub fn pad(mut self, p: f32) -> Self {
+        self.pad = p.max(0.0);
+        self
+    }
+
+    /// 终结：执行闭包并返回行结算尺寸（物理像素；已按 `min_h` / `max_h` 夹过）。
+    pub fn show(self, f: impl FnOnce(&mut Pack<'_, '_>)) -> Vec2 {
+        let Self { ui, min_h, max_h, gap, pad } = self;
+        let scale = ui.scale();
+        let std_h = min_h.map_or_else(|| ui.theme().row_h, |h| h.to_physical(scale));
+        let max_h = max_h.map(|h| h.to_physical(scale));
+        let gap = gap.map_or_else(|| ui.theme().gap, |g| g.to_physical(scale));
+        let origin = ui.cursor_pos();
+        let (size, _) = ui.container(origin, Frame::new_stack(PackSide::Left, gap, pad), |ctx| {
+            let fr = ctx.ui.frames.last_mut().expect("row frame");
+            fr.set_force_h_all(std_h);
+            fr.set_row_bounds(Some(std_h), max_h);
+            let mut p = Pack { ui: ctx.ui };
+            f(&mut p);
+        });
+        // 结算后补记父容器光标（占一行）。
+        if let Some(fr) = ui.frames.last_mut() {
+            fr.place_external(size);
+        }
+        size
     }
 }
 

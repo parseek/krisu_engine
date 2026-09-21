@@ -157,8 +157,8 @@ impl<'a> TextEditor<'a> {
     /// （[`Ui::size_handler`](crate::Ui::size_handler)）约束。
     ///
     /// **柄的形状 / 颜色 / 尺寸来自主题** [`InputStyle::grip`](crate::style::InputStyle::grip)
-    /// （默认 [`GripShape::Bars`](crate::style::GripShape::Bars) 三条横线；想要经典角落观感
-    /// 就把主题设成 `Diagonal`，`Hidden` 则"不画图案但仍能拖"）。
+    /// （默认 [`GripShape::Diagonal`](crate::style::GripShape::Diagonal) **三条斜线**；
+    /// `Bars` = 三条横线，`Hidden` = "不画图案但仍能拖"）。
     pub fn resize(mut self, r: Resize) -> Self {
         self.resize = r;
         self
@@ -354,6 +354,16 @@ impl<'a> TextEditor<'a> {
 }
 
 impl Widget for TextEditor<'_> {
+    /// **多行 ⇒ [`SizeClass::Multiline`]**：水平行（`row`）里多行编辑器可以**撑高整行**
+    /// （行高 = 编辑器高），单行输入框仍被钉到标准行高（文字中心线对齐）。
+    fn size_class(&self) -> super::SizeClass {
+        if self.multiline {
+            super::SizeClass::Multiline
+        } else {
+            super::SizeClass::SingleLine
+        }
+    }
+
     /// 定矩形（`.at` / 自动申请）→ 逐控件样式覆盖 → 交给文本编辑核心。
     fn ui(self, ui: &mut Ui) -> Response {
         let style = self.resolve_style(ui);

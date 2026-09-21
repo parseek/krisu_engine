@@ -515,6 +515,23 @@ pub enum Expansion {
 }
 
 
+/// **控件的尺寸类**（[`Widget::size_class`]）：决定它在**水平行**（`row`）里被怎么钉高。
+///
+/// 行容器要把"标签 / 输入框 / 按钮"排整齐（文字中心线对齐）就必须让单行子项**等高**；
+/// 但多行控件（多行 `TextEditor`）天生比一行高——过去被一起压成一行高，内容只能滚动。
+/// 尺寸类把这两件事分开：
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SizeClass {
+    /// **单行控件**（默认）：行内被**钉到标准行高**（行的 `min_h`，默认 `Theme::row_h`）
+    /// —— 与历史行为一致（文字中心线对齐、竖直居中）。
+    #[default]
+    SingleLine,
+    /// **多行控件**：标准行高只是**下限**，可以**撑高整行**（行高 = 子项高，直到行的
+    /// `max_h` 为止）。多行 `TextEditor` 覆写 [`Widget::size_class`] 返回它。
+    Multiline,
+}
+
+
 /// **控件 trait**：新控件 = 实现**这一个方法**的 builder 结构体（普通 Rust，无宏）。
 ///
 /// 尺寸在 [`Widget::ui`] 里**就地申请**（参考 egui 的 `allocate_exact_size`）：
@@ -556,6 +573,16 @@ pub trait Widget {
     /// （[`Ui::interact`](crate::Ui::interact) / [`Ui::allocate_sense`](crate::Ui::allocate_sense)），
     /// 返回本帧响应。
     fn ui(self, ui: &mut Ui) -> Response;
+
+    /// **尺寸类**（默认 [`SizeClass::SingleLine`]）：水平行（`row`）据此决定高度——
+    /// 单行控件钉到标准行高、多行控件可撑高整行。
+    ///
+    /// 自定义控件**想在 `row` 里长高**（多行文本框 / 代码编辑器 / 日志视图…）就覆写它；
+    /// 不覆写 = 历史行为（外部控件因此**不受影响**）。`Ui::add` 在调用
+    /// [`Self::ui`] **之前**读取，读的是"还没被消费的 self"。
+    fn size_class(&self) -> SizeClass {
+        SizeClass::SingleLine
+    }
 }
 
 /// 应用尺寸约束：`natural` 每轴 clamp 到 `min`/`max`（纯函数，可单测）。

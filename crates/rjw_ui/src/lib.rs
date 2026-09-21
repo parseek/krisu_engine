@@ -188,7 +188,7 @@ pub use style::{
     PanelStyle, ShadowStyle, SliderStyle, Theme, bevel_raised, bevel_sunken, hgrad, vgrad,
 };
 pub use input::{KeyboardSnapshot, MouseSnapshot};
-pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Placement, Resize, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
+pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Placement, Resize, RowBuilder, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
 pub use view::{ViewCtx, ViewMode};
 /// 文本**形状层**的重导出（`rjw_text`）：`Ui` 只在此处依赖 cosmic-text 名字，
 /// 应用侧用 [`Theme::with_font_weight`] / [`Weight`] 时不必自己引 `rjw_text`。

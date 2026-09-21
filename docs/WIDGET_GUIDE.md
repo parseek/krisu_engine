@@ -73,7 +73,7 @@ ui.add_at(Vec2::new(400.0, 40.0), Label::new("HUD"));
 | `Button` | `Button::new(id, label)` | `color` `bg` `bg_hover` `bg_pressed` `border` `border_w` `radius` `padding` `font_size` `font_family` |
 | `Checkbox` | `Checkbox::new(id, label, checked)` | `color` `box_border` `checked_fill` `font_size` `font_family` |
 | `Divider` | `Divider::new()` / `.horizontal()` / `.vertical()` | `axis(DividerAxis)` `color` `thickness` `margin`（占光标分割线）。**水平**（默认）：宽 = 容器可用宽，行高 = 线厚 + 2×留白；**竖直**（`vertical()`，`row`/菜单栏里用）：宽 = 线厚 + 2×留白、高 = **一行**（`Theme::row_h`），线在占位矩形里垂直居中、长度 = 高 − 2×留白 |
-| `TextEditor` | `TextEditor::new(id, &mut String)` | `multiline()` `no_wrap()` `resize(Resize)` `width` `height` `min_size` `max_size`（**物理像素**）`font_size` `font_family` `text_color` `caret_color` `selection_color` `preedit_color` `background` `border` `border_focus` `border_w` `radius` `padding_x`；`at(rect)` = 绝对定位。**开了 `.resize(..)` 时**：默认尺寸 = 单行 `min_w×height` / 多行 `max(min_w,200)×90`（**逻辑像素**）、下限默认 = `(min_w, height)`（一行文字标准高，拖不到 0）、尺寸跨帧持久于 `UiState::sizes`；自动申请会**先问尺寸责任链**（`Ui::resolved_size`）⇒ 拖大后容器与后续控件跟着长；柄形状取自 `Theme::input.grip`（默认三条横线，`Diagonal`/`Hidden` 可选，`Hidden` 仍可拖） |
+| `TextEditor` | `TextEditor::new(id, &mut String)` | `multiline()` `no_wrap()` `resize(Resize)` `width` `height` `min_size` `max_size`（**物理像素**）`font_size` `font_family` `text_color` `caret_color` `selection_color` `preedit_color` `background` `border` `border_focus` `border_w` `radius` `padding_x`；`at(rect)` = 绝对定位。**开了 `.resize(..)` 时**：默认尺寸 = 单行 `min_w×height` / 多行 `max(min_w,200)×90`（**逻辑像素**）、下限默认 = `(min_w, height)`（一行文字标准高，拖不到 0）、尺寸跨帧持久于 `UiState::sizes`；自动申请会**先问尺寸责任链**（`Ui::resolved_size`）⇒ 拖大后容器与后续控件跟着长；柄形状取自 `Theme::input.grip`（默认三条斜线 `Diagonal`，`Bars`/`Hidden` 可选，`Hidden` 仍可拖） |
 
 **Label 溢出策略**（Resizable 窗口缩窄）：默认在父级可用宽内**自动换行**；
 `.ellipsis()` 切换为单行"…"省略。Button / 勾选 / 下拉的文本超出分配矩形时
@@ -101,8 +101,14 @@ ui.add_at(Vec2::new(400.0, 40.0), Label::new("HUD"));
   （那是无声把逻辑当物理）；实现体内造值只写 `Size::Logical(..)` / `Size::Physical(..)`，
   主题值 / 持久化值一律 `Physical`；
 - **min/max 尺寸**：`apply_constraints(desired, c)` 后交给 `allocate`（不再有 trait 钩子）；
+- **尺寸类**（`fn size_class(&self) -> SizeClass`，**第二个带默认实现的 trait 方法**）：
+  水平行（`row`）据此决定"单行子项钉到标准行高 / 多行子项可撑高整行"。默认
+  `SizeClass::SingleLine`（= 旧行为，外部控件不受影响）；多行编辑器这类想被行撑高的
+  控件覆写它返回 `Multiline`（`TextEditor::multiline()` 就是这么做的）；
 - 拖拽缩放：`Ui::resize_handle(id, handle, current, min, cursor)` 通用原语 +
-  `UiState::sizes` 持久尺寸（`ui.window(id).width(w)` 宽度缩放即基于它）。
+  `UiState::sizes` 持久尺寸（`ui.window(id).width(w)` 宽度缩放即基于它）。**配对的读**用
+  [`Ui::resolved_size`](crate::Ui::resolved_size)：申请尺寸前问一次，把跨帧的拖拽尺寸并进来
+  （否则"画的是拖大的框、申请的却是默认尺寸"——容器不长、后续控件不动）。
 
 ---
 

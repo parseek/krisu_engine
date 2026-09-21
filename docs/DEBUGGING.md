@@ -18,12 +18,12 @@ $env:CARGO_TARGET_DIR = "C:\rust-targets\"
 # 1) 编译 / 静态检查 / 单测
 cargo check  --offline --workspace --all-targets          # 期望 0 warning
 cargo clippy --offline -p rjw_ui --all-targets            # 期望 0 warning
-cargo test   --offline --workspace                        # 全绿（rjw_ui 基线：324 lib + 40 doc）
+cargo test   --offline --workspace                        # 全绿（rjw_ui 基线：332 lib + 42 doc）
 
-# 2) 交互行为：15 个脚本化仿真（判定打在 stderr，全 [OK] 才算过）
+# 2) 交互行为：16 个脚本化仿真（判定打在 stderr，全 [OK] 才算过）
 #    ⚠ 每个 sim 自己打印判定帧，`--frames` 只要"超过最后一个判定帧"；260 覆盖全部（现网最大 240）。
 foreach ($s in "drag","picker","overlap","cover","chrome","weight","shadow","clip",
-              "zorder","text-cull","tuner","menu","dropdown","weight-modal","resize") {
+              "zorder","text-cull","tuner","menu","dropdown","weight-modal","resize","ta-resize") {
     cargo run --offline -p eg260818UI -- "--sim-$s" --frames 260
 }
 

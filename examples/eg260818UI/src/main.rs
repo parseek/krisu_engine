@@ -81,6 +81,7 @@ fn main() -> Result<(), RunError> {
     app.sim_dropdown = args.iter().any(|a| a == "--sim-dropdown");
     app.sim_weight_modal = args.iter().any(|a| a == "--sim-weight-modal");
     app.sim_resize = args.iter().any(|a| a == "--sim-resize");
+    app.sim_ta_resize = args.iter().any(|a| a == "--sim-ta-resize");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
         .iter()
@@ -1383,6 +1384,35 @@ struct UiApp {
     /// --sim-resize：**冻结**的拖拽目标点（柄会随窗口长大而移动；目标点若每帧重算，
     /// 鼠标就被"追着拖"，位移每帧累加——脚本自己会变成 bug 源）。
     sim_resize_to: Option<Vec2>,
+    /// --sim-ta-resize：脚本化拖拽**行内多行 TextEditor** 的右下角缩放柄
+    /// （验"申请尺寸 = 绘制尺寸 ⇒ 窗口/下面的控件跟着长" + "单行子项在行里被钉住"）。
+    sim_ta_resize: bool,
+    /// --sim-ta-resize：两个输入框的内容（多行那个要缩放；单行那个在 `min_h(60)` 行里）。
+    sim_ta_text: String,
+    sim_ta_single: String,
+    /// --sim-ta-resize：编辑器**窗口局部**矩形（`Response::rect`）与 `row(..)` 返回的行高。
+    sim_ta_rect: Option<Rect>,
+    sim_ta_row_h: f32,
+    /// --sim-ta-resize：`row_builder().min_h(60)` 那一行的返回尺寸
+    /// （单行子项自己被钉到 60 ⇒ 行高恰为 60 逻辑像素 = 90 物理像素）。
+    sim_ta_pin_row: Vec2,
+    /// --sim-ta-resize：grip 中心（屏幕物理，每帧由几何解算）。
+    sim_ta_grip: Option<Vec2>,
+    /// --sim-ta-resize：**冻结**的两段拖拽目标（柄随编辑器长大而移动 ⇒ 目标必须冻结）。
+    sim_ta_to: Option<Vec2>,
+    sim_ta_to2: Option<Vec2>,
+    /// --sim-ta-resize：拖动前 / 后 / 过拖后的 `(编辑器尺寸, 窗口高)`。
+    sim_ta_before: Option<(Vec2, f32)>,
+    sim_ta_after: Option<(Vec2, f32)>,
+    sim_ta_min: Option<(Vec2, f32)>,
+    /// --sim-ta-resize：每帧刷新的 `(编辑器尺寸, 窗口高)` 与默认下限
+    /// （判定在录制段**外**做 ⇒ 只能从这里读，段内 `ui` 已不可见）。
+    sim_ta_now: Option<(Vec2, f32)>,
+    sim_ta_min_want: Option<Vec2>,
+    /// --sim-ta-resize：DPI scale（判定在段外做 ⇒ 一并记下）。
+    sim_ta_scale: f32,
+    /// --sim-ta-resize：标准行高 `Theme::row_h`（**物理像素**，主题已预乘）——③ 的对照值。
+    sim_ta_std_row: f32,
     /// --sim-zorder：列表里"点得到"的两个屏幕点 `(行, 滚动条条带)`（每帧从几何解算：
     /// `win_b` 下缘 + 8，并夹进列表可视区——写死会被长高后的 `win_b` 盖住 ⇒ 点空）。
     sim_zorder_pts: Option<(Vec2, Vec2)>,
@@ -1655,6 +1685,22 @@ impl UiApp {
             sim_resize_size: None,
             sim_resize_after: None,
             sim_resize_to: None,
+            sim_ta_resize: false,
+            sim_ta_text: String::new(),
+            sim_ta_single: String::new(),
+            sim_ta_rect: None,
+            sim_ta_row_h: 0.0,
+            sim_ta_pin_row: Vec2::ZERO,
+            sim_ta_grip: None,
+            sim_ta_to: None,
+            sim_ta_to2: None,
+            sim_ta_before: None,
+            sim_ta_after: None,
+            sim_ta_min: None,
+            sim_ta_now: None,
+            sim_ta_min_want: None,
+            sim_ta_scale: 1.0,
+            sim_ta_std_row: 0.0,
             sim_zorder_pts: None,
             menu_trigger_pt: None,
             menu_item_pt: None,
@@ -2216,6 +2262,42 @@ impl App for UiApp {
                 // ④ 再点**同一个屏幕点**：内容已滚过 ⇒ 命中的条目号必须更大。
                 142 => f.debug_inject_mouse(row, true),
                 143 => f.debug_inject_mouse(row, false),
+                _ => {}
+            }
+        }
+
+        // ── 调试：脚本化鼠标（`--sim-ta-resize`）────────────────────
+        // ① 拖 `ta_edit`（行内多行 TextEditor）的右下角缩放柄 +120/+80 物理像素；
+        // ② 再往左上猛拖 300 → 期望被**默认下限**挡住（一行文字高 / `min_w`，拖不到 0）。
+        // 目标点**冻结**（柄随编辑器长大而移动；每帧重算就是"追着拖"）。
+        if self.sim_ta_resize {
+            let n = f.frames();
+            let grip = self.sim_ta_grip.unwrap_or(Vec2::ZERO);
+            match n {
+                34 => {
+                    let to = grip + Vec2::new(120.0, 80.0);
+                    self.sim_ta_to = Some(to);
+                    f.debug_inject_mouse(grip, true);
+                }
+                35..=50 => {
+                    let to = self.sim_ta_to.unwrap_or(grip);
+                    let k = (n - 34) as f32 / 16.0;
+                    f.debug_inject_mouse(grip + (to - grip) * k, true);
+                }
+                51 => f.debug_inject_mouse(self.sim_ta_to.unwrap_or(grip), false),
+                // ② 过拖：起点 = 现在的柄（已长大），终点冻结为左上方向 300。
+                64 => {
+                    let to = grip - Vec2::new(300.0, 300.0);
+                    self.sim_ta_to2 = Some(to);
+                    f.debug_inject_mouse(grip, true);
+                }
+                65..=80 => {
+                    let from = grip;
+                    let to = self.sim_ta_to2.unwrap_or(from);
+                    let k = (n - 64) as f32 / 16.0;
+                    f.debug_inject_mouse(from + (to - from) * k, true);
+                }
+                81 => f.debug_inject_mouse(self.sim_ta_to2.unwrap_or(grip), false),
                 _ => {}
             }
         }
@@ -2809,6 +2891,42 @@ impl App for UiApp {
                 .ui(&mut ui, &mut clicks, &prev_press, prev_blocked, prev_widget_blocked);
             self.theme_tuner.ui(&mut ui);
 
+            // ── **行 + 多行 TextEditor**（widget 路径；`--sim-ta-resize` 的现场）───
+            //
+            // 三件事一起演示 / 自证（都被 `--sim-ta-resize` 断言）：
+            // ① **行 + 多行编辑器**：多行子项把行撑高（`SizeClass::Multiline` ⇒ 行高 = 子项高），
+            //    编辑器右下角有缩放柄；
+            // ② 拖大编辑器 ⇒ **窗口与下面的标签跟着长**（自动申请先问尺寸责任链
+            //    [`Ui::resolved_size`]，所以"申请尺寸 = 绘制尺寸"）；
+            // ③ 再放一行 `min_h(60)` 的**单行**控件：子项自己要 90 逻辑像素高，也会被
+            //    行的 `min_h` **钉到 60**（单行控件的标准高）。
+            // ⚠ 只在本仿真里出现：它的位置会盖住 `img_box_fill` 的 ⌃（`--sim-chrome` 要点的
+            // 那个像素），常态演示留在 egUI 的 Gallery/后续模块里（P3 会把内容整体搬过去）。
+            if self.sim_ta_resize {
+                ui.window("ta_win").pos(vec2(20.0, 320.0)).show(|w| {
+                    self.sim_ta_row_h = w
+                        .row(|r| {
+                            let resp = r.add(
+                                TextEditor::new("ta_edit", &mut self.sim_ta_text)
+                                    .multiline()
+                                    .resize(Resize::Both),
+                            );
+                            self.sim_ta_rect = Some(resp.rect);
+                        })
+                        .y;
+                    w.label("FOLLOW（拖大上面那行之后，我应该往下走）");
+                    self.sim_ta_pin_row = w
+                        .row_builder()
+                        .min_h(60.0)
+                        .show(|r| {
+                            r.add(
+                                TextEditor::new("ta_single", &mut self.sim_ta_single)
+                                    .height(90.0),
+                            );
+                        });
+                });
+            }
+
             // ── **菜单栏**（横向；`Ui::menu_bar`）────────────────────────────────
             // 录在各窗口**之后**：下拉面板是浮层窗口，窗口 z 在**首次录制**时按 `max+1`
             // 分配 ⇒ 放最后才能保证它盖住别的窗口（见 `widgets/menubar.rs` 模块文档）。
@@ -3003,6 +3121,41 @@ impl App for UiApp {
                         self.dd_sub_panel = Some(abs);
                         self.dd_sub_item1_pt =
                             Some(Vec2::new(abs.x + m_inset + 20.0, abs.y + m_inset + ih + menu_gap + ih * 0.5));
+                    }
+                }
+            }
+            // `--sim-ta-resize`：grip 点解算 —— 窗口原点 + 编辑器**窗口局部**矩形的右下角
+            // − 半个柄（柄命中区 = 14×14 贴右下角 ⇒ 中心 = 右下角 − 7）。全部由几何得来，
+            // 编辑器自己长大 / 行高变化都不用改脚本。
+            if self.sim_ta_resize {
+                let dump = ui.debug_dump();
+                let win = dump.windows.iter().find(|p| p.id == "ta_win");
+                if let (Some(win), Some(local)) = (win, self.sim_ta_rect) {
+                    // ⚠ `Response::rect` 是**行局部**坐标（控件录在它所在的容器里），而窗口内容
+                    // 原点又比窗口外框多一个 `pad`（= `panel.padding + border_w`，主题已预乘
+                    // DPI ⇒ 这里只 × scale，不再叠加任何逻辑值）。
+                    let pad = (ui.theme().panel.padding + ui.theme().panel.border_w) * ui.scale();
+                    self.sim_ta_grip = Some(
+                        Vec2::new(win.origin.x, win.origin.y) + Vec2::splat(pad) + local.max()
+                            - Vec2::splat(7.0),
+                    );
+                    let editor = ui
+                        .state()
+                        .sizes
+                        .get("ta_edit")
+                        .copied()
+                        .unwrap_or_else(|| local.size());
+                    if self.sim_ta_before.is_none() {
+                        self.sim_ta_before = Some((editor, win.size.y));
+                    }
+                    self.sim_ta_now = Some((editor, win.size.y));
+                    if self.sim_ta_min_want.is_none() {
+                        // 默认下限 = `(min_w, height)` —— 主题里的值**已经是物理像素**，
+                        // 不能再 × scale（那正是单位纪律第 2 条要防的错）。
+                        self.sim_ta_min_want =
+                            Some(Vec2::new(ui.theme().input.min_w, ui.theme().input.height));
+                        self.sim_ta_scale = ui.scale();
+                        self.sim_ta_std_row = ui.theme().row_h;
                     }
                 }
             }
@@ -3559,6 +3712,83 @@ impl App for UiApp {
                     "[FAIL] 分段没被点到 / 没写回选中"
                 }
             );
+        }
+        // --sim-ta-resize 判定（读段内记下的现场：编辑器持久尺寸 / 窗口高 / 行高）。
+        if self.sim_ta_resize {
+            let n = f.frames();
+            let now = self.sim_ta_now.unwrap_or((Vec2::ZERO, 0.0));
+            if n == 60 {
+                self.sim_ta_after = Some(now);
+                let ok = self.sim_ta_before.is_some_and(|(e0, w0)| {
+                    (now.0 - e0 - Vec2::new(120.0, 80.0)).length() <= 3.0
+                        && ((now.1 - w0) - 80.0).abs() <= 3.0
+                });
+                eprintln!(
+                    "sim-ta-resize: ① 拖柄后 编辑器 {:?} → {:?} · 窗口高 {:?} → {:?} {}",
+                    self.sim_ta_before.map(|b| b.0),
+                    now.0,
+                    self.sim_ta_before.map(|b| b.1),
+                    now.1,
+                    if ok {
+                        "[OK] 申请尺寸 = 绘制尺寸：编辑器 +120/+80，窗口高同步 +80（下面的控件跟着下去）"
+                    } else {
+                        "[FAIL] 拖大后窗口/后续控件没跟着长（申请尺寸没走尺寸责任链）"
+                    }
+                );
+                // ③ 在**编辑器被拖高**的这一帧断言：行高必须 = 子项高（远大于标准行高）。
+                //    旧语义（`force_h_all` 覆盖一切）会让行高恒等于 `Theme::row_h`（39 物理）
+                //    ⇒ 这条才是有区分度的现场。
+                let std_row = self.sim_ta_std_row;
+                let ok_row = (self.sim_ta_row_h - now.0.y).abs() <= 1.5 && self.sim_ta_row_h > std_row;
+                eprintln!(
+                    "sim-ta-resize: ③ 行高={} · 编辑器高={}（标准行高 ≈{std_row}）{}",
+                    self.sim_ta_row_h,
+                    now.0.y,
+                    if ok_row {
+                        "[OK] 多行子项把行撑高了（行高 = 子项高，没被压成一行高）"
+                    } else {
+                        "[FAIL] 行高与多行子项高不一致（多行被压成一行高）"
+                    }
+                );
+                let _ = &self.sim_ta_min;
+            } else if n == 90 {
+                self.sim_ta_min = Some(now);
+                let min = self.sim_ta_min_want.unwrap_or(Vec2::ZERO);
+                let ok_min = now.0.x >= min.x - 1.0 && now.0.y >= min.y - 1.0;
+                eprintln!(
+                    "sim-ta-resize: ② 往左上过拖后 编辑器 {:?}（默认下限 {min:?}）{}",
+                    now.0,
+                    if ok_min {
+                        "[OK] 默认最小尺寸生效（拖不到 0）"
+                    } else {
+                        "[FAIL] 能被拖到默认下限以下 / 拖到 0"
+                    }
+                );
+                let ok_row = (self.sim_ta_row_h - now.0.y).abs() <= 1.5;
+                eprintln!(
+                    "sim-ta-resize: ③b 行高={} · 编辑器高={}（缩到下限后仍同步）{}",
+                    self.sim_ta_row_h,
+                    now.0.y,
+                    if ok_row {
+                        "[OK] 行高仍 = 子项高"
+                    } else {
+                        "[FAIL] 行高与子项高不一致"
+                    }
+                );
+                // ④ 单行子项被**钉到行的 `min_h`**：子项自己要 90 逻辑像素高（= 135 物理），
+                //    行 `min_h(60)` ⇒ 行高必须恰为 60 逻辑像素（90 物理），不是 135。
+                let want = 60.0 * self.sim_ta_scale;
+                let ok_pin = (self.sim_ta_pin_row.y - want).abs() <= 1.5;
+                eprintln!(
+                    "sim-ta-resize: ④ 单行行的行高={}（期望 {want}）{}",
+                    self.sim_ta_pin_row.y,
+                    if ok_pin {
+                        "[OK] 单行子项被钉到行的 min_h（哪怕它自己 .height(90)）"
+                    } else {
+                        "[FAIL] 单行子项没被钉到行高（或行高被子项撑开）"
+                    }
+                );
+            }
         }
         // --sim-resize：**宽高同调**判定 —— 拖完后两个轴都必须变大（只变大一个 = 轴没接上）。
         if self.sim_resize && f.frames() == 30 {

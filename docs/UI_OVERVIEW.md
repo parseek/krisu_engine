@@ -82,7 +82,9 @@ scroll / row）压一帧。控件经 `child_rect(w, h)` 在栈顶帧内占一个
 - **固定宽容器**（`ui.window(id).width(w)`）：子项宽度 clamp 到固定值、高度自然（egui 风格）；
 - **flex**：固定总高按权重等分；
 - **min/max 约束**：`p.min_size(w,h)` / `p.max_size(w,h)` 作用于下一子项；
-- **row（等高）**：水平排列 + `Theme.row_h` 强制所有子项等高 → 文字中心线对齐。
+- **row（一行）**：水平排列（左上角 + 沿 X 推进）；**单行子项**被钉到 `Theme.row_h`
+  （文字中心线对齐），**多行子项**（如多行 `TextEditor`）可把行**撑高**（`SizeClass` 区分）；
+  行高上下限 / 间距 / 内边距用 `row_builder()`。
 
 **Widget 尺寸契约**（`widgets.rs`，v0.3 起**就地申请**）：
 ```rust

@@ -1054,6 +1054,9 @@ impl Sense {
 | `label_wrap` | `p.label_wrap(max_w, text) -> Vec2` | **自动换行标签**：`max_w`（逻辑像素）内按词/字换行；宽 = min(自然宽, max_w)，高 = 行数 × 行高；`max_w <= 0` = 不换行 |
 | `min_size` | `p.min_size(w, h)` | **下一子项最小尺寸约束**（`0` = 该轴不约束；一次性，作用于紧接着的下一个子项） |
 | `max_size` | `p.max_size(w, h)` | **下一子项最大尺寸约束**（同上） |
+| `row` | `p.row(\|r\| ..) -> Vec2` | **水平行**（占光标）：子项左上角对齐、沿 X 推进；**单行子项**（`SizeClass::SingleLine`，默认）被钉到行的标准高（默认 `Theme::row_h`），**多行子项**（`SizeClass::Multiline`，如多行 `TextEditor`）以它为下限、**可撑高整行** |
+| `row_builder` | `p.row_builder().min_h(..).max_h(..).height(..).gap(..).pad(..).show(\|r\| ..) -> Vec2` | 行的可配置形态（`crates/rjw_ui` 的 `RowBuilder`）：`min_h` = 行高下限**且是单行子项的标准高**（默认 `Theme::row_h`）、`max_h` = 上限（超出的子项照录，溢出可见）、`height` = 固定行高；尺寸收 `Size<f32>`（逻辑默认）。`min > max` 时 min 胜 |
+| `SizeClass` | `Widget::size_class() -> SizeClass` | 控件在行里被怎么钉高：`SingleLine`（默认，钉到标准行高）/ `Multiline`（标准行高只是下限）。**自定义控件想被行撑高就覆写**（不覆写 = 旧行为） |
 | `button` | `p.button(id, label) -> ButtonState` | hover / pressed / clicked（按下+释放均在本体） |
 | `slider` | `p.slider(id, range, value) -> f32` | 拖拽；返回更新后的值（越界 clamp） |
 | `Slider`（builder，泛型） | `p.add(Slider::new(id, range, &mut v).drag_sensitivity(..).shift_speed(..).ctrl_speed(..))` | **滑块**：`range` 与 `&mut v` 的类型决定 `T: SliderValue`（`f32` / `f64` / 全部整数类型）。**内部一律 `f32` 数学**（与渲染 / 命中同单位），进出各换算一次；整数类型在回写时**四舍五入** ⇒ 范围是整数时"一格一格跳"、`f64` 只是接口便利（滑条分辨率本来就受物理像素限制）。⚠ **没有 `step` 吸附**：拖出来的是连续值（想网格化就绑整数类型，或与一根 `NumberInput` 配对） |
@@ -1095,7 +1098,7 @@ impl Sense {
 + **`--theme <路径>`**（启动载入；与导入同一条通路）+ `--sim-theme <路径>`（脚本化验证）。
 见 `docs/ENGINE_GUIDE.md` §18.16。
 `LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**/**shadow**/**grip**）、`ButtonStyle`（三态 bg + padding + **radius**）、
-`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius** + **grip**：可缩放文本框的柄形状/尺寸/颜色，默认 `GripShape::Bars`、颜色随 `Palette::text_dim`）、
+`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius** + **grip**：可缩放文本框的柄形状/尺寸/颜色，默认 `GripShape::Diagonal`（三条斜线）、颜色随 `Palette::text_dim`）、
 `CheckboxStyle`（box_size/checked_fill/gap）、`DividerStyle`、`DebugStyle`（layout_outline / layout_outline_width）、
 `FocusStyle`（color / width，键盘导航焦点描边）、`ModalStyle`（dim / size）、
 `ComboStyle`（下拉浮层现代菜单：menu_bg/border/radius/pad_v + item_hover/selected/pad_x/min_w + fg/fg_mark）、

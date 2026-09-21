@@ -92,7 +92,8 @@ ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {
 | `label / button / slider / checkbox / text_input / …` | 占光标放置（内容自然尺寸） |
 | `add(Widget)` / `add_at(pos, Widget)` | 属性化 builder 控件（`Label` / `Button` / `Slider`…） |
 | `label_wrap(max_w, …)` | 宽内自动换行的标签 |
-| `row(closure)` | 水平行：子项 `PackSide::Left` 排列，**行内全部强制等高** `Theme::row_h`（`force_h_all`），在父容器中占一行 |
+| `row(closure)` | 水平行：子项 `PackSide::Left` 排列（**左上角对齐、沿 X 推进**），在父容器中占一行。行高 = 子项最高的那个；**单行子项**（[`SizeClass::SingleLine`]，默认）被**钉到行的标准高**（默认 [`Theme::row_h`](crate::Theme::row_h)），**多行子项**（[`SizeClass::Multiline`]，如多行 `TextEditor`）以它为下限、可撑高整行 |
+| `row_builder()` | 行的可配置形态（[`crate::RowBuilder`]）：`min_h`（行高下限 + 单行子项标准高）/ `max_h`（上限）/ `height`（固定行高）/ `gap` / `pad`，最后 `.show(closure)` |
 | `min_size / max_size(w, h)` | 一次性约束**下一个子项**（`set_next_min/max`） |
 | `divider()` | 分割线（占光标；宽 = 容器当前可用宽） |
 
@@ -115,8 +116,13 @@ p.button("btn_max", "max 宽");   // 这个按钮宽 ≤ 120
 `Frame` 提供两种「覆盖测量高度」的机制：
 
 - `force_next_h(h)`：**一次性**强制下一子项高度（`flex_at` 按权重分配各子项高度用）；
-- `set_force_h_all(h)`：**持续作用于本 frame 全部子项**（`row` 行等高用，`Theme::row_h`；
-  优先级最高，覆盖自然高度与一次性 `force_next_h`）。
+- `set_force_h_all(h)`：**持续作用于本 frame 全部子项**（`row` 的标准行高用，默认
+  `Theme::row_h`）。语义按子项的**尺寸类**（[`crate::widgets::SizeClass`]）分两种：
+  **单行子项被钉到 `h`**（覆盖自然高度与一次性 `force_next_h`），**多行子项以 `h` 为下限**
+  （`h.max(自然高)` ⇒ 可以撑高整行）。尺寸类由 `Ui::add` 在调 `Widget::ui` 之前从
+  [`crate::widgets::Widget::size_class`] 读取（一次性，`child_rect` 消费）。
+- 行级 min/max（只由 `RowBuilder` 设置）：`Frame::set_row_bounds(min, max)`，在
+  `settle_size` 末尾按"先压 max 再抬 min"夹取容器**自身**高度（min 胜）。
 
 ### 3.6 固定宽 / 固定高（`fixed_w` / `fixed_h`）
 
@@ -185,8 +191,10 @@ ui.window("win_b").pos(pos).show(|w| { … });             // 绝对定位一个
 
 ### 4.6 row —— 水平行（等高管线）
 
-`p.row(|r| { … })`：子项按 `PackSide::Left` 水平排列、**全部强制等高** `Theme::row_h`
-（内容各自垂直居中 → 文字中心线对齐），整体在父容器中占一行（宽 = 子项结算、撑大父级）。
+`p.row(|r| { … })`：子项按 `PackSide::Left` 水平排列、**左上角对齐**；**单行子项**被钉到
+行的标准高 [`Theme::row_h`](crate::Theme::row_h)（内容各自垂直居中 → 文字中心线对齐），
+**多行子项**（`TextEditor::multiline()`）可以把行**撑高**（行高 = 最高的子项）。整体在父
+容器中占一行（宽 = 子项结算、撑大父级）。要自定义行高上下限用 `row_builder()`（见 §3.3）。
 
 ---
 

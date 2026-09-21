@@ -10,6 +10,8 @@
 use glam::Vec2;
 use rjw_transform::Rect;
 
+use crate::widgets::SizeClass;
+
 /// pack 堆叠方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackSide {
@@ -70,7 +72,17 @@ pub(crate) struct Frame {
     next_fixed_h: Option<f32>,
     /// **本 frame 全部子项的强制高度**（水平行 `row` 等高；`None` = 自然测量）。
     /// 持续作用于本 frame 所有子项（区别于一次性 `next_fixed_h`）。
+    ///
+    /// ⚠ 语义 = **标准行高**：单行子项被**钉到**它，多行子项以它为**下限**（见
+    /// [`Self::next_class`] 与 [`crate::widgets::SizeClass`]）。
     force_h_all: Option<f32>,
+    /// **下一个子项的尺寸类**（一次性，`child_rect` 消费；默认
+    /// [`SizeClass::SingleLine`] = 旧行为）。由 `Ui::add` 在调 `Widget::ui` 之前写入。
+    next_class: SizeClass,
+    /// **行级高度下限 / 上限**（只由 `Ui::row_builder` 的 `RowBuilder` 设置；`None` = 不限）。
+    /// 在 [`Self::settle_size`] 末尾按"先压 max 再抬 min"夹取（min 胜）。
+    row_min_h: Option<f32>,
+    row_max_h: Option<f32>,
     /// **容器固定高度**（flex_at 等；覆盖 `settle_size` 的自然高度）。
     fixed_h: Option<f32>,
     /// **容器固定宽度**（`window_at_w` 等；覆盖 `settle_size` 的自然宽度，
@@ -101,6 +113,9 @@ impl Frame {
             next_max: Vec2::ZERO,
             next_fixed_h: None,
             force_h_all: None,
+            next_class: SizeClass::SingleLine,
+            row_min_h: None,
+            row_max_h: None,
             fixed_h: None,
             fixed_w: None,
             content_bounds: None,
@@ -119,6 +134,9 @@ impl Frame {
             next_max: Vec2::ZERO,
             next_fixed_h: None,
             force_h_all: None,
+            next_class: SizeClass::SingleLine,
+            row_min_h: None,
+            row_max_h: None,
             fixed_h: None,
             fixed_w: None,
             content_bounds: None,
@@ -149,8 +167,27 @@ impl Frame {
 
     /// **强制本 frame 全部子项等高**（水平行 `row` 用）：`child_rect` 时高度 =
     /// `force_h_all`（覆盖自然高 / 一次性 next_fixed_h），持续到 frame 结束。
+    ///
+    /// ⚠ 对**多行**子项（[`SizeClass::Multiline`]）它是**下限**而不是上限——多行控件
+    /// 可以把整行撑高（`row` 的 `min_h` 语义）；单行子项照旧被钉到该高度。
     pub(crate) fn set_force_h_all(&mut self, h: f32) {
         self.force_h_all = Some(h.max(0.0));
+    }
+
+    /// 设置**下一子项**的尺寸类（一次性，`child_rect` 消费）。`Ui::add` 在调用
+    /// `Widget::ui` 之前按 [`crate::widgets::Widget::size_class`] 写入。
+    pub(crate) fn set_next_class(&mut self, class: SizeClass) {
+        self.next_class = class;
+    }
+
+    /// **行级高度约束**（`row_builder` 的 `min_h` / `max_h`）：容器结算尺寸的高度被
+    /// 夹到 `[min, max]`（`min > max` 时 min 胜）。`None` = 该端不限。
+    ///
+    /// 只影响**容器自身**的结算高度（⇒ 父级光标推进 / 后续控件位置）；子项各自
+    /// 按自己的高度录制，`max` 比子项矮时内容溢出（同 `fixed_h` 的语义）。
+    pub(crate) fn set_row_bounds(&mut self, min: Option<f32>, max: Option<f32>) {
+        self.row_min_h = min.map(|v| v.max(0.0));
+        self.row_max_h = max.map(|v| v.max(0.0));
     }
 
     /// 固定容器结算高度（`settle_size` 覆盖自然高度）。
@@ -250,10 +287,18 @@ impl Frame {
         let w = if self.next_max.x > 0.0 { w.min(self.next_max.x).max(self.next_min.x) } else { w.max(self.next_min.x) };
         let h = if self.next_max.y > 0.0 { h.min(self.next_max.y).max(self.next_min.y) } else { h.max(self.next_min.y) };
         let h = self.next_fixed_h.take().unwrap_or(h);
-        // 行等高（row）：覆盖一切高度（含一次性 flex 高度），持续作用于本 frame 全部子项。
-        let h = self.force_h_all.unwrap_or(h);
+        // 行标准高（`row`）：**单行子项钉到它**（旧行为，文字中心线对齐）、
+        // **多行子项以它为下限**（可撑高整行——`TextEditor::multiline()` 这类）。
+        let h = match self.force_h_all {
+            None => h,
+            Some(std_h) => match self.next_class {
+                SizeClass::Multiline => h.max(std_h),
+                SizeClass::SingleLine => std_h,
+            },
+        };
         self.next_min = Vec2::ZERO;
         self.next_max = Vec2::ZERO;
+        self.next_class = SizeClass::SingleLine;
         // 容器固定宽：子项宽度 clamp（内容按固定宽排布，高度自然）
         let w = match self.fixed_w {
             Some(fw) if fw > 0.0 => w.min(fw),
@@ -335,8 +380,23 @@ impl Frame {
     }
 
     /// 结算容器**总尺寸**（含 pad_total 外扩；相对容器 origin）：
-    /// 自然尺寸 ∪ 绝对放置内容的包围盒（[`Self::content_bounds`]）。
+    /// 自然尺寸 ∪ 绝对放置内容的包围盒（[`Self::content_bounds`]），最后按
+    /// [`Self::set_row_bounds`] 夹取高度（行级 min/max）。
     pub(crate) fn settle_size(&self) -> Vec2 {
+        let size = self.settle_size_inner();
+        // 行级高度：先压 max 再抬 min（**min 胜**，与 `apply_constraints` 同口径）。
+        let h = match self.row_max_h {
+            Some(m) => size.y.min(m),
+            None => size.y,
+        };
+        let h = match self.row_min_h {
+            Some(m) => h.max(m),
+            None => h,
+        };
+        Vec2::new(size.x, h)
+    }
+
+    fn settle_size_inner(&self) -> Vec2 {
         let natural = self.natural_size();
         let Some(b) = self.content_bounds else {
             return natural;
@@ -631,6 +691,51 @@ mod tests {
         g.set_force_h_all(26.0);
         g.force_next_h(60.0);
         assert_eq!(g.child_rect(30.0, 16.0).h, 26.0, "行等高优先于一次性 flex 高");
+    }
+
+    #[test]
+    fn row_multiline_child_grows_the_row() {
+        // 多行子项（`SizeClass::Multiline`）：标准行高只是**下限**，可以撑高整行。
+        let mut f = Frame::new_stack(PackSide::Left, 6.0, 0.0);
+        f.set_force_h_all(26.0);
+        f.set_next_class(SizeClass::Multiline);
+        assert_eq!(
+            f.child_rect(200.0, 90.0),
+            Rect::new(0.0, 0.0, 200.0, 90.0),
+            "多行子项按自身高度（不被压成一行）"
+        );
+        // 同 frame 内混排：后面的单行子项仍被钉到 26（文字中心线对齐不受影响）
+        assert_eq!(f.child_rect(30.0, 16.0), Rect::new(206.0, 0.0, 30.0, 26.0));
+        assert_eq!(f.settle_size(), Vec2::new(236.0, 90.0), "行高 = 最高子项（宽 = 200+6+30）");
+        // 比标准行高**矮**的多行子项也要吃下限
+        let mut g = Frame::new_stack(PackSide::Left, 0.0, 0.0);
+        g.set_force_h_all(26.0);
+        g.set_next_class(SizeClass::Multiline);
+        assert_eq!(g.child_rect(100.0, 10.0).h, 26.0, "多行子项同样有标准高下限");
+        // 类标记是**一次性**的：用一个"自然高 > 行高"的后续子项来证明它已复位
+        // （单行 ⇒ 被压回 26；若标记泄漏 ⇒ 会保持 90）。
+        let mut h = Frame::new_stack(PackSide::Left, 0.0, 0.0);
+        h.set_force_h_all(26.0);
+        h.set_next_class(SizeClass::Multiline);
+        h.child_rect(10.0, 90.0);
+        assert_eq!(h.child_rect(10.0, 90.0).h, 26.0, "标记只作用于紧接着的那个子项");
+    }
+
+    #[test]
+    fn row_bounds_clamp_settled_height() {
+        // 行级 min/max：先压 max 再抬 min（min 胜，与 `apply_constraints` 同口径）。
+        let mut f = Frame::new_stack(PackSide::Left, 0.0, 0.0);
+        f.child_rect(50.0, 20.0);
+        f.set_row_bounds(Some(40.0), None);
+        assert_eq!(f.settle_size().y, 40.0, "低于下限 ⇒ 抬到下限");
+        let mut g = Frame::new_stack(PackSide::Left, 0.0, 0.0);
+        g.child_rect(50.0, 200.0);
+        g.set_row_bounds(Some(40.0), Some(120.0));
+        assert_eq!(g.settle_size().y, 120.0, "高于上限 ⇒ 压到上限");
+        let mut h = Frame::new_stack(PackSide::Left, 0.0, 0.0);
+        h.child_rect(50.0, 60.0);
+        h.set_row_bounds(Some(90.0), Some(30.0));
+        assert_eq!(h.settle_size(), Vec2::new(50.0, 90.0), "min > max 时 min 胜；宽度不受影响");
     }
 
     #[test]
