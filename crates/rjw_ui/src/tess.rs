@@ -800,11 +800,16 @@ pub(crate) fn push_rounded_rect_uv(
 /// | 圈 | 半径 | alpha |
 /// |---|---|---|
 /// | 外羽化（`A`） | `r_outer + f/2` | 0 |
-/// | 外轮廓（`B`） | `r_outer` | 1 |
-/// | 内轮廓（`C`） | `r_inner` | 1 |
-/// | 内羽化（`D`） | `r_inner - f/2` | 0 |
+/// | 硬体外沿（`B`） | `r_outer − f/2` | 1 |
+/// | 硬体内沿（`C`） | `r_inner + f/2` | 1 |
+/// | 内羽化（`D`） | `r_inner − f/2` | 0 |
 ///
-/// 三组带子 `A-B` / `B-C` / `C-D`。`f <= 0` 时只留 `B-C`。
+/// 三组带子 `A-B` / `B-C` / `C-D`。`f <= 0` 时只留 `B-C`（硬体直接落在视觉边界上）。
+///
+/// ⚠ **两条边界的斜坡各以视觉边界为中心**（外边界 = `r_outer`、内边界 = `r_inner`）——
+/// 与 [`push_rounded_rect`]（背景填充：硬体内缩 `f/2`、外环外扩 `f/2`）**同一约定**，
+/// 于是同一块面板的"填充边"与"边框边"alpha 剖面重合，`f/2` 不会鼓到填充之外。
+/// 硬体宽 = `width − f`（靠 `f ≤ width` 保证非负）。
 ///
 /// # 羽化宽度（`feather`）与"边框看起来多粗"
 ///
@@ -892,11 +897,9 @@ pub(crate) fn push_rounded_ring(
     // 内半径太小 ⇒ 内角是直角。夹到 0.5px（视觉上与直角无异），避免内圈点重合导致
     // 零面积三角形、以及两级轮廓点数不一致。
     let ri = ro.map(|r| (r - width).max(MIN_AA_RADIUS)).fit(inner_rect.w, inner_rect.h);
-    // **羽化带宽不得超过边框本身宽度**：环带的内外两条边界**各**带 f/2 的斜坡 ⇒
-    // 视觉粗度 = `width + f`。f 比 width 还大时，1 物理像素的边框会画出 1.8 像素的墨迹
-    // （用户实测：`border_w 1.0` × 1.5 取整 = 1 物理像素，而 `DEFAULT_FEATHER 1.2` × 1.5
-    // = 1.8 物理像素 ⇒ 看起来 2.8 像素粗）。这与 [`push_convex`] 的"细条羽化夹到半厚以内"
-    // 是同一条规矩：**薄形状的羽化必须 ≤ 它薄的那一维**。
+    // **羽化带宽不得超过边框本身宽度**：硬体（B→C）宽 = `width − f`，`f > width` 会让内外
+    // 两条边界的斜坡互相越过 ⇒ 轮廓次序颠倒（负面积三角形）；同时这也是"1 物理像素的边框
+    // 不该被 AA 画成 2 像素"的那条夹取（见本文档末尾"羽化宽度与边框看起来多粗"）。
     let f = feather.max(0.0).min(width).min(w.min(h) * 0.25);
     let half = f * 0.5;
     // 内羽化需要 `ri - half` 仍是有效半径（否则跳过内羽化，只保外羽化）。
@@ -911,7 +914,24 @@ pub(crate) fn push_rounded_ring(
     let solid: [f32; 4] = color.into();
     let flat = |_i: usize, _p: Vec2| solid;
 
-    // 由外向内写：A（外羽化，0）→ B（外轮廓，1）→ C（内轮廓，1）→ D（内羽化，0）。
+    // ⚠ **硬体同样按 `half` 内缩 / 外扩**，与 `push_rounded_rect`（背景填充）**同一约定**：
+    // 视觉外边界在 `rect` ⇒ 硬体外沿在 `rect − half`、外羽化圈在 `rect + half`；
+    // 视觉内边界在 `inner_rect` ⇒ 硬体内沿在 `inner_rect + half`、内羽化圈在
+    // `inner_rect − half`。于是两条边界的 alpha 斜坡**各以视觉边界为中心**，剖面与填充
+    // 的边缘完全一致。
+    //
+    // 旧实现把硬体直接落在 `rect` / `inner_rect` 上：外边界少了这 `half` 的内缩 ⇒
+    // ① 边框墨迹比填充的视觉边缘**鼓出 `f/2`**（圆角处最明显，观感"糊了一层"）；
+    // ② 最外那半像素上边框是 alpha 1、而同处填充只有 ~0.5 ⇒ 半透明背景（窗口 / 背景图
+    // tint）下会**透出背后内容**（用户实测："圆角观感不好"、"向内羽化像变成透明"）。
+    let b_rect = grow(rect, -half);
+    let b_radii = ro.map(|r| (r - half).max(MIN_AA_RADIUS)).fit(b_rect.w, b_rect.h);
+    let c_rect = grow(inner_rect, half);
+    // ⚠ 扩张后半径要 `+half` 并**重新 `fit`**（同 `push_rounded_rect` 外圈的注释：窄矩形
+    // 会出现"两角半径之和 > 边长" ⇒ 角心次序颠倒 ⇒ 轮廓变逆时针 ⇒ 负面积三角形）。
+    let c_radii = ri.map(|r| r + half).fit(c_rect.w, c_rect.h);
+
+    // 由外向内写：A（外羽化，0）→ B（硬体外沿，1）→ C（硬体内沿，1）→ D（内羽化，0）。
     // 羽化圈的**颜色照抄对应主轮廓的同序号点**（只把 alpha 置 0）⇒ 纯 alpha 斜坡，
     // 不夹带色偏。
     let b_start = push_outline(
@@ -919,7 +939,7 @@ pub(crate) fn push_rounded_ring(
         table,
         stride,
         segs,
-        &corners_of(rect, ro),
+        &corners_of(b_rect, b_radii),
         &|_p| uv,
         flat,
     );
@@ -928,7 +948,7 @@ pub(crate) fn push_rounded_ring(
         table,
         stride,
         segs,
-        &corners_of(inner_rect, ri),
+        &corners_of(c_rect, c_radii),
         &|_p| uv,
         flat,
     );
@@ -953,7 +973,14 @@ pub(crate) fn push_rounded_ring(
     };
 
     // B-C 是边框本体；A-B / C-D 是两条羽化斜坡。
-    push_band(tris, c_start, b_start, n);
+    //
+    // ⚠ 硬体宽 = `width − f`（内缩/外扩各 `half` 之后）。`f == width`（细边框 + 大羽化，
+    // 例如 1 物理像素边框 + 1.0 羽化）时它**退化成零宽**——峰值只剩一条线，内外两条
+    // 斜坡直接接在同一条轮廓上。此时**不推中间那条带子**：零面积三角形在数值上无害，
+    // 但会被"每个三角形绕序必须为正"的单测判为失败，也会白占三角形。
+    if width - f > 1e-4 {
+        push_band(tris, c_start, b_start, n);
+    }
     if let Some(a) = a_start {
         push_band(tris, b_start, a, n);
     }
@@ -1610,6 +1637,67 @@ mod tests {
             (rect.x - min_x2 - feather * 0.5).abs() < 0.05,
             "宽边框的羽化不该被夹（实际 {}）",
             rect.x - min_x2
+        );
+    }
+
+    #[test]
+    fn ring_and_fill_share_the_same_edge_alpha_profile() {
+        // **不变量**：同一块面板的"背景填充"与"边框环带"在**外边界**上必须有同一套
+        // alpha 剖面——填充的硬体内缩 f/2、外环外扩 f/2（视觉边 = rect）；环带也必须
+        // 如此。旧实现让环带的硬体直接落在 rect 上 ⇒ 边框比填充的视觉边缘鼓出 f/2，
+        // 且最外半像素是 alpha 1（填充只有 ~0.5）⇒ 圆角发糊 / 半透明背景下透出背后。
+        let t = table();
+        let rect = Rect::new(10.0, 10.0, 60.0, 36.0);
+        let f = 1.0_f32;
+        let half = f * 0.5;
+        // `rect.grow(half)` 是"含羽化的最外沿"（A 圈），`rect.grow(-half)` 是硬体（B 圈）。
+        let outer = |v: &[VertexP3U2C4]| v.iter().map(|p| p.pos[0]).fold(f32::INFINITY, f32::min);
+        let hard = |v: &[VertexP3U2C4]| {
+            v.iter()
+                .filter(|p| p.color[3] >= 0.999)
+                .map(|p| p.pos[0])
+                .fold(f32::INFINITY, f32::min)
+        };
+        // 填充（圆角实心矩形）
+        let mut fv = Vec::new();
+        let mut ft = Vec::new();
+        push_rounded_rect(
+            &mut fv,
+            &mut ft,
+            &t,
+            RoundedRectSpec {
+                rect,
+                radius: 8.0.into(),
+                feather: f,
+                corners: [Color::RED; 4],
+                uv: TEST_UV,
+            },
+        );
+        // 环带（同 rect / 同圆角 / 1px 边框）
+        let mut rv = Vec::new();
+        let mut rt = Vec::new();
+        push_rounded_ring(&mut rv, &mut rt, &t, rect, 8.0.into(), 1.0, f, Color::RED, TEST_UV);
+        assert!(
+            (outer(&fv) - outer(&rv)).abs() < 1e-3,
+            "最外沿（外羽化圈）必须重合：填充 {:.3} vs 环带 {:.3}",
+            outer(&fv),
+            outer(&rv)
+        );
+        assert!(
+            (hard(&fv) - hard(&rv)).abs() < 1e-3,
+            "硬体外沿必须重合：填充 {:.3} vs 环带 {:.3}",
+            hard(&fv),
+            hard(&rv)
+        );
+        assert!(
+            (hard(&rv) - (rect.x + half)).abs() < 1e-3,
+            "环带硬体外沿 = rect + f/2（**内缩**半像素，与填充一致；实际 {}）",
+            hard(&rv) - rect.x
+        );
+        assert!(
+            (outer(&rv) - (rect.x - half)).abs() < 1e-3,
+            "最外沿 = rect − f/2（环带与填充一致；实际 {}）",
+            outer(&rv) - rect.x
         );
     }
 
