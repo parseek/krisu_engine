@@ -2208,6 +2208,41 @@ impl<'a> Ui<'a> {
         (size, max_child)
     }
 
+    /// **长宽已确定的装饰容器**（内部原语）：在 `rect`（**当前容器局部**坐标、尺寸固定）里跑一个
+    /// `Pack`，命令留在当前容器的局部空间（随后由调用方统一平移），**不参与父级尺寸结算**。
+    ///
+    /// 与 [`Self::container`] 的区别只有一条，但很关键：**不 `note_content` 到父 frame**
+    /// —— 装饰（标题栏 / 状态条）是在**尺寸已经结算之后**才跑的，它的内容**不得**反过来
+    /// 影响任何容器尺寸（否则"结算后再画"就自相矛盾）。
+    ///
+    /// 用途：窗口标题栏（[`Self::window_impl`] 在 `settle_size` 之后、**按下裁决之前**
+    /// 用最终外框宽跑它 ⇒ 标题可居中、按钮可贴外缘）。用户侧想要同一形状可以用公开的
+    /// [`Self::view_at`]（`ViewMode::Expand` 的沙箱：提供 `avail_w`、不裁剪、内容可溢出）。
+    fn ornament_at(&mut self, rect: Rect, f: impl FnOnce(&mut Pack<'_, '_>)) {
+        let start = self.painter.q.queue.len();
+        let saved_base = self.abs_base;
+        self.abs_base = saved_base + Vec2::new(rect.x, rect.y);
+        let mut frame = Frame::new_stack(PackSide::Top, self.theme.gap, 0.0);
+        // 固定长宽：子项因此拿到确定的 `avail_w`（省略号 / `LimitedInParent` 用得上）。
+        frame.set_fixed_w(rect.w);
+        frame.set_fixed_h(rect.h);
+        self.frames.push(frame);
+        // 深度与"同一窗口里的内容"持平 ⇒ `elem` 语义与旧实现（标题/按钮录在窗口 frame 里）
+        // 完全一致：晚入队 ⇒ 排在面板底色（`elem = 0`，在窗口外一层画）之上、内容同级之上。
+        self.painter.q.depth += 1;
+        let mut p = Pack { ui: self };
+        f(&mut p);
+        // 丢弃它的结算尺寸：装饰不参与父级尺寸（`Frame::settle_size` 只有调用者关心）。
+        let _ = self.frames.pop().expect("ornament frame");
+        self.painter.q.depth -= 1;
+        self.abs_base = saved_base;
+        if rect.x != 0.0 || rect.y != 0.0 {
+            for d in &mut self.painter.q.queue[start..] {
+                d.translate(Vec2::new(rect.x, rect.y));
+            }
+        }
+    }
+
     /// **View 沙箱**（闭包作用域，见 [`crate::view`]）：进入沙箱后——
     ///
     /// - [`ViewMode::Clip`]：内容超出沙箱**强制裁剪**（外层裁剪 ∩ 沙箱可视区），
@@ -3157,28 +3192,81 @@ impl<'a> Ui<'a> {
         // ID 命名空间：窗口进入压栈、退出弹栈（闭包作用域保证配对——取代手动
         // push_id/pop_id，杜绝漏配对/多弹出）。窗口内子控件 ID 自动带窗口前缀。
         //
-        // **标题栏先录**（窗口内容第一行，与用户内容同一个 `Frame` 结算 ⇒ 窗口高度自然
-        // 包含它）；**收起**时只录标题栏、跳过用户闭包（`*collapsed` 由调用方持有）。
-        // 通条高度 = **一行**（标题行**贴窗口顶边**录，起点 0）：内容上抬 `pad_total`、
-        // 条高不再含上内边距，下面的内容与窗口高度随之各少一个 `pad_total`。
+        // **标题栏 = "长宽已确定的容器"，在窗口结算之后再跑**（见 [`Self::ornament_at`]）。
+        // 第一遍只**占位**：留出条高，让用户内容从条下开始（与旧实现同一个 y）。
+        // 通条高度 = **一行**（条贴窗口顶边，起点 0）：内容上抬 `pad_total`、
+        // 条高不含上内边距，下面的内容与窗口高度随之各少一个 `pad_total`。
         // ⚠ 条只是**背景装饰、不裁剪内容**：标题 / ▲ / ✕ 可以比条高再高一点（用户要求）。
         let bar_h = if chrome.bar_on() { title_bar_h(self.theme.row_h) } else { 0.0 };
         let collapsed = chrome.collapsed(self.state, id_for.as_str());
-        self.with_id(id, |ui| {
-            let mut w = Window { ui };
-            if chrome.bar_on() {
-                // `style.radius` 一并传下去：最右按钮的右上角要取**面板圆角**，
-                // 贴外缘时才能嵌进圆角轮廓（见 `window_title_bar`）。
-                // `id_for`（绝对 ID）也传下去：引擎托管的收起状态（`collapsed: None`）按它存取。
-                window_title_bar(&mut w, chrome, &id_for, collapsed, pad_total, style.radius);
+        // **占位宽度**：展开态由**内容**决定（标题不再撑宽窗口 —— 标题改为在最终宽度里
+        // 居中 / 省略）；**没有内容**时（收起态、且未给 `.width()`）用"标题 + 按钮簇 +
+        // 内边距"兜底，否则窗口会塌成 `2×pad`、标题被省略成空。
+        // ⚠ 固定宽窗口（`.width(..)`）由 `fixed_w` 决定宽度 ⇒ 这里不需要占位宽。
+        // （展开态但内容为空的自动宽窗口仍是 `2×pad`：那种窗口没有内容可依据，属已知取舍。）
+        let reserve_w = if bar_h > 0.0 && collapsed && width.is_none() {
+            let (row_h, gap) = (self.theme.row_h, self.theme.gap);
+            // 先拷 held 值再调 `&mut self` 的方法（`font_family` 借用不能跨调用）。
+            let (font_size, family) =
+                (self.theme.label.font_size, self.theme.label.font_family.clone());
+            let title_w = self
+                .text_size(chrome.title.unwrap_or(""), font_size, family.as_deref())
+                .x;
+            // `None` = "没有外框宽"那条解算 ⇒ 返回"标题 + 按钮簇 + 内边距"的最低宽度。
+            title_bar_layout(
+                None,
+                pad_total,
+                row_h,
+                gap,
+                chrome.show_collapse(),
+                chrome.close.is_some(),
+                TITLE_BUTTON_INSET,
+                title_w,
+            )
+            .bar_w
+        } else {
+            0.0
+        };
+        if bar_h > 0.0 {
+            // **占位记录在窗口顶边**（`y = 0`，x 保持内容左缘）——与旧实现"把内容光标临时
+            // 抬到 `y = 0` 再录标题行"同一口径：内容因此从 `bar_h + gap` 开始（**不是**
+            // `pad_total + bar_h + gap`），窗口高度不会多出一个 `pad_total`。
+            if let Some(fr) = self.frames.last_mut() {
+                fr.cursor.y = 0.0;
             }
-            if !collapsed {
-                f(&mut w);
+            self.child_rect(reserve_w, bar_h, Child::Expand);
+        }
+        // **结算 + 标题栏容器都在窗口 ID 命名空间内**（`with_id` 作用域里）：
+        // 装饰控件的 id 必须带窗口前缀，否则帧末"被更高窗口遮挡"的复核会把标题栏按钮
+        // 当成 **win=0 内容**而撤销它的按下（实测：`hit[..] ::collapse OK` 但点不动、
+        // 收起状态永远不翻转）。
+        let mut size = Vec2::ZERO;
+        self.with_id(id, |ui| {
+            {
+                // 显式重借用：`Window` 拿走 `&mut Ui`，块结束后 `ui` 仍可用。
+                let mut w = Window { ui: &mut *ui };
+                if !collapsed {
+                    f(&mut w);
+                }
+            }
+            // 结算尺寸（装饰之前）：标题/按钮不得反过来影响窗口尺寸。
+            size = ui.frames.last().expect("window frame").settle_size();
+            // **标题栏容器**：宽 = 最终外框宽 ⇒ 按钮贴外缘、标题可按最终宽度居中/省略。
+            // 插在**按下裁决之前**（裁决在 `with_id` 之后）：按钮的 `claim_press()` 必须
+            // 早于窗口自己的裁决，否则"按按钮把窗口拖走"复现。
+            if bar_h > 0.0 && size.x > 0.0 {
+                let (chrome, id_for) = (&mut *chrome, &id_for);
+                ui.ornament_at(Rect::new(0.0, 0.0, size.x, bar_h), |bar| {
+                    // `style.radius`：最右按钮的右上角取**面板圆角**（贴外缘才嵌得进圆角）；
+                    // `id_for`（绝对 ID）：引擎托管的收起状态（`collapsible: None`）按它存取。
+                    window_title_bar(bar, chrome, id_for, collapsed, size.x, pad_total, style.radius);
+                });
             }
         });
 
-        let frame = self.frames.pop().expect("window frame");
-        let size = frame.settle_size();
+        // 弹出窗口 frame。**沿用上面已经算好的 `size`**：`ornament_at` 不 note_content
+        // ⇒ 装饰不可能改变尺寸（语义保证：装饰绝不参与尺寸结算）。
+        self.frames.pop().expect("window frame");
         self.painter.q.depth -= 1;
         self.abs_base = saved_base;
         // 记录窗口尺寸（按 id 持久；点击置顶 z 变化后下帧 prev_size 仍可取）。
@@ -7698,37 +7786,38 @@ fn title_bar_layout(
 ///   且按下时 `claim_press()` ⇒ **按按钮不会建立窗口拖拽基准**；标题栏空白处仍可拖窗口；
 /// - 点击效果：关闭 ⇒ `*close = false`（该窗口**下一帧**整体不录）；收起 ⇒ 状态取反
 ///   （`Some(&mut bool)` 写回应用；`None` 写进 [`UiState::collapsed`]，**下一帧**生效）。
+///
+/// ⚠ **它现在跑在一个"长宽已确定的容器"里**（[`Ui::ornament_at`]，`rect = (0, 0, size.x, bar_h)`）：
+/// 由 `window_impl` 在**窗口尺寸结算之后、按下裁决之前**调用 ⇒ 这里拿到的 `bar_w` 是
+/// **最终外框宽**，所以按钮能贴外缘、标题能按最终宽度居中/省略（旧实现在第一遍录，
+/// 自动宽窗口不知道最终宽度，只能回退"跟随标题"）。
 fn window_title_bar(
-    w: &mut Window<'_, '_>,
+    bar: &mut Pack<'_, '_>,
     chrome: &mut WindowChrome<'_>,
     abs_id: &IdAbsolute<'_>,
     collapsed: bool,
+    bar_w: f32,
     pad_total: f32,
     panel_radius: CornerRadius,
 ) {
-    let ui = w.ui_mut();
+    // 行内尺寸全部取**缩放后**主题（`Ui::theme` 已按 DPI 预乘）。
+    let (gap, row_h, font_size, family, btn_radius) = {
+        let ui = bar.ui_mut();
+        (
+            ui.theme.gap,
+            ui.theme.row_h,
+            ui.theme.label.font_size,
+            ui.theme.label.font_family.clone(),
+            ui.theme.button.radius,
+        )
+    };
     let title = chrome.title.unwrap_or("");
     let show_close = chrome.close.is_some();
     let show_collapse = chrome.show_collapse();
-    // 行内尺寸全部取**缩放后**主题（`Ui::theme` 已按 DPI 预乘）。
-    let (gap, row_h, font_size, family, btn_radius) = (
-        ui.theme.gap,
-        ui.theme.row_h,
-        ui.theme.label.font_size,
-        ui.theme.label.font_family.clone(),
-        ui.theme.button.radius,
-    );
-    // **外框宽**：`Ui::avail_w()` 是"固定宽 − 2×pad"（[`Frame::fixed_avail_w`]），`+2×pad`
-    // 回到**内容宽**，再 `+2×pad` 才是外框宽（与 `Frame::natural_size` 的固定宽口径一致，
-    // 实测 win_a：`avail_w + 28 = 358` = dump 的 `size.x`）。
-    // `None`（无 `.width()`）= 自动宽窗口：宽度由内容决定，交给纯函数走"跟随标题"那条路。
-    let bar_w = ui
-        .avail_w()
-        .map(|a| a + pad_total * 2.0)
-        .map(|cw| cw + pad_total * 2.0);
-    let natural = ui.text_size(title, font_size, family.as_deref()).x;
+    let natural = bar.ui_mut().text_size(title, font_size, family.as_deref()).x;
+    // `Some(bar_w)`：宽度**恒为已知终值** ⇒ 不再走"跟随标题"那条回退分支。
     let layout = title_bar_layout(
-        bar_w,
+        Some(bar_w),
         pad_total,
         row_h,
         gap,
@@ -7742,14 +7831,13 @@ fn window_title_bar(
     let mut close_clicked = false;
     let mut collapse_clicked = false;
     // **标题行贴窗口顶边**：把内容光标临时抬到 `y = 0`（x 保持内容左缘）。
-    // `row()` 按该光标放置、并在结算后把光标推进到「条下沿 + gap」⇒ 后续内容自然上移
-    // `pad_total`（条高同时从 `pad_total + row_h` 变成 `row_h`，见 [`title_bar_h`]）。
-    if let Some(fr) = w.ui_mut().frames.last_mut() {
+    // `row()` 按该光标放置、并在结算后把光标推进到「条下沿 + gap」。
+    if let Some(fr) = bar.ui_mut().frames.last_mut() {
         fr.cursor.y = 0.0;
     }
     // **只有标题留在"行"里**：`row` 负责条高（`force_h_all(row_h)`）与标题的垂直居中；
     // 空标题也照录（它 + `force_h_all` 就是"一行标题栏"的高度来源，否则无标题窗口少一行）。
-    w.row(|r| {
+    bar.row(|r| {
         // 省略号模式 + 簇左缘的硬上限 ⇒ 过长时截断（不撑宽窗口、不挤走按钮）；
         // 不超长时绘制与普通 `label` 完全一致。
         if layout.title_max > 0.0 {
@@ -7757,8 +7845,8 @@ fn window_title_bar(
         }
         r.add(crate::widgets::Label::new(title).ellipsis());
     });
-    // **按钮绝对定位**：窗口帧局部 `(0, 0)` 就是**外框左上角**（见 `window_impl` 里
-    // `bar = Rect::new(0, 0, size.x, bar_h)` 与末尾统一 `translate(display_pos)`）
+    // **按钮绝对定位**：本容器局部 `(0, 0)` 就是**外框左上角**（见 [`Ui::ornament_at`] 的
+    // `rect = (0, 0, size.x, bar_h)` 与 `window_impl` 末尾统一 `translate(display_pos)`）
     // ⇒ 落点直接是外框坐标，**不需要任何 pad 补偿**。
     // `add_at` 走"一次性放置覆盖"，控件本身照旧 `allocate_sense`（尺寸 = `row_h - 2` ×
     // `row_h`，与解算一致），命中 / 按下认领路径完全不变。
@@ -7769,7 +7857,7 @@ fn window_title_bar(
         let icon = if collapsed { Icon::ChevronDown } else { Icon::ChevronUp };
         // 只有"收起在最右"（= 没画关闭按钮）时它才需要接面板圆角。
         let corners = if show_close { None } else { Some(btn_radius_tr) };
-        collapse_clicked = w
+        collapse_clicked = bar
             .ui_mut()
             .add_at(
                 Position::Physical(Vec2::new(rect.x, rect.y)),
@@ -7779,7 +7867,7 @@ fn window_title_bar(
             .clicked();
     }
     if let Some(rect) = layout.close {
-        close_clicked = w
+        close_clicked = bar
             .ui_mut()
             .add_at(
                 Position::Physical(Vec2::new(rect.x, rect.y)),
@@ -7794,7 +7882,7 @@ fn window_title_bar(
         match c {
             Some(c) => **c = !**c,
             None => {
-                w.ui_mut().state_mut().toggle_collapsed(abs_id.as_str());
+                bar.ui_mut().state_mut().toggle_collapsed(abs_id.as_str());
             }
         }
     }
