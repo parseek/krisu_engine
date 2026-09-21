@@ -7826,15 +7826,19 @@ fn window_title_bar(
         TITLE_BUTTON_INSET,
         natural,
     );
-    trace_title_bar(collapsed, natural, &layout);
 
     let mut close_clicked = false;
     let mut collapse_clicked = false;
-    // **标题行贴窗口顶边**：把内容光标临时抬到 `y = 0`（x 保持内容左缘）。
-    // `row()` 按该光标放置、并在结算后把光标推进到「条下沿 + gap」。
+    // **标题行贴窗口顶边**，x 取**内容左缘**（`pad_total`）：旧实现靠"窗口 frame 的初始
+    // 光标 x = `pad_total`"隐式得到；现在跑在装饰容器里（局部原点 = 外框左上角、光标 x = 0），
+    // 所以必须**显式**给回 `pad_total`，否则标题会左移一个 `pad_total`
+    // （`--ui-dump` 看不到——它只列窗口矩形、不列控件矩形；`RJ_CHROME_TRACE` 的 `title_at`
+    // 就是为核对这一条加的）。
     if let Some(fr) = bar.ui_mut().frames.last_mut() {
-        fr.cursor.y = 0.0;
+        fr.cursor = Vec2::new(pad_total, 0.0);
     }
+    let title_at = bar.ui_mut().cursor_pos();
+    trace_title_bar(collapsed, natural, &layout, title_at);
     // **只有标题留在"行"里**：`row` 负责条高（`force_h_all(row_h)`）与标题的垂直居中；
     // 空标题也照录（它 + `force_h_all` 就是"一行标题栏"的高度来源，否则无标题窗口少一行）。
     bar.row(|r| {
@@ -7891,13 +7895,16 @@ fn window_title_bar(
     }
 }
 
-/// `RJ_CHROME_TRACE=1`：打印标题栏布局解算（外框宽 / 标题实测宽 / 标题可用宽 / 按钮矩形）。
+/// `RJ_CHROME_TRACE=1`：打印标题栏布局解算（外框宽 / 标题实测宽 / 标题可用宽 / 按钮矩形 /
+/// **标题落点** `title_at`）。
 ///
 /// 为什么留一个开关而不是删掉临时打印：标题栏的**贴右缘**依赖"外框宽 + 实测标题宽"，
 /// 而文本测量随字体 / 字号 / DPI 变化——出问题时第一件事就是看这几个数。
 /// ⚠ 这里打的是**解算结果**（`title_bar_layout` 的输出）而不是中间量：断言口径就是
 /// "按钮右缘 == `bar_w − inset`"，所以打印必须包含**能直接核对这条的矩形**。
-fn trace_title_bar(collapsed: bool, title_w: f32, layout: &TitleBarLayout) {
+/// `title_at` = 标题行的落点（含 `pad_total` 的左内边距）——`--ui-dump` 只列窗口矩形、
+/// **看不到控件矩形**，所以标题的位置只能靠这一行核对。
+fn trace_title_bar(collapsed: bool, title_w: f32, layout: &TitleBarLayout, title_at: Vec2) {
     if std::env::var_os("RJ_CHROME_TRACE").is_some() {
         let r = |o: Option<Rect>| match o {
             Some(r) => format!("[{:.1},{:.1} {:.1}x{:.1}]", r.x, r.y, r.w, r.h),
@@ -7905,9 +7912,11 @@ fn trace_title_bar(collapsed: bool, title_w: f32, layout: &TitleBarLayout) {
         };
         eprintln!(
             "chrome[collapsed={collapsed}] bar_w={:.1} title_w={title_w:.1} title_max={:.1} \
-             collapse={} close={} inset={TITLE_BUTTON_INSET:.1}",
+             title_at=({:.1},{:.1}) collapse={} close={} inset={TITLE_BUTTON_INSET:.1}",
             layout.bar_w,
             layout.title_max,
+            title_at.x,
+            title_at.y,
             r(layout.collapse),
             r(layout.close),
         );
