@@ -49,9 +49,12 @@ pub trait SliderValue: Copy {
     fn is_integral() -> bool {
         false
     }
-    /// 默认拖拽步进（浮点 `0.1` = 拖 10px ±1；整数 `1`）。
+    /// 默认拖拽步进（浮点 `0.01` = 每物理像素 ±0.01；整数 `1`）。
+    ///
+    /// ⚠ 它同时决定**显示小数位**（见 `NumberInput` 的 `step_decimals`）：`0.01` ⇒ 2 位。
+    /// 需要更细的（颜色通道 / 归一化参数）显式 `.step(0.001)` 等覆盖。
     fn default_step() -> Self {
-        Self::from_f64(0.1)
+        Self::from_f64(0.01)
     }
     /// 解析用户输入（默认按 `f32` 解析后走 [`Self::from_f32`]；`f64` / 整数各自覆盖，
     /// 免得大值 / 高精度在手打时被 `f32` 截断）。
@@ -288,7 +291,7 @@ mod tests {
         assert!(!<f32 as SliderValue>::is_integral());
         assert!(!<f64 as SliderValue>::is_integral());
         assert_eq!(<u32 as SliderValue>::default_step(), 1);
-        assert_eq!(<f32 as SliderValue>::default_step(), 0.1);
+        assert_eq!(<f32 as SliderValue>::default_step(), 0.01);
         assert_eq!(<i32 as SliderValue>::parse_text(" -42 "), Some(-42));
         assert_eq!(<i32 as SliderValue>::parse_text("3.5"), None, "整数不收小数");
         assert_eq!(<u32 as SliderValue>::parse_text("-1"), None, "无符号不收负号");

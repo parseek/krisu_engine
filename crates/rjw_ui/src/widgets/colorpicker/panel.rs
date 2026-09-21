@@ -407,7 +407,10 @@ fn popup_body(
         ni = if int_mode {
             ni.range(0.0, 255.0).step(1.0)
         } else {
-            ni.range(0.0, 1.0).step(0.01)
+            // **比 `NumberInput` 的默认精度更细**：默认 `0.01`（2 位小数）不足以区分
+            // 8 位通道（`1/255 ≈ 0.0039`，相邻字节只差 0.004）⇒ F 模式用 `0.001`（3 位，
+            // 显示如 `0.502`）。u8 / HEX 模式是整数通道（步进 1），不受影响。
+            ni.range(0.0, 1.0).step(0.001)
         };
         ui.add_at(Position::Physical(Vec2::new(frect.x, frect.y)), ni);
         if (nv2 - shown).abs() > f32::EPSILON {

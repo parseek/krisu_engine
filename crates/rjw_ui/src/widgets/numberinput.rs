@@ -89,7 +89,7 @@ pub struct NumberInput<'a, T: SliderValue = f32> {
     pub min: Option<T>,
     /// 上界（`None` = 不限制）。
     pub max: Option<T>,
-    /// 拖拽**精度**：每物理像素数值（默认：浮点 `0.1` = 拖 10px ±1；整数 `1`；`≤ 0` = 不吸附）。
+    /// 拖拽**精度**：每物理像素数值（默认：浮点 `0.01` = 每像素 ±0.01、整数 `1`；`≤ 0` = 不吸附）。
     pub step: T,
     /// 按住 **Shift** 拖拽的速度倍率（默认 10：细调）。
     pub shift_speed: f32,
@@ -138,7 +138,8 @@ impl<'a, T: SliderValue + PartialOrd> NumberInput<'a, T> {
         self
     }
 
-    /// 拖拽**精度**：每物理像素数值（默认：浮点 `0.1` = 拖 10px ±1、整数 `1`；`≤ 0` = 不吸附）。
+    /// 拖拽**精度**：每物理像素数值（默认：浮点 `0.01` = 每像素 ±0.01、整数 `1`；`≤ 0` = 不吸附）。
+    /// 它也决定**显示小数位**（`0.01` ⇒ 2 位、`0.001` ⇒ 3 位——颜色通道那种更细的场景显式覆盖）。
     pub fn step(mut self, step: T) -> Self {
         self.step = step;
         self
