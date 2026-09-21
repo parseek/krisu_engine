@@ -79,7 +79,9 @@ pub(super) fn show_popup(
     // 面板最小宽 = 一行通道所需（标签 + 滑块最小宽 + 数值框）：
     // 主题 `input.min_w` 变大也不会把行挤爆。
     let body_min = PAD * 2.0 + LABEL_W + GAP + SLIDER_MIN_W + GAP + field_w;
-    let pw = popup_w.unwrap_or_else(|| (anchor.w * 1.9).max(body_min));
+    // 默认宽取**主题**口径的入口宽（`input.min_w`）× 1.9，**不取入口色块的实测宽**：
+    // 否则 `ColorPicker::size(..)` 一调，弹出的对话框也跟着变宽/变窄（两者应各自独立）。
+    let pw = popup_w.unwrap_or_else(|| (field_w * 1.9).max(body_min));
     let n_ch = 3 + if alpha { 1 } else { 0 };
     // SV 平面取正方（见 `sv_side`）：面板高随之变化，故先算边长再算高。
     let sv = sv_side(pw - PAD * 2.0);

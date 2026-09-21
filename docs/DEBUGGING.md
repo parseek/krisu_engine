@@ -130,7 +130,14 @@ fn update(&mut self, ctx: &mut Ctx) {
   `sim-picker: frame=… mode=… text=…` 与最终颜色作为证据：
   `cargo run -p eg260818UI -- --sim-picker --frames 110`。
   ⚠ 脚本坐标必须**由主题解算**（`Theme` 在 `Ui` 内才按 DPI 预乘）——写死像素在非 1.0
-  DPI 下会点空。
+  DPI 下会点空。该位置（`PICKER_DEMO_POS`）还必须**避开窗口矩形与 win=0 控件**：取色器是
+  `win=0` 内容，被窗口盖住收不到按下（`window_occluded`，`RJ_HIT_TRACE` 也不打印，只在
+  `state().hits().occluded_hits` 里计数 —— **静默失败**），压在别的控件上则被控件级遮挡并
+  被对方抢走点击。实测踩过 `(240,250)`（被 `chishi` 盖住 ⇒ "点色块"变成拖窗口）、
+  `(24,250)`（压在「重置」上）、`(24,400)`（压在 `hp_bar` 上）三处。
+  第 88/92 帧还顺带钉住 **入口尺寸 ≠ 面板尺寸**：第 88 帧把入口色块换成 200×40（面板仍
+  开着），第 92 帧读 `picker_demo::popup` 窗口宽必须仍是 `picker_panel_w(主题默认入口宽)+2`
+  ——旧实现（按入口实测宽 × 1.9）在这里读到 382 并 `[FAIL]`（已验证该断言可失败）。
 - **重叠控件的命中归属**（"点了 A 却连 B 也触发"）：示例的 `--sim-overlap` 把鼠标压在两个
   **故意重叠**的控件交集中心（坐标由 `examples/eg260818UI/src/overlap.rs` 与绘制同源解算），
   按下 + 释放后打印

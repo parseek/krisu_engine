@@ -73,7 +73,7 @@ use glam::Vec2;
 use rjw_color::Color;
 use rjw_transform::Rect;
 
-use crate::draw::{CornerRadius, DrawKind, Icon, TextVAlign};
+use crate::draw::{CornerRadius, DrawKind, Icon, Size, TextVAlign};
 use crate::id::IdAbsolute;
 use crate::{Response, TextAlign, Ui, Widget};
 
@@ -90,19 +90,32 @@ pub struct ColorPicker<'a> {
     alpha: bool,
     /// 可选的文本编辑缓冲（跨帧由调用方持有；`None` = 用全局跨帧缓冲）。
     hex: Option<&'a mut String>,
-    /// 弹出面板宽度（物理像素；`None` = 内联宽度的 1.9 倍与"通道行最小宽"取大）。
+    /// 弹出面板宽度（物理像素；`None` = **主题**默认宽（`Theme::input.min_w`）的 1.9 倍
+    /// 与"通道行最小宽"取大 —— 与**入口色块的实测宽无关**，见 [`Self::size`]）。
     popup_w: Option<f32>,
+    /// **入口色块**的尺寸（[`Size<Vec2>`]：逻辑（默认）/ 物理；`None` = 主题默认
+    /// `Theme::input.min_w × SWATCH_H`）。设它**不会**改变面板尺寸（面板宽默认取主题宽）。
+    size: Option<Size<Vec2>>,
 }
 
 impl<'a> ColorPicker<'a> {
     /// 主构造：颜色直接写在 `&mut Color` 上。
     pub fn new(id: &'a str, color: &'a mut Color) -> Self {
-        Self { id, color, alpha: false, hex: None, popup_w: None }
+        Self { id, color, alpha: false, hex: None, popup_w: None, size: None }
     }
 
     /// 面板里显示 Alpha 行（默认不显示：多数取色只关心 RGB）。
     pub fn alpha(mut self, on: bool) -> Self {
         self.alpha = on;
+        self
+    }
+
+    /// **入口色块**的尺寸（[`Size<Vec2>`]：`Logical`（默认）/ `Physical`）。
+    ///
+    /// 只改"内联那一行色块"多大；**不影响弹出面板**——面板宽默认取
+    /// `Theme::input.min_w × 1.9`（主题口径），要改面板请用 [`Self::popup_width`]。
+    pub fn size(mut self, s: impl Into<Size<Vec2>>) -> Self {
+        self.size = Some(s.into());
         self
     }
 
@@ -116,7 +129,7 @@ impl<'a> ColorPicker<'a> {
         self
     }
 
-    /// 弹出面板宽度（物理像素）。
+    /// 弹出面板宽度（物理像素；不调 = 主题默认宽的 1.9 倍与"通道行最小宽"取大）。
     pub fn popup_width(mut self, w: f32) -> Self {
         self.popup_w = Some(w);
         self
@@ -151,15 +164,19 @@ fn focus_inside(ui: &Ui, abs: &IdAbsolute<'_>) -> bool {
 
 impl Widget for ColorPicker<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
+        // 先解构：`color`（&mut Color）与 `hex`（Option<&mut String>）是**互不相干**的
+        // 借用，颜色值在外面读写成 `Copy` 的 `Color`，两边不打架。
+        let ColorPicker { id, color, alpha, hex, popup_w, size } = self;
         // 申请：内联只占**一行**（面板弹出，不参与这里的尺寸结算）。
-        let rect = ui.allocate(Vec2::new(ui.theme().input.min_w, SWATCH_H));
+        // 入口尺寸可调，**且只影响这一行**——面板宽另取主题口径（见 `panel::show_popup`）。
+        let trig = size.map_or(Vec2::new(ui.theme().input.min_w, SWATCH_H), |s| {
+            s.to_physical(ui.scale())
+        });
+        let rect = ui.allocate(trig);
         // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
         if ui.culled(rect) {
             return Response { rect, culled: true, ..Default::default() };
         }
-        // 先解构：`color`（&mut Color）与 `hex`（Option<&mut String>）是**互不相干**的
-        // 借用，颜色值在外面读写成 `Copy` 的 `Color`，两边不打架。
-        let ColorPicker { id, color, alpha, hex, popup_w } = self;
         let color_in = *color;
         let id_for = ui.id_for(id);
         let abs = id_for.to_static();

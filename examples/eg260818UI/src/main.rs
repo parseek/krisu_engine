@@ -130,6 +130,38 @@ fn caption_pts(
     Some((Vec2::new(fold_x, cy), Vec2::new(close_x, cy)))
 }
 
+/// **取色器演示**的锚点（物理像素，左上角）：录制（`TopBar::ui`）与 `--sim-picker`
+/// 的坐标解算共用同一常量（脚本不写死像素）。
+///
+/// ⚠ 位置必须**避开窗口矩形与 win=0 控件**：取色器是 `win=0` 内容，被窗口盖住收不到按下
+/// （`window_occluded`），压在别的控件上则被控件级遮挡 / 被对方的点击处理抢走（还会抢焦点）。
+/// 踩过的三个位置：`(240,250)` 被 `chishi`（263,255,236×195）整块盖住（"点色块"实际变成了
+/// **拖窗口**，面板从没开过——早期只打印不判定，所以一直没暴露）；`(24,250)` 压在「重置」
+/// （24,246,183×39）上；`(24,400)` 压在 `hp_bar`（24,393,190×39）上。
+/// 现在落在 `hp_bar` 上方那格（y 220..242 无控件、x 24..234 无窗口），且面板高 633 ⇒
+/// 弹出后底边 877 < 1080，不被屏幕夹住（popup 是锚点 + 24 后向下铺开）。
+const PICKER_DEMO_POS: Vec2 = Vec2::new(24.0, 220.0);
+
+/// `--sim-picker` 在第 88 帧把**入口色块**改成的尺寸（物理像素，故意远宽于默认）。
+/// 面板此时仍开着 ⇒ 用来钉住"**入口尺寸不影响对话框尺寸**"。
+const PICKER_BIG_TRIGGER: Vec2 = Vec2::new(200.0, 40.0);
+
+/// 取色面板里的**固定**几何常量（物理像素；与 `colorpicker/panel.rs` 同源）。
+const PICKER_PAD: f32 = 6.0;
+const PICKER_GAP: f32 = 6.0;
+const PICKER_LABEL_W: f32 = 14.0;
+const PICKER_SLIDER_MIN: f32 = 90.0;
+
+/// 取色面板的**默认外宽**（物理像素）：`主题默认入口宽 × 1.9` 与"一行通道最小宽"取大。
+///
+/// ⚠ 取的是**主题**口径（`Theme::input.min_w`），**不是入口色块的实测宽** —— 那正是
+/// `ColorPicker::size(..)` 不该影响对话框尺寸的地方（`--sim-picker` 第 88/92 帧钉住）。
+fn picker_panel_w(field_w: f32) -> f32 {
+    (field_w * 1.9).max(
+        PICKER_PAD * 2.0 + PICKER_LABEL_W + PICKER_GAP + PICKER_SLIDER_MIN + PICKER_GAP + field_w,
+    )
+}
+
 /// **「玩家名」可拖动面板的初始位置**（逻辑像素，左上角）：录制与 `--sim-zorder`
 /// 的坐标解算共用同一常量（同理：脚本不写死像素）。
 const NAME_PANEL_POS: Vec2 = Vec2::new(430.0, 12.0);
@@ -195,6 +227,10 @@ struct TopBar {
     font_modal_open: bool,
     /// **固定位置**的取色器颜色（物理定位：`--sim-picker` 的脚本化点击要能算到坐标）。
     demo_color: Color,
+    /// 取色器**入口色块**的显式尺寸（物理像素；`None` = 主题默认）。
+    /// `--sim-picker` 第 88 帧把它设成 [`PICKER_BIG_TRIGGER`] ⇒ 面板仍开着，用来验证
+    /// "入口尺寸改了，**对话框宽度不变**"。
+    demo_picker_size: Option<Vec2>,
     /// **待处理的导入请求**（点「导入图片…」/「导入字体…」只记请求：系统选择器是
     /// **阻塞**调用，录制期不能弹——见 `filedialog` 模块文档）。
     import_request: Option<ImportKind>,
@@ -217,6 +253,7 @@ impl TopBar {
             font_input: String::new(),
             font_modal_open: false,
             demo_color: Color::rgba_u8(255, 128, 40, 255),
+            demo_picker_size: None,
             import_request: None,
             export_request: None,
             import_status: String::new(),
@@ -284,10 +321,13 @@ impl TopBar {
         });
         // **取色器演示**（固定物理位置：`--sim-picker` 的脚本化点击按这个坐标算）。
         // 不传 `&mut String` —— 面板的文本框用全局跨帧缓冲（`ColorPickerState::text`）。
-        ui.add_at(
-            Position::Physical(Vec2::new(240.0, 250.0)),
-            ColorPicker::new("picker_demo", &mut self.demo_color).alpha(true),
-        );
+        // 入口色块可 `.size(..)`（`--sim-picker` 用它验证"入口尺寸 ≠ 对话框尺寸"）。
+        let picker = ColorPicker::new("picker_demo", &mut self.demo_color).alpha(true);
+        let picker = match self.demo_picker_size {
+            Some(s) => picker.size(Size::Physical(s)),
+            None => picker,
+        };
+        ui.add_at(Position::Physical(PICKER_DEMO_POS), picker);
     }
 
     /// 字体 Modal（**帧末调用**：modal 的 z 每帧重写为当前最大，最后录制才能保证
@@ -2111,17 +2151,17 @@ impl App for UiApp {
             let theme = self
                 .theme_tuner
                 .theme(self.top.font_name(), self.top.font_weight());
-            // 取色面板内部的固定常量（与 `panel.rs` 一致）+ 主题尺寸 × DPI。
-            let (pad, gap, hue_w, label_w, slider_min) =
-                (6.0f32, 6.0f32, 14.0f32, 14.0f32, 90.0f32);
+            // 取色面板内部的固定常量（与 `panel.rs` 一致；`PICKER_*` 与判定段同源）+
+            // 主题尺寸 × DPI。`hue_w` 只有面板坐标解算用，不在 `picker_panel_w` 里。
+            let (pad, gap, hue_w, label_w) = (PICKER_PAD, PICKER_GAP, 14.0f32, PICKER_LABEL_W);
             let (row, input_h, field_w) = (
                 theme.row_h * scale,
                 theme.input.height * scale,
                 theme.input.min_w * scale,
             );
-            let anchor = Vec2::new(240.0, 250.0); // `TopBar` 里 picker_demo 的物理定位
+            let anchor = PICKER_DEMO_POS; // `TopBar` 里 picker_demo 的物理定位
             let swatch = Vec2::new(anchor.x + field_w * 0.5, anchor.y + 11.0);
-            let pw = (field_w * 1.9).max(pad * 2.0 + label_w + gap + slider_min + gap + field_w);
+            let pw = picker_panel_w(field_w);
             let body_w = pw - pad * 2.0;
             let origin = Vec2::new(anchor.x, anchor.y + 24.0); // 内联高 22 + 2px 间隙
             let mode_w = (body_w - gap * 2.0) / 3.0;
@@ -2175,6 +2215,9 @@ impl App for UiApp {
                 75 => f.debug_inject_mouse(warn, false),
                 82 => f.debug_inject_mouse(mode(2), true), // 切到 F 呈现
                 83 => f.debug_inject_mouse(mode(2), false),
+                // 面板仍开着，把**入口色块**换成远宽于默认的尺寸（下一帧生效）：
+                // 第 92 帧的判定要看到"对话框宽度**没变**"（宽取主题口径，与入口无关）。
+                88 => self.top.demo_picker_size = Some(PICKER_BIG_TRIGGER),
                 96 => f.debug_inject_mouse(Vec2::new(900.0, 100.0), true), // 点面板外 → 收起
                 97 => f.debug_inject_mouse(Vec2::new(900.0, 100.0), false),
                 _ => {}
@@ -2774,6 +2817,36 @@ impl App for UiApp {
             // 且段 2 那份还应包含段 1 录的窗口（帧级暂存跨段共享）。
             if ui_dump {
                 eprintln!("[段 1] {}", ui.debug_dump());
+            }
+            // ── `--sim-picker` 判定（第 92 帧）：**入口色块尺寸 ≠ 对话框尺寸** ──
+            // 脚本第 88 帧把入口换成 `PICKER_BIG_TRIGGER`（200×40，远宽于默认），
+            // 面板此时仍开着 ⇒ 面板外宽必须**仍是** `picker_panel_w(主题默认入口宽)`；
+            // 旧实现按**入口实测宽 × 1.9** 算 ⇒ 这里会读到 ~380（立刻 FAIL）。
+            // `+2` = 面板边框（`panel_style.border_w = 1`，两侧共 2 物理像素）。
+            if sim_picker && sim_frame == 92 {
+                let field_w = ui.theme().input.min_w;
+                let want = picker_panel_w(field_w) + 2.0;
+                let got = ui
+                    .debug_dump()
+                    .windows
+                    .iter()
+                    .find(|w| w.id.ends_with("picker_demo::popup"))
+                    .map(|w| w.size.x);
+                // 判据能失败的自证：入口宽 × 1.9 必须**明显不同于**期望值（否则等式
+                // 两边恰好撞上，断言等于没写）。
+                let bug = PICKER_BIG_TRIGGER.x * 1.9 + 2.0;
+                let discriminates = (bug - want).abs() > 8.0;
+                let ok = got.is_some_and(|g| (g - want).abs() <= 2.0) && discriminates;
+                eprintln!(
+                    "sim-picker: 入口={:?} 面板宽 期望={want:.0} 实测={:?}（按入口算会是 {bug:.0}） {}",
+                    PICKER_BIG_TRIGGER,
+                    got.map(|g| g.round()),
+                    if ok {
+                        "[OK] 入口尺寸改了、对话框宽度不变（宽取主题口径）"
+                    } else {
+                        "[FAIL] 面板宽跟着入口走了 / 面板没开"
+                    }
+                );
             }
             // ── `--sim-clip`（放在**窗口都录完**之后：`debug_dump` 只看本帧已录窗口）──
             // 环境裁剪走 batch scissor（严格窗口 / Clip 沙箱），而不是逐命令切割几何。
