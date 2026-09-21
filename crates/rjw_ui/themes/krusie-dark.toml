@@ -1,0 +1,30 @@
+# 内置主题（仓库内）——**深色（默认观感 + 收紧间距）**
+#
+# 这是**裸主题表**（没有 `format_version` 头）⇒ `Theme::apply_toml` 按"合并覆盖"处理：
+# 只有写在这里的字段被改，其余保持**调用方当前主题**的值。它刻意只写"皮肤该有的
+# 那一层"（配色 / 间距 / 圆角 / 字体），与引擎默认主题叠加后即得成品。
+#
+# 谁在用它：`rjw_ui::theme_toml::BUILTIN_THEMES`（`include_str!` 编译期导入）——
+# 单测对**本目录下每个 .toml** 逐个解析并断言"注册表里有它"，示例用
+# `--theme builtin:krusie-dark` 自动加载（无需文件路径），CI 的 sim 套件跑这一份。
+#
+# ⚠ 颜色是 **0–1 归一化浮点**（导出就是这个形式）；写 0–255 会被当成 >1 ⇒ 夹到全白。
+
+row_h = 32.0
+gap = 7.0
+feather = 1.0
+
+[panel]
+padding = 12.0
+radius = { tl = 6.0, tr = 6.0, br = 6.0, bl = 6.0 }
+
+[button]
+radius = { tl = 5.0, tr = 5.0, br = 5.0, bl = 5.0 }
+
+[input]
+min_w = 140.0
+radius = { tl = 5.0, tr = 5.0, br = 5.0, bl = 5.0 }
+
+[menubar]
+gap = 2.0
+trigger_pad_x = 10.0

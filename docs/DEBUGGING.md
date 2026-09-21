@@ -31,6 +31,16 @@ foreach ($s in "drag","picker","overlap","cover","chrome","weight","shadow","cli
 cargo run --offline -p eg260818UI -- --frames 240   # => krusie smoke: [OK] 240/240
 cargo run --offline -p egUI -- --frames 60          # => krusie smoke: [OK] 60/60
 
+# 3b) **主题扫掠**：同一套 sim 换仓库内置主题再跑一遍（自动加载，无需人准备文件）
+foreach ($s in "drag","picker","overlap","cover","chrome","weight","clip","zorder",
+              "text-cull","menu","dropdown","weight-modal","resize","ta-resize") {
+    cargo run --offline -p eg260818UI -- "--sim-$s" --theme builtin:krusie-compact --frames 260
+}
+# `--sim-tuner` / `--sim-shadow` 会被自动**跳过**（`--theme` = override 期间调参旋钮故意
+# 不生效，见 `ThemeTuner::theme`）—— 它们断言的是"拧旋钮 ⇒ 主题变"，不适用。
+# 现网：`builtin:krusie-compact` **14/14 全 [OK]**；`builtin:krusie-dark` 有 3 个**已知**
+# 依赖默认度量的现场会 `[FAIL]`（`zorder` / `weight-modal` / `ta-resize`，见 §0 末尾）。
+
 # 4) egUI 单窗口诊断（demo **默认全关** ⇒ 不带 --demo 的冒烟跑的是空屏）
 cargo run --offline -p egUI -- --demo Gallery --ui-dump --frames 60
 ```
@@ -45,6 +55,31 @@ cargo run --offline -p egUI -- --demo Gallery --ui-dump --frames 60
 诊断专用（不进上表）：`--sim-import <图片>` / `--sim-theme <toml>` / `--sim-click X,Y`（配
 `RJ_HIT_TRACE=1`）/ `--auto-drag` / `--script-pos` / `RJ_CHROME_TRACE` / `RJ_MENU_TRACE` /
 `RJ_ORDER_TRACE=<frame>`。各 sim 的**判定口径与现场**见 §2–§5。
+
+## 0.1 仓库内置主题（自动化测试的主题输入）
+
+主题文件**提交在仓库里**（`crates/rjw_ui/themes/*.toml`），由 `include_str!` **编译期**
+导入注册表（`rjw_ui::theme_toml::BUILTIN_THEMES`）⇒ 测试跑的就是提交进仓库的那份文本，
+**不依赖运行目录 / 外部文件**：
+
+```powershell
+cargo test -p rjw_ui --lib theme_toml          # 内置主题逐个解析 + 键路径核对 + 目录登记核对
+cargo run  -p eg260818UI -- --theme builtin:krusie-dark --frames 30   # 示例侧自动加载
+#   => theme: 启动载入 builtin:krusie-dark
+```
+
+两条守卫（`crates/rjw_ui/src/theme_toml.rs` 的测试）：
+`builtin_themes_load_and_change_the_theme`（每个内置主题能加载、**真的改了东西**、且文件里
+每个键路径都存在于 `Theme` 字段树——多余键按"向前兼容"被**静默忽略**，字段名写错时
+"加载成功但什么都没改"，这条把它变成失败）与 `every_theme_file_in_the_repo_is_registered`
+（自己**列目录**核对"`themes/` 里每个 `.toml` 都登记了"）。
+加主题：放文件 + 在 `BUILTIN_THEMES` 里加一行。
+
+**主题扫掠下仍会失败的 3 个 sim（`krusie-dark`，已知）**：`--sim-zorder`（列表点按
+`win_b` 底边解算，主题改了面板尺寸后窗口被屏幕夹住，翻页后的落点偏）、`--sim-weight-modal`
+（字体对话框里的下拉行位随 `row_h` 变化）、`--sim-ta-resize`（编辑器窗口默认高随
+`row_h/padding` 变化，拖柄起点偏）。三者都不是引擎缺陷，而是**脚本现场仍假定默认度量**；
+修法是把这些现场也改成"从 `debug_dump` 读实测矩形"（`--sim-picker` 本轮就是这么修的）。
 
 ---
 
@@ -133,11 +168,21 @@ fn update(&mut self, ctx: &mut Ctx) {
   DPI 下会点空。该位置（`PICKER_DEMO_POS`）还必须**避开窗口矩形与 win=0 控件**：取色器是
   `win=0` 内容，被窗口盖住收不到按下（`window_occluded`，`RJ_HIT_TRACE` 也不打印，只在
   `state().hits().occluded_hits` 里计数 —— **静默失败**），压在别的控件上则被控件级遮挡并
-  被对方抢走点击。实测踩过 `(240,250)`（被 `chishi` 盖住 ⇒ "点色块"变成拖窗口）、
-  `(24,250)`（压在「重置」上）、`(24,400)`（压在 `hp_bar` 上）三处。
+  被对方抢走点击（还可能顺手触发对方，如「重置」会**清空 UI 状态**）。实测踩过
+  `(240,250)`（被 `chishi` 盖住 ⇒ "点色块"变成拖窗口；那个窗口每帧被应用重新 `.pos()`
+  钉住 ⇒ 脚本也拖不开它）、`(24,250)`（压在「重置」上）、`(24,220)`（默认主题没事，
+  **换紧凑主题**后重置按钮行位上移 ⇒ 又撞上）三处；现在落在控件列**上方**的空白带
+  `(24,150)`（`chishi` 左边、行高变化也掉不进来）。
+  ⚠⚠ **面板的绝对位置不要按"锚点 + 24"硬算**：面板比屏幕下半部还高时会被
+  `WindowClamp` **翻到上方**（实测 `krusie-dark`：面板高 676 ⇒ 被翻），于是模式行 /
+  SV 平面 / 滑杆坐标全落空，点到"面板外"还会把面板关掉——看起来像"面板压根没开"。
+  正确做法：`debug_dump()` 里读 `picker_demo::popup` 的**实测 origin**（`--sim-dropdown`
+  / `--sim-chrome` 同路子）。顺带一条：**别把取色器塞进别的窗口里**——面板会变成嵌套
+  浮层（`picker_win/picker_demo::popup`），dump 里的 origin 是**父窗口局部**坐标。
   第 88/92 帧还顺带钉住 **入口尺寸 ≠ 面板尺寸**：第 88 帧把入口色块换成 200×40（面板仍
   开着），第 92 帧读 `picker_demo::popup` 窗口宽必须仍是 `picker_panel_w(主题默认入口宽)+2`
   ——旧实现（按入口实测宽 × 1.9）在这里读到 382 并 `[FAIL]`（已验证该断言可失败）。
+  本 sim 在三个主题下都通过：默认 401 / `builtin:krusie-dark` 401 / `builtin:krusie-compact` 344。
 - **重叠控件的命中归属**（"点了 A 却连 B 也触发"）：示例的 `--sim-overlap` 把鼠标压在两个
   **故意重叠**的控件交集中心（坐标由 `examples/eg260818UI/src/overlap.rs` 与绘制同源解算），
   按下 + 释放后打印

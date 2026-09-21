@@ -1,0 +1,22 @@
+# 内置主题（仓库内）——**紧凑**：行高 / 间距压到最小可用，用于验证"同一套控件在不同
+# 主题下仍然对得上"（自动化测试的第二份主题：多一份不同取值的主题，才看得出断言是
+# 真的在跟随主题，而不是把某一份的数值写死进了断言）。
+#
+# 语义同 `krusie-dark.toml`：裸主题表 ⇒ **合并覆盖**（没写的字段保持调用方当前值）。
+# 加载方式：`--theme builtin:krusie-compact`。
+# ⚠ 字段名写错**不会报错**（多余键按"向前兼容"忽略）——所以单测会把每个内置主题的
+# 键路径逐个对着 `Theme::default()` 的字段树核一遍
+# （`builtin_themes_load_and_change_the_theme`），并由
+# `every_theme_file_in_the_repo_is_registered` 核对"目录里每个 .toml 都登记了"。
+
+row_h = 26.0
+gap = 4.0
+
+[panel]
+padding = 8.0
+
+[button]
+padding = [8.0, 3.0]
+
+[input]
+min_w = 120.0

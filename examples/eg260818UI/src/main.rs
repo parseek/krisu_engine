@@ -76,6 +76,20 @@ fn main() -> Result<(), RunError> {
     app.sim_tuner = args.iter().any(|a| a == "--sim-tuner");
     app.sim_import = parse_str_arg(&args, "--sim-import");
     app.theme_file = parse_str_arg(&args, "--theme");
+    // `--theme`（启动载入主题 = `override_theme`）与 **"调参旋钮 → 主题"** 类 sim **不兼容**：
+    // override 生效期间旋钮**故意不生效**（窗口里有「恢复调节」，见 `ThemeTuner::theme`），
+    // 而 `--sim-tuner` / `--sim-shadow` 断言的就是"拧旋钮 ⇒ 引擎主题变" ⇒ 必然 `[FAIL]`。
+    // 与其让人误以为回归了，不如**不开这两个 sim 并说明**（其余 sim 照常跑；`--sim-picker`
+    // 这类不依赖旋钮的正是主题扫掠要用到的）。见 docs/DEBUGGING.md 的主题扫掠一节。
+    let theme_override = app.theme_file.is_some();
+    if theme_override && (app.sim_tuner || app.sim_shadow) {
+        eprintln!(
+            "theme: --theme 生效 ⇒ 跳过依赖调参旋钮的 sim（--sim-tuner / --sim-shadow）：\
+             override 期间旋钮故意不生效"
+        );
+        app.sim_tuner = false;
+        app.sim_shadow = false;
+    }
     app.sim_theme = parse_str_arg(&args, "--sim-theme");
     app.sim_menu = args.iter().any(|a| a == "--sim-menu");
     app.sim_dropdown = args.iter().any(|a| a == "--sim-dropdown");
@@ -133,14 +147,17 @@ fn caption_pts(
 /// **取色器演示**的锚点（物理像素，左上角）：录制（`TopBar::ui`）与 `--sim-picker`
 /// 的坐标解算共用同一常量（脚本不写死像素）。
 ///
-/// ⚠ 位置必须**避开窗口矩形与 win=0 控件**：取色器是 `win=0` 内容，被窗口盖住收不到按下
-/// （`window_occluded`），压在别的控件上则被控件级遮挡 / 被对方的点击处理抢走（还会抢焦点）。
-/// 踩过的三个位置：`(240,250)` 被 `chishi`（263,255,236×195）整块盖住（"点色块"实际变成了
-/// **拖窗口**，面板从没开过——早期只打印不判定，所以一直没暴露）；`(24,250)` 压在「重置」
-/// （24,246,183×39）上；`(24,400)` 压在 `hp_bar`（24,393,190×39）上。
-/// 现在落在 `hp_bar` 上方那格（y 220..242 无控件、x 24..234 无窗口），且面板高 633 ⇒
-/// 弹出后底边 877 < 1080，不被屏幕夹住（popup 是锚点 + 24 后向下铺开）。
-const PICKER_DEMO_POS: Vec2 = Vec2::new(24.0, 220.0);
+/// ⚠ 这里是 `win=0` 内容，位置必须**既不被窗口盖住、也不压在别的控件上**：
+/// - 被窗口盖住 ⇒ 按下被 `window_occluded` 吞掉，而 `RJ_HIT_TRACE` **不打印**这种拦截
+///   （只进 `hits().occluded_hits`）⇒ **静默失败**：脚本的"点色块"会变成"拖那个窗口"，
+///   面板永远开不了（历史 bug：本 sim 早期只打印不断言，所以没人发现）。且**挪窗救不了**：
+///   演示位置 `(240,250)` 被 `chishi` 盖住，而那个窗口每帧被应用重新 `.pos()` 钉住。
+/// - 压在别的控件上 ⇒ 控件级遮挡 / 被对方的点击处理抢走（实测 `(24,250)` 落在「重置」上，
+///   按下被 reset 抢走并**清空 UI 状态**；`(24,220)` 在紧凑主题下正好撞上重置按钮的新行位）。
+///
+/// 现在取 `chishi`（263,255 起）左边、重置按钮那一列**上方**的空白带：x 24..214 没有
+/// 窗口，y 150..172 在控件列起点之上（换主题行高变了也不会掉进来）。
+const PICKER_DEMO_POS: Vec2 = Vec2::new(24.0, 150.0);
 
 /// `--sim-picker` 在第 88 帧把**入口色块**改成的尺寸（物理像素，故意远宽于默认）。
 /// 面板此时仍开着 ⇒ 用来钉住"**入口尺寸不影响对话框尺寸**"。
@@ -322,6 +339,11 @@ impl TopBar {
         // **取色器演示**（固定物理位置：`--sim-picker` 的脚本化点击按这个坐标算）。
         // 不传 `&mut String` —— 面板的文本框用全局跨帧缓冲（`ColorPickerState::text`）。
         // 入口色块可 `.size(..)`（`--sim-picker` 用它验证"入口尺寸 ≠ 对话框尺寸"）。
+        //
+        // ⚠ **不要把它塞进某扇窗口里**（试过）：面板会变成**嵌套浮层**
+        // （`picker_win/picker_demo::popup`），`debug_dump` 里那个 origin 是**父窗口局部**
+        // 坐标 ⇒ 脚本按它算出的面板坐标全落在父窗口坐标系里（点空）。`win=0` 摆放时
+        // 面板是**顶层**浮层，origin 是屏幕绝对坐标。
         let picker = ColorPicker::new("picker_demo", &mut self.demo_color).alpha(true);
         let picker = match self.demo_picker_size {
             Some(s) => picker.size(Size::Physical(s)),
@@ -1280,6 +1302,14 @@ struct UiApp {
     sim_drag: bool,
     /// --sim-picker：**脚本化鼠标**打开取色面板并在其中拖动（面板路径只有点击才录制）。
     sim_picker: bool,
+    /// --sim-picker：**面板窗口的实测原点**（从 `debug_dump` 读到就存下来）。
+    ///
+    /// 面板的绝对位置**不能**按"锚点 + 24"硬算：面板比屏幕下半部还高时会被
+    /// `WindowClamp` **翻到上方**（实测 `krusie-dark` 主题：面板高 676 ⇒ 被翻），
+    /// 于是按常数算出的模式行 / SV 平面 / 滑杆坐标全部落空——点到"面板外"还会把面板
+    /// 关掉，看起来却像"面板压根没开"。与 `--sim-dropdown` / `--sim-chrome` 同路子：
+    /// **从引擎状态里读**，别复刻布局公式。
+    sim_picker_popup: Option<Vec2>,
     /// --sim-overlap：**脚本化鼠标**点击两个重叠控件的交集——验证"只有上层被触发"。
     sim_overlap: bool,
     /// --sim-click X,Y：**脚本化鼠标**在指定屏幕物理点按下 + 释放（配合 `RJ_HIT_TRACE=1`
@@ -1678,6 +1708,7 @@ impl UiApp {
             ui_dump: false,
             sim_drag: false,
             sim_picker: false,
+            sim_picker_popup: None,
             sim_overlap: false,
             sim_click: None,
             overlap: OverlapDemo::default(),
@@ -2059,25 +2090,41 @@ impl App for UiApp {
                 },
             }
         }
-        // ── `--theme <路径>`：**启动时指定主题**（TOML 序列化格式）──────────────
+        // ── `--theme <路径|builtin:名字>`：**启动时指定主题**（TOML 序列化格式）──────
         // 与「导入主题…」同一条通路（`filedialog::load_theme_onto`）：文件里出现的字段
         // 覆盖在**当前**（旋钮组装出来的）主题上 ⇒ 一个只写两行的文件也能当"启动皮肤"。
         // 放在帧外（不需要 `Ctx` / `Gpu`），失败只写状态行，不挡启动。
-        if let Some(path) = self.theme_file.take() {
-            let path = std::path::PathBuf::from(path);
+        //
+        // `builtin:<名字>` 走**仓库内置主题**（`include_str!` 编译期导入，
+        // `crates/rjw_ui/themes/*.toml`）——自动化测试用它：不依赖磁盘路径、不带外部
+        // 文件，跑的就是提交进仓库的那份文本。`--theme builtin:` 后跟不存在名字时把
+        // 可用名字列出来（`apply_builtin_theme` 的错误消息）。
+        if let Some(spec) = self.theme_file.take() {
             let base = self
                 .theme_tuner
                 .theme(self.top.font_name(), self.top.font_weight());
-            match filedialog::load_theme_onto(&path, &base) {
+            let loaded = match spec.strip_prefix("builtin:") {
+                Some(name) => {
+                    let mut t = base;
+                    match rjw_krusie::ui::theme_toml::apply_builtin_theme(&mut t, name) {
+                        Ok(()) => Ok(t),
+                        Err(e) => Err(e),
+                    }
+                }
+                None => {
+                    let path = std::path::PathBuf::from(&spec);
+                    filedialog::load_theme_onto(&path, &base)
+                }
+            };
+            match loaded {
                 Ok(t) => {
-                    self.top.import_status =
-                        format!("主题已载入：{}", filedialog::file_label(&path));
+                    self.top.import_status = format!("主题已载入：{spec}");
                     self.theme_tuner.override_theme = Some(t);
-                    eprintln!("theme: 启动载入 {}", path.display());
+                    eprintln!("theme: 启动载入 {spec}");
                 }
                 Err(e) => {
                     self.top.import_status = format!("主题载入失败：{e}");
-                    eprintln!("theme: 启动载入失败 {}：{e}", path.display());
+                    eprintln!("theme: 启动载入失败 {spec}：{e}");
                 }
             }
         }
@@ -2159,11 +2206,18 @@ impl App for UiApp {
                 theme.input.height * scale,
                 theme.input.min_w * scale,
             );
-            let anchor = PICKER_DEMO_POS; // `TopBar` 里 picker_demo 的物理定位
+            // 取色器**在 `win=0`**（见 `TopBar::ui` 的注释）：脚本坐标 = 锚点 + 常数
+            // （面板是顶层浮层，位置见下），锚点就是演示位置本身。
+            let anchor = PICKER_DEMO_POS;
             let swatch = Vec2::new(anchor.x + field_w * 0.5, anchor.y + 11.0);
             let pw = picker_panel_w(field_w);
             let body_w = pw - pad * 2.0;
-            let origin = Vec2::new(anchor.x, anchor.y + 24.0); // 内联高 22 + 2px 间隙
+            // 面板**实测**原点（见 `sim_picker_popup`）；还没读到就先按锚点 + 24 估一个
+            // （仅第 20~21 帧用得到，那两帧只点色块，不碰面板内部坐标）。
+            let origin = self.sim_picker_popup.map_or(
+                Vec2::new(anchor.x, anchor.y + 24.0),
+                |o| o + Vec2::splat(1.0),
+            );
             let mode_w = (body_w - gap * 2.0) / 3.0;
             let text_y = origin.y + pad + row + gap;
             let sv_y = text_y + input_h + gap;
@@ -2815,6 +2869,18 @@ impl App for UiApp {
             }
             // `--ui-dump`：段 1 也打印一份——两段应打印**同一个 `frame=`**（帧号每帧只 +1），
             // 且段 2 那份还应包含段 1 录的窗口（帧级暂存跨段共享）。
+            //
+            // ── `--sim-picker`：记下面板窗口的**实测原点**（供下一帧的脚本坐标解算）──
+            // 面板位置受 `WindowClamp` 影响（太高就被翻到上方），按"锚点 + 24"硬算会
+            // 全盘落空 ⇒ 从引擎状态里读（`--sim-dropdown` / `--sim-chrome` 同路子）。
+            if sim_picker && self.sim_picker_popup.is_none() {
+                self.sim_picker_popup = ui
+                    .debug_dump()
+                    .windows
+                    .iter()
+                    .find(|w| w.id.ends_with("picker_demo::popup"))
+                    .map(|w| w.origin);
+            }
             if ui_dump {
                 eprintln!("[段 1] {}", ui.debug_dump());
             }

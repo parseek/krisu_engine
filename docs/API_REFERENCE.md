@@ -1091,6 +1091,15 @@ impl Sense {
 | `Theme::from_toml(s) -> Result<Theme, String>` | 从 TOML 加载（起点 `Theme::default()`；缺字段回落默认、多余键忽略） |
 | `Theme::apply_toml(&mut self, s) -> Result<(), String>` | **在当前主题上合并覆盖**（文件里出现的字段才改）——手写 `gap = 12` 这类小文件的语义 |
 | `THEME_FORMAT_VERSION`（`rjw_ui::theme_toml`） | 格式版本；加载时**比本引擎新**⇒报错拒载。加字段不用改它，**改名 / 删字段要改** |
+| `BUILTIN_THEMES` / `builtin_theme_toml(name)` / `builtin_theme_names()` | **仓库内置主题**：`crates/rjw_ui/themes/*.toml` 经 `include_str!` **编译期导入**（不读磁盘 ⇒ 测试不依赖运行目录） |
+| `apply_builtin_theme(&mut Theme, name) -> Result<(), String>` | 按名字把内置主题**合并**到当前主题（`apply_toml` 语义）；未知名字的错误消息**列出可用名字** |
+
+**内置主题是自动化测试的输入**（也是"编译期导入 TOML"的落点）：单测
+`builtin_themes_load_and_change_the_theme` 逐个解析并核对**每个键路径都存在于
+`Theme` 字段树**（多余键按向前兼容被静默忽略 ⇒ 字段名写错时"加载成功但什么都没改"，
+这条把它变成失败），`every_theme_file_in_the_repo_is_registered` 自己**列目录**核对
+"`themes/` 里每个 `.toml` 都登记了"（漏登记 = 文件躺在仓库里没人跑）。
+示例侧 `--theme builtin:<名字>` 即自动加载（无需路径）。
 
 `Weight` 存 `u16`（`weight = 700`）、`Align` 存小写名、`CornerRadius` 反序列化**两种写法都收**
 （`radius = 6.0` 或 `radius = { tl = .. }`）、`Brush`（背景刷）用显式

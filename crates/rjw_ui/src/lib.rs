@@ -132,7 +132,8 @@
 //! - [`layout`]：容器布局（Frame / PackSide）
 //! - [`style`]：`Theme` 样式系统 + [`Palette`]（配色令牌）+ [`Brush`]（背景刷）
 //! - [`theme_toml`]：**主题序列化**（TOML：`Theme::to_toml` / `from_toml` / `apply_toml`；
-//!   `serde` feature）
+//!   `serde` feature）+ **仓库内置主题**（`themes/*.toml` 经 `include_str!` 编译期导入，
+//!   [`theme_toml::BUILTIN_THEMES`] / [`theme_toml::apply_builtin_theme`]）
 //! - [`state`]：`UiState` 持久状态 + `ButtonState` / `CheckboxState`
 //! - [`hit`]：命中测试与交互状态机
 //! - [`focus`]：键盘导航（焦点链 / [`focus_step`]）

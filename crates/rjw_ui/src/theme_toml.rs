@@ -52,6 +52,69 @@ use crate::Theme;
 /// 免得"新字段被静默丢弃"。向后兼容的字段新增**不需要**改这个值（缺字段会回落默认）。
 pub const THEME_FORMAT_VERSION: u32 = 1;
 
+/// **仓库内置主题**（编译期导入的一对 `(名字, TOML 文本)`）。
+///
+/// ```no_run
+/// # use rjw_ui::theme_toml::{BUILTIN_THEMES, builtin_theme_toml};
+/// // 列出内置主题名（示例 `--theme builtin:<名字>` 用的就是它）
+/// for t in BUILTIN_THEMES { println!("{}", t.name); }
+/// // 取出文本 → 合并到当前主题（语义同文件：只覆盖写了的字段）
+/// let text = builtin_theme_toml("krusie-dark").expect("内置主题");
+/// # let mut theme = rjw_ui::Theme::default();
+/// theme.apply_toml(text).unwrap();
+/// ```
+///
+/// # 为什么放在**仓库里**、又用 `include_str!` 而不是读文件
+///
+/// 自动化测试（单测 / `--sim-*`）需要一份**确定的**主题输入：从磁盘读路径会让测试依赖
+/// "谁在什么目录下运行"，而**编译期**导入把"文件存在"变成编译错误、把内容钉进二进制
+/// ⇒ 测试跑的就是提交进仓库的那份文本（`themes/*.toml`），没有中间环节。
+///
+/// **加新主题**：往 `crates/rjw_ui/themes/` 放 `.toml`，然后在 [`BUILTIN_THEMES`] 里加一行
+/// —— 单测 `builtin_themes_are_registered_and_known` 会把目录**逐个文件**与注册表核对，
+/// 漏登记 / 字段名写错都会在 `cargo test` 里失败。
+pub struct BuiltinTheme {
+    /// 主题名（`--theme builtin:<name>` 里的 `<name>`）。
+    pub name: &'static str,
+    /// 完整的 TOML 文本（**裸主题表**：合并覆盖语义，见文件头的注释）。
+    pub toml: &'static str,
+}
+
+/// 内置主题注册表（编译期导入；见 [`BuiltinTheme`] 的文档）。
+pub const BUILTIN_THEMES: &[BuiltinTheme] = &[
+    BuiltinTheme {
+        name: "krusie-dark",
+        toml: include_str!("../themes/krusie-dark.toml"),
+    },
+    BuiltinTheme {
+        name: "krusie-compact",
+        toml: include_str!("../themes/krusie-compact.toml"),
+    },
+];
+
+/// 按名字取内置主题的 TOML 文本（`None` = 没有这个主题）。
+///
+/// 认名字**不认路径**：需要加载任意文件请用 [`Theme::apply_toml`] + 自己的 `fs::read_to_string`。
+pub fn builtin_theme_toml(name: &str) -> Option<&'static str> {
+    BUILTIN_THEMES.iter().find(|t| t.name == name).map(|t| t.toml)
+}
+
+/// 内置主题名（列表 / 错误提示用）。
+pub fn builtin_theme_names() -> impl Iterator<Item = &'static str> {
+    BUILTIN_THEMES.iter().map(|t| t.name)
+}
+
+/// **在 `base` 上加载内置主题**（`Err` 里带可用主题名，可直接显示给用户）。
+pub fn apply_builtin_theme(base: &mut Theme, name: &str) -> Result<(), String> {
+    let toml = builtin_theme_toml(name).ok_or_else(|| {
+        format!(
+            "没有内置主题 `{name}`（可用：{}）",
+            builtin_theme_names().collect::<Vec<_>>().join(" / ")
+        )
+    })?;
+    base.apply_toml(toml)
+}
+
 /// 导出文件的外层：版本头 + `[theme]` 表。
 ///
 /// 单独一个外壳（而不是把版本号塞进 [`Theme`]）的原因：`Theme` 是给控件用的纯样式，
@@ -366,5 +429,77 @@ bg = { Vertical = { r = 1.0, g = 0.0, b = 0.0, a = 1.0 } }
         assert!(!text.contains("bg_image"), "背景图不该出现在主题文件里：{text}");
         let back = Theme::from_toml(&text).unwrap();
         assert!(back.panel.bg_image.is_none());
+    }
+
+    /// 收集 `file` 里出现、但 `known`（= `Theme::default()` 的字段树）里没有的键路径。
+    ///
+    /// 存在的理由：**多余键按"向前兼容"被静默忽略**（见模块文档第 3 条）⇒ 主题文件里
+    /// 把 `panel.padding` 写成顶层 `padding` 不会报错，只是"改了等于没改"（我在写
+    /// `themes/*.toml` 时当场写错了一次，正是这个测试要抓的）。
+    fn unknown_paths(file: &toml::Value, known: &toml::Value, path: &str, out: &mut Vec<String>) {
+        if let (toml::Value::Table(f), toml::Value::Table(k)) = (file, known) {
+            for (key, v) in f {
+                match k.get(key) {
+                    Some(kv) => unknown_paths(v, kv, &format!("{path}.{key}"), out),
+                    None => out.push(format!("{path}.{key}")),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_themes_load_and_change_the_theme() {
+        // **仓库内置主题**（编译期导入）必须能加载，且真的改了东西 —— 否则"加载成功"
+        // 只是因为字段名全写错了（多余键被忽略）。这一条 + 下面那条路径核对，
+        // 合起来保证"自动化测试拿这份主题跑 = 真的按这份主题跑"。
+        let base_toml = toml::Value::try_from(Theme::default()).expect("默认主题可序列化");
+        for t in BUILTIN_THEMES {
+            let mut theme = Theme::default();
+            theme
+                .apply_toml(t.toml)
+                .unwrap_or_else(|e| panic!("内置主题 {} 加载失败：{e}", t.name));
+            assert_ne!(
+                theme.to_toml().unwrap(),
+                Theme::default().to_toml().unwrap(),
+                "内置主题 {} 合并后主题一点没变（字段名大概率写错了）",
+                t.name
+            );
+            // 逐键路径核对：多余键会被静默忽略，这里把它变成失败。
+            let file: toml::Value = toml::from_str(t.toml).expect("内置主题是合法 TOML");
+            let mut bad = Vec::new();
+            unknown_paths(&file, &base_toml, "theme", &mut bad);
+            assert!(bad.is_empty(), "内置主题 {} 写了不存在的字段：{bad:?}", t.name);
+            // 名字要能取回同一份文本（示例 `--theme builtin:<name>` 走这条）。
+            assert_eq!(builtin_theme_toml(t.name), Some(t.toml), "注册表按名字取不到 {}", t.name);
+        }
+        assert!(builtin_theme_toml("没有这个主题").is_none());
+        assert_eq!(builtin_theme_names().count(), BUILTIN_THEMES.len());
+        // 未知名字的错误消息要能直接用（列出可用项），别只有一句"失败"。
+        let e = apply_builtin_theme(&mut Theme::default(), "nope").unwrap_err();
+        assert!(e.contains("krusie-dark"), "{e}");
+    }
+
+    #[test]
+    fn every_theme_file_in_the_repo_is_registered() {
+        // **自动加载**的关键一环：目录里放了 `.toml` 就必须在 `BUILTIN_THEMES` 里登记，
+        // 否则文件"躺在仓库里但没人跑它"——测试自己列目录（不靠清单），漏登记会失败。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("themes");
+        let mut seen = 0usize;
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("读 {}：{e}", dir.display()))
+        {
+            let path = entry.expect("目录项").path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            seen += 1;
+            let text = std::fs::read_to_string(&path).expect("读主题文件");
+            assert!(
+                BUILTIN_THEMES.iter().any(|t| t.toml == text),
+                "{} 没登记进 BUILTIN_THEMES（加了文件要加一行，否则 sim 套件跑不到它）",
+                path.display()
+            );
+        }
+        assert!(seen >= 1, "themes/ 目录里一个 .toml 都没有：{}", dir.display());
+        assert_eq!(seen, BUILTIN_THEMES.len(), "注册表里有不存在于 themes/ 的条目");
     }
 }
