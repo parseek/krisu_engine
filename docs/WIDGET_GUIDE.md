@@ -110,6 +110,24 @@ ui.add_at(Vec2::new(400.0, 40.0), Label::new("HUD"));
   [`Ui::resolved_size`](crate::Ui::resolved_size)：申请尺寸前问一次，把跨帧的拖拽尺寸并进来
   （否则"画的是拖大的框、申请的却是默认尺寸"——容器不长、后续控件不动）。
 
+### 第三方控件能用什么（边界白名单）
+
+> 完整分层契约与判据见 `docs/UI_ARCHITECTURE.md` §2.5。**一句话**：只用能写出
+> "控件作者为什么需要它"的**语义化**接口；不要碰引擎内部事实。
+
+| 用途 | 可用 |
+|---|---|
+| 协议 | `Widget` / `Response` / `Sense` / `Expansion` / `SizeConstraints` / `SizeClass` |
+| 申请 + 交互 | `allocate` / `allocate_mode` / `allocate_at` / `allocate_sense*` / `interact` / `culled` / `child_rect` / `note_placed` / `register_focus` / `claim_press` / `set_cursor` |
+| 度量 + 状态 | `theme()`（**不是** `ui.theme` 字段）/ `state()`（9 个模块视图 + `sizes_mut()` 等写入口，见 §`UiState`）/ `scale()` / `text_size` / `resolved_size` |
+| 输入 | `mouse_screen()` / `mouse_local()` / `mouse_left()` / `key_down*()` / `hit_abs` |
+| 绘制 | `painter()`（`panel` / `text` / `rect` / `shadow` / `grip`…）+ `elem_hint()` + `push_panel_like*` / `push_solid_rect` / `push_border_rect` / `push_text_rect*` / `icon_at` / `image_at` / `push_resize_grip(_at)` |
+
+**禁止**（判据编号见 §2.5.2）：读 `ui.theme` 字段 / 写引擎状态（`ui.theme.x = ..`）⇒ 4；
+调 `UiAdd::ui_mut()`（那是容器包装的接口）⇒ 6；碰 `tess` / `gpu_batch` / `painter.q`（原始
+队列）⇒ 5。**已知缺口**：第三方"组合控件"（自绘面板，如 `ColorPicker`）目前够不到
+`push_draw`（`pub(crate)`）⇒ 需要那种形态时先提 issue，别绕过边界。
+
 ---
 
 ## 3. 添加一个新控件（完整步骤）

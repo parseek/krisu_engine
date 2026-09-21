@@ -109,6 +109,70 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 
 ---
 
+## 2.5 分层契约（谁负责什么、谁能用什么）
+
+> 这一节是**规矩**，不是描述：任何搬运 / 新增控件 / 扩展公开面都必须先过 §2.5.2 的判据。
+> 起因是"为了把某块代码搬进 `widgets/` 而把引擎内部暴露成公开 API"——那是**职责被 API
+> 倒逼**：公开面一旦为了搬运而开洞，边界就再也收不回来。
+
+### 2.5.1 每一层 owns / 禁止
+
+| 层 | 拥有（owns） | 禁止（must not） |
+|---|---|---|
+| `draw.rs` | 绘制**数据类型**：`UiDraw` / `DrawKind` / `Gradient` / `Icon` / `Size` / `Position` / `CornerRadius` / `text_cmd` | 布局、状态、镶嵌 |
+| `tess.rs` | 形状 → 顶点（圆角 / 环带 / 羽化 / 阴影）；纯几何 | 认识控件、读 `Ui` / `WidgetState` |
+| `gpu_batch.rs` / `backend.rs` | 几何收集 + 切段 + 批次契约 | 认识控件 |
+| `painter/` | **唯一的公开绘制入口**：`elem` / `seq` / `clip` 推进 + 原语（`panel` / `text` / `rect` / `shadow` / `grip`…） | 布局决策、跨帧状态 |
+| `layout` / `hit` / `focus` / `edit` / `id` / `view` | 纯逻辑内核（**无 `Ui`、可单测**）：光标与结算 / 命中与遮挡 / 焦点链 / 文本编辑状态机 / ID / 裁剪分层 | 拿 `Ui`、画东西、持久状态 |
+| `style.rs` / `theme_toml.rs` | 主题令牌 + 序列化 | 行为 |
+| `state.rs` | **跨帧**状态（`UiState` + 9 个模块**视图**，见 §5.3） | 每帧事实（那在 `Ui`） |
+| `ui.rs`（`Ui`） | **每帧事实 + 编排**：录制序、容器 / 窗口、布局责任链、命中裁决、z-order、提交、诊断 | 实现控件**外观**（那是 `widgets/`）；push 原始绘制队列 / 调 `next_seq` |
+| `widgets/` | **控件**：`Widget::ui` 协议、每控件状态、外观、交互语义；**只用公开面** | 读 `ui.theme` 字段 / 写引擎状态（`ui.theme.x = ..`）/ 调 `UiAdd::ui_mut()` / 碰 `tess` / `gpu_batch` / `painter.q` |
+| `UiAdd` | 容器闭包内的便捷方法 | 被**控件**调用（`ui_mut()` 只属于容器包装：`Panel` / `Pack` / `Grid` / `Window` / `Scroll` / `FlexCtx` / `ViewCtx`，以及本身就是容器的 `MenuCtx` / `MenuBar`） |
+
+依赖方向（单向，无环）：`widgets → ui → {painter, layout, hit, focus, edit, view, id, state, style}`；
+`widgets` **不得**依赖 `tess` / `gpu_batch` / `backend`；`ui` 不得依赖 `wgpu`
+（§5.5 的 `VertexP3U2C4` / `SpriteRect` 例外保留，理由见该节）。
+
+**第三方控件能用的公开面**（白名单，详见 `docs/WIDGET_GUIDE.md`）：
+`Widget` / `Response` / `Sense` / `Expansion` / `SizeConstraints` +
+`allocate` / `allocate_mode` / `allocate_at` / `allocate_sense*` / `interact` / `culled` /
+`note_placed` / `resolved_size` / `child_rect` + `theme()` / `state()`（9 个模块视图）/
+`scale()` / `mouse_*()` / `key_down*()` / `hit_abs` / `register_focus` / `claim_press` /
+`set_cursor` / `elem_hint` / `painter()` + `push_panel_like*` / `push_solid_rect` /
+`push_border_rect` / `push_text_rect*` / `icon_at` / `image_at` / `push_resize_grip(_at)`。
+
+### 2.5.2 责任判据（逐条引用；违反哪条就写哪条）
+
+1. **纯 vs 有状态**：形状→顶点、命令→批次、值→布局各自纯；出现 `Ui` / `WidgetState` 即越界。
+2. **每帧 vs 跨帧**：`Ui` 的字段是每帧重建的事实；`UiState` 是跨帧持久。别把跨帧值塞进 `Ui`（每帧重建 = 丢），也别把每帧值塞进 `UiState`（会残留）。
+3. **公开面只暴露"语义"，不暴露"事实"**：新增公开 API 必须能写出"控件作者为什么需要它"。**"只有让某次搬运能编译"是唯一理由 ⇒ 拒绝**——要么把该件的**职责**判给正确的一层，要么在正确的一层补**语义化**原语（例：需要"播放头" ⇒ 给 `Painter` 补一个 push 原语，而不是公开 `Ui::next_seq`）。
+4. **控件不得写引擎**：要传配置就给函数参数（`&InputStyle`），不许 `ui.theme.x = ..`。
+5. **引擎不得画控件**：`ui.rs` 里不得 push 原始队列 / 调 `next_seq`；要画就走 `Painter` 原语。
+6. **`ui_mut()` 只属于容器**；控件走申请 / 交互 / 绘制原语。
+7. **搬运提交只改结构、不改行为**：同一提交不夹带视觉 / 交互变更；行为改动单独提交并由 `--sim-*` 守着（15+1 个仿真是"零行为变化"的证据）。
+
+### 2.5.3 现状越界（2026-xx 审计，实测 `file:line`）与处置
+
+| # | 现象 | 证据 | 判据 | 处置 |
+|---|---|---|---|---|
+| 1 | 控件读 `ui.theme` **字段**（crate 私有）而不是公开的 `ui.theme()` | `menu.rs:212-224`、`colorpicker/panel.rs:76-78…392`、`dropdown.rs:259/358/401`、`checkbox.rs:87`、`segmented.rs:72/129`、`label.rs:72-80`、`numberinput.rs:315…530`、`slider.rs:220`、`fontmodal.rs:73-78/141/151`、`texteditor.rs:272/377/382/393`、`button.rs:132`（~30 处） | 3 | 改 `ui.theme()`；同一事实只留一条入口 |
+| 2 | 控件**写引擎帧内主题**把样式传给引擎里的核心 | `texteditor.rs:377` `mem::replace(&mut ui.theme.input, style)`、`:393` 还原 | 4 | 核心改为收 `&InputStyle` 参数（D3 第一步） |
+| 3 | 控件调 `UiAdd::ui_mut()` | `fontmodal.rs:148/195` | 6 | 改用 `child_rect`（公开）；`MenuCtx`/`MenuBar` 的 `ui_mut` 是**容器**实现 ⇒ 白名单 |
+| 4 | 控件读引擎几何事实表 | `menu.rs:377` `ui.state().window_rects` | 2/3 | 改读 `state().windows().rect(id)`（模块视图） |
+| 5 | 引擎自己画控件外观（原始队列 + `next_seq`） | `ui.rs::draw_check_common` | 5 | 改走 `Painter` / 公开矩形原语（D2 第一步） |
+| 6 | 文本编辑核心（~1000 行）住在 `ui.rs` | `ui.rs::text_input_core` / `text_area_impl` | 5 | 搬进 `widgets/texteditor.rs`（D3） |
+| 7 | 公开绘制面不完整：`Ui::push_draw` 与 `ellipsized` 是 `pub(crate)` | `ui.rs:1310` / `:1559` | 3 | **记为已知缺口**：第三方"组合控件"（如 `ColorPicker` 那种自绘面板）目前写不出来；补公开面是独立一轮（D4），不在搬运算内 |
+
+### 2.5.4 边界守卫（机器可查）
+
+`crates/rjw_ui/src/ui/tests.rs` 的 `widget_boundary_guard`：对每个 `widgets/*.rs` 用
+`include_str!` 断言**不含**禁用子串（`painter.q` / `next_seq` / `ui.theme.` / `ui_mut()` /
+`crate::tess` / `crate::gpu_batch`），白名单逐条给出理由（容器实现、`ColorPicker` 的
+`push_draw` 等）。它守"明显越界"，失败信息直接指向本节与判据编号。
+
+---
+
 ## 4. 受控实验：顶点到底花在哪
 
 `tess.rs` 的圆角矩形是 **CPU 镶嵌**的同心轮廓扇形 + 羽化带：
@@ -190,6 +254,11 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 >    不可见）。缺什么就**扩展公开面**并写清理由，不开 `pub(crate)` 后门；
 > 2. 搬运提交里**只允许出现 `use` / 路径 / 位置变化**，行为改动单独提交——这样
 >    15 个 sim 的数值断言就是"零行为变化"的证据。
+>
+> ⚠ **配额与边界由 §2.5 决定**：第 1 条"扩展公开面"只允许**语义化**扩展（要能写出
+> "控件作者为什么需要它"）；**"只有让某次搬运能编译"是唯一理由 ⇒ 拒绝**——那说明该件的
+> 职责判错了层，应该在正确的一层补原语（例：核心需要播放头 ⇒ 给 `Painter` 补 push 原语，
+> 而不是公开 `Ui::next_seq`）。
 >
 > **本轮进展（A：TextEditor 行为修复）**：`TextEditor::allocate_rect` 过去只算默认尺寸，
 > 而绘制用的尺寸由尺寸责任链解出（`resizable_text_*` 内部）⇒ **申请尺寸 ≠ 绘制尺寸**：
