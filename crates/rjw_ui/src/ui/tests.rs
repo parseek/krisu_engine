@@ -1461,3 +1461,97 @@ fn submit_order_still_keeps_windows_above_non_window_content() {
         "win 升序优先，place 只在同 win 内比较"
     );
 }
+
+/// **边界守卫**（正典：`docs/UI_ARCHITECTURE.md` §2.5）：`widgets/` 是**控件层**，只许用公开面。
+///
+/// 用源码文本做"明显越界"的机器检查——它守的是粗线条（原始绘制队列 / 播放头 / crate 私有
+/// 字段 / 跨层依赖 / `ui_mut`），**不替代 review**。失败信息直接指向 §2.5 与判据编号。
+///
+/// 白名单（`ALLOW`）**必须逐条写理由**，否则守卫会退化成噪音。
+#[test]
+fn widget_boundary_guard() {
+    // 全部控件源码（`include_str!` 相对本文件 `src/ui/tests.rs` ⇒ `../widgets/…`）。
+    const FILES: &[(&str, &str)] = &[
+        ("button.rs", include_str!("../widgets/button.rs")),
+        ("checkbox.rs", include_str!("../widgets/checkbox.rs")),
+        ("colorpicker.rs", include_str!("../widgets/colorpicker.rs")),
+        ("colorpicker/format.rs", include_str!("../widgets/colorpicker/format.rs")),
+        ("colorpicker/hsv.rs", include_str!("../widgets/colorpicker/hsv.rs")),
+        ("colorpicker/panel.rs", include_str!("../widgets/colorpicker/panel.rs")),
+        ("colorpicker/state.rs", include_str!("../widgets/colorpicker/state.rs")),
+        ("divider.rs", include_str!("../widgets/divider.rs")),
+        ("dropdown.rs", include_str!("../widgets/dropdown.rs")),
+        ("fontmodal.rs", include_str!("../widgets/fontmodal.rs")),
+        ("label.rs", include_str!("../widgets/label.rs")),
+        ("menu.rs", include_str!("../widgets/menu.rs")),
+        ("menubar.rs", include_str!("../widgets/menubar.rs")),
+        ("numberinput.rs", include_str!("../widgets/numberinput.rs")),
+        ("segmented.rs", include_str!("../widgets/segmented.rs")),
+        ("slider.rs", include_str!("../widgets/slider.rs")),
+        ("texteditor.rs", include_str!("../widgets/texteditor.rs")),
+        ("title_button.rs", include_str!("../widgets/title_button.rs")),
+    ];
+    // 禁用子串 + 它违反的判据（§2.5.2）。
+    const BANNED: &[(&str, &str)] = &[
+        ("painter.q", "判据 5：绘制队列属于 Painter；引擎/控件都不得直接 push 原始队列"),
+        ("next_seq", "判据 5：播放头属于绘制层（缺原语就在 Painter 补，见判据 3）"),
+        ("crate::tess", "§2.5.1：widgets 不得依赖 tess"),
+        ("crate::gpu_batch", "§2.5.1：widgets 不得依赖 gpu_batch"),
+        ("window_rects", "判据 2/3：几何事实走 `state().windows()` 模块视图，不读字段"),
+        ("ui.theme.", "判据 3：读 `ui.theme()` 访问器；写引擎主题是判据 4 的违规"),
+    ];
+    // 白名单：`(文件, 允许的子串, 理由)`。**加白名单就是加欠账**，理由必须能追溯。
+    const ALLOW: &[(&str, &str, &str)] = &[
+        (
+            "texteditor.rs",
+            "ui.theme.",
+            "§2.5.3 #2 **未修**：文本核心仍靠临时改帧内主题拿样式（D3 第一步改 `&InputStyle` 参数后删除本白名单）",
+        ),
+        (
+            "menu.rs",
+            ".ui_mut()",
+            "判据 6 例外：`MenuCtx` 是**容器**（`Deref` 到 `Window`），容器实现可用 `ui_mut`",
+        ),
+        (
+            "menubar.rs",
+            ".ui_mut()",
+            "判据 6 例外：`MenuBar` 是**容器**（`Deref` 到 `Pack`），同上",
+        ),
+        (
+            "colorpicker/panel.rs",
+            ".ui_mut()",
+            "判据 6 例外：取色弹层里 `w` 是**容器**（popup `Window`），同上",
+        ),
+        (
+            "fontmodal.rs",
+            ".ui_mut()",
+            "§2.5.3 #3 记缺口：组合控件需要 `child_rect`/`cursor_pos`/`wrap_buffer`/`push_*` 的公开 compose 面（D4）——待补",
+        ),
+    ];
+    let allowed = |file: &str, pat: &str| ALLOW.iter().any(|(f, p, _)| *f == file && *p == pat);
+
+    for (name, src) in FILES {
+        for (pat, why) in BANNED {
+            assert!(
+                !src.contains(pat) || allowed(name, pat),
+                "widgets/{name} 含禁用子串 {pat:?} —— {why}（docs/UI_ARCHITECTURE.md §2.5.2）"
+            );
+        }
+    }
+    // 守卫自身：白名单里的文件必须真的在 FILES 里（防拼错路径 ⇒ 白名单形同虚设）。
+    for (file, _, _) in ALLOW {
+        assert!(
+            FILES.iter().any(|(f, _)| f == file),
+            "白名单引用了不存在的控件文件 {file:?}"
+        );
+    }
+    // 守卫自身：**它必须真的会失败**——合成一段含禁用子串的源码要被抓住
+    // （否则 `BANNED` 写错字也会"永远绿"）。
+    let fake = "fn ui(ui: &mut Ui) { ui.painter.q.queue.push(UiDraw { .. }); }";
+    for (pat, _) in BANNED {
+        if *pat == "painter.q" {
+            assert!(fake.contains(pat), "守卫失效：合成源码没被 {pat:?} 抓住");
+            assert!(!allowed("button.rs", pat), "button.rs 不该被白名单放行 {pat:?}");
+        }
+    }
+}
