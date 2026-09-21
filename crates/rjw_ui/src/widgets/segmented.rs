@@ -69,7 +69,7 @@ impl<'a> Segmented<'a> {
 
 impl Widget for Segmented<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        let (st, fam, fs) = self.resolve(&ui.theme, ui.scale());
+        let (st, fam, fs) = self.resolve(ui.theme(), ui.scale());
         let n = self.labels.len();
         // ① 先量（与旧 `size()` 同式：每段文字宽 + 内边距，再保证每段至少 `font_size` 宽）
         let size = {
@@ -126,7 +126,7 @@ impl Widget for Segmented<'_> {
             x += w;
         }
         // ④ 画（一个绘制块一个 painter；组底 / 高亮段 / 分隔线 / 文字都在这里）
-        let sep = if st.border_w > 0.0 { st.border } else { ui.theme.palette.surface_dim };
+        let sep = if st.border_w > 0.0 { st.border } else { ui.theme().palette.surface_dim };
         let fg = st.fg;
         let labels = self.labels;
         let selected = *self.selected;

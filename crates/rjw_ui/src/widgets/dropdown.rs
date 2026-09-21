@@ -256,7 +256,7 @@ impl<'a, F: MenuContent> Dropdown<'a, F> {
 
     /// 在显式 `rect` 里录控件（[`Widget::ui`] 与 [`Ui::combo_at`](crate::Ui::combo_at) 共用）。
     pub(crate) fn show_in(self, ui: &mut Ui<'_>, rect: Rect) -> Response {
-        let (st, fs) = self.resolve(&ui.theme, ui.scale());
+        let (st, fs) = self.resolve(ui.theme(), ui.scale());
         let fam = st.font_family.clone();
         // `id` / `label` 是 `&str`（Copy）——先取出，后面要把 `self` 拆开喂给闭包。
         let id = self.id;
@@ -398,7 +398,7 @@ impl<'a, F: MenuContent> Dropdown<'a, F> {
 
 impl<F: MenuContent> Widget for Dropdown<'_, F> {
     fn ui(self, ui: &mut Ui) -> Response {
-        let (st, fs) = self.resolve(&ui.theme, ui.scale());
+        let (st, fs) = self.resolve(ui.theme(), ui.scale());
         // ① 先量（触发器尺寸：文字宽 + 内边距，或显式 `.width(..)`）
         let size = self.trigger_size(ui, &st, fs);
         // ② 申请：**触发器在窄容器里被截断**（文字走省略号），不把父级撑破 ⇒

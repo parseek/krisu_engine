@@ -69,15 +69,15 @@ impl<'a> Label<'a> {
     /// **解析文本样式**（属性覆盖 / 主题回落）→ `(颜色, 字号, 对齐, 字体族)`。
     /// 先把主题值拷出（Copy / owned），避免主题借用与绘制时 `&mut ui` 调用冲突。
     fn resolve_style(&self, ui: &Ui) -> (Color, f32, Align, Option<Arc<str>>) {
-        let color = self.color.unwrap_or(ui.theme.label.color);
+        let color = self.color.unwrap_or(ui.theme().label.color);
         let size = self
             .font_size
             .map(|s| s.to_physical(ui.scale()))
-            .unwrap_or(ui.theme.label.font_size);
-        let align = ui.theme.label.align;
+            .unwrap_or(ui.theme().label.font_size);
+        let align = ui.theme().label.align;
         let family = match self.font_family {
             Some(f) => Some(Arc::from(f)),
-            None => ui.theme.label.font_family.clone(),
+            None => ui.theme().label.font_family.clone(),
         };
         (color, size, align, family)
     }

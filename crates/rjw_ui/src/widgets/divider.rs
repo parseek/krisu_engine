@@ -96,7 +96,7 @@ fn divider_line(rect: Rect, axis: DividerAxis, thickness: f32, margin: f32) -> R
 
 impl Widget for Divider {
     fn ui(self, ui: &mut Ui) -> Response {
-        let st = ui.theme.divider.clone();
+        let st = ui.theme().divider.clone();
         let t = self.thickness.map(|x| x.to_physical(ui.scale())).unwrap_or(st.thickness);
         let m = self.margin.map(|x| x.to_physical(ui.scale())).unwrap_or(st.margin);
         let c = self.color.unwrap_or(st.color);

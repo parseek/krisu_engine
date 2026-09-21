@@ -125,7 +125,7 @@ impl<'a> ColorPicker<'a> {
 
 /// 画一个"色块"（圆角矩形填充 + 居中的十六进制文本）——内联部分用。
 fn push_swatch(ui: &mut Ui, rect: Rect, color: Color, with_alpha: bool, font_size: f32) {
-    let border = ui.theme.input.border;
+    let border = ui.theme().input.border;
     ui.push_panel_like(rect, color, border, 1.0, CornerRadius::all(SWATCH_RADIUS), 1);
     ui.push_text_rect(
         rect,
@@ -152,7 +152,7 @@ fn focus_inside(ui: &Ui, abs: &IdAbsolute<'_>) -> bool {
 impl Widget for ColorPicker<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
         // 申请：内联只占**一行**（面板弹出，不参与这里的尺寸结算）。
-        let rect = ui.allocate(Vec2::new(ui.theme.input.min_w, SWATCH_H));
+        let rect = ui.allocate(Vec2::new(ui.theme().input.min_w, SWATCH_H));
         // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
         if ui.culled(rect) {
             return Response { rect, culled: true, ..Default::default() };
@@ -167,7 +167,7 @@ impl Widget for ColorPicker<'_> {
         let hit = ui.hit_abs(&abs, &rect);
 
         // ── 内联色块（整行）：当前色 + 十六进制 + 右侧 ⌄ 提示 ──
-        let label_fs = ui.theme.label.font_size;
+        let label_fs = ui.theme().label.font_size;
         if hit {
             ui.set_cursor(crate::UiCursor::Default);
         }

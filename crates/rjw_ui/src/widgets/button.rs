@@ -129,7 +129,7 @@ impl<'a> Button<'a> {
 
 impl Widget for Button<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        let style = self.resolve(&ui.theme, ui.scale());
+        let style = self.resolve(ui.theme(), ui.scale());
         // ① 先量（文本测量必须在申请之前——申请会推进容器光标）
         let size = {
             let tsize = ui.text_size(self.label, style.font_size, style.font_family.as_deref());

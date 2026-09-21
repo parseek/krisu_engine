@@ -156,10 +156,10 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 
 | # | 现象 | 证据 | 判据 | 处置 |
 |---|---|---|---|---|
-| 1 | 控件读 `ui.theme` **字段**（crate 私有）而不是公开的 `ui.theme()` | `menu.rs:212-224`、`colorpicker/panel.rs:76-78…392`、`dropdown.rs:259/358/401`、`checkbox.rs:87`、`segmented.rs:72/129`、`label.rs:72-80`、`numberinput.rs:315…530`、`slider.rs:220`、`fontmodal.rs:73-78/141/151`、`texteditor.rs:272/377/382/393`、`button.rs:132`（~30 处） | 3 | 改 `ui.theme()`；同一事实只留一条入口 |
-| 2 | 控件**写引擎帧内主题**把样式传给引擎里的核心 | `texteditor.rs:377` `mem::replace(&mut ui.theme.input, style)`、`:393` 还原 | 4 | 核心改为收 `&InputStyle` 参数（D3 第一步） |
-| 3 | 控件调 `UiAdd::ui_mut()` | `fontmodal.rs:148/195` | 6 | 改用 `child_rect`（公开）；`MenuCtx`/`MenuBar` 的 `ui_mut` 是**容器**实现 ⇒ 白名单 |
-| 4 | 控件读引擎几何事实表 | `menu.rs:377` `ui.state().window_rects` | 2/3 | 改读 `state().windows().rect(id)`（模块视图） |
+| 1 | 控件读 `ui.theme` **字段**（crate 私有）而不是公开的 `ui.theme()` | 曾 ~36 处读 + 9 处 `&ui.theme`（`menu.rs` / `colorpicker*` / `dropdown.rs` / `checkbox.rs` / `segmented.rs` / `label.rs` / `numberinput.rs` / `slider.rs` / `fontmodal.rs` / `texteditor.rs` / `button.rs` / `divider.rs`） | 3 | ✅ **已修**：全部改成 `ui.theme()`（同一事实只留一条入口；`texteditor.rs` 的**写入**属 #2） |
+| 2 | 控件**写引擎帧内主题**把样式传给引擎里的核心 | `texteditor.rs:377` `mem::replace(&mut ui.theme.input, style)`、`:393` 还原 | 4 | 核心改为收 `&InputStyle` 参数（D3 第一步）——**尚未修**，注释已指向本条 |
+| 3 | 控件调 `UiAdd::ui_mut()` | `fontmodal.rs:148/195`（要 `child_rect` / `cursor_pos` / `wrap_buffer` / `push_*`） | 6 | **记为 D4 已知缺口**：`UiAdd` 目前不提供这些"组合控件自己排版"的原语；本轮只清理 `ui.theme`（#1），要把它们做成公开 compose 面是独立一轮。`MenuCtx` / `MenuBar` 的 `ui_mut` 是**容器**实现 ⇒ 白名单 |
+| 4 | 控件读引擎几何事实表 | 曾 `menu.rs:377` `ui.state().window_rects` | 2/3 | ✅ **已修**：`UiState::windows()` 模块视图新增只读 `rects()`（与 `debug_dump` 同口径），`menu.rs` 改用它 |
 | 5 | 引擎自己画控件外观（原始队列 + `next_seq`） | `ui.rs::draw_check_common` | 5 | 改走 `Painter` / 公开矩形原语（D2 第一步） |
 | 6 | 文本编辑核心（~1000 行）住在 `ui.rs` | `ui.rs::text_input_core` / `text_area_impl` | 5 | 搬进 `widgets/texteditor.rs`（D3） |
 | 7 | 公开绘制面不完整：`Ui::push_draw` 与 `ellipsized` 是 `pub(crate)` | `ui.rs:1310` / `:1559` | 3 | **记为已知缺口**：第三方"组合控件"（如 `ColorPicker` 那种自绘面板）目前写不出来；补公开面是独立一轮（D4），不在搬运算内 |

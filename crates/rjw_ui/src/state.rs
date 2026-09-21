@@ -866,6 +866,13 @@ impl<'a> WindowsModule<'a> {
     pub fn fx(&self, id: &str) -> Option<&'a crate::ui::WindowFx> {
         self.0.window_fx.get(id)
     }
+    /// **本帧全部窗口的遮挡矩形**（绝对 ID → 矩形，绝对坐标）——命中 / "指针是否还在
+    /// 某个窗口子树内"这类判定的输入。与 [`Ui::debug_dump`](crate::Ui::debug_dump) 同口径：
+    /// 录制期写入、**帧末只保留本帧录制的窗口**（窗口消失 ⇒ 自然不再命中，无需额外清理）。
+    #[inline]
+    pub fn rects(&self) -> impl Iterator<Item = (&'a IdAbsolute<'static>, Rect)> {
+        self.0.window_rects.iter().map(|(id, r)| (id, *r))
+    }
 }
 
 /// **文本模块**（[`UiState::texts`]）：排版缓存 / IME 组合状态。

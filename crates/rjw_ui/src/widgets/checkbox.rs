@@ -84,7 +84,7 @@ impl<'a> Checkbox<'a> {
 
 impl Widget for Checkbox<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        let style = self.resolve(&ui.theme, ui.scale());
+        let style = self.resolve(ui.theme(), ui.scale());
         // ① 先量：方框 + 间距 + 文本宽
         let tsize = ui.text_size(self.label, style.font_size, style.font_family.as_deref());
         let size = Vec2::new(

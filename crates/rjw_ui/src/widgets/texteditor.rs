@@ -269,7 +269,7 @@ impl<'a> TextEditor<'a> {
     /// 得到本控件这一帧真正用于绘制的 [`InputStyle`]。
     fn resolve_style(&self, ui: &Ui) -> InputStyle {
         let scale = ui.scale();
-        let mut style = ui.theme.input.clone();
+        let mut style = ui.theme().input.clone();
         if let Some(v) = self.font_size {
             style.font_size = v.to_physical(scale);
         }
@@ -379,7 +379,7 @@ impl Widget for TextEditor<'_> {
             // 缩放柄路径：尺寸责任链 + 拖拽（核心只负责绘制文本）。
             // 下限与 `allocate_rect` **同源**（都不调 `.min_size` ⇒ 主题下限：
             // 最小宽 + 一行文字高）——两处不一致就会"申请尺寸有下限、拖拽却能拖到 0"。
-            let min = self.min_size.unwrap_or_else(|| default_min(&ui.theme.input));
+            let min = self.min_size.unwrap_or_else(|| default_min(&ui.theme().input));
             if self.multiline {
                 ui.resizable_text_area_at(self.id, rect, self.value, min, self.resize);
             } else {

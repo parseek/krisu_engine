@@ -312,7 +312,7 @@ fn display_text<T: SliderValue>(v: T, step: T) -> String {
 impl<T: SliderValue + PartialOrd> Widget for NumberInput<'_, T> {
     fn ui(mut self, ui: &mut Ui) -> Response {
         // ① 申请（尺寸 = 主题固定值；手柄与文本框的切分见下）
-        let rect = ui.allocate(Vec2::new(ui.theme.input.min_w, ui.theme.input.height));
+        let rect = ui.allocate(Vec2::new(ui.theme().input.min_w, ui.theme().input.height));
         // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
         if ui.culled(rect) {
             return Response { rect, culled: true, ..Default::default() };
@@ -472,7 +472,7 @@ impl<T: SliderValue + PartialOrd> Widget for NumberInput<'_, T> {
         // 文本框**只圆左侧两角**（右侧与手柄拼成一条直边，否则文本框自己的圆角会在
         // 手柄左缘留下缺口）：经 [`TextEditor::radius`] 逐控件覆盖圆角——
         // `Size::Physical`（主题圆角在 `Theme::build` 已预乘 scale，不能再乘一次）。
-        let in_radius = ui.theme.input.radius;
+        let in_radius = ui.theme().input.radius;
         let panel_radius = CornerRadius {
             tl: in_radius.tl,
             br: 0.0,
@@ -525,9 +525,9 @@ impl<T: SliderValue + PartialOrd> Widget for NumberInput<'_, T> {
         // - 底色用按钮刷（略高于输入框的"可按"暗示），边框色只作**左缘分隔线**，
         //   不再整块刷成边框色（旧样子像"两个独立的深色方块"）。
         let (grip_bg, sep, glyph, radius) = {
-            let st = &ui.theme.input;
+            let st = &ui.theme().input;
             (
-                ui.theme.button.bg,
+                ui.theme().button.bg,
                 st.border,
                 st.fg,
                 CornerRadius { tl: 0.0, tr: st.radius.tr, br: st.radius.br, bl: 0.0 },

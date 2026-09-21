@@ -209,9 +209,9 @@ pub(crate) fn popup_show(
     spec: &PopupSpec<'_>,
     content: impl MenuContent,
 ) -> PopupResult {
-    let cs = ui.theme.combo.clone();
+    let cs = ui.theme().combo.clone();
     let pad = popup_padding(ui.theme());
-    let border_w = ui.theme.panel.border_w;
+    let border_w = ui.theme().panel.border_w;
     let pad_total = pad + border_w;
     // 面板样式 = **菜单外观**（`ComboStyle`）+ 主题面板的投影 / 边框宽（`border_w` 走
     // 主题令牌，不再像早期那样硬编码 1.0）。
@@ -221,7 +221,7 @@ pub(crate) fn popup_show(
         padding: pad,
         radius: cs.menu_radius,
         bg_image: None,
-        ..ui.theme.panel.clone()
+        ..ui.theme().panel.clone()
     };
     let pos = popup_origin(spec.trigger, spec.side);
     // **浮层 z（基址 + 嵌套层数）**：恒在一切窗口之上，且**子浮层整段画在父浮层之上**
@@ -370,13 +370,15 @@ fn id_in_window_tree(id: &str, root: &str) -> bool {
 
 /// 鼠标是否落在**某个窗口子树**（`root` = 窗口绝对 id）的任何窗口矩形内。
 ///
-/// 用 `UiState::window_rects`（**绝对**矩形，键 = 窗口绝对 ID）——它在录制期写入、
-/// 帧末只保留本帧录制的窗口 ⇒ 面板消失后自然不再命中（不需要额外清理）。
+/// 用 [`UiState::windows()`](crate::UiState::windows) 模块视图的 `rects()`（**绝对**矩形，
+/// 键 = 窗口绝对 ID）——它在录制期写入、帧末只保留本帧录制的窗口 ⇒ 面板消失后自然不再
+/// 命中（不需要额外清理）。
 fn mouse_in_window_tree(ui: &Ui<'_>, root: &str) -> bool {
     let m = ui.mouse_screen();
-    ui.state().window_rects.iter().any(|(id, r)| {
-        id_in_window_tree(id.as_str(), root) && r.contains_point(m)
-    })
+    ui.state()
+        .windows()
+        .rects()
+        .any(|(id, r)| id_in_window_tree(id.as_str(), root) && r.contains_point(m))
 }
 
 /// 一行的几何 / 交互结果（[`MenuCtx::item`] 用它录子菜单面板）。

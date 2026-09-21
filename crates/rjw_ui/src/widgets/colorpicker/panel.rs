@@ -73,9 +73,9 @@ pub(super) fn show_popup(
     ext_buf: Option<&mut String>,
     popup_w: Option<f32>,
 ) -> (Color, bool) {
-    let row = ui.theme.row_h;
-    let input_h = ui.theme.input.height;
-    let field_w = ui.theme.input.min_w;
+    let row = ui.theme().row_h;
+    let input_h = ui.theme().input.height;
+    let field_w = ui.theme().input.min_w;
     // 面板最小宽 = 一行通道所需（标签 + 滑块最小宽 + 数值框）：
     // 主题 `input.min_w` 变大也不会把行挤爆。
     let body_min = PAD * 2.0 + LABEL_W + GAP + SLIDER_MIN_W + GAP + field_w;
@@ -130,7 +130,7 @@ pub(super) fn show_popup(
 
 /// 面板背景样式（菜单底 + 细边框 + 小圆角，与下拉框浮层一致；投影沿用主题）。
 fn popup_panel_style(ui: &Ui) -> PanelStyle {
-    let cs = ui.theme.combo.clone();
+    let cs = ui.theme().combo.clone();
     PanelStyle {
         bg: cs.menu_bg.into(),
         border: cs.menu_border,
@@ -138,7 +138,7 @@ fn popup_panel_style(ui: &Ui) -> PanelStyle {
         padding: 0.0,
         radius: cs.menu_radius,
         bg_image: None,
-        ..ui.theme.panel.clone()
+        ..ui.theme().panel.clone()
     }
 }
 
@@ -166,8 +166,8 @@ fn popup_body(
     let mut mode_changed = false;
     for (i, m) in ColorFormat::ALL.iter().enumerate() {
         let r = Rect::new(PAD + (mode_w + GAP) * i as f32, y, mode_w, row);
-        let pal = ui.theme.palette;
-        let mut style = ui.theme.button.clone();
+        let pal = ui.theme().palette;
+        let mut style = ui.theme().button.clone();
         if *m == mode_now {
             // 选中态 = 强调色实心（与"当前模式"这个事实一一对应）。
             style.bg = pal.accent.into();
@@ -323,12 +323,12 @@ fn popup_body(
         // 归属立刻正确，不需要再改这里）。
         let warn_abs = IdAbsolute::owned(format!("{id}::warn"));
         let wh = ui.hit_abs(&warn_abs, &wrect);
-        let pal = ui.theme.palette;
+        let pal = ui.theme().palette;
         let danger = pal.danger;
         let bg = if wh {
             pal.surface_hover.into()
         } else {
-            ui.theme.button.bg
+            ui.theme().button.bg
         };
         // ⚠ 元素序同样取 `elem_hint()`：警告按钮画在文本框**之后**（文本框用
         // `elem = seq + 1`，写死 `1` 会被它压住）。
@@ -366,8 +366,8 @@ fn popup_body(
     y += sv + GAP;
     let labels = ["R", "G", "B", "A"];
     let int_mode = mode.integer_channels();
-    let lfs = ui.theme.label.font_size;
-    let lfg = ui.theme.label.color;
+    let lfs = ui.theme().label.font_size;
+    let lfg = ui.theme().label.color;
     for i in 0..n_ch {
         let (range_max, val) = if int_mode {
             (255.0, (c[i] * 255.0).round())
@@ -389,7 +389,7 @@ fn popup_body(
         // 颜色滑块：轨道 = 该通道 0 → 最大，**右端与数值框齐平**（中间不留缝：
         // 用户看到的就是"条缺了几个像素"——轨道短了一截，行看起来断成两节）。
         let style =
-            channel_slider_style(&ui.theme, channel_color(c, i, 0.0), channel_color(c, i, 1.0));
+            channel_slider_style(ui.theme(), channel_color(c, i, 0.0), channel_color(c, i, 1.0));
         let slide_w = (body_w - LABEL_W - GAP - field_w).max(1.0);
         let srect = Rect::new(PAD + LABEL_W + GAP, y, slide_w, row);
         let sid = format!("ch{i}");

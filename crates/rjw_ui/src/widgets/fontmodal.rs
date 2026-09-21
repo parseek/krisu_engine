@@ -70,12 +70,12 @@ impl FontModal<'_> {
         }
         // 主题/测量值先拷出（Copy / owned），闭包内不再借用 `ui`
         let (font_size, fg, gap) = {
-            let t = &ui.theme;
+            let t = ui.theme();
             (t.input.font_size, t.input.fg, t.gap)
         };
         let width = 340.0_f32;
         let bsz = |ui: &mut Ui, s: &str| -> f32 {
-            let t = ui.theme.button.clone();
+            let t = ui.theme().button.clone();
             ui.text_size(s, t.font_size, t.font_family.as_deref()).x + t.padding.x * 2.0
         };
         let btn_w = bsz(ui, "确定") + bsz(ui, "取消") + gap;
@@ -138,7 +138,7 @@ impl FontModal<'_> {
                     let fam = (!name.is_empty()).then_some(name.as_str());
                     (
                         ui.text_size(&example, psize, fam).x,
-                        ui.theme.font_weight.0,
+                        ui.theme().font_weight.0,
                     )
                 };
                 eprintln!(
@@ -148,7 +148,7 @@ impl FontModal<'_> {
             let pbox = m.ui_mut().child_rect(content_w, th + 12.0, Child::Expand);
             {
                 let ui = m.ui_mut();
-                let st = &ui.theme.input;
+                let st = &ui.theme().input;
                 ui.push_panel_like(pbox, st.bg, st.border, 1.0, 0.0, 1);
                 // 换行排版缓冲（预览文本超宽自动换行，不裁剪）——缓存键含**主题字重**
                 // （= 上面的草稿）⇒ 换档位必得另一份缓冲，不会拿到旧字重的排版。

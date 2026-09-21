@@ -217,7 +217,7 @@ impl<'a, T: SliderValue> Slider<'a, T> {
 impl<T: SliderValue> Widget for Slider<'_, T> {
     fn ui(self, ui: &mut Ui) -> Response {
         // ① 申请（尺寸 = 主题，不需要测量）
-        let rect = ui.allocate(Vec2::new(ui.theme.slider.min_w.max(40.0), ui.theme.slider.height));
+        let rect = ui.allocate(Vec2::new(ui.theme().slider.min_w.max(40.0), ui.theme().slider.height));
         // 被裁剪层完全剔除 ⇒ 直接 return（不镶嵌、不入段：scissor 只省片元）。
         if ui.culled(rect) {
             return Response { rect, culled: true, ..Default::default() };
