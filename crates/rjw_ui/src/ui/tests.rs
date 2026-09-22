@@ -1214,7 +1214,70 @@ fn resize_axes_pick_the_axes_that_the_user_takes_over() {
 }
 
 #[test]
+fn scroll_mode_resolution_prefers_explicit_then_legacy_then_dragged() {
+    use ScrollMode::*;
+    // ① **显式设置胜**（`.vscroll` / `.hscroll` 覆盖 `Placement` 与"拖过尺寸"的老语义）。
+    assert_eq!(resolve_scroll_mode(Some(NoClip), true, true), NoClip);
+    assert_eq!(resolve_scroll_mode(Some(ClipOnly), false, false), ClipOnly);
+    assert_eq!(resolve_scroll_mode(Some(Scroll), false, true), Scroll);
+    // ② 没显式给：`Placement::Clip` ⇒ 两条轴都裁（老行为）。
+    assert_eq!(resolve_scroll_mode(None, true, false), ClipOnly);
+    // ③ 没显式给、也没 Clip：**被用户拖过尺寸的那条轴**自动成为视口
+    //    （"拖过高度之后内容会被裁掉"既有语义的机器化表达）。
+    assert_eq!(resolve_scroll_mode(None, false, true), ClipOnly);
+    // ④ 都没有 ⇒ 不裁（与不加本 API 之前逐像素一致）。
+    assert_eq!(resolve_scroll_mode(None, false, false), NoClip);
+    // **与老判据的等价性**：两条轴都按老判据解算时，"是否裁"必须与
+    // `window_content_clipped(strict, fixed_h)` 完全一致（否则就是无声的行为漂移）。
+    for strict in [false, true] {
+        for fixed_h in [None, Some(120.0)] {
+            let v = resolve_scroll_mode(None, strict, fixed_h.is_some());
+            let h = resolve_scroll_mode(None, strict, fixed_h.is_some());
+            let clipped = v != NoClip || h != NoClip;
+            assert_eq!(
+                clipped,
+                window_content_clipped(strict, fixed_h),
+                "strict={strict} fixed_h={fixed_h:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn clip_for_axes_only_clips_the_axes_that_ask() {
+    use ScrollMode::*;
+    let win = Rect::new(100.0, 200.0, 300.0, 150.0);
+    // "不裁"那条轴的兜底：引擎里传的是**屏幕**矩形（不裁 ≠ 无限，只是别用窗口边界裁）。
+    let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+    // 两条轴都 NoClip 且没有外层裁剪 ⇒ **不动**（返回 None，与旧行为逐像素一致）。
+    assert_eq!(clip_for_axes(None, win, screen, NoClip, NoClip), None);
+    // 只裁纵向：y 收到窗口范围；x **不裁**（用屏幕兜底）⇒ 横向溢出仍可见。
+    let c = clip_for_axes(None, win, screen, ClipOnly, NoClip).expect("有裁剪");
+    assert_eq!((c.y, c.h), (win.y, win.h), "纵向 = 窗口范围");
+    assert!(c.x < win.x && c.w > win.w, "横向不裁：x 范围远大于窗口");
+    // 只裁横向：镜像。
+    let c = clip_for_axes(None, win, screen, NoClip, ClipOnly).expect("有裁剪");
+    assert_eq!((c.x, c.w), (win.x, win.w), "横向 = 窗口范围");
+    assert!(c.y < win.y && c.h > win.h, "纵向不裁");
+    // 两条轴都裁 ⇒ 与老的 `clip_for_view(.., Clip)` **等价**。
+    let both = clip_for_axes(None, win, screen, ClipOnly, ClipOnly).expect("有裁剪");
+    assert_eq!(both, clip_for_view(None, win, ViewMode::Clip).expect("老实现也给裁剪"));
+    let outer = Rect::new(150.0, 250.0, 400.0, 400.0);
+    assert_eq!(
+        clip_for_axes(Some(outer), win, screen, ClipOnly, ClipOnly),
+        clip_for_view(Some(outer), win, ViewMode::Clip),
+        "有外层裁剪时也要与老实现等价"
+    );
+    // 外层裁剪 ∩ 单轴裁剪：外层仍然生效（不会因为"另一条轴不裁"就被丢掉）。
+    let c = clip_for_axes(Some(outer), win, screen, ClipOnly, NoClip).expect("有裁剪");
+    assert_eq!(c.y, outer.y.max(win.y), "纵向取两者交集");
+    assert_eq!(c.x, outer.x, "横向沿用外层");
+    assert_eq!(c.w, outer.w);
+}
+
+#[test]
 fn window_content_clips_when_height_is_user_fixed() {
+    // 老判据本身（`window_impl` 已改用按轴解算，本测试与上一条的"等价性"一起守住它）。
     // **内容裁剪的触发条件**：
     // ① 应用显式 `.placement(Placement::Clip)`；
     // ② **高度被用户拖过**（`Resize::Both` 的柄 ⇒ 窗口成了固定尺寸视口）——不裁剪的话

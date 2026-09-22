@@ -1655,6 +1655,27 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 把窗口的遮挡矩形撑到窗口外面**（同一条守卫顺带修掉"遮挡矩形随溢出内容变大"）。
 未裁切的窗口（`Placement::Expand`）**不变**：溢出内容看得见就还能点（见 §"看得见就能点"）。
 
+**按轴的溢出策略（`.vscroll` / `.hscroll`）**：`ScrollMode::{NoClip(默认), ClipOnly, Scroll}`，
+两条轴**各自独立** —— 这是旧的 `Placement::Clip`（一体化）做不到的：只裁横向的窗口，
+纵向仍能由内容撑高。
+
+| 模式 | 该轴的大小 | 超出部分 |
+|---|---|---|
+| `NoClip`（默认） | 内容撑开；`.width(..)` / 拖出来的值是**下限** | 不裁（可见、可点） |
+| `ClipOnly` | 固定 = `.width(..)` / 拖出来的值 | 裁掉（`clip_for_axes` 只收窄该轴） |
+| `Scroll` | 同 `ClipOnly` | ⚠ **暂按 `ClipOnly` 处理并打印一次提示**（窗口内的滚动条 / 视口偏移还没做，见 `UI_NEEDS.md`） |
+
+解算顺序（纯函数 `resolve_scroll_mode`，单测 `scroll_mode_resolution_prefers_explicit_then_legacy_then_dragged`）：
+**显式设置 > `Placement::Clip` > "该轴被用户拖过尺寸"**；都没有 ⇒ `NoClip`
+（与不加本 API 之前逐像素一致；"拖过高度的轴自动成为视口"这条既有行为由第 3 条保住）。
+
+> - **命中**跟着裁切走：只有"会被裁的那条轴"把命中限制收到窗口矩形内（`cur_win_hit_limit` +
+>   `clip_for_axes`），另一条轴继续按屏幕兜底 ⇒ `NoClip` 轴溢出可见就还能点（幽灵控件那条规则
+>   不会被顺手扩大）。
+> - 验收：`--sim-scroll-mode` —— 两扇同内容窗，`hscroll(NoClip)` 撑到 626（`.width(150)`=225 只是下限）、
+>   `hscroll(ClipOnly)` 固定 251，且它的 scissor = `(520, 0, 251, 1080)`（宽 = 窗口、**高 = 整屏**
+>   ⇒ 只裁了横向）。
+
 **缩放柄令牌**（固定宽窗口右下角那个"拖拽按钮"）：
 
 `PanelStyle::grip: GripStyle { shape: GripShape, color, size, step, count }`，

@@ -46,8 +46,8 @@ use rjw_krusie::prelude::*;
 use rjw_krusie::ui::{
     ColorPicker, CornerRadius, DEFAULT_LINE_SPACING, Density, Dropdown, FONT_WEIGHT_CHOICES,
     FontModal, GRIP_W, GripShape, GripStyle, IdAbsolute, Item, Label, MenuClick, Palette, PopupSide,
-    Position, Segmented, ShadowStyle, Size, Weight, item_h, popup_gap, popup_origin, popup_padding,
-    weight_label,
+    Position, ScrollMode, Segmented, ShadowStyle, Size, Weight, item_h, popup_gap, popup_origin,
+    popup_padding, weight_label,
 };
 
 /// 「重叠控件」演示模块（控件级遮挡：重叠处只有最上层被触发 + `--sim-overlap` 自证）。
@@ -111,6 +111,8 @@ fn main() -> Result<(), RunError> {
         }
     };
     app.windows.show_grip_win = app.sim_resize;
+    // `--sim-scroll-mode`：按轴溢出策略（`.vscroll` / `.hscroll`）的验收现场。
+    app.windows.show_scroll_wins = args.iter().any(|a| a == "--sim-scroll-mode");
     app.sim_ta_resize = args.iter().any(|a| a == "--sim-ta-resize");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
@@ -187,6 +189,11 @@ const ROW_WIN_POS: Vec2 = Vec2::new(200.0, 620.0);
 /// （缩放柄所在处）不能被任何更高 z 的窗口压住（`icons` y ≤ 575 / `strict_win` y ≥ 690 /
 /// `chishi` x ≤ 499 都要避开），否则 `window_occluded` 会让柄判不中（实测踩过两次）。
 const GRIP_WIN_POS: Vec2 = Vec2::new(500.0, 590.0);
+
+/// `--sim-scroll-mode` 的两扇窗（都避开 `chishi`(x ≤ 499) / `inv_panel`(y ≤ 307) /
+/// `icons`(x ≥ 840) / `strict_win`(y ≥ 690)）。
+const SCROLL_NOCLIP_POS: Vec2 = Vec2::new(520.0, 330.0);
+const SCROLL_CLIP_POS: Vec2 = Vec2::new(520.0, 470.0);
 /// 窗口**外面**那个控件（"幽灵控件"）在窗口内容坐标里的位置：x 明显超过内容宽。
 const ROW_GHOST_OFFSET: Vec2 = Vec2::new(260.0, 12.0);
 /// 窗口**里面**那个控件（正对照）在窗口内容坐标里的位置与宽（物理像素）。
@@ -630,6 +637,11 @@ struct Windows {
     shrink_later: Option<f32>,
     /// --sim-resize 阶段 2：是否录 `grip_win` 那扇窗口（由 App 侧按 `--sim-resize` 置位）。
     show_grip_win: bool,
+    /// --sim-scroll-mode：是否录那两扇"按轴溢出策略"窗口。
+    show_scroll_wins: bool,
+    /// --sim-scroll-mode 两扇窗的文本（各自独立，避免共用缓冲互相覆写）。
+    scroll_text_a: String,
+    scroll_text_b: String,
     /// --sim-chrome 阶段 5：⌃ 按钮的**行中心**（`caption_pts` 给的是"上半"——那是为了
     /// 躲开收起态右下角的缩放柄；本轮让柄给内容让位之后，**中心也该能点**）。
     eng_center_pt: Option<Vec2>,
@@ -684,6 +696,9 @@ impl Windows {
             grip_to: None,
             resize_up: None,
             show_grip_win: false,
+            show_scroll_wins: false,
+            scroll_text_a: String::new(),
+            scroll_text_b: String::new(),
             eng_center_pt: None,
             eng_center_before: None,
             eng_center_after: None,
@@ -814,6 +829,43 @@ impl Windows {
                 .title("没有 width，也能拖宽")
                 .show(|w| {
                     w.label("只有宽度轴可拖（Resize::Horizontal）");
+                });
+        }
+        // ── `--sim-scroll-mode`：**按轴**的溢出策略验收现场 ──────────────────────
+        // 两扇窗**同宽同内容**，只有水平轴的策略不同：
+        //  · `hscroll(NoClip)`：该轴不裁 ⇒ `.width(150)` 只是**下限**，内容（宽 400 的编辑器）
+        //    把窗口撑到 ~426；
+        //  · `hscroll(ClipOnly)`：该轴是视口 ⇒ 窗口固定 150×scale（内容溢出被裁）。
+        // 两扇窗的**高**必须相同（纵向都是默认的 `NoClip` ⇒ 内容撑高）——这条一起证明
+        // "两条轴各自独立"（旧的 `Placement::Clip` 会把两条轴一起处理）。
+        if self.show_scroll_wins {
+            // `NoClip` 那扇**故意不给 `.width(..)`**：该轴"不裁"的前提是**大小装得下内容**
+            // ⇒ 让它自动宽（内容 400 逻辑像素 = 600 物理 ⇒ 窗口 ~626）。给了 `.width(..)`
+            // 就是"我要这个宽"（固定），内容超出只会**溢出可见**而不是把窗口撑大。
+            ui.window("scroll_noclip_win")
+                .pos(Position::Physical(SCROLL_NOCLIP_POS))
+                .hscroll(ScrollMode::NoClip)
+                .title("hscroll(NoClip)")
+                .show(|w| {
+                    // 与 ClipOnly 那扇窗**同一个**普通子项（占光标）⇒ 两窗自然高一致，
+                    // 才谈得上"纵向没被牵连"。
+                    w.label("横向溢出：");
+                    w.add(TextEditor::new("scroll_noclip_te", &mut self.scroll_text_a).width(400.0));
+                });
+            ui.window("scroll_clip_win")
+                .pos(Position::Physical(SCROLL_CLIP_POS))
+                .width(150.0)
+                .hscroll(ScrollMode::ClipOnly)
+                .title("hscroll(ClipOnly)")
+                .show(|w| {
+                    // 一行普通内容（占光标）⇒ 与 NoClip 那扇窗的"内容撑高"口径一致，
+                    // 两窗高度才对得上（`add_at` 不占光标、不进自然高）。
+                    w.label("横向溢出：");
+                    // 绝对定位：不进可用宽 clamp ⇒ 内容真的比视口宽（这才是"要裁"的现场）。
+                    w.add_at(
+                        Position::Physical(Vec2::ZERO),
+                        TextEditor::new("scroll_clip_te", &mut self.scroll_text_b).width(400.0),
+                    );
                 });
         }
         // ── `--sim-row-overflow`：**窄的固定宽窗口**里的验收现场 ──────────────────
@@ -3598,6 +3650,43 @@ impl App for UiApp {
                         self.windows.shrink_later = Some(w.size.y);
                     }
                 }
+            }
+            // `--sim-scroll-mode`：读两扇窗的**实测尺寸 + 裁剪层**（判定：按轴策略各自生效）。
+            if self.windows.show_scroll_wins && sim_frame == 40 {
+                let dump = ui.debug_dump();
+                let find = |id: &str| dump.windows.iter().find(|p| p.id == id);
+                let (a, b) = (find("scroll_noclip_win"), find("scroll_clip_win"));
+                let pad = (ui.theme().panel.padding + ui.theme().panel.border_w) * 2.0;
+                let want_clip = 150.0 * ui.scale() + pad;
+                let screen_h = ui.window_physical_size().1 as f32;
+                let (sa, sb) = (a.map(|w| w.size), b.map(|w| w.size));
+                let (ca, cb) = (a.and_then(|w| w.clip), b.and_then(|w| w.clip));
+                // ① NoClip 的水平轴：`.width(150)` 只是下限 ⇒ 内容（400 逻辑 = 600 物理）
+                //    把窗口撑到 ~626；
+                let noclip_ok = sa.is_some_and(|s| s.x >= 400.0);
+                // ② ClipOnly：固定视口宽 = 150×scale + 内边距；
+                let clip_ok = sb.is_some_and(|s| (s.x - want_clip).abs() <= 3.0);
+                // ③ **两条轴各自独立**（这条是旧的 `Placement::Clip` 做不到的）：NoClip 窗
+                //    **完全没有裁剪层**；ClipOnly 窗的裁剪层 x = 窗口宽（横向被裁）、
+                //    y 仍铺满屏幕（**纵向没被裁**）。
+                let no_clip_layer = a.is_some_and(|w| w.clip.is_none());
+                let clip_x_only = cb
+                    .zip(sb)
+                    .is_some_and(|(c, s)| (c.w - s.x).abs() <= 1.0 && c.h >= screen_h - 1.0);
+                // ⚠ 不能用"NoClip 窗的 `clip` 是 `None`"当判据：那个字段是**该窗最后一批的
+                // scissor**，而窗里的 `TextEditor` 自带**文本框盒裁剪** ⇒ 恒为 `Some`。
+                // 所以 NoClip 那条轴用"窗口宽被内容撑过 `.width()`"来证（626 > 225），
+                // ClipOnly 那条轴用"scissor 宽 = 窗口宽 且 纵向铺满屏幕"来证（只裁横向）。
+                let _ = (no_clip_layer, ca);
+                eprintln!(
+                    "sim-scroll-mode: NoClip 窗={sa:?}（期望宽 ≥ 400）· ClipOnly 窗={sb:?}（期望宽 {want_clip:.0}）\
+                     · NoClip scissor={ca:?} · ClipOnly scissor={cb:?}（期望宽=窗口宽、高≥{screen_h:.0}）{}",
+                    if noclip_ok && clip_ok && clip_x_only {
+                        "[OK] 按轴策略各自生效：NoClip 让内容定宽、ClipOnly 固定视口宽且只裁横向（纵向未被牵连）"
+                    } else {
+                        "[FAIL] 某条轴没按策略走（NoClip 被压窄 · ClipOnly 被撑开 · 纵向被牵连）"
+                    }
+                );
             }
             // `--sim-row-overflow`：① 两个点击点（窗口内 / 窗口外）从 `row_win` 的**实测
             // 原点** + 主题内边距解算——不写死像素；② 两次点击后各看一眼**焦点**落点。

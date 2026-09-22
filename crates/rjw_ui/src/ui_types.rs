@@ -116,14 +116,44 @@ pub enum Level {
     Normal,
 }
 
+/// **单轴的内容溢出策略**（egui 风：`.vscroll(..)` / `.hscroll(..)` 各管一条轴）。
+///
+/// 一条轴上的语义：
+/// - [`ScrollMode::NoClip`]（默认）：**不许裁切** —— 该轴的大小必须**装得下全部内容**
+///   （内容撑大窗口；用户拖过该轴时，拖出的大小是**下限**而不是固定值）；
+/// - [`ScrollMode::ClipOnly`]：该轴是**视口** —— 超出部分被裁掉，但没有滚动条；
+/// - [`ScrollMode::Scroll`]：该轴是**视口 + 滚动条**（滚轮 / 拖 thumb 能翻到被裁掉的部分）。
+///
+/// ⚠ 与 [`Placement`] 的关系：`Placement::{Expand, Clip}` 是**老的一体化开关**
+/// （两条轴一起），仍然保留；**显式的 `.vscroll(..)` / `.hscroll(..)` 覆盖它**。
+/// 都没给时按老语义解算：不裁切，但**被用户拖过尺寸的那条轴自动成为视口**
+/// （`ClipOnly`，这正是"拖过高度之后内容会被裁掉"的既有行为，见
+/// [`WindowBuilder::resize`](crate::WindowBuilder::resize)）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ScrollMode {
+    /// **不裁切**：该轴装得下所有内容（默认）。
+    #[default]
+    NoClip,
+    /// **只裁切**：视口语义，无滚动条。
+    ClipOnly,
+    /// **裁切 + 滚动条**（滚轮 / 拖 thumb / 点轨道）。
+    ///
+    /// 当前实现覆盖**垂直轴**；`hscroll(Scroll)` 暂按 `ClipOnly` 处理并打印一次提示
+    /// （水平滚动条 + `ScrollState` 的第二条轴还没做，见 `docs/UI_NEEDS.md`）。
+    Scroll,
+}
+
 /// **窗口内容排布方式**（取代旧的 `.strict()` 开关）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Placement {
     /// **Expand**（默认）：内容自然尺寸撑高窗口，**不裁剪**（子项自动换行）。
     #[default]
     Expand,
-    /// **Clip**：内容**强制裁剪**到窗口矩形（Clip 沙箱：超出部分被裁，含 noclip
+    /// **Clip**：内容**强制裁剪**到窗口矩形（Clip 沙箱：超出部分被裁、含 noclip
     /// 绘制；外层 ScrollView 的裁切一并生效）。命中仍由窗口遮挡机制隔离。
+    ///
+    /// = 两条轴都 [`ScrollMode::ClipOnly`]（新 API 的简写；显式 `.vscroll(..)` /
+    /// `.hscroll(..)` 优先）。
     Clip,
 }
 
@@ -181,6 +211,11 @@ pub struct WindowOptions {
     /// （见 [`crate::widgets::menu::popup_gap`]）——否则每一行之间都空出一个 `Theme::gap`
     /// （用户实测：菜单项之间的空位太大）。
     pub gap: Option<Size<f32>>,
+    /// **垂直轴**的内容溢出策略（`None` = 按 `placement` + "该轴是否被拖过"解算；
+    /// 见 [`ScrollMode`]）。
+    pub vscroll: Option<ScrollMode>,
+    /// **水平轴**的内容溢出策略（同上）。
+    pub hscroll: Option<ScrollMode>,
 }
 
 impl Default for WindowOptions {
@@ -195,6 +230,8 @@ impl Default for WindowOptions {
             clamp: WindowClamp::Screen,
             resize: None,
             gap: None,
+            vscroll: None,
+            hscroll: None,
         }
     }
 }

@@ -148,7 +148,7 @@ pub(crate) const TEXT_LINE_HEIGHT_VERSION: u8 = 1;
 //     Placement / Resize / WindowOptions / PanelOptions）已拆到 `crate::ui_types`，
 //     在此重导出以保持 `crate::ui::X` 路径不变。 ─────────────────────
 pub use crate::ui_types::{
-    Anchor, Level, PanelOptions, Placement, Resize, UiCursor, WindowClamp, WindowFx,
+    Anchor, Level, PanelOptions, Placement, Resize, ScrollMode, UiCursor, WindowClamp, WindowFx,
     WindowOptions,
 };
 
@@ -327,6 +327,9 @@ impl<'a> UiInit<'a> {
 /// **自动窗口位置（`CW_USEDEFAULT`）的级联步长**（**逻辑**像素）：没写 `.pos()` 的
 /// 窗口按首次出现顺序，每级右下偏移这么多（同 Win32 的层叠窗口）。
 pub const AUTO_POS_STEP: f32 = 28.0;
+
+/// `hscroll(Scroll)` 的降级提示只打一次（避免每帧刷屏）。
+static HS_SCROLL_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// **自动窗口位置**：第 `n` 个未指定 `.pos()` 的窗口落在哪（纯函数，可单测）。
 ///
@@ -3105,6 +3108,8 @@ impl<'a> Ui<'a> {
         strict: bool,
         style: Option<&PanelStyle>,
         clamp: WindowClamp,
+        // 两条轴的溢出策略（显式设置；`None` = 按 `strict` / "该轴是否被拖过"解算）。
+        scroll: (Option<ScrollMode>, Option<ScrollMode>),
         chrome: &mut WindowChrome<'_>,
         f: impl FnOnce(&mut Window<'_, '_>),
     ) -> Vec2 {
@@ -3112,16 +3117,14 @@ impl<'a> Ui<'a> {
         // 固定宽优先用**持久值**（缩放柄结果，跨帧保持；首次 = 传入 width）。统一在此
         // 读取——`window_at_w` / `modal_at_w` / `WindowBuilder::width` 都不必各自处理。
         //
-        // ⚠ **没有 `.width()` 也能拖宽**：只读 `width.map(..)` 时，`window_widths` 会被
-        // 写进去却**没人读** ⇒ `Resize::Horizontal` / `Both` 的**宽度轴完全无效**（用户
-        // 实测："resize Horizontal 不在设置 width 的情况下无法缩放"；`Resize::Both` 的
-        // 高度轴之所以照旧能用，是因为 `fixed_h` 是独立读的）。现在：拖过就有持久宽，
-        // 语义与高度一致——**拖过就由用户接管**（固定轴不再参与内容撑开）。
+        // ⚠ **`.width(..)` 恒为固定宽**（文档语义）；**持久宽**（缩放柄拖出来的）才看轴策略：
+        // `NoClip` 轴 ⇒ 下限（内容可撑大）、`ClipOnly` 轴 ⇒ 视口（固定）。把 `.width(..)`
+        // 也按"下限"处理会悄悄改掉所有固定宽窗口的布局（实测：`--sim-chrome` /
+        // `--sim-cover` 的现场全变）。
+        let explicit_w = width;
         let persisted_w = self.state.window_widths.get(id_for.as_str()).copied();
-        let width = match width {
-            Some(w) => Some(persisted_w.unwrap_or(w)),
-            None => persisted_w,
-        };
+        // 用于 clamp / 缩放柄 / 持久化判断的"有效宽"。
+        let width = explicit_w.or(persisted_w);
         
         // z-order：首次分配 max+1；点击置顶在拖拽判定处处理
         let z = {
@@ -3280,35 +3283,69 @@ impl<'a> Ui<'a> {
         // 内容基准 = **本帧显示基准**（`display_pos`）——录制期的绝对空间量与几何一致。
         self.abs_base = saved_base + display_pos;
         let saved_hit_limit = self.cur_win_hit_limit.take();
-        let mut frame = Frame::new_stack(PackSide::Top, gap, pad_total);
-        if let Some(w) = width {
-            frame.set_fixed_w(w);
+        // ── 按轴解算溢出策略（显式 `.vscroll/.hscroll` > `Placement::Clip` > "该轴被拖过"）
+        // `axis_dragged` = 该轴**已有持久尺寸**（用户拖过 ⇒ 老语义里"由用户接管"）。
+        let v_dragged = self.state.window_heights.contains_key(id_for.as_str());
+        let h_dragged = self.state.window_widths.contains_key(id_for.as_str());
+        let vs = resolve_scroll_mode(scroll.0, strict, v_dragged);
+        let hs = resolve_scroll_mode(scroll.1, strict, h_dragged);
+        // ⚠ **`Scroll` 的滚动条还没接上**（窗口内容要包一层滚动视口 + 第二条滚动状态）：
+        // 先按 `ClipOnly` 处理并**打印一次**提示 —— 静默降级比"没实现"更难查
+        // （用户会以为滚动条只是没画出来）。见 `docs/UI_NEEDS.md` 的待办。
+        let mut degrade_scroll = false;
+        let (vs, hs) = (
+            if vs == ScrollMode::Scroll { degrade_scroll = true; ScrollMode::ClipOnly } else { vs },
+            if hs == ScrollMode::Scroll { degrade_scroll = true; ScrollMode::ClipOnly } else { hs },
+        );
+        if degrade_scroll && !HS_SCROLL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "ui: vscroll/hscroll(Scroll) 暂按 ClipOnly 处理（窗口内的滚动条 / 视口偏移还没做，见 docs/UI_NEEDS.md）"
+            );
         }
-        // **高度固定**（"只调高"或"宽高同调"拖过的窗口）：高度被拖过之后由用户接管
-        // —— 与宽度同理（固定轴不参与内容撑开；要裁剪配 `Placement::Clip`）。
+        let mut frame = Frame::new_stack(PackSide::Top, gap, pad_total);
+        match (explicit_w, persisted_w, hs) {
+            // ① **没给 `.width()`**、但拖过、且该轴是 `NoClip`：拖出来的宽是**下限**
+            //    （内容可撑大 ⇒ "装得下全部内容"）。
+            (None, Some(p), ScrollMode::NoClip) => frame.set_min_w(p),
+            // ② 其余有宽可用的情形一律**固定宽**：`.width(..)` 是"我要这个宽"；拖过之后
+            //    由用户接管（持久值覆盖 `.width(..)`，`width` 已是 `explicit.or(persisted)`）；
+            //    拖过 + `ClipOnly` ⇒ 视口（固定，超出被裁）。
+            (_, Some(w), _) | (Some(w), None, _) => frame.set_fixed_w(w),
+            (None, None, _) => {}
+        }
+        // **高度**：`Vertical` 或 `Both` 拖过 ⇒ 由用户接管。
         let fixed_h = if resize_fixes_height(resize_axes) {
             self.state.window_heights.get(id_for.as_str()).copied()
         } else {
             None
         };
-        if let Some(h) = fixed_h {
-            frame.set_fixed_h(h);
+        match (vs, fixed_h) {
+            // 视口轴（ClipOnly）：固定高，内容不撑高它。
+            (ScrollMode::ClipOnly, Some(h)) => frame.set_fixed_h(h),
+            // `NoClip` 轴：拖出来的高度是**下限**（内容仍可撑高）⇒ "大小必须能呈现所有内容"。
+            (ScrollMode::NoClip, Some(h)) => frame.set_row_bounds(Some(h), None),
+            _ => {}
         }
-        // **可命中限制**：内容会被裁切的窗口（`Placement::Clip` / 高度已被拖过）把命中
-        // 范围也钉在窗口矩形内 ⇒ 溢出到面板外的**幽灵控件**既看不见也点不到。
+        // **可命中限制**：内容会被裁切的那条轴把命中范围钉在窗口矩形内 ⇒ 溢出到面板外的
+        // **幽灵控件**既看不见也点不到（`NoClip` 的轴不限制：溢出可见就该可点）。
         // 用 `prev_size`（上一帧结算尺寸）：尺寸要等录完才知道，而鼠标事件本来就是针对
         // "屏幕上已有的几何"产生的（与命中 / 拖拽 / clamp 同一口径）。
-        if window_content_clipped(strict, fixed_h)
+        if (vs != ScrollMode::NoClip || hs != ScrollMode::NoClip)
             && let Some(ps) = prev_size
             && ps.x > 0.0
             && ps.y > 0.0
         {
-            self.cur_win_hit_limit = Some(Rect::new(
-                saved_base.x + display_pos.x,
-                saved_base.y + display_pos.y,
-                ps.x,
-                ps.y,
-            ));
+            let w = saved_base.x + display_pos.x;
+            let h = saved_base.y + display_pos.y;
+            // 与外层窗口的限制求交（浮层是嵌套窗口）；"不裁"那条轴的兜底 = **屏幕**
+            // （不裁 ≠ 无限，只是别用窗口边界去裁）。
+            self.cur_win_hit_limit = clip_for_axes(
+                saved_hit_limit,
+                Rect::new(w, h, ps.x, ps.y),
+                Rect::new(0.0, 0.0, sw, sh),
+                vs,
+                hs,
+            );
         }
         self.frames.push(frame);
         self.painter.q.depth += 1;
@@ -3506,23 +3543,25 @@ impl<'a> Ui<'a> {
         // 严格裁剪（`window_at_strict`）：窗口内容**强制裁剪**到窗口矩形——结算后
         // 统一改写本窗口命令的裁剪层（录制期窗口尺寸未知，背景/子控件命令都覆盖；
         // 命中裁剪由窗口遮挡机制负责）。默认窗口为 Expand 语义（不裁剪）。
-        // 严格裁剪：窗口内容**强制裁剪**到窗口矩形——结算后统一改写本窗口命令的裁剪层
-        // （录制期窗口尺寸未知，背景/子控件命令都覆盖；命中裁剪由窗口遮挡机制负责）。
+        // **按轴**强制裁剪：结算后统一改写本窗口命令的裁剪层（录制期窗口尺寸未知，
+        // 背景 / 子控件命令都覆盖；命中侧由 `cur_win_hit_limit` 负责）。
         //
-        // 触发条件两条：
-        // ① `.placement(Placement::Clip)`（应用的显式选择，`window_at_strict` 语义）；
-        // ② **高度被用户固定**（拖过 `Resize::Both` 的柄）——此时窗口是一个"固定尺寸的
-        //    视口"，内容再撑不高它了；不裁剪的话内容会**画到窗口外面**（用户实测：
-        //    "TTT 窗口的内容不会被裁剪"）。裁剪之后里面的 `scroll_at` 才谈得上滚动。
-        if window_content_clipped(strict, fixed_h) {
+        // 每条轴独立：`NoClip` 的轴**不裁**（内容溢出可见，也能点），另一条轴照裁 ——
+        // 这正是"只要纵向滚动条、横向不裁"能成立的原因。触发条件：
+        // ① `.vscroll/.hscroll(ClipOnly|Scroll)`（显式）；
+        // ② `.placement(Placement::Clip)`（老的一体化开关 ⇒ 两条轴都裁）；
+        // ③ **该轴被用户拖过尺寸**（固定尺寸视口：内容再撑不开它，不裁就会画到面板外
+        //    —— 用户实测的 TTT 窗口 bug）。
+        if vs != ScrollMode::NoClip || hs != ScrollMode::NoClip {
             let win_abs = Rect::new(
                 saved_base.x + display_pos.x,
                 saved_base.y + display_pos.y,
                 size.x,
                 size.y,
             );
+            let clip = clip_for_axes(saved_clip, win_abs, Rect::new(0.0, 0.0, sw, sh), vs, hs);
             for d in &mut self.painter.q.queue[start..] {
-                d.clip = clip_for_view(saved_clip, win_abs, ViewMode::Clip);
+                d.clip = clip;
             }
         }
         // 背景 + 边框（win = z，画在窗口子控件之下；radius > 0 走圆角双层矩形）
@@ -3756,6 +3795,8 @@ impl<'a> Ui<'a> {
             false,
             None,
             WindowClamp::Screen,
+            // modal 不做按轴滚动 / 裁切（要滚动就在对话框内容里嵌 `scroll_at`）。
+            (None, None),
             &mut WindowChrome::none(),
             f,
         )
@@ -6033,9 +6074,28 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
         self.o.level = level;
         self
     }
-    /// **内容排布**（默认 [`Placement::Expand`]；[`Placement::Clip`] = 严格裁剪到窗口矩形）。
+    /// **内容排布**（默认 [`Placement::Expand`]；[`Placement::Clip`] = 两条轴都裁到窗口矩形）。
+    ///
+    /// 想要"只裁一条轴"或"滚动条"请用 [`Self::vscroll`] / [`Self::hscroll`]（它们**优先**）。
     pub fn placement(mut self, placement: Placement) -> Self {
         self.o.placement = placement;
+        self
+    }
+    /// **垂直轴的溢出策略**（[`ScrollMode`]）：`NoClip`（默认，内容撑高）/ `ClipOnly`
+    /// （视口，裁掉超出部分）/ `Scroll`（视口 + 滚动条 + 滚轮）。
+    ///
+    /// 显式设置**覆盖** [`Self::placement`]。`Scroll` 时窗口高度取"上一帧结算高"
+    /// 作为视口（首次 = 内容高），之后由用户拖拽 / 内容变化驱动。
+    pub fn vscroll(mut self, mode: ScrollMode) -> Self {
+        self.o.vscroll = Some(mode);
+        self
+    }
+    /// **水平轴的溢出策略**（同 [`Self::vscroll`]）。
+    ///
+    /// ⚠ 当前实现里 `Scroll` 只覆盖**垂直**轴：`hscroll(Scroll)` 暂按 `ClipOnly` 处理并
+    /// 打印一次提示（水平滚动条 + 第二条滚动状态还没做，见 `docs/UI_NEEDS.md`）。
+    pub fn hscroll(mut self, mode: ScrollMode) -> Self {
+        self.o.hscroll = Some(mode);
         self
     }
     /// **逐窗口样式覆盖**（默认 `None` = 全局 [`Theme::panel`]）。
@@ -6156,6 +6216,7 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
             strict,
             o.style.as_ref(),
             o.clamp,
+            (o.vscroll, o.hscroll),
             &mut chrome,
             f,
         )
@@ -8107,6 +8168,65 @@ fn resize_fixes_height(axes: Resize) -> bool {
     matches!(axes, Resize::Vertical | Resize::Both)
 }
 
+/// **单轴的内容溢出策略解算**（纯函数，可单测）。
+///
+/// 输入：应用的显式选择（`.vscroll(..)` / `.hscroll(..)`，`None` = 没给）、老的
+/// [`Placement::Clip`] 一体化开关、以及**这条轴是否被用户拖过尺寸**。输出：该轴怎么处理。
+///
+/// 规则（顺序即优先级）：
+/// 1. **显式设置胜**（新 API 覆盖 `Placement`）；
+/// 2. 否则 `Placement::Clip` ⇒ `ClipOnly`（两条轴都裁，老行为）；
+/// 3. 否则**被拖过的轴** ⇒ `ClipOnly` —— 这是既有语义："高度一旦被拖过，窗口就是固定
+///    尺寸视口，内容不再撑高它"（用户实测的 TTT 窗口 bug 就是这么修的）；
+/// 4. 其余 ⇒ `NoClip`（内容撑大窗口，与不加本 API 之前逐像素一致）。
+fn resolve_scroll_mode(explicit: Option<ScrollMode>, placement_clip: bool, axis_dragged: bool) -> ScrollMode {
+    match explicit {
+        Some(m) => m,
+        None if placement_clip => ScrollMode::ClipOnly,
+        None if axis_dragged => ScrollMode::ClipOnly,
+        None => ScrollMode::NoClip,
+    }
+}
+
+/// **按轴求交裁剪层**（纯函数，可单测）：`ScrollMode::NoClip` 的那条轴**不裁**
+/// （另一条轴照裁）——于是"只裁纵向"的窗口内容仍能横向溢出（反之亦然）。
+///
+/// - 两条轴都 `NoClip` 且无外层裁剪 ⇒ 返回 `None`（**与不加本 API 之前逐字节一致**）；
+/// - 只有一条轴裁 ⇒ 另一条轴沿用外层裁剪；没有外层裁剪时用 `fallback`
+///   （调用方传**屏幕矩形**：不裁 ≠ 无限，只是"别用窗口边界去裁"）；
+/// - 函数名里的"按轴"是重点：旧的 `clip_for_view(.., Clip)` 会把两条轴一起裁，
+///   那正是"只想要纵向滚动条，却被横向也裁掉"的原因。
+fn clip_for_axes(
+    saved: Option<Rect>,
+    win: Rect,
+    fallback: Rect,
+    v: ScrollMode,
+    h: ScrollMode,
+) -> Option<Rect> {
+    if v == ScrollMode::NoClip && h == ScrollMode::NoClip {
+        return saved;
+    }
+    let mut out = saved.unwrap_or(fallback);
+    if h != ScrollMode::NoClip {
+        // 横向收窄到窗口的 x 范围，纵向保持外层的。
+        out = Rect::new(win.x, out.y, win.w, out.h);
+    }
+    if v != ScrollMode::NoClip {
+        out = Rect::new(out.x, win.y, out.w, win.h);
+    }
+    if let Some(s) = saved {
+        let x0 = out.x.max(s.x);
+        let y0 = out.y.max(s.y);
+        let x1 = (out.x + out.w).min(s.x + s.w);
+        let y1 = (out.y + out.h).min(s.y + s.h);
+        if x1 <= x0 || y1 <= y0 {
+            return Some(Rect::new(x0, y0, 0.0, 0.0));
+        }
+        out = Rect::new(x0, y0, x1 - x0, y1 - y0);
+    }
+    Some(out)
+}
+
 /// **嵌套容器的内容最大宽**（纯函数，可单测）：父级可用宽扣掉本容器内边距。
 ///
 /// `None`（父级不限宽）/ 结果为 `<= 0` ⇒ `None`（不限）——"父级可用宽 0"不该把子项
@@ -8122,11 +8242,17 @@ fn content_max_w(parent_avail: Option<f32>, pad_total: f32) -> Option<f32> {
     })
 }
 
-/// **窗口内容是否强制裁剪**（纯函数，可单测）。///
+/// **窗口内容是否强制裁剪**（纯函数，可单测；**旧的"一体化"判据**）。
+///
 /// - `strict`（`.placement(Placement::Clip)`）：应用的显式选择；
 /// - `fixed_h = Some(..)`：**高度被用户拖过**（`Resize::Both` 的柄）⇒ 窗口成了"固定
 ///   尺寸视口"，内容撑不高它；不裁剪就会画到窗口外面（用户实测的 TTT 窗口 bug）。
 ///   `.width(..)` 不触发本项：固定宽但高度自然时，内容在垂直方向不会溢出。
+///
+/// ⚠ `window_impl` 现在走**按轴**的 [`resolve_scroll_mode`] + [`clip_for_axes`]；本函数
+/// **只剩测试用途**（等价性基准：两条轴都按老判据解算时必须与它一致）⇒ `#[cfg(test)]`，
+/// 免得"没人用的旧判据"留在生产代码里被误用。
+#[cfg(test)]
 fn window_content_clipped(strict: bool, fixed_h: Option<f32>) -> bool {
     strict || fixed_h.is_some()
 }

@@ -112,6 +112,8 @@ pub(crate) struct Frame {
     /// 后自动换行（实测过的 bug：窄的 `.width()` 窗口里 `row` 里的控件整排突出去，
     /// 直到把窗口拖大才看得回去）。
     max_w: Option<f32>,
+    /// **容器最小宽度**（见 [`Self::set_min_w`]；`None` = 不限）：只抬 `settle_size` 的宽。
+    min_w: Option<f32>,
     /// **绝对放置内容的包围盒**（`*_at` / `add_at` / 控件命中区 的矩形并集；
     /// **相对容器 origin**，与 `child_rect` 同一空间）。
     ///
@@ -143,6 +145,7 @@ impl Frame {
             fixed_h: None,
             fixed_w: None,
             max_w: None,
+            min_w: None,
             content_bounds: None,
         }
     }
@@ -165,6 +168,7 @@ impl Frame {
             fixed_h: None,
             fixed_w: None,
             max_w: None,
+            min_w: None,
             content_bounds: None,
         }
     }
@@ -245,6 +249,15 @@ impl Frame {
             Some(w) if w > 0.0 => Some(w),
             _ => None,
         })
+    }
+
+    /// **容器最小宽度**（`None` = 不限）：`settle_size` 的宽度被**抬到**它
+    /// （内容比它宽 ⇒ 内容胜 —— 这正是 `ScrollMode::NoClip` 的"拖出来的是下限"语义：
+    /// 窗口不许裁掉内容，所以拖小只会被内容顶回去）。
+    ///
+    /// 与 [`Self::fixed_w`] 的区别：固定宽**覆盖**自然宽（内容超出被裁）；最小宽只是下限。
+    pub(crate) fn set_min_w(&mut self, w: f32) {
+        self.min_w = (w > 0.0).then_some(w);
     }
 
     /// 设置**内容最大宽**（见 [`Self::max_w`]；`None` / `<= 0` = 不限）。
@@ -478,7 +491,13 @@ impl Frame {
             Some(m) => h.max(m),
             None => h,
         };
-        Vec2::new(size.x, h)
+        // 容器**最小宽度**（`set_min_w`）：只抬宽，不改写子项布局 —— `NoClip` 轴的
+        // "拖出来的是下限"用它表达（内容比拖出来的大 ⇒ 内容胜）。
+        let w = match self.min_w {
+            Some(m) => size.x.max(m),
+            None => size.x,
+        };
+        Vec2::new(w, h)
     }
 
     fn settle_size_inner(&self) -> Vec2 {

@@ -20,9 +20,9 @@ cargo check  --offline --workspace --all-targets          # 期望 0 warning
 cargo clippy --offline -p rjw_ui --all-targets            # 期望 0 warning
 cargo test   --offline --workspace                        # 全绿（rjw_ui 基线：332 lib + 42 doc）
 
-# 2) 交互行为：17 个脚本化仿真（判定打在 stderr，全 [OK] 才算过）
+# 2) 交互行为：18 个脚本化仿真（判定打在 stderr，全 [OK] 才算过）
 #    ⚠ 每个 sim 自己打印判定帧，`--frames` 只要"超过最后一个判定帧"；260 覆盖全部（现网最大 240）。
-foreach ($s in "drag","picker","row-overflow","overlap","cover","chrome","weight","shadow","clip",
+foreach ($s in "drag","picker","row-overflow","scroll-mode","overlap","cover","chrome","weight","shadow","clip",
               "zorder","text-cull","tuner","menu","dropdown","weight-modal","resize","ta-resize") {
     cargo run --offline -p eg260818UI -- "--sim-$s" --frames 260
 }
@@ -48,7 +48,7 @@ cargo run --offline -p egUI -- --demo Gallery --ui-dump --frames 60
 | 命令 | 守什么 |
 |---|---|
 | `check` / `clippy` / `test` | 公开面没坏、单测期望（几何 / 命中 / 文本 / 主题）没变、无新增告警 |
-| 17 个 `--sim-*` | **交互行为**（拖拽 / 收起 / 遮挡 / 层级 / 裁剪 / 菜单 / 下拉 / 尺寸责任链 / 窄窗溢出行…）；数值断言写在各 sim 的判定行里 |
+| 18 个 `--sim-*` | **交互行为**（拖拽 / 收起 / 遮挡 / 层级 / 裁剪 / 菜单 / 下拉 / 尺寸责任链 / 窄窗溢出行 / 按轴裁切…）；数值断言写在各 sim 的判定行里 |
 | `--frames N` 冒烟 | 帧循环 / 资源生命周期（present 满 N 帧；退出路径无 panic） |
 | `--demo … --ui-dump` | **指定代码路径真的被跑到**：`--ui-dump` 的窗口行 = 那个 demo 的窗口（`--demo` 打错 ⇒ 打清单 + **非 0 退出**，不静默） |
 
@@ -222,6 +222,19 @@ fn update(&mut self, ctx: &mut Ctx) {
   开着），第 92 帧读 `picker_demo::popup` 窗口宽必须仍是 `picker_panel_w(主题默认入口宽)+2`
   ——旧实现（按入口实测宽 × 1.9）在这里读到 382 并 `[FAIL]`（已验证该断言可失败）。
   本 sim 在三个主题下都通过：默认 401 / `builtin:krusie-dark` 401 / `builtin:krusie-compact` 344。
+- **按轴裁切 / 滚动（`.vscroll` / `.hscroll`）**：`--sim-scroll-mode` 摆两扇**同内容**窗，
+  只改水平轴的策略，读 `--ui-dump` 的**尺寸 + scissor** 判定：
+
+  ```
+  sim-scroll-mode: NoClip 窗=Some(Vec2(626.0, 130.0))（期望宽 ≥ 400）· ClipOnly 窗=Some(Vec2(251.0, 82.0))（期望宽 251）
+                   · NoClip scissor=Some(Rect { x: 533.0, y: 408.0, w: 600.0, h: 39.0 })
+                   · ClipOnly scissor=Some(Rect { x: 520.0, y: 0.0, w: 251.0, h: 1080.0 }) [OK]
+  ```
+
+  判据三条：① `NoClip` 轴让**内容**定宽（626 ≥ 400 逻辑像素 ×scale）；② `ClipOnly` 轴固定
+  视口宽（`150×scale + 2×pad = 251`）；③ **两条轴互不牵连** —— `ClipOnly` 那扇窗的 scissor
+  `宽 = 窗口宽、高 = 整屏`（只裁了横向）。⚠ 别拿"NoClip 窗的 `clip` 是 `None`"当判据：那是
+  **该窗最后一批的 scissor**，窗里的 `TextEditor` 自带文本框盒裁剪 ⇒ 恒为 `Some`。
 - **窄的固定宽窗口：内容"突出去"与"幽灵控件"**（`--sim-row-overflow`）：用户实测
   "指定 `width` 里，`width` 较小的时候控件会突出去，直到你去拖拽缩放"。示例用一扇
   `.width(150.0)` + `Placement::Clip` 的窗口做现场：
