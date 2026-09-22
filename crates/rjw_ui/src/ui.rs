@@ -773,6 +773,29 @@ impl<'a> Ui<'a> {
         self.frames.last().map(|f| f.cursor).unwrap_or(Vec2::ZERO)
     }
 
+    /// **当前容器内容原点的绝对坐标**（物理像素；`abs_base`）——**组合控件作者公开面**。
+    ///
+    /// 自绘浮层（取色器面板 / 第三方下拉）要把"当前容器局部"的锚点换算成**屏幕绝对**
+    /// 坐标才能判断"放不放得下"；`Ui::abs_rect` 是它的常用封装。
+    #[inline]
+    pub fn content_origin(&self) -> Vec2 {
+        self.abs_base
+    }
+
+    /// **局部矩形 → 绝对矩形**（物理像素；与 [`Self::content_origin`] 配套）。
+    ///
+    /// 用途：组合控件在"当前容器局部"里拿到自己的矩形后，需要绝对坐标去做**屏幕级**
+    /// 决策（浮层该朝哪边翻、会不会出屏幕）。引擎侧同名的绝对量是 `abs_base`。
+    #[inline]
+    pub fn abs_rect(&self, local: Rect) -> Rect {
+        Rect::new(
+            self.abs_base.x + local.x,
+            self.abs_base.y + local.y,
+            local.w,
+            local.h,
+        )
+    }
+
     /// **声明本次按下归本控件**：自定义交互控件（自身有**拖拽语义**，如数字输入的
     /// 拖动手柄）在 `down_edge && hit` 时调用——阻止外层窗口/面板把本次按下当作
     /// **窗口拖拽基准**（否则窗口内拖滑块/手柄会连窗口一起动）。内置滑块 / 滚动条
@@ -2450,12 +2473,39 @@ impl<'a> Ui<'a> {
         id: &str,
         f: impl FnOnce(&mut Scroll<'_, '_>),
     ) -> Vec2 {
+        // 公开形式 = 两轴都 `Scroll`（内容超出即滚动；与加按轴 API 之前逐行为一致）。
+        self.scroll_at_axes(pos, view_size, id, ScrollMode::Scroll, ScrollMode::Scroll, |ui| {
+            f(&mut Scroll { ui })
+        })
+    }
+
+    /// [`Self::scroll_at`] 的**核心**（按轴版本）：把 `f` 录进一个滚动视口，返回可视区尺寸。
+    ///
+    /// `v` / `h` 决定**哪条轴**是滚动轴：
+    /// - `NoClip`：那条轴**不裁**（内容溢出可见，也不参与滚动偏移）；
+    /// - `ClipOnly` / `Scroll`：那条轴是视口（裁切；`Scroll` 时还画滚动条、吃滚轮）。
+    ///
+    /// 抽出来是为了让**窗口**（`.vscroll(Scroll)`）与 `scroll_at` 共用同一实现：窗口把用户
+    /// 闭包包进来即可（`f` 收 `&mut Ui`，两边各自包成 `Scroll` / `Window`）。
+    pub(crate) fn scroll_at_axes(
+        &mut self,
+        pos: impl Into<Position>,
+        view_size: impl Into<Size<Vec2>>,
+        id: &str,
+        v: ScrollMode,
+        h: ScrollMode,
+        f: impl FnOnce(&mut Ui),
+    ) -> Vec2 {
         let pos = pos.into().to_physical(self.scale);
         let view_size = view_size.into().to_physical(self.scale);
         // 滚动容器自身也是命名空间边界：内部子控件 ID 自动带 `id` 前缀。
         let abs = self.id_for(id);
         let saved_clip = self.painter.q.clip;
         let saved_base = self.abs_base;
+        let (sw, sh) = (
+            self.window.inner_size().width as f32,
+            self.window.inner_size().height as f32,
+        );
         // 可视区（**相对**当前容器 origin：内容 / 滚动条命令都录在容器局部坐标，
         // 随外层容器弹出统一平移成绝对坐标）。
         let view_rel = Rect::new(pos.x, pos.y, view_size.x.max(0.0), view_size.y.max(0.0));
@@ -2466,8 +2516,9 @@ impl<'a> Ui<'a> {
             view_size.x.max(0.0),
             view_size.y.max(0.0),
         );
-        // 强制裁剪层 = 外层裁剪 ∩ 本可视区（View 沙箱 Clip 语义）。
-        self.painter.q.clip = clip_for_view(saved_clip, view_abs, ViewMode::Clip);
+        // 强制裁剪层 = 外层裁剪 ∩ 本可视区 —— **按轴**（`NoClip` 那条轴不动）。
+        self.painter.q.clip =
+            clip_for_axes(saved_clip, view_abs, Rect::new(0.0, 0.0, sw, sh), v, h);
         // 滚动偏移（**物理像素**，跨帧状态；先 Copy 读出，`f` 结束再写回——避免
         // 借用冲突）。以整物理像素步进（滚轮 / 拖 thumb 均取整）。
         let mut offset_px = self
@@ -2489,7 +2540,7 @@ impl<'a> Ui<'a> {
         self.frames.push(Frame::new_stack(PackSide::Top, self.theme.gap, 0.0));
         self.painter.q.depth += 1;
         // ID 命名空间：滚动容器进入压栈、退出弹栈（闭包作用域保证配对）。
-        self.with_id(id, |ui| f(&mut Scroll { ui }));
+        self.with_id(id, |ui| f(ui));
         let frame = self.frames.pop().expect("scroll frame");
         let content_size = frame.settle_size();
         self.painter.q.depth -= 1;
@@ -3229,6 +3280,23 @@ impl<'a> Ui<'a> {
                 _ => crate::UiCursor::EwResize,
             };
             let hit = self.resize_handle_hit(&h_id, &handle, cursor);
+            // **按下即落持久值**（种子 = 当前尺寸）：`fixed_w/h` 与 `axis_dragged` 都在
+            // **本函数前面**读过，不种这一下，第一次拖拽本帧不生效（要等下一帧）——
+            // 症状正是"点击缩小窗口后不会缩小"（尤其内容比它高时，本帧仍按内容撑开）。
+            if hit && self.mouse_left().down_edge() {
+                if resize_fixes_width(resize_axes) && explicit_w.is_none() {
+                    self.state
+                        .window_widths
+                        .entry(id_for.to_static())
+                        .or_insert(ps.x);
+                }
+                if resize_fixes_height(resize_axes) {
+                    self.state
+                        .window_heights
+                        .entry(id_for.to_static())
+                        .or_insert(ps.y);
+                }
+            }
             // 当前尺寸 = 屏幕上那个（宽取持久固定宽，高取持久高度 / 结算高）。
             let cur_w = width.unwrap_or(ps.x);
             let cur_h = self
@@ -3289,19 +3357,19 @@ impl<'a> Ui<'a> {
         let h_dragged = self.state.window_widths.contains_key(id_for.as_str());
         let vs = resolve_scroll_mode(scroll.0, strict, v_dragged);
         let hs = resolve_scroll_mode(scroll.1, strict, h_dragged);
-        // ⚠ **`Scroll` 的滚动条还没接上**（窗口内容要包一层滚动视口 + 第二条滚动状态）：
-        // 先按 `ClipOnly` 处理并**打印一次**提示 —— 静默降级比"没实现"更难查
-        // （用户会以为滚动条只是没画出来）。见 `docs/UI_NEEDS.md` 的待办。
-        let mut degrade_scroll = false;
-        let (vs, hs) = (
-            if vs == ScrollMode::Scroll { degrade_scroll = true; ScrollMode::ClipOnly } else { vs },
-            if hs == ScrollMode::Scroll { degrade_scroll = true; ScrollMode::ClipOnly } else { hs },
-        );
-        if degrade_scroll && !HS_SCROLL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!(
-                "ui: vscroll/hscroll(Scroll) 暂按 ClipOnly 处理（窗口内的滚动条 / 视口偏移还没做，见 docs/UI_NEEDS.md）"
-            );
-        }
+        // ⚠ **水平滚动条还没接上**（`ScrollState` 的第二条轴 + 横向 thumb）：`hscroll(Scroll)`
+        // 先按 `ClipOnly` 处理并**打印一次**提示 —— 静默降级比"没实现"更难查。
+        // `vscroll(Scroll)` 是**真的**（窗口内容包进滚动视口，见下面的 `viewport`）。
+        let hs = if hs == ScrollMode::Scroll {
+            if !HS_SCROLL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "ui: hscroll(Scroll) 暂按 ClipOnly 处理（水平滚动条 / 第二条滚动状态还没做，见 docs/UI_NEEDS.md）"
+                );
+            }
+            ScrollMode::ClipOnly
+        } else {
+            hs
+        };
         let mut frame = Frame::new_stack(PackSide::Top, gap, pad_total);
         match (explicit_w, persisted_w, hs) {
             // ① **没给 `.width()`**、但拖过、且该轴是 `NoClip`：拖出来的宽是**下限**
@@ -3313,6 +3381,8 @@ impl<'a> Ui<'a> {
             (_, Some(w), _) | (Some(w), None, _) => frame.set_fixed_w(w),
             (None, None, _) => {}
         }
+        // `vscroll(Scroll)` 的**视口高**在下面算（要等标题栏占位之后才拿得到内容原点）；
+        // 这里先记下"该轴是滚动视口"，`set_fixed_h` 在那里做。
         // **高度**：`Vertical` 或 `Both` 拖过 ⇒ 由用户接管。
         let fixed_h = if resize_fixes_height(resize_axes) {
             self.state.window_heights.get(id_for.as_str()).copied()
@@ -3402,12 +3472,62 @@ impl<'a> Ui<'a> {
         // 当成 **win=0 内容**而撤销它的按下（实测：`hit[..] ::collapse OK` 但点不动、
         // 收起状态永远不翻转）。
         let mut size = Vec2::ZERO;
+        // ─── `vscroll(Scroll)`：把内容录进一个**滚动视口**（窗口内滚动条）───────────
+        // 视口 = 窗口内容盒（标题栏之下），高 = 固定高（拖过 / `.min_height`）**或**
+        // "窗口顶到屏幕底还剩多少"（`Scroll` 的自然含义：不许跑出屏幕，多出来的滚）。
+        let scroll_axis_on = vs == ScrollMode::Scroll || hs == ScrollMode::Scroll;
+        let viewport = if scroll_axis_on {
+            let top_left = self
+                .frames
+                .last()
+                .map(|f| f.cursor)
+                .unwrap_or(Vec2::splat(pad_total));
+            let avail_h = if fixed_h.is_some() {
+                prev_size.map(|s| s.y).unwrap_or(0.0)
+            } else {
+                // 屏幕内可用高（窗口顶到屏幕底）。
+                let top_abs = saved_base.y + display_pos.y;
+                (sh - top_abs).max(0.0)
+            };
+            let h = if fixed_h.is_some() { avail_h } else { avail_h - top_left.y - pad_total };
+            let w = width.unwrap_or(0.0) - top_left.x * 2.0;
+            Some(Rect::new(
+                top_left.x,
+                top_left.y,
+                w.max(1.0),
+                h.max(1.0),
+            ))
+        } else {
+            None
+        };
         self.with_id(id, |ui| {
             {
                 // 显式重借用：`Window` 拿走 `&mut Ui`，块结束后 `ui` 仍可用。
-                let mut w = Window { ui: &mut *ui };
-                if !collapsed {
-                    f(&mut w);
+                if let Some(vp) = viewport {
+                    // 视口高固定 ⇒ 窗口尺寸 = 视口 + 内边距（内容再高也不撑大它）。
+                    if let Some(fr) = ui.frames.last_mut() {
+                        fr.set_fixed_h(vp.y + vp.h + pad_total);
+                    }
+                    // ⚠ 滚动容器的 id 用**相对名**（这里已经在 `with_id(id)` 的窗口命名空间里；
+                    // 写 `{id}::scroll` 会变成 `win/win::scroll` —— 双重前缀）。
+                    ui.scroll_at_axes(
+                        Position::Physical(Vec2::new(vp.x, vp.y)),
+                        Size::Physical(Vec2::new(vp.w, vp.h)),
+                        "scroll",
+                        vs,
+                        hs,
+                        |ui| {
+                            let mut w = Window { ui };
+                            if !collapsed {
+                                f(&mut w);
+                            }
+                        },
+                    );
+                } else {
+                    let mut w = Window { ui: &mut *ui };
+                    if !collapsed {
+                        f(&mut w);
+                    }
                 }
             }
             // 结算尺寸（装饰之前）：标题/按钮不得反过来影响窗口尺寸。

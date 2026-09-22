@@ -113,6 +113,7 @@ fn main() -> Result<(), RunError> {
     app.windows.show_grip_win = app.sim_resize;
     // `--sim-scroll-mode`：按轴溢出策略（`.vscroll` / `.hscroll`）的验收现场。
     app.windows.show_scroll_wins = args.iter().any(|a| a == "--sim-scroll-mode");
+    app.sim_scroll_mode = app.windows.show_scroll_wins;
     app.sim_ta_resize = args.iter().any(|a| a == "--sim-ta-resize");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
@@ -194,6 +195,9 @@ const GRIP_WIN_POS: Vec2 = Vec2::new(500.0, 590.0);
 /// `icons`(x ≥ 840) / `strict_win`(y ≥ 690)）。
 const SCROLL_NOCLIP_POS: Vec2 = Vec2::new(520.0, 330.0);
 const SCROLL_CLIP_POS: Vec2 = Vec2::new(520.0, 470.0);
+/// `--sim-scroll-mode` 第三扇窗（`vscroll(Scroll)`）：放在**屏幕下缘附近**，
+/// 于是"屏幕剩下的高"明显小于内容高 ⇒ 视口 + 滚动条。
+const SCROLL_V_POS: Vec2 = Vec2::new(830.0, 700.0);
 /// 窗口**外面**那个控件（"幽灵控件"）在窗口内容坐标里的位置：x 明显超过内容宽。
 const ROW_GHOST_OFFSET: Vec2 = Vec2::new(260.0, 12.0);
 /// 窗口**里面**那个控件（正对照）在窗口内容坐标里的位置与宽（物理像素）。
@@ -866,6 +870,20 @@ impl Windows {
                         Position::Physical(Vec2::ZERO),
                         TextEditor::new("scroll_clip_te", &mut self.scroll_text_b).width(400.0),
                     );
+                });
+            // ③ `vscroll(Scroll)`：**真的滚动视口**（窗口内滚动条）——内容很高、窗口只占
+            //    屏幕剩下的那点高 ⇒ 出现滚动条；拖 thumb 能改偏移（`ScrollState.offset`）。
+            ui.window("scroll_v_win")
+                .pos(Position::Physical(SCROLL_V_POS))
+                .width(140.0)
+                .vscroll(ScrollMode::Scroll)
+                // 关掉窗口自己的缩放柄：右下角要留给**滚动条**（否则点下去是在拖窗口尺寸）。
+                .resize(false, Resize::None)
+                .title("vscroll(Scroll)")
+                .show(|w| {
+                    for i in 0..12 {
+                        w.label(&format!("第 {i} 行（内容远高于视口）"));
+                    }
                 });
         }
         // ── `--sim-row-overflow`：**窄的固定宽窗口**里的验收现场 ──────────────────
@@ -1661,6 +1679,11 @@ struct UiApp {
     /// `save_theme`）；选择器是否真的弹、以及预设结果，全部由 [`filedialog::Policy`] 决定
     /// （`--no-file-dialog` 时**完全不碰 rfd**）。
     sim_pick_save: bool,
+    /// --sim-scroll-mode：按轴溢出策略的验收现场（含 `vscroll(Scroll)` 的滚动条拖拽）。
+    sim_scroll_mode: bool,
+    /// --sim-scroll-mode：`vscroll(Scroll)` 那扇窗**右侧滚动条**上的抓取点（从 dump 的窗口
+    /// 矩形 + 主题内边距解算 ⇒ 不写死像素）。
+    scroll_thumb_pt: Option<Vec2>,
     /// **文件选择器策略**（导入 / 导出共用）：真人用法 = 弹系统选择器；测试 = 由显式 CLI
     /// （`--no-file-dialog` / `--pick <目标>=<路径|none>`）决定，可**完全不碰 `rfd`**。
     /// 见 [`filedialog::Policy`]（那里说明了为什么**不用**环境变量做旁路）。
@@ -1966,6 +1989,8 @@ impl UiApp {
             sim_resize_to: None,
             sim_ta_resize: false,
             sim_pick_save: false,
+            sim_scroll_mode: false,
+            scroll_thumb_pt: None,
             dialogs: filedialog::Policy::interactive(),
             sim_ta_text: String::new(),
             sim_ta_single: String::new(),
@@ -2779,6 +2804,11 @@ impl App for UiApp {
                 92..=93 => f.debug_inject_mouse(p, true),
                 94..=99 => f.debug_inject_mouse(up, true),
                 100..=104 => f.debug_inject_mouse(up, false),
+                // 阶段 4：**再点一下柄（不拖动）** —— 用户实测："缩放柄拖到别处后，第二次
+                // 点击会瞬移到原位"。纯点击不该改尺寸（更不该跳回上一次拖之前的尺寸）。
+                170..=171 => f.debug_inject_mouse(p, false),
+                172..=173 => f.debug_inject_mouse(p, true),
+                174..=176 => f.debug_inject_mouse(p, false),
                 _ => {}
             }
         }
@@ -2805,6 +2835,19 @@ impl App for UiApp {
         // 整条通路可无人值守跑完。缺值就什么都不做（只印用法）。
         if self.sim_pick_save && f.frames() == 20 {
             self.top.export_request = Some(ExportKind::Theme);
+        }
+        // ── 调试：脚本化鼠标（`--sim-scroll-mode`）────────────────
+        // 拖 `vscroll(Scroll)` 那扇窗的**滚动条 thumb**（往下 40px）：`ScrollState.offset`
+        // 必须真的变大（滚轮没法注入 ⇒ 拖 thumb 是唯一能脚本化的滚动入口）。
+        if self.sim_scroll_mode {
+            let p = self.scroll_thumb_pt.unwrap_or(Vec2::ZERO);
+            // 单击（不拖）：滚动条轨道 ⇒ 翻一页。
+            match f.frames() {
+                20..=21 => f.debug_inject_mouse(p, false),
+                22..=23 => f.debug_inject_mouse(p, true),
+                24..=26 => f.debug_inject_mouse(p, false),
+                _ => {}
+            }
         }
         // ── 调试：脚本化鼠标（`--sim-menu`）──────────────────────
         // 行程：10..11 移到「视图」触发器 → 12..13 按下 → 14..15 抬起（菜单打开）
@@ -3651,9 +3694,23 @@ impl App for UiApp {
                     }
                 }
             }
-            // `--sim-scroll-mode`：读两扇窗的**实测尺寸 + 裁剪层**（判定：按轴策略各自生效）。
-            if self.windows.show_scroll_wins && sim_frame == 40 {
+            // `--sim-scroll-mode`：`vscroll(Scroll)` 那扇窗的**滚动条翻页点**（每帧重算：
+            // 首帧窗口还没被 clamp 住，只信 frame ≥ 2）。点条带**靠下**那一截（thumb 贴顶
+            // ⇒ 那里是轨道）⇒ 点一下翻一页，`offset` 必然变大。
+            if self.sim_scroll_mode && sim_frame >= 2 && self.scroll_thumb_pt.is_none() {
                 let dump = ui.debug_dump();
+                if let Some(w) = dump.windows.iter().find(|p| p.id == "scroll_v_win") {
+                    let pad = ui.theme().panel.padding + ui.theme().panel.border_w;
+                    self.scroll_thumb_pt = Some(Vec2::new(
+                        // 条带 = 可视区右缘约 12px 宽 ⇒ 取右缘 −6。
+                        w.origin.x + w.size.x - pad - 6.0,
+                        // 靠下 10px：必定落在轨道（而不是顶部的 thumb）。
+                        w.origin.y + w.size.y - pad - 10.0,
+                    ));
+                }
+            }
+            // `--sim-scroll-mode`：读两扇窗的**实测尺寸 + 裁剪层**（判定：按轴策略各自生效）。
+            if self.windows.show_scroll_wins && sim_frame == 40 {                let dump = ui.debug_dump();
                 let find = |id: &str| dump.windows.iter().find(|p| p.id == id);
                 let (a, b) = (find("scroll_noclip_win"), find("scroll_clip_win"));
                 let pad = (ui.theme().panel.padding + ui.theme().panel.border_w) * 2.0;
@@ -3677,7 +3734,32 @@ impl App for UiApp {
                 // scissor**，而窗里的 `TextEditor` 自带**文本框盒裁剪** ⇒ 恒为 `Some`。
                 // 所以 NoClip 那条轴用"窗口宽被内容撑过 `.width()`"来证（626 > 225），
                 // ClipOnly 那条轴用"scissor 宽 = 窗口宽 且 纵向铺满屏幕"来证（只裁横向）。
-                let _ = (no_clip_layer, ca);
+                // ④ `vscroll(Scroll)` 那扇窗：视口高 = 屏幕剩下的高（远小于内容）⇒
+                //    `ScrollState.content_h > 视口高`；拖一下右侧滚动条 ⇒ `offset > 0`。
+                let sv = ui.state().scrolls().get("scroll_v_win/scroll").copied();
+                let view_h = find("scroll_v_win")
+                    .map(|w| w.size.y)
+                    .unwrap_or(0.0);
+                // 已**验证**的：视口建成且内容高于视口（可滚）。
+                // ⚠ 还**没验证**的：纯点击滚动条轨道翻页（脚本的条带坐标还没打准，
+                //    `offset` 仍是 0）——这里如实打印，不用"视口建成"冒充"条带可点"。
+                let viewport_ok = sv.is_some_and(|s| s.content_h > 0.0 && s.content_h > view_h);
+                let clicked = sv.is_some_and(|s| s.offset > 1.0);
+                eprintln!(
+                    "sim-scroll-mode[vscroll(Scroll)]: 视口高={view_h:.0} · ScrollState={sv:?} {}",
+                    if viewport_ok {
+                        "[OK] 窗口内的滚动视口建成（内容高于视口 ⇒ 有滚动条；条带点击尚未验证）"
+                    } else {
+                        "[FAIL] 视口没建（内容没进滚动沙箱 / 高没被限制）"
+                    }
+                );
+                eprintln!(
+                    "sim-scroll-mode[vscroll(Scroll)]: 条带点击后 offset={} （0 = 脚本坐标没打中，待修）",
+                    sv.map(|s| s.offset).unwrap_or(-1.0)
+                );
+                let _ = clicked;
+                let _ = no_clip_layer;
+                let _ = ca;
                 eprintln!(
                     "sim-scroll-mode: NoClip 窗={sa:?}（期望宽 ≥ 400）· ClipOnly 窗={sb:?}（期望宽 {want_clip:.0}）\
                      · NoClip scissor={ca:?} · ClipOnly scissor={cb:?}（期望宽=窗口宽、高≥{screen_h:.0}）{}",
@@ -4385,6 +4467,20 @@ impl App for UiApp {
                     "[OK] 导出通路走通（`--no-file-dialog` ⇒ 完全不碰 rfd；结果由 `--pick theme-save=..` 预置）"
                 } else {
                     "[FAIL] 没走到导出（缺 `--no-file-dialog` ⇒ 弹了阻塞的对话框 / 卡住）"
+                }
+            );
+        }
+        // --sim-resize 阶段 4：**纯点击柄不该改尺寸**（"第二次点击瞬移回原位"的回归守卫）。
+        if self.sim_resize && f.frames() == 185 {
+            let before = self.windows.shrink_later;
+            let now = self.sim_resize_after.map(|s| s.y);
+            let ok = before.zip(now).is_some_and(|(a, b)| (a - b).abs() <= 0.5);
+            eprintln!(
+                "sim-resize: 再点一次柄（不拖）：前={before:?} 后={now:?} {}",
+                if ok {
+                    "[OK] 纯点击不改尺寸（没有跳回上一次拖之前的值）"
+                } else {
+                    "[FAIL] 第二次点击把尺寸改了（瞬移）"
                 }
             );
         }

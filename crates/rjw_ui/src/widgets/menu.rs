@@ -101,19 +101,89 @@ pub enum PopupSide {
     /// 触发器正下方（默认；按钮下拉菜单）。
     #[default]
     Below,
+    /// 触发器**正上方**（下方装不下时 [`popup_place`] 会翻到这边）。
+    Above,
     /// 触发器右侧（子菜单：菜单里再 `add` 一个 `Dropdown` 时用它）。
     Right,
+    /// 触发器**左侧**。
+    Left,
+}
+
+impl PopupSide {
+    /// **对面**那一侧（`Below ↔ Above`、`Right ↔ Left`）——翻转的候选顺序用它。
+    pub fn flip(self) -> Self {
+        match self {
+            PopupSide::Below => PopupSide::Above,
+            PopupSide::Above => PopupSide::Below,
+            PopupSide::Right => PopupSide::Left,
+            PopupSide::Left => PopupSide::Right,
+        }
+    }
 }
 
 /// **面板原点**（触发器矩形 + 方位 ⇒ 面板左上角；纯函数，可单测）。
 ///
-/// 两档之间留 2px 缝隙（面板与触发器不粘连，一眼看出"这是浮层"）。
+/// 各档之间留 2px 缝隙（面板与触发器不粘连，一眼看出"这是浮层"）。
+///
+/// ⚠ **只对 `Below` / `Right` 直接可用**（这两侧的原点只由触发器决定）；`Above` / `Left`
+/// 要**面板自身的长宽**才能算左上角 ⇒ 请用 [`popup_place`]（它接 `size` 并会挑方位）。
+/// 这里对那两侧按"0 尺寸"给退化值（= 触发器那条边 + 2px），仅为 API 完整。
 #[inline]
 pub fn popup_origin(trigger: Rect, side: PopupSide) -> Vec2 {
     match side {
         PopupSide::Below => Vec2::new(trigger.x, trigger.y + trigger.h + 2.0),
+        PopupSide::Above => Vec2::new(trigger.x, trigger.y - 2.0),
         PopupSide::Right => Vec2::new(trigger.x + trigger.w + 2.0, trigger.y),
+        PopupSide::Left => Vec2::new(trigger.x - 2.0, trigger.y),
     }
+}
+
+/// **把浮层放进屏幕**（纯函数，可单测）：`anchor` = 触发器（**绝对**矩形，物理像素）、
+/// `size` = 面板尺寸、`screen` = 屏幕尺寸、`prefer` = 首选方位。
+///
+/// 返回 `(面板左上角, 实际用的方位)`。规则：
+/// 1. **按候选顺序试**：`prefer` → `prefer.flip()` → 其余两个方向；
+/// 2. 命中条件 = 面板**完整落进屏幕**（横向允许贴着左右缘）；
+/// 3. 横向位置会**夹进屏幕**（先按原 x，超出右缘就左移贴边）——比"整块被挪走"可预期；
+/// 4. 四个方向都装不下 ⇒ 用 `prefer` 的位置再夹一次（宁可压边也不跑到屏幕外）。
+///
+/// 为什么需要它：`ColorPicker` 曾经直接给 `.pos(锚点 + 下移)`，装不下时被
+/// `WindowClamp::Screen` **整块搬到别处**（实测：面板高 676 时被翻到屏幕上方，
+/// 脚本坐标全落空、点面板外还会把面板关掉）。这里把"该翻到哪"变成**可测的纯函数**。
+pub fn popup_place(
+    anchor: Rect,
+    size: Vec2,
+    screen: Vec2,
+    prefer: PopupSide,
+) -> (Vec2, PopupSide) {
+    // 候选顺序：首选 → 对面 → 另外两侧（`Right/Left` 优先于 `Below/Above` 之外的组合）。
+    let mut candidates: Vec<PopupSide> = vec![prefer, prefer.flip()];
+    for s in [PopupSide::Below, PopupSide::Above, PopupSide::Right, PopupSide::Left] {
+        if !candidates.contains(&s) {
+            candidates.push(s);
+        }
+    }
+    // 无尺寸信息也能算 Below/Right；Above/Left 要用 size。
+    let place = |side: PopupSide| -> Vec2 {
+        match side {
+            PopupSide::Below => Vec2::new(anchor.x, anchor.y + anchor.h + 2.0),
+            PopupSide::Above => Vec2::new(anchor.x, anchor.y - size.y - 2.0),
+            PopupSide::Right => Vec2::new(anchor.x + anchor.w + 2.0, anchor.y),
+            PopupSide::Left => Vec2::new(anchor.x - size.x - 2.0, anchor.y),
+        }
+    };
+    // 横向夹进屏幕（保持"贴边"而不是被整块挪走）；纵向不夹 —— 纵向靠**换方位**解决。
+    let clamp_x = |p: Vec2| Vec2::new(p.x.clamp(0.0, (screen.x - size.x).max(0.0)), p.y);
+    let fits = |p: Vec2| {
+        p.x >= 0.0 && p.x + size.x <= screen.x && p.y >= 0.0 && p.y + size.y <= screen.y
+    };
+    for side in candidates {
+        let p = clamp_x(place(side));
+        if fits(p) {
+            return (p, side);
+        }
+    }
+    (clamp_x(place(prefer)), prefer)
 }
 
 // ─── 内容渲染器（`Dropdown` 的泛型约束） ────────────────────────
@@ -905,6 +975,29 @@ mod tests {
         assert!(!option_marked(0, None), "未选择 ⇒ 全不打勾");
         assert!(option_marked(2, Some(2)));
         assert!(!option_marked(1, Some(2)));
+    }
+
+    #[test]
+    fn popup_place_prefers_below_then_flips_above_then_clamps() {
+        let screen = Vec2::new(1000.0, 800.0);
+        let size = Vec2::new(200.0, 300.0);
+        // 下方装得下 ⇒ 用首选（Below），且 x 与锚点对齐。
+        let a = Rect::new(100.0, 100.0, 80.0, 30.0);
+        assert_eq!(popup_place(a, size, screen, PopupSide::Below), (Vec2::new(100.0, 132.0), PopupSide::Below));
+        // 下方装不下（锚点贴近屏幕底）⇒ **翻到上方**（这正是旧的 `WindowClamp` 会
+        // "整块搬到别处"、脚本坐标全落空的场景）。
+        let b = Rect::new(100.0, 700.0, 80.0, 30.0);
+        assert_eq!(popup_place(b, size, screen, PopupSide::Below), (Vec2::new(100.0, 398.0), PopupSide::Above));
+        // 贴右缘 ⇒ **横向夹进屏幕**（贴边而不是整块挪走）。
+        let c = Rect::new(950.0, 100.0, 40.0, 30.0);
+        let (p, side) = popup_place(c, size, screen, PopupSide::Below);
+        assert_eq!(side, PopupSide::Below);
+        assert_eq!(p.x, 800.0, "右缘贴边 = screen.w − size.w");
+        // 到处都装不下（面板比屏幕还高）⇒ 仍用首选方位、只夹横向（宁可压边不出屏）。
+        let huge = Vec2::new(200.0, 900.0);
+        let (p, side) = popup_place(a, huge, screen, PopupSide::Below);
+        assert_eq!(side, PopupSide::Below);
+        assert!(p.x >= 0.0 && p.x + huge.x <= screen.x);
     }
 
     #[test]

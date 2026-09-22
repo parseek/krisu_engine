@@ -31,7 +31,7 @@ use crate::id::IdAbsolute;
 use crate::layout::Child;
 use crate::style::{Brush, PanelStyle, SliderStyle};
 use crate::ui::UiAdd;
-use crate::{TextAlign, Ui};
+use crate::{TextAlign, Ui, WindowClamp};
 
 use super::SWATCH_RADIUS;
 use super::format::{ColorFormat, format_color, parse_color, rgba, rgba_keep_alpha};
@@ -93,7 +93,23 @@ pub(super) fn show_popup(
         + sv
         + GAP
         + row * n_ch as f32;
-    let popup_pos = Vec2::new(anchor.x, anchor.y + anchor.h + 2.0);
+    // ── **放哪儿**：不再"锚点 + 下移"交给 `WindowClamp` 整块搬走 ────────────────
+    // 旧实现直接 `.pos(锚点 + 24)`，面板比剩余空间高时 `WindowClamp::Screen` 会把它
+    // **整块翻到别处**（实测 `krusie-dark`：面板高 676 ⇒ 被搬到屏幕上方，脚本坐标全落空、
+    // 点面板外还会把面板关掉，看起来像"面板压根没开"）。
+    // 现在按**屏幕**自己挑方位（`popup_place`：下方 → 上方 → 其余，横向夹进屏幕），
+    // 并显式 `WindowClamp::Free`（位置已由本函数算好，引擎不要再挪）。
+    let screen = ui.window_physical_size();
+    let screen = Vec2::new(screen.0 as f32, screen.1 as f32);
+    let anchor_abs = ui.abs_rect(anchor);
+    let (placed_abs, _side) = crate::widgets::menu::popup_place(
+        anchor_abs,
+        Vec2::new(pw, ph),
+        screen,
+        crate::widgets::menu::PopupSide::Below,
+    );
+    // 回到"当前容器局部"（`.pos` 的坐标系）——`popup_place` 给的是绝对坐标。
+    let popup_pos = placed_abs - ui.content_origin();
     let popup_raw = format!("{id}::popup");
 
     // **浮层 z（基址 + 嵌套层数）**：`window_at` 的 `entry().or_insert()` 会保留既有值。
@@ -109,6 +125,9 @@ pub(super) fn show_popup(
     let mut color_out = color_in;
     ui.window(&popup_raw)
         .pos(Position::Physical(popup_pos))
+        // 位置已经由 `popup_place` 按屏幕算好 ⇒ **别再让引擎 clamp**（那正是
+        // "整块被搬走"的来源）。
+        .clamp(WindowClamp::Free)
         .style(panel_style)
         .show(|w| {
             let ui = w.ui_mut();
