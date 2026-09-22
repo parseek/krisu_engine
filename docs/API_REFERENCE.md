@@ -949,16 +949,27 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.window(id)` | `.pos(..)`（**不调 = 引擎自动级联**，Win32 `CW_USEDEFAULT` 语义：按首次出现顺序右下偏移 28 逻辑像素，越界回绕；结果持久于 `UiState::auto_pos`，用户拖拽优先） `.width(w)` `.gap(Size)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` **`.resize(allow, axes)`** `.title(&str)` `.close_button(&mut bool)` **`.collapsible(bool, Option<&mut bool>)`** `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；`.gap` = **内容子项行距**（不调 = `Theme::gap`；下拉 / 菜单浮层用 `Physical(popup_gap(scale))` 拿"逻辑 1px"的紧行距）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**单轴溢出策略** `.vscroll(ScrollMode)` / `.hscroll(ScrollMode)`（`ScrollMode::{NoClip, ClipOnly, Scroll}`）：
-- `NoClip`（默认）：该轴**不许裁** —— 大小必须装得下全部内容；此时 `.width(..)` / 拖出来的尺寸是**下限**（内容胜）；
-- `ClipOnly`：该轴是视口（超出被裁，无滚动条）；
-- `Scroll`：视口 + 滚动条。⚠ **当前实现里 `Scroll` 会降级成 `ClipOnly` 并打印一次提示**
-  （窗口内的滚动条 / 视口偏移还没做，见 `docs/UI_NEEDS.md`；`scroll_at` 的滚动容器不受影响）。
+| `ui.window(id)` | `.pos(..)`（**不调 = 引擎自动级联**，Win32 `CW_USEDEFAULT` 语义：按首次出现顺序右下偏移 28 逻辑像素，越界回绕；结果持久于 `UiState::auto_pos`，用户拖拽优先） `.width(w)` **`.height(h)`** `.gap(Size)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` **`.resizable(bool)`** / **`.resize(allow, axes)`** `.title(&str)` `.close_button(&mut bool)` **`.collapsible(bool, Option<&mut bool>)`** `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）；`.width` = 固定宽（右下角可缩放）；**`.height` = 固定高**（长内容窗口的**有界视口**：`.width(320.0).height(420.0).vscroll(Scroll)` ⇒ 视口 420 逻辑高 + 窗口内滚动条；不调 = 由内容决定）；`.gap` = **内容子项行距**（不调 = `Theme::gap`；下拉 / 菜单浮层用 `Physical(popup_gap(scale))` 拿"逻辑 1px"的紧行距）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**单轴溢出策略** `.vscroll(ScrollMode)` / `.hscroll(ScrollMode)`（`ScrollMode::{NoClip, ClipOnly, Scroll}`）：
+- `NoClip`（默认）：该轴**压缩**内容 —— `.width(..)` / 拖出来的尺寸是**固定宽**，子项被**压进**可用宽（`row` 里最后一个控件按余量缩；`Label` 自动换行 / 省略号）；
+- `ClipOnly`：该轴**裁切**内容（视口：子项按**自然宽**排、超出被裁、无滚动条）；
+- `Scroll`：视口 + 滚动条。⚠ **当前实现里 `hscroll(Scroll)` 会降级成 `ClipOnly` 并打印一次提示**
+  （水平滚动条 / 第二条滚动状态还没做，见 `docs/UI_NEEDS.md`；`vscroll(Scroll)` 是**真的**，`scroll_at` 的滚动容器不受影响）。
 - 显式设置**覆盖** `.placement(..)`；没给时老语义不变（`Placement::Clip` ⇒ 两轴都裁；
   **被拖过尺寸的那条轴**自动成为视口）。
 - **两条轴互相独立**（旧的 `Placement::Clip` 做不到）：只裁横向的窗口，纵向仍能由内容撑高。
 
-**拖拽缩放** `.resize(allow: bool, axes: Resize)`：`allow = false` ⇒ 不画柄也不响应拖拽（`.width` 仍是布局固定宽）；`Resize::{Horizontal, Vertical, Both}` 选轴（`↔` / `↕` / `↖↘`）；**没有 `.width(..)` 也能拖宽**（拖过即由用户接管，跨帧持久 `window_widths`——旧实现只在 `width.map(..)` 里读持久宽 ⇒ 拖了等于没拖）；高度被拖过（`Vertical` / `Both`）⇒ 窗口成为固定尺寸视口（**并自动裁剪内容**）；**不调** = 旧行为（有 `.width` 才能横向拖）。窗口柄与内容里的缩放柄 / 标题栏按钮重叠时**内容与按钮优先**（柄的应用推迟到内容之后且只在没人认领按下时生效）。**外框**（标题栏 / × / 收起）见下 |
+**拖拽缩放（egui 风）** `.resizable(allow: bool)`：只给"能不能拖大小"，**允许的轴自己推导**、内容"压缩还是裁切"由 `hscroll` 决定：
+
+| 垂直轴有视口？（`.vscroll(ClipOnly/Scroll)` 或给了 `.height(..)`） | `.resizable(true)` 允许的轴 | 水平轴内容 |
+|---|---|---|
+| 是 | **垂直 + 水平**都能拖 | `hscroll` 非 `NoClip` ⇒ **裁切**；否则 **压缩** |
+| 否（默认，高度由内容定） | **只有水平**能拖 | 同上 |
+
+`.resizable(false)` = 不画柄也不响应拖拽。**收起态**整条缩放链路关闭（没有尺寸可调：收起就是一行标题栏，柄的命中区会压住 ⌃/✕，按下种子还会把"收起后的那一行高"写成持久高 ⇒ 展开回来是一条缝）。
+
+**`Resize` / `.resize(allow, axes)`（低层显式版）**：`allow = false` ⇒ 不画柄也不响应拖拽（`.width` 仍是布局固定宽）；`Resize::{Horizontal, Vertical, Both}` 选轴（`↔` / `↕` / `↖↘`）；**没有 `.width(..)` 也能拖宽**；高度被拖过（`Vertical` / `Both`）⇒ 窗口成为固定尺寸视口（**并自动裁剪内容**）；**不调** = 旧行为（有 `.width` 才能横向拖）。调了 `.resizable(..)` 时**它覆盖本方法**。窗口柄与内容里的缩放柄 / 标题栏按钮重叠时**内容与按钮优先**（柄的应用推迟到内容之后且只在没人认领按下时生效）。
+
+**持久尺寸优先**（两条轴同口径）：`.width(..)` / `.height(..)` 只是**初始值**，用户拖过之后由 `UiState::{window_widths, window_heights}` **接管**（`persisted.or(explicit)`）。⚠ 让**显式值压过持久值**会出现"**第二次拖柄时那条轴弹回原位**"（用户实测："拖拽缩放柄到别的地方，然后下一次点击 x 坐标弹回"——`eg260818UI` 里只有唯一没有 `.width()` 的 `strict_win` 不弹，正是反证）；`--sim-resize[第二次拖柄不弹宽]` 是它的回归守卫。**外框**（标题栏 / × / 收起）见下 |
 | `ui.panel()` | `.pos(..)` `.drag(id)` `.style(..)` `.show(\|pp\| ..)` | 面板 = `panel_at` + `drag_panel_at` 统一入口 |
 | `ui.modal(id)` | `.pos(..)` `.width(w)` `.show(\|m\| ..)` | 模态对话框（唯一入口） |
 
@@ -1172,7 +1183,8 @@ impl Sense {
 「投影」滑杆后面那个色块就是它（可拖 alpha），`--sim-shadow` 脚本化守护这条通路。
 
 **缩放柄令牌**：`PanelStyle::grip: GripStyle { shape: GripShape, color, size, step, count }`
-—— 只对**允许拖拽缩放**的窗口（`.resize(true, ..)`，或没调 `.resize` 但设了 `.width(..)`）生效。
+—— 只对**允许拖拽缩放**的窗口（`.resizable(true)` / `.resize(true, ..)`，或没调 `.resize` 但设了 `.width(..)`）生效，
+且**收起态一律不画也不响应**（收起 = 一行标题栏，没有尺寸可调）。
 `GripShape::{Squares（默认，历史观感）, Bars（**三条实心横杠**）, Diagonal（**三条 45° 斜线**：首端点在同一水平线上等距、末端点在同一竖直线上等距）, Hidden}`；
 逐窗口入口 `PanelStyle::{with_grip, with_grip_color, with_grip_shape, without_grip}`。
 `Hidden` 只是**不画图案**，**拖动缩放照旧**（命中区独立存在，跟随 `size*step*count`，下限 14px）。

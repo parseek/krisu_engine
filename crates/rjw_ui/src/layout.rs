@@ -16,8 +16,22 @@ use crate::widgets::SizeClass;
 ///
 /// `Ui::avail_w` 用它：`row` 自己不是固定宽容器，只看最内层会让 row 里的控件拿不到
 /// 外层窗口的可用宽（见 [`Frame::avail_w`] 的说明）。
+///
+/// ⚠ **遇到"布局根"就停**（[`Frame::is_layout_root`]：窗口 frame 就是根）：窗口的内容
+/// 宽只能来自**它自己**（`.width(..)` 固定宽 / 内容自然宽），**不许**向窗口外面的
+/// 容器借宽。历史 bug：根 frame 的固定宽 = 视口宽（那是给 `win=0` 顶层内容用的），
+/// 自动宽窗口里的 `ui.divider()` 于是拿到"可用宽 = 视口宽（1920）"⇒ 整窗被撑成
+/// 屏幕宽（用户实测："Gallery 被撑开得很大，并且跟随窗口大小；疑似是分割线的问题"）。
 pub(crate) fn stack_avail_w(frames: &[Frame]) -> Option<f32> {
-    frames.iter().rev().find_map(|f| f.avail_w())
+    for f in frames.iter().rev() {
+        if let Some(w) = f.avail_w() {
+            return Some(w);
+        }
+        if f.is_layout_root() {
+            return None;
+        }
+    }
+    None
 }
 
 /// **自适应收窄的下限**（物理像素）：水平一行里给"下一个子项"留的余量小于它时
@@ -112,8 +126,13 @@ pub(crate) struct Frame {
     /// 后自动换行（实测过的 bug：窄的 `.width()` 窗口里 `row` 里的控件整排突出去，
     /// 直到把窗口拖大才看得回去）。
     max_w: Option<f32>,
-    /// **容器最小宽度**（见 [`Self::set_min_w`]；`None` = 不限）：只抬 `settle_size` 的宽。
-    min_w: Option<f32>,
+    /// **宽度轴是视口**（见 [`Self::set_clip_w`]）：子项**不按宽度压缩**（按自然宽排布，
+    /// 超出部分由外层裁剪）。`fixed_w` / `max_w` / `remaining_w` 的 clamp 全部跳过 ——
+    /// 这正是"**裁切**内容"与"**压缩**内容"的分界（用户要的 egui 语义）。
+    clip_w: bool,
+    /// **本 frame 是"布局根"**（见 [`Self::set_layout_root`]）：`avail_w` 的向外扫描
+    /// **到此为止** —— 窗口的内容宽只能由它自己给（`fixed_w` / 内容自然宽）。
+    layout_root: bool,
     /// **绝对放置内容的包围盒**（`*_at` / `add_at` / 控件命中区 的矩形并集；
     /// **相对容器 origin**，与 `child_rect` 同一空间）。
     ///
@@ -145,7 +164,8 @@ impl Frame {
             fixed_h: None,
             fixed_w: None,
             max_w: None,
-            min_w: None,
+            clip_w: false,
+            layout_root: false,
             content_bounds: None,
         }
     }
@@ -168,7 +188,8 @@ impl Frame {
             fixed_h: None,
             fixed_w: None,
             max_w: None,
-            min_w: None,
+            clip_w: false,
+            layout_root: false,
             content_bounds: None,
         }
     }
@@ -244,25 +265,45 @@ impl Frame {
     ///
     /// `Ui::avail_w` 由内向外找**第一个**有值的 frame —— 于是 `row` 里的 `Label`
     /// 也能看到外层窗口的固定宽（否则它会按自然宽把整行排到窗口外面）。
+    ///
+    /// ⚠ **视口轴（[`Self::clip_w`]）恒返回 `None`**：该轴要的是"自然宽 + 裁切"，
+    /// 一旦上报可用宽，`LimitedInParent` 控件（`Label` 折行 / 省略号）就会**压缩**
+    /// 自己 —— 那正好是 [`ScrollMode::NoClip`](crate::ScrollMode) 的语义。
     pub(crate) fn avail_w(&self) -> Option<f32> {
+        if self.clip_w {
+            return None;
+        }
         self.fixed_avail_w().or(match self.max_w {
             Some(w) if w > 0.0 => Some(w),
             _ => None,
         })
     }
 
-    /// **容器最小宽度**（`None` = 不限）：`settle_size` 的宽度被**抬到**它
-    /// （内容比它宽 ⇒ 内容胜 —— 这正是 `ScrollMode::NoClip` 的"拖出来的是下限"语义：
-    /// 窗口不许裁掉内容，所以拖小只会被内容顶回去）。
-    ///
-    /// 与 [`Self::fixed_w`] 的区别：固定宽**覆盖**自然宽（内容超出被裁）；最小宽只是下限。
-    pub(crate) fn set_min_w(&mut self, w: f32) {
-        self.min_w = (w > 0.0).then_some(w);
-    }
-
     /// 设置**内容最大宽**（见 [`Self::max_w`]；`None` / `<= 0` = 不限）。
     pub(crate) fn set_max_w(&mut self, w: Option<f32>) {
         self.max_w = w.filter(|w| *w > 0.0);
+    }
+
+    /// **宽度轴当视口**（`clip_w`）：子项**按自然宽排布、不压缩**，超出由外层裁掉。
+    ///
+    /// 与 `fixed_w` 的区别只在**子项**：`fixed_w` 既定死结算宽、又把子项压进这个宽
+    /// （"压缩"）；`clip_w` 只定死结算宽，子项照自然尺寸排（"裁切"）。两者常一起设。
+    pub(crate) fn set_clip_w(&mut self, on: bool) {
+        self.clip_w = on;
+    }
+
+    /// **本 frame 是"布局根"**（窗口 frame）：`avail_w` 的**向外扫描到此为止**。
+    ///
+    /// 没有它，根 frame（固定宽 = 视口宽，见 `Ui::new`）会把"视口宽"当成窗口内容的
+    /// 可用宽 ⇒ 自动宽窗口里的 `divider()` / `Label` 按屏幕宽排 ⇒ 整窗被撑成屏幕宽
+    /// （用户实测："Gallery 被撑开得很大，并且跟随窗口大小；疑似是分割线的问题"）。
+    pub(crate) fn set_layout_root(&mut self, on: bool) {
+        self.layout_root = on;
+    }
+
+    /// 见 [`Self::set_layout_root`]。
+    pub(crate) fn is_layout_root(&self) -> bool {
+        self.layout_root
     }
 
     /// **本容器还能给下一个子项多少宽**（`None` = 不限 / 不是水平堆叠）。
@@ -383,25 +424,35 @@ impl Frame {
         self.next_min = Vec2::ZERO;
         self.next_max = Vec2::ZERO;
         self.next_class = SizeClass::SingleLine;
-        // 容器固定宽：子项宽度 clamp（内容按固定宽排布，高度自然）
-        let w = match self.fixed_w {
-            Some(fw) if fw > 0.0 => w.min(fw),
-            _ => w,
-        };
-        // 内容最大宽（从父级继承）：同样 clamp 子项宽度，但**不改写**结算宽 ——
-        // 嵌套容器因此不会把内容排到固定宽窗口外面（宽度收窄，`LimitedInParent`
-        // 控件经 `avail_w` 拿到该宽后自动换行 / 压窄）。
-        let w = match self.max_w {
-            Some(mw) => w.min(mw),
-            None => w,
-        };
-        // **水平堆叠的余量**：一行里"最后一个控件"也必须缩，否则整行会排到可用宽
-        // 外面（单子项各自都没超限）。只在余量还够一个像样的控件时才压——余量太小
-        // 就宁可让它溢出，也不能把控件压成 0 宽（那等于凭空消失）。
-        let w = match self.remaining_w() {
-            Some(rem) if rem < w && rem >= ADAPT_MIN_W => rem,
-            _ => w,
-        };
+        // ─── 子项宽度 clamp（三条）────────────────────────────────────────────
+        //
+        // ⚠ **视口轴（`clip_w`）三条全部跳过**：子项按**自然宽**排布，超出部分交给
+        // 外层裁剪 —— 这就是"**裁切**内容"与"**压缩**内容"的分界（用户要的 egui 语义）。
+        // `fixed_w` 仍然定死**结算宽**（窗口就是我给的这个宽），但不再压缩子项。
+        let mut w = w;
+        if !self.clip_w {
+            // 容器固定宽：子项宽度 clamp（内容按固定宽排布，高度自然）
+            if let Some(fw) = self.fixed_w
+                && fw > 0.0
+            {
+                w = w.min(fw);
+            }
+            // 内容最大宽（从父级继承）：同样 clamp 子项宽度，但**不改写**结算宽 ——
+            // 嵌套容器因此不会把内容排到固定宽窗口外面（宽度收窄，`LimitedInParent`
+            // 控件经 `avail_w` 拿到该宽后自动换行 / 压窄）。
+            if let Some(mw) = self.max_w {
+                w = w.min(mw);
+            }
+            // **水平堆叠的余量**：一行里"最后一个控件"也必须缩，否则整行会排到可用宽
+            // 外面（单子项各自都没超限）。只在余量还够一个像样的控件时才压——余量太小
+            // 就宁可让它溢出，也不能把控件压成 0 宽（那等于凭空消失）。
+            if let Some(rem) = self.remaining_w()
+                && rem < w
+                && rem >= ADAPT_MIN_W
+            {
+                w = rem;
+            }
+        }
         let placed = match &mut self.kind {
             FrameKind::Stack { side, gap } => {
                 let local = self.cursor;
@@ -491,13 +542,9 @@ impl Frame {
             Some(m) => h.max(m),
             None => h,
         };
-        // 容器**最小宽度**（`set_min_w`）：只抬宽，不改写子项布局 —— `NoClip` 轴的
-        // "拖出来的是下限"用它表达（内容比拖出来的大 ⇒ 内容胜）。
-        let w = match self.min_w {
-            Some(m) => size.x.max(m),
-            None => size.x,
-        };
-        Vec2::new(w, h)
+        // 宽度**不再有"最小宽"这一档**：固定宽（`fixed_w`）与视口（`clip_w`）已经覆盖
+        // "内容压缩"与"内容裁切"两种语义（用户给的判定表，见 `WindowBuilder::resizable`）。
+        Vec2::new(size.x, h)
     }
 
     fn settle_size_inner(&self) -> Vec2 {

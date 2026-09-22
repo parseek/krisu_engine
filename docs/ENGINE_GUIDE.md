@@ -1657,13 +1657,14 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 
 **按轴的溢出策略（`.vscroll` / `.hscroll`）**：`ScrollMode::{NoClip(默认), ClipOnly, Scroll}`，
 两条轴**各自独立** —— 这是旧的 `Placement::Clip`（一体化）做不到的：只裁横向的窗口，
-纵向仍能由内容撑高。
+纵向仍能由内容撑高。**"压缩内容"与"裁切内容"就是这条轴的分界**（用户给的判定表）：
 
-| 模式 | 该轴的大小 | 超出部分 |
-|---|---|---|
-| `NoClip`（默认） | 内容撑开；`.width(..)` / 拖出来的值是**下限** | 不裁（可见、可点） |
-| `ClipOnly` | 固定 = `.width(..)` / 拖出来的值 | 裁掉（`clip_for_axes` 只收窄该轴） |
-| `Scroll` | 同 `ClipOnly` | ⚠ **暂按 `ClipOnly` 处理并打印一次提示**（窗口内的滚动条 / 视口偏移还没做，见 `UI_NEEDS.md`） |
+| 模式 | 该轴的大小 | 超出部分 | 子项宽度 |
+|---|---|---|---|
+| `NoClip`（默认） | `.width(..)` / 拖出来的值 = **固定宽** | 不裁（可见、可点） | **压缩**：被 `fixed_w` / `max_w` / `remaining_w` 压进可用宽（`Label` 换行 / 省略号） |
+| `ClipOnly` | 固定 = `.width(..)` / 拖出来的值 | 裁掉（`clip_for_axes` 只收窄该轴） | **裁切**：`Frame::set_clip_w(true)` ⇒ 三条 clamp 全跳过，子项按**自然宽**排 |
+| `Scroll`（垂直） | 同 `ClipOnly`，且内容包进 `scroll_at_axes` 视口（滚动条 + 滚轮） | 裁掉 + 可滚 | 同 `ClipOnly` |
+| `Scroll`（水平） | ⚠ **暂按 `ClipOnly` 处理并打印一次提示**（水平滚动条 / `offset_x` 还没做，见 `UI_NEEDS.md`） | 裁掉 | 同 `ClipOnly` |
 
 解算顺序（纯函数 `resolve_scroll_mode`，单测 `scroll_mode_resolution_prefers_explicit_then_legacy_then_dragged`）：
 **显式设置 > `Placement::Clip` > "该轴被用户拖过尺寸"**；都没有 ⇒ `NoClip`
@@ -1672,9 +1673,16 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 > - **命中**跟着裁切走：只有"会被裁的那条轴"把命中限制收到窗口矩形内（`cur_win_hit_limit` +
 >   `clip_for_axes`），另一条轴继续按屏幕兜底 ⇒ `NoClip` 轴溢出可见就还能点（幽灵控件那条规则
 >   不会被顺手扩大）。
-> - 验收：`--sim-scroll-mode` —— 两扇同内容窗，`hscroll(NoClip)` 撑到 626（`.width(150)`=225 只是下限）、
->   `hscroll(ClipOnly)` 固定 251，且它的 scissor = `(520, 0, 251, 1080)`（宽 = 窗口、**高 = 整屏**
->   ⇒ 只裁了横向）。
+> - **窗口是布局根**（`Frame::set_layout_root`）：`avail_w()` 的向外扫描**在窗口 frame 停住**。
+>   根 frame 的固定宽 = **视口宽**（那是给 `win=0` 顶层内容用的），漏进窗口里会让自动宽窗口的
+>   `divider()` / `Label` 拿到"可用宽 = 1920" ⇒ **整窗被撑成屏幕宽、还跟着主窗口大小变**
+>   （用户实测："Gallery 被撑开得很大，并且跟随窗口大小；疑似是分割线的问题"——正是分割线）。
+> - 验收：`--sim-scroll-mode`（按轴独立）—— 两扇同内容窗：`hscroll(NoClip)` 那扇**不给 `.width()`**
+>   ⇒ 内容定宽 626；`hscroll(ClipOnly)` 固定 251 且 scissor = `(520, 0, 251, 1080)`
+>   （宽 = 窗口、**高 = 整屏** ⇒ 只裁了横向）。`--sim-row-overflow` 则摆**同宽同内容**（`.width(150)`）
+>   的两扇窗证明"压缩 vs 裁切"：`hscroll(NoClip)` 的行被压到 199（可用宽 225）、
+>   `hscroll(ClipOnly)` 的行**保持自然宽 282**（超出被裁）且幽灵控件点不到；
+>   同一条里还有"自动宽窗 + `divider()`"必须留在 240..600（守卫布局根）。
 
 **缩放柄令牌**（固定宽窗口右下角那个"拖拽按钮"）：
 
@@ -1697,14 +1705,56 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 > 斜线在 `size*count` 的小方框里间距不到 1px，羽化会把它们糊成一片。`GripStyle::extent()`
 > （命中区下限的来源）同步按 1.5× 算。
 
-### 拖拽缩放（窗口）：显式 `bool` + 轴向
+**窗口内的滚动视口（`vscroll(Scroll)` + `.height(..)`）**：
+
+- `.height(h)` = **固定高**（外框高，物理；逻辑值 `×scale`）—— 长内容窗口（列表 / 调色板 /
+  日志）要的是"有界的视口"，而不是"被内容撑到和屏幕一样高"。`.width(320.0).height(420.0)
+  .vscroll(Scroll)` ⇒ 视口 420 逻辑高 + 滚动条（实测外框高 = `420 × scale`）。
+- 不给 `.height(..)` 时视口高 = **`min(内容需要的总高, 屏幕剩余)`** —— "按内容定高、不许跑出屏幕"。
+  只用"屏幕剩余"会把**内容很矮**的窗口也撑到屏幕底（两行内容的窗口 ≈ 1000 高的大空面板）；
+  内容高从**上一帧**的滚动状态读（`ScrollState.content_h`，与视口无关；首次未知 ⇒ 先按屏幕
+  剩余、次帧收敛）。回归守卫：`--sim-scroll-mode[短内容视口]`（两行内容 ⇒ 112 高；去掉 min
+  立刻回到 1020 `[FAIL]`）。
+  ⚠ 内容**很长**时这条规则给的就是"屏幕剩余"（例如 21 行调色板），想要一个**从一开始就有界**
+  的窗口必须自己给 `.height(..)`（`egUI` 的调色板就是这么修的：用户实测"最开始打开调色板
+  编辑器时，仍然会将高度撑到窗口底端，直到手动拉开大小"）。
+- 实现：`window_impl` 先把内容基线让给标题栏占位，再 `frame.set_fixed_h(视口高 + pad)` 并
+  `scroll_at_axes(..)`（滚动容器 id 用**相对名** `"scroll"` —— 外面已经 `with_id(window)`，
+  写 `{id}::scroll` 会变成 `win/win::scroll`）。
+- ⚠ **收起态不建视口**（`!collapsed`）：收起 = 一行标题栏，而视口会 `set_fixed_h(视口高 + pad)`
+  把窗口重新顶高 ⇒ 用户实测"resizable 的窗口点 ⌃ 仍然不收起"（状态翻转了、内容也没了，
+  但那个空面板还是原来那么高）。同理视口高取 `fixed_h`（**已按收起态清零**）而不是原始
+  `eff_h`。回归守卫：`--sim-scroll-mode[收起 resizable+vscroll 窗]`（630 → 52）。
+
+
+
+### 拖拽缩放（窗口）：`resizable(bool)` + 轴向推导
 
 ```rust
-ui.window("w").width(200.0).resize(true, Resize::Both).show(|w| ..);      // 宽高同调
-ui.window("popup").width(300.0).resize(false, Resize::None).show(|w| ..); // 固定宽但不可拖
+// egui 风：只给"能不能拖大小"，轴自己推导（见下表）
+ui.window("palette").width(320.0).height(420.0).vscroll(ScrollMode::Scroll)
+    .resizable(true).show(|w| ..);                 // 垂直 + 水平都能拖，水平压缩
+ui.window("list").width(320.0).vscroll(ScrollMode::Scroll)
+    .resizable(true).hscroll(ScrollMode::ClipOnly).show(|w| ..); // 水平改成裁切
+// 低层显式版（`.resizable(..)` 覆盖它）
+ui.window("w").width(200.0).resize(true, Resize::Both).show(|w| ..);
+ui.window("popup").width(300.0).resize(false, Resize::None).show(|w| ..);
 ```
 
-| 写法 | 效果 |
+**判定表**（`.resizable(allow)`；纯函数 `resolve_resizable_axes` / `v_axis_is_viewport`）：
+
+| 垂直轴是视口？（`.vscroll(ClipOnly/Scroll)` 或给了 `.height(..)`） | 允许的轴 | 水平轴内容 |
+|---|---|---|
+| 是 | **垂直 + 水平** | `hscroll` 非 `NoClip` ⇒ 裁切；否则压缩 |
+| 否（高度由内容定） | **只有水平**（拖高没意义：内容当帧就顶回来） | 同上 |
+
+`.resizable(false)` ⇒ `Resize::None`（不画柄也不响应）。**`allow = false` ⇒ 收起态**：整条
+缩放链路关闭 —— 收起 = 一行标题栏（没有尺寸可调），而柄的命中区（右下角 14~35px 方块）
+会压住标题栏最右那两个按钮、按下种子还会把"收起后的那一行高"写进 `window_heights`
+（`or_insert` 是永久的）⇒ 用户实测两条症状："**resizable 的窗口在点击收起按钮时仍然不会
+收起**"（短窗口里 ⌃ 被柄抢走）与"**点一下柄就弹回/跳回去了**"（展开回来成一条缝）。
+
+| 低层写法 | 效果 |
 |---|---|
 | **不调 `.resize(..)`** | **旧行为**：有 `.width(..)` 就能横向拖（右下角柄），没有就不出柄 |
 | `.resize(false, ..)` | **不画柄、不响应拖拽**；`.width(..)` 仍是布局固定宽（菜单 / 下拉浮层用） |
@@ -1712,11 +1762,18 @@ ui.window("popup").width(300.0).resize(false, Resize::None).show(|w| ..); // 固
 | `.resize(true, Resize::Vertical)` | 只调高（`↕` 光标）：宽度仍由内容决定，拖出的高度跨帧持久 |
 | `.resize(true, Resize::Both)` | **宽高同调**（`↖↘` 光标）：高度跨帧持久于 `UiState::window_heights`，被拖过之后由用户接管（内容不再撑高；**并且内容自动裁剪**，见下） |
 
+> ⚠ **尺寸是"持久优先"**（`.width(..)` / `.height(..)` 只是**初始值**）：
+> `window_impl` 里 `width = persisted_w.or(explicit_w)`、`eff_h = persisted_h.or(explicit_h)`，
+> **缩放柄的基准尺寸 `cur_w` / `cur_h` 必须与它同口径**。让**显式值压过持久值**的病是：
+> 第二次拖柄时基准从 `.width()` 的初值起算 ⇒ 那条轴**弹回原位**（用户实测："拖拽缩放柄到
+> 别的地方，然后下一次点击 x 坐标弹回"；`eg260818UI` 里只有**唯一没有 `.width()`** 的
+> `strict_win` 不弹 —— 反证）。回归守卫：`--sim-resize[第二次拖柄不弹宽]`
+> （阶段 1 拖到 386 → 阶段 3 只拖 y → 宽度必须仍是 386；旧实现会回到 326）。
+>
 > ⚠ **没有 `.width()` 也能拖宽**（用户实测："resize Horizontal 不在设置 width 的情况下
-> 无法缩放"）：`window_impl` 里持久宽（`UiState::window_widths`）必须**无条件**读
-> （`width.or(persisted)`），只在 `width.map(..)` 里读会让拖出来的宽度**没人用**
-> （写进去又被丢掉）。语义与高度一致：**拖过就由用户接管**（该轴不再参与内容撑开）。
-> 轴 → "谁接管" 的表格抽成纯函数 `resize_fixes_width` / `resize_fixes_height` 并单测
+> 无法缩放"）：持久宽（`UiState::window_widths`）必须**无条件**读，只在 `width.map(..)` 里
+> 读会让拖出来的宽度**没人用**（写进去又被丢掉）。轴 → "谁接管" 的表格抽成纯函数
+> `resize_fixes_width` / `resize_fixes_height` 并单测
 > （`resize_axes_pick_the_axes_that_the_user_takes_over`）。
 >
 > ⚠ **缩放柄的拖拽基准属于"某一次按住"**：`resize_handle_apply` 在松手时清空

@@ -196,6 +196,10 @@ pub struct WindowOptions {
     /// `CW_USEDEFAULT` 语义；见 [`WindowBuilder::pos`](crate::WindowBuilder::pos)）。
     pub pos: Option<Position>,
     pub width: Option<Size<f32>>,
+    /// **固定高**（[`WindowBuilder::height`](crate::WindowBuilder::height)；`None` = 由内容
+    /// 决定）。窗口此前只有"固定宽"，长内容（列表 / 调色板）只能把窗口撑成屏幕那么高 ——
+    /// 与 `.vscroll(Scroll)` 合用才有"有界视口 + 滚动条"。
+    pub height: Option<Size<f32>>,
     pub level: Level,
     pub placement: Placement,
     pub style: Option<PanelStyle>,
@@ -203,7 +207,20 @@ pub struct WindowOptions {
     /// `(allow, axes)`：`allow = false` ⇒ 既**不画缩放柄**也**不响应拖拽**
     /// （`.width(..)` 仍作为布局固定宽生效，菜单 / 下拉浮层就是这么用的）；
     /// `axes = Resize::Both` ⇒ 右下角柄**宽高同调**（高度跨帧持久）。
+    ///
+    /// ⚠ **两条轴由 [`WindowBuilder::resizable`](crate::WindowBuilder::resizable) 推导**
+    /// （egui 语义）：一旦调了它，本字段被推导结果**覆盖**（见那里的判定表）。
     pub resize: Option<(bool, Resize)>,
+    /// **只给一个"能不能拖大小"的布尔**（egui 风：[`WindowBuilder::resizable`]
+    /// (crate::WindowBuilder::resizable)）——允许的**轴**由 `vscroll` / `height` 推导：
+    ///
+    /// | `vscroll`（垂直轴是视口 / 有固定高） | 允许的轴 | 水平轴内容 |
+    /// |---|---|---|
+    /// | 是 | **垂直 + 水平** 都能拖 | `hscroll` ⇒ **裁切**；否则**压缩** |
+    /// | 否 | **只有水平**能拖（高度由内容定） | 同上 |
+    ///
+    /// `Some(false)` = 不画柄也不响应；`None`（默认）= 退回 [`Self::resize`] 的老语义。
+    pub resizable: Option<bool>,
     /// **内容子项间距**（[`WindowBuilder::gap`](crate::WindowBuilder::gap)；`None` = 用
     /// [`Theme::gap`](crate::Theme::gap)）。
     ///
@@ -224,11 +241,13 @@ impl Default for WindowOptions {
             // `None` = **引擎自动分配位置**（CW_USEDEFAULT 语义；见 `Ui::window` 文档）。
             pos: None,
             width: None,
+            height: None,
             level: Level::Topmost,
             placement: Placement::Expand,
             style: None,
             clamp: WindowClamp::Screen,
             resize: None,
+            resizable: None,
             gap: None,
             vscroll: None,
             hscroll: None,

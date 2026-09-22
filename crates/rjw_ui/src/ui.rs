@@ -3157,6 +3157,8 @@ impl<'a> Ui<'a> {
         id: &str,
         pos: Vec2,
         width: Option<f32>,
+        // **固定高**（物理；`None` = 由内容决定）——`.height(..)` 的物理值。
+        height: Option<f32>,
         // 内容子项间距（物理；`None` = `Theme::gap`）。下拉 / 菜单浮层传更紧的值。
         content_gap: Option<f32>,
         topmost: bool,
@@ -3169,18 +3171,25 @@ impl<'a> Ui<'a> {
         f: impl FnOnce(&mut Window<'_, '_>),
     ) -> Vec2 {
         let id_for = self.id_for(id);
-        // 固定宽优先用**持久值**（缩放柄结果，跨帧保持；首次 = 传入 width）。统一在此
-        // 读取——`window_at_w` / `modal_at_w` / `WindowBuilder::width` 都不必各自处理。
+        // **本帧生效的尺寸** = 持久值（缩放柄拖出来的，跨帧保持）**优先**于传入的
+        // `.width(..)` / `.height(..)`（那只是**初始值**）。统一在此读取——`window_at_w` /
+        // `modal_at_w` / `WindowBuilder::{width,height}` 都不必各自处理。
         //
-        // ⚠ **`.width(..)` 恒为固定宽**（文档语义）；**持久宽**（缩放柄拖出来的）才看轴策略：
-        // `NoClip` 轴 ⇒ 下限（内容可撑大）、`ClipOnly` 轴 ⇒ 视口（固定）。把 `.width(..)`
-        // 也按"下限"处理会悄悄改掉所有固定宽窗口的布局（实测：`--sim-chrome` /
-        // `--sim-cover` 的现场全变）。
+        // ⚠ **必须"持久优先"**，否则第二次拖柄会从**旧值**重新起算 ⇒ 那条轴弹回原位
+        // （用户实测："拖拽缩放柄到别的地方，然后下一次点击 x 坐标弹回"——`eg260818UI`
+        // 里只有**唯一没有 `.width()`** 的 `strict_win` 不弹，正是这条的反证）。
         let explicit_w = width;
         let persisted_w = self.state.window_widths.get(id_for.as_str()).copied();
         // 用于 clamp / 缩放柄 / 持久化判断的"有效宽"。
-        let width = explicit_w.or(persisted_w);
-        
+        let width = persisted_w.or(explicit_w);
+        // **高度**：`.height(..)`（固定高）与持久高（拖过）同口径（持久优先）；
+        // **收起态例外**（收起 = 只剩一行标题栏 ⇒ 忽略固定高 / 持久高）。这里**必须在
+        // 缩放柄之前**算好：柄的基准 / 当前尺寸要用它。
+        let explicit_h = height;
+        let persisted_h = self.state.window_heights.get(id_for.as_str()).copied();
+        let eff_h = persisted_h.or(explicit_h);
+        let collapsed_now = chrome.collapsed(self.state, id_for.as_str());
+        let fixed_h = if collapsed_now { None } else { eff_h };
         // z-order：首次分配 max+1；点击置顶在拖拽判定处处理
         let z = {
             // z-order：首次分配 max+1；点击置顶在拖拽判定处处理。
@@ -3263,7 +3272,14 @@ impl<'a> Ui<'a> {
         // `allow = false` ⇒ 不画柄也不响应拖拽（`.width(..)` 仍作布局固定宽）；
         // `axes`：`Horizontal` 只调宽 / `Vertical` 只调高 / `Both` 宽高同调（光标随之）。
         let (allow_resize, resize_axes) = resolve_window_resize(chrome.resize, width.is_some());
-        let resize_on = allow_resize && resize_axes != Resize::None;
+        // ⚠ **收起态没有尺寸可调**：收起 = 一行标题栏（固定高都被忽略），此时——
+        // ① 柄的命中区（右下角 14~35px 方块）**压住标题栏最右那两个按钮**：短窗口（收起后
+        //    只有一行高）里 ⌃/✕ 会被柄抢走 ⇒ 用户实测"resizable 的窗口在点击收起按钮时
+        //    仍然不会收起"（点下去是在拖尺寸）；
+        // ② 柄的**按下种子**会把"收起后的那一行高"写进 `window_heights`（`or_insert` 是
+        //    永久的）⇒ 展开回来时窗口变成一条缝，看起来就是"点一下柄就弹回/跳回去了"。
+        // 故收起态整条缩放链路关掉（不画、不命中、不种子、不应用）。
+        let resize_on = allow_resize && resize_axes != Resize::None && !collapsed_now;
         // **窗口柄：命中在这里（内容之前），应用推迟到内容 + 标题栏之后** ——
         // 面板内最后一个控件的缩放柄（如 `TextEditor::resize(Both)`）常常和窗口柄叠在
         // 同一个右下角：内容后登记 ⇒ 控件级遮挡上它在上；应用再等 `!press_claimed` ⇒
@@ -3306,15 +3322,12 @@ impl<'a> Ui<'a> {
                         .or_insert(ps.y);
                 }
             }
-            // 当前尺寸 = 屏幕上那个（宽取持久**内容**宽 / 无 `.width()` 时由外框宽换算；
-            // 高取持久高度 = 外框高。**两者单位不同**，混用会让每拖一次涨 2×pad）。
+            // 当前尺寸 = 屏幕上那个 = **本帧生效的尺寸**（`width` / `eff_h` 已是"持久优先"；
+            // 两者都没有 = 自动尺寸，由上一帧外框换算）。**宽是内容宽、高是外框高** ——
+            // 单位不同，混用会让每拖一次涨 2×pad；用**显式值**当基准则会让第二次拖拽
+            // 从旧值起算（那条轴"弹回原位"）。
             let cur_w = width.unwrap_or((ps.x - pad_total * 2.0).max(1.0));
-            let cur_h = self
-                .state
-                .window_heights
-                .get(id_for.as_str())
-                .copied()
-                .unwrap_or(ps.y);
+            let cur_h = eff_h.unwrap_or(ps.y);
             grip = Some((
                 h_id,
                 Vec2::new(cur_w, cur_h),
@@ -3381,30 +3394,28 @@ impl<'a> Ui<'a> {
             hs
         };
         let mut frame = Frame::new_stack(PackSide::Top, gap, pad_total);
-        match (explicit_w, persisted_w, hs) {
-            // ① **没给 `.width()`**、但拖过、且该轴是 `NoClip`：拖出来的宽是**下限**
-            //    （内容可撑大 ⇒ "装得下全部内容"）。
-            (None, Some(p), ScrollMode::NoClip) => frame.set_min_w(p),
-            // ② 其余有宽可用的情形一律**固定宽**：`.width(..)` 是"我要这个宽"；拖过之后
-            //    由用户接管（持久值覆盖 `.width(..)`，`width` 已是 `explicit.or(persisted)`）；
-            //    拖过 + `ClipOnly` ⇒ 视口（固定，超出被裁）。
-            (_, Some(w), _) | (Some(w), None, _) => frame.set_fixed_w(w),
-            (None, None, _) => {}
+        // ── 宽度：**一律固定**（不再有"拖出来的是下限"这条）────────────────────────
+        //
+        // 老语义里 `NoClip` + 持久宽 = **下限**（内容可以把窗口撑得更宽）。它有两个
+        // 后果，用户都实测过：拖过一次之后窗口被内容顶得**越拖越宽**（"gallery 咋变
+        // 这么宽"）；而"压缩内容"根本没发生。egui 语义（用户给的判定表）是：
+        // 水平轴要么**压缩**内容（`NoClip`）、要么**裁切**内容（`ClipOnly`/`Scroll`），
+        // 两条都用**给定的宽**（`.width(..)` 或用户拖出来的持久宽）。
+        // **有宽就固定宽**（`.width(..)` 的初始值 / 用户拖出来的持久值都已含在 `width` 里）；
+        // 没宽 = 自动宽（由内容结算）。
+        if let Some(w) = width {
+            frame.set_fixed_w(w);
         }
+        // **该轴是视口** ⇒ 子项按自然宽排布、不压缩（超出由下面的 clip 层裁掉）。
+        // 这就是"**裁切内容**"与"**压缩内容**"的唯一开关（见 `Frame::set_clip_w`）。
+        frame.set_clip_w(hs != ScrollMode::NoClip);
+        // **窗口 = 布局根**：内容宽只能由本窗口给（`fixed_w` / 内容自然宽），**不许**
+        // 向窗口外的容器借宽（根 frame 的固定宽是"视口宽"，那是给顶层 `win=0` 内容用的）。
+        // 不设它 ⇒ 自动宽窗口里的 `divider()` / `Label` 拿到视口宽 ⇒ 整窗被撑成屏幕宽。
+        frame.set_layout_root(true);
         // `vscroll(Scroll)` 的**视口高**在下面算（要等标题栏占位之后才拿得到内容原点）；
         // 这里先记下"该轴是滚动视口"，`set_fixed_h` 在那里做。
-        // **高度**：`Vertical` 或 `Both` 拖过 ⇒ 由用户接管。
-        // ⚠ **收起态例外**：收起就是"只剩一行标题栏"，此时**必须忽略持久高** ——
-        // 否则"先拖高过、再点 ⌃"会得到一扇**空着的高窗**（用户实测："点击收起后不会
-        // 收起"，截图里就是一扇没有内容的 527 高窗）。展开时持久高照旧生效。
-        let collapsed_now = chrome.collapsed(self.state, id_for.as_str());
-        let fixed_h = if collapsed_now {
-            None
-        } else if resize_fixes_height(resize_axes) {
-            self.state.window_heights.get(id_for.as_str()).copied()
-        } else {
-            None
-        };
+        // `fixed_h` / `eff_h` / `collapsed_now` 已在缩放柄之前算好（柄要用它）。
         match (vs, fixed_h) {
             // 视口轴（ClipOnly）：固定高，内容不撑高它。
             (ScrollMode::ClipOnly, Some(h)) => frame.set_fixed_h(h),
@@ -3489,23 +3500,39 @@ impl<'a> Ui<'a> {
         // 收起状态永远不翻转）。
         let mut size = Vec2::ZERO;
         // ─── `vscroll(Scroll)`：把内容录进一个**滚动视口**（窗口内滚动条）───────────
-        // 视口 = 窗口内容盒（标题栏之下），高 = 固定高（拖过 / `.min_height`）**或**
+        // 视口 = 窗口内容盒（标题栏之下），高 = 固定高（`.height(..)` / 拖过）**或**
         // "窗口顶到屏幕底还剩多少"（`Scroll` 的自然含义：不许跑出屏幕，多出来的滚）。
-        let scroll_axis_on = vs == ScrollMode::Scroll || hs == ScrollMode::Scroll;
+        //
+        // ⚠ **收起态不建视口**（`!collapsed`）：收起就是"只剩一行标题栏"，而视口会
+        // `set_fixed_h(视口高 + pad)` 把窗口重新顶高 ⇒ 用户实测的"resizable 窗口点 ⌃
+        // 仍然不收起"（状态翻转了、内容也没了，但那个空面板还是原来那么高）。
+        let scroll_axis_on = !collapsed && (vs == ScrollMode::Scroll || hs == ScrollMode::Scroll);
         let viewport = if scroll_axis_on {
             let top_left = self
                 .frames
                 .last()
                 .map(|f| f.cursor)
                 .unwrap_or(Vec2::splat(pad_total));
-            let avail_h = if fixed_h.is_some() {
-                prev_size.map(|s| s.y).unwrap_or(0.0)
+            // ⚠ 用 `fixed_h`（**已按收起态清零**）而不是 `eff_h`：同一条"收起忽略固定高"
+            // 的规则必须在这里也生效，否则视口会把忽略掉的那个高又拿回来。
+            let avail_h = if let Some(h) = fixed_h {
+                // 固定高（`.height(..)` / 拖过）：外框高 ⇒ 视口 = 它扣掉标题栏与内边距。
+                h
             } else {
-                // 屏幕内可用高（窗口顶到屏幕底）。
+                // **没给固定高也没拖过 ⇒ 按内容定高**：视口 = min(内容需要的总高, 屏幕剩余)。
+                // 只用"屏幕剩余"会把**内容很矮**的窗口也撑到屏幕底（用户实测："最开始打开
+                // 调色板编辑器时仍然会把高度撑到窗口底端"的同一根因）。
+                // 内容高从**上一帧**的滚动状态读（`ScrollState.content_h`；它是滚动容器结算
+                // 出来的内容高，与视口无关）——首次会话未知 ⇒ 先按屏幕剩余，次帧收敛。
                 let top_abs = saved_base.y + display_pos.y;
-                (sh - top_abs).max(0.0)
+                let screen_avail = (sh - top_abs).max(0.0);
+                let key = format!("{}/scroll", id_for.as_str());
+                match self.state.scrolls.get(key.as_str()).map(|s| s.content_h) {
+                    Some(ch) if ch > 0.0 => screen_avail.min(ch + top_left.y + pad_total),
+                    _ => screen_avail,
+                }
             };
-            let h = if fixed_h.is_some() { avail_h } else { avail_h - top_left.y - pad_total };
+            let h = avail_h - top_left.y - pad_total;
             // ⚠ 视口**横跨窗口内容盒**：`width` 已经是**内容宽**（`set_fixed_w` 的语义，
             // 外框宽 = `width + 2×pad_total`），再减一次内边距会让视口窄 2×pad（实测：
             // 条带跟着左移 26px ⇒ 脚本按"窗口右缘 − pad − 7"点的条带落空、`offset` 恒 0）。
@@ -3934,6 +3961,8 @@ impl<'a> Ui<'a> {
             id,
             pos,
             width,
+            // modal 不设固定高（高度由内容定）。
+            None,
             None,
             false,
             false,
@@ -6213,6 +6242,18 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
         self.o.width = Some(w.into());
         self
     }
+    /// **固定高**（[`Size<f32>`]：`Logical`（默认）/ `Physical`）。
+    ///
+    /// 用途：**长内容窗口**（列表 / 调色板 / 日志）要的是"有界的视口"，而不是"被内容撑到
+    /// 和屏幕一样高"。常与 [`Self::vscroll`]`(ScrollMode::Scroll)` 合用：
+    /// `.width(320.0).height(420.0).vscroll(Scroll)` ⇒ 视口 420 高 + 窗口内滚动条。
+    ///
+    /// 语义与 [`Self::width`] 一致：拖过（`Resize::Vertical`/`Both` 的柄）之后由用户接管，
+    /// 持久值（`UiState::window_heights`）优先；收起态**不生效**（收起就是一行标题栏）。
+    pub fn height(mut self, h: impl Into<Size<f32>>) -> Self {
+        self.o.height = Some(h.into());
+        self
+    }
     /// **层级**（点击是否置顶；默认 [`Level::Topmost`]）。
     pub fn level(mut self, level: Level) -> Self {
         self.o.level = level;
@@ -6262,8 +6303,30 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
     ///   与宽度同理（固定轴不参与内容撑开；要裁剪请配 `Placement::Clip`）。
     ///
     /// `allow` 是**显式 bool**（用户要的签名）：枚举只表达"哪条轴"，"允不允许"用布尔更直白。
+    ///
+    /// ⚠ 想要 **egui 那样"只给一个布尔、轴自己推导"** 请用 [`Self::resizable`]
+    /// （它会**覆盖**本方法）。
     pub fn resize(mut self, allow: bool, axes: Resize) -> Self {
         self.o.resize = Some((allow, axes));
+        self
+    }
+    /// **能不能拖拽改大小**（只有一个布尔；egui 风 —— 允许的轴由 `vscroll` / `.height(..)`
+    /// 推导，内容"压缩还是裁切"由 `hscroll` 决定）：
+    ///
+    /// | 垂直轴 | `resizable(true)` 允许的轴 | 水平轴内容 |
+    /// |---|---|---|
+    /// | 视口（`.vscroll(ClipOnly/Scroll)` 或给了 `.height(..)`） | **垂直 + 水平** | `hscroll` 给了非 `NoClip` ⇒ **裁切**；否则**压缩** |
+    /// | 不是视口（默认，高度由内容定） | **只有水平** | 同上 |
+    ///
+    /// `resizable(false)` = 不画柄也不响应拖拽（轴无所谓）。
+    ///
+    /// **为什么垂直轴要"先有视口"才能拖**：高度由内容决定时（默认）拖高没有意义 ——
+    /// 内容当帧就把它顶回去；先给它一个有界视口（`.height(..)` / `.vscroll(..)`），
+    /// 拖出来的高才是真正生效的那个值。
+    ///
+    /// **本方法覆盖 [`Self::resize`]**（`None` = 未调 ⇒ 用 `resize` 的老语义）。
+    pub fn resizable(mut self, allow: bool) -> Self {
+        self.o.resizable = Some(allow);
         self
     }
     /// **内容子项间距**（[`Size<f32>`]：`Logical`（默认，× scale 取整）/ `Physical` 原样）：
@@ -6346,15 +6409,26 @@ impl<'ui, 'a> WindowBuilder<'ui, 'a> {
             }
         };
         let width = o.width.map(|w| w.to_physical(ui.scale));
+        // **egui 风推导**（`.resizable(bool)`）：允许的轴由"垂直轴有没有视口"决定，
+        // 覆盖 `.resize(allow, axes)` 的老写法（判定表见 [`Self::resizable`]）。
+        let resize = match o.resizable {
+            Some(allow) => Some((
+                allow,
+                resolve_resizable_axes(allow, v_axis_is_viewport(o.vscroll, o.height.is_some())),
+            )),
+            None => o.resize,
+        };
+        let height = o.height.map(|h| h.to_physical(ui.scale));
         let content_gap = o.gap.map(|g| g.to_physical(ui.scale));
         // 枚举 → 内部两个开关（公开面不再出现裸布尔）。
         let topmost = o.level == Level::Topmost;
         let strict = o.placement == Placement::Clip;
-        let mut chrome = WindowChrome { title, close, collapsible, resize: o.resize };
+        let mut chrome = WindowChrome { title, close, collapsible, resize };
         ui.window_impl(
             id,
             pos,
             width,
+            height,
             content_gap,
             topmost,
             strict,
@@ -8329,6 +8403,26 @@ fn resolve_scroll_mode(explicit: Option<ScrollMode>, placement_clip: bool, axis_
         None if placement_clip => ScrollMode::ClipOnly,
         None if axis_dragged => ScrollMode::ClipOnly,
         None => ScrollMode::NoClip,
+    }
+}
+
+/// **垂直轴是不是"视口"**（纯函数，可单测）：显式 `.vscroll(ClipOnly|Scroll)`，或给了
+/// `.height(..)`（固定高 = 有界视口）。
+///
+/// `NoClip`（默认）= 高度由内容决定 —— 此时"拖高"没有意义（内容当帧就把它顶回去）。
+fn v_axis_is_viewport(vscroll: Option<ScrollMode>, has_height: bool) -> bool {
+    has_height || vscroll.is_some_and(|m| m != ScrollMode::NoClip)
+}
+
+/// **`.resizable(bool)` 的判定表**（纯函数，可单测；egui 风）：
+/// 垂直轴是视口 ⇒ **垂直 + 水平**都能拖；否则**只有水平**（高度由内容定，拖它没意义）。
+///
+/// `allow = false` ⇒ [`Resize::None`]（不画柄也不响应）。
+fn resolve_resizable_axes(allow: bool, v_is_viewport: bool) -> Resize {
+    match (allow, v_is_viewport) {
+        (false, _) => Resize::None,
+        (true, true) => Resize::Both,
+        (true, false) => Resize::Horizontal,
     }
 }
 

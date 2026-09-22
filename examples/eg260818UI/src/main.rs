@@ -184,7 +184,12 @@ const PICKER_BIG_TRIGGER: Vec2 = Vec2::new(200.0, 40.0);
 
 /// `--sim-row-overflow` 的窄窗口左上角（物理像素）与该窗口**外面**那个控件的偏移
 /// （内容坐标）。窗口宽固定为逻辑 150 ⇒ 内容宽 = 150 × scale，输入框默认宽远超它。
-const ROW_WIN_POS: Vec2 = Vec2::new(200.0, 620.0);
+///
+/// 两扇窗**同内容同宽**，只有水平轴的策略不同 —— 这就是用户给的判定表的两个格子：
+/// `row_win`（`.hscroll(NoClip)`）= **压缩**内容；`row_clip_win`（`.hscroll(ClipOnly)`）
+/// = **裁切**内容（子项按自然宽排，超出被裁；幽灵控件的命中守卫也挂在这扇窗上）。
+const ROW_WIN_POS: Vec2 = Vec2::new(200.0, 470.0);
+const ROW_CLIP_POS: Vec2 = Vec2::new(200.0, 640.0);
 
 /// `--sim-resize` 阶段 2 的窗口（**故意不给 `.width()`**）：位置取空白带 —— 它的**右下角**
 /// （缩放柄所在处）不能被任何更高 z 的窗口压住（`icons` y ≤ 575 / `strict_win` y ≥ 690 /
@@ -198,8 +203,19 @@ const SCROLL_CLIP_POS: Vec2 = Vec2::new(520.0, 470.0);
 /// `--sim-scroll-mode` 第三扇窗（`vscroll(Scroll)`）：放在**屏幕下缘附近**，
 /// 于是"屏幕剩下的高"明显小于内容高 ⇒ 视口 + 滚动条。
 const SCROLL_V_POS: Vec2 = Vec2::new(830.0, 700.0);
+/// `--sim-scroll-mode`：**内容很矮**的 `vscroll(Scroll)` 窗（摆在高处 ⇒ 屏幕剩余很大）——
+/// 没有 `.height(..)` 时视口必须**按内容**定高（min(内容高, 屏幕剩余)），不许撑到屏幕底
+/// （用户实测："最开始打开调色板编辑器时，仍然会将高度撑到窗口底端，直到手动拉开大小"）。
+const SCROLL_SHORT_POS: Vec2 = Vec2::new(830.0, 60.0);
 /// `--sim-scroll-mode` 第四扇窗（调色板形态：21 行 `标签 + 取色器`，**自动宽、不设 resize**）。
 const PALETTE_POS: Vec2 = Vec2::new(1260.0, 120.0);
+/// 另外两种调色板配置的位置（`.width(320)` / `.width(320)+vscroll`）。
+const PALETTE_W_POS: Vec2 = Vec2::new(1600.0, 120.0);
+const PALETTE_WS_POS: Vec2 = Vec2::new(1600.0, 640.0);
+/// `.width(320) + .height(420) + vscroll(Scroll)` 那扇窗（**回答"长内容窗口怎么办"**）：
+/// 放空白带 ⇒ 窗口不会被 `WindowClamp::Screen` 挪走（尺寸断言与位置无关，但位置变了会
+/// 让"视口高"这类**依赖屏幕剩余高**的量跟着变，所以两样都不依赖才稳）。
+const PALETTE_H_POS: Vec2 = Vec2::new(660.0, 380.0);
 /// 21 个取色器的 id（静态，避免每行 `format!` 分配）。
 const PALETTE_IDS: [&str; 21] = [
     "pal_0", "pal_1", "pal_2", "pal_3", "pal_4", "pal_5", "pal_6", "pal_7", "pal_8", "pal_9",
@@ -647,6 +663,10 @@ struct Windows {
     /// 且必须 ≥ 引擎的恒定下限（`row_h + 2×pad`）。
     shrink_after_free: Option<f32>,
     shrink_later: Option<f32>,
+    /// --sim-resize 阶段 3：同一现场的**宽度**（阶段 3 只动 y）——用户实测："拖拽缩放柄到
+    /// 别的地方，然后下一次点击 x 坐标弹回"。`(阶段 3 之前, 阶段 3 之后)` 必须相等。
+    shrink_w_before: Option<f32>,
+    shrink_w_after: Option<f32>,
     /// --sim-resize 阶段 2：是否录 `grip_win` 那扇窗口（由 App 侧按 `--sim-resize` 置位）。
     show_grip_win: bool,
     /// --sim-scroll-mode：是否录那两扇"按轴溢出策略"窗口。
@@ -656,6 +676,21 @@ struct Windows {
     scroll_text_b: String,
     /// --sim-scroll-mode：调色板形态那扇窗的 21 个颜色。
     pal_colors: [Color; 21],
+    /// 另两种调色板配置各用一份（避免同一 id 的取色器状态互相干扰）。
+    pal_colors2: [Color; 21],
+    /// 第三份（自动宽那扇窗）与第四份（`.height()` 那扇窗）。
+    pal_colors3: [Color; 21],
+    pal_colors4: [Color; 21],
+    /// --sim-scroll-mode：`palette_h_win`（`.height(420) + vscroll(Scroll) + resize`）的
+    /// ⌃ 按钮点 —— 点它之后窗口必须**收起成一行标题栏**。
+    ///
+    /// 用户实测："resizable 的窗口在点击收起按钮时仍然不会收起"：收起态本来已经
+    /// 忽略固定高（`fixed_h = None`），但 `vscroll(Scroll)` 的**滚动视口**又把那个高
+    /// 拿了回来（`set_fixed_h(视口高 + pad)`）⇒ 空面板仍是原高。
+    pal_fold_pt: Option<Vec2>,
+    /// --sim-scroll-mode：点 ⌃ 之前 / 之后的高度（前 = 420×scale，后 ≈ 一行标题栏）。
+    pal_h_before: Option<f32>,
+    pal_h_after: Option<f32>,
     /// --sim-chrome 阶段 5：⌃ 按钮的**行中心**（`caption_pts` 给的是"上半"——那是为了
     /// 躲开收起态右下角的缩放柄；本轮让柄给内容让位之后，**中心也该能点**）。
     eng_center_pt: Option<Vec2>,
@@ -678,6 +713,9 @@ struct Windows {
     row_avail_w: f32,
     /// --sim-row-overflow：`Label + ColorPicker` 那一行的结算尺寸（同上，判定不溢出）。
     row_size_picker: Option<Vec2>,
+    /// --sim-row-overflow：**裁切**那扇窗（`.hscroll(ClipOnly)`）里同一行的结算尺寸 ——
+    /// 用户判定表要求它**大于**可用宽（"裁切内容而不是压缩"），与上面的压缩窗成对照。
+    row_clip_size: Option<Vec2>,
     /// --sim-row-overflow：取色器的颜色（演示行用）。
     row_color: Color,
     /// --sim-row-overflow 两个控件的文本（控件本身只用来产生可观测的点击）。
@@ -725,6 +763,12 @@ impl Windows {
             scroll_text_a: String::new(),
             scroll_text_b: String::new(),
             pal_colors: [Color::rgba_u8(110, 168, 255, 255); 21],
+            pal_colors2: [Color::rgba_u8(110, 168, 255, 255); 21],
+            pal_colors3: [Color::rgba_u8(110, 168, 255, 255); 21],
+            pal_colors4: [Color::rgba_u8(110, 168, 255, 255); 21],
+            pal_fold_pt: None,
+            pal_h_before: None,
+            pal_h_after: None,
             eng_center_pt: None,
             eng_center_before: None,
             eng_center_after: None,
@@ -734,9 +778,12 @@ impl Windows {
             eng_drag_to: None,
             shrink_after_free: None,
             shrink_later: None,
+            shrink_w_before: None,
+            shrink_w_after: None,
             sim_row_overflow: false,
             row_size: None,
             row_size_picker: None,
+            row_clip_size: None,
             row_color: Color::rgba_u8(110, 168, 255, 255),
             row_avail_w: 0.0,
             ghost_text: String::new(),
@@ -899,13 +946,67 @@ impl Windows {
                         TextEditor::new("scroll_clip_te", &mut self.scroll_text_b).width(400.0),
                     );
                 });
-            // ③ 调色板形态：**自动宽 + 21 行 `标签 + 取色器` + 不设 `.resize`** ——
-            //    用户实测："不加 resizable 则缩成一条缝"。这里量它到底多宽多高。
+            // ③a 调色板的**基线**（用户原本的写法：自动宽 + 21 行）——长内容把窗口撑到
+            //     屏幕那么高（"调色板窗口比屏幕还高"就是这么来的）。
             ui.window("palette_like_win")
                 .pos(Position::Physical(PALETTE_POS))
-                .title("调色板形态（21 行）")
+                .title("调色板（自动宽）")
+                .show(|w| {
+                    // **分割线**（用户实测的"Gallery 被撑开得很大，并且跟随窗口大小；
+                    // 疑似是分割线的问题"）：`divider()` 取"可用宽"，而自动宽窗口**没有**
+                    // 自己的可用宽 —— 引擎必须在这里返回"无约束"（退回最宽子项 / 120），
+                    // 不能借用根 frame 的**视口宽**（1920）。借了 ⇒ 本窗宽 = 1944（跟屏幕走）。
+                    w.divider();
+                    for (id, color) in PALETTE_IDS.iter().zip(self.pal_colors3.iter_mut()) {
+                        w.row(|r| {
+                            r.label("颜色：");
+                            r.add(ColorPicker::new(id, color));
+                        });
+                    }
+                });
+            // ③b 调色板的另外两种配置：`.width(320)`（用户的写法）与
+            //     `.width(320) + vscroll(Scroll)`（我建议的写法）——用数字回答"改宽有用吗 /
+            //     加 vscroll 有用吗"。
+            ui.window("palette_w_win")
+                .pos(Position::Physical(PALETTE_W_POS))
+                .width(320.0)
+                .title("调色板（width 320）")
                 .show(|w| {
                     for (id, color) in PALETTE_IDS.iter().zip(self.pal_colors.iter_mut()) {
+                        w.row(|r| {
+                            r.label("颜色：");
+                            r.add(ColorPicker::new(id, color));
+                        });
+                    }
+                });
+            ui.window("palette_ws_win")
+                .pos(Position::Physical(PALETTE_WS_POS))
+                .width(320.0)
+                .vscroll(ScrollMode::Scroll)
+                .title("调色板（width 320 + vscroll）")
+                .show(|w| {
+                    for (id, color) in PALETTE_IDS.iter().zip(self.pal_colors2.iter_mut()) {
+                        w.row(|r| {
+                            r.label("颜色：");
+                            r.add(ColorPicker::new(id, color));
+                        });
+                    }
+                });
+            // ③d **`.height(420)` + `vscroll(Scroll)`**：这才是"长内容窗口"的正解 ——
+            //     视口高由 `.height()` 钉住（不再只能"屏幕剩多少算多少"），内容在里面滚。
+            //     用户实测的"调色板窗口要么缩成一条缝、要么无限增高"就是缺这一条 API。
+            ui.window("palette_h_win")
+                .pos(Position::Physical(PALETTE_H_POS))
+                .width(320.0)
+                .height(420.0)
+                .vscroll(ScrollMode::Scroll)
+                // 与用户现场一致（egUI 的调色板窗）：可拖大小 + 可收起 ⇒ "收起"必须
+                // 真的把它收成一行标题栏（引擎侧的固定高不得把视口又顶回 420）。
+                .resize(true, Resize::Both)
+                .collapsible(true, None)
+                .title("调色板（width 320 + height 420 + vscroll）")
+                .show(|w| {
+                    for (id, color) in PALETTE_IDS.iter().zip(self.pal_colors4.iter_mut()) {
                         w.row(|r| {
                             r.label("颜色：");
                             r.add(ColorPicker::new(id, color));
@@ -926,15 +1027,26 @@ impl Windows {
                         w.label(&format!("第 {i} 行（内容远高于视口）"));
                     }
                 });
+            // ③c **内容很矮**的 `vscroll(Scroll)` 窗（没有 `.height(..)`）：视口必须按**内容**
+            //     定高 —— 只按"屏幕剩余"会让它撑到屏幕底（两行内容 ⇒ 一个大空面板）。
+            ui.window("scroll_short_win")
+                .pos(Position::Physical(SCROLL_SHORT_POS))
+                .width(140.0)
+                .vscroll(ScrollMode::Scroll)
+                .title("vscroll(短内容)")
+                .show(|w| {
+                    w.label("第 0 行");
+                    w.label("第 1 行");
+                });
         }
         // ── `--sim-row-overflow`：**窄的固定宽窗口**里的验收现场 ──────────────────
         //
-        // 用户实测的两条 BUG：
-        // ① `.width()` 较小时，`row` 里的控件**整排突到窗口外面**（每个子项各自都没
-        //    超限，但整行超过了可用宽）——判定用 `row(..)` 的**结算宽** ≤ 窗口内容宽；
-        // ② 溢出到面板外的控件（这里是 `add_at` 放到窗口右边的编辑器）**看不见却点得着**
-        //    （`Placement::Clip` 裁掉了绘制命令，命中区还在）——判定"窗口外那个点
-        //    点不到、窗口内那个点点得到"（正反对照，避免把守卫写成"整窗不可点"）。
+        // 用户给的判定表（egui 语义）：同宽同内容下，**水平轴的策略**决定"压缩"还是"裁切"：
+        // ① `.hscroll(NoClip)` = **压缩**内容 ⇒ `row` 里整排控件缩进可用宽（每个子项各自
+        //    都没超限，但整行超过可用宽 ⇒ 必须按余量压最后一个 —— 用户实测的 BUG）；
+        // ② `.hscroll(ClipOnly)` = **裁切**内容 ⇒ 子项按**自然宽**排（不压缩），超出部分
+        //    被裁掉；此时溢出到窗口外的控件（`add_at` 到右边）**看不见也点不着**
+        //    （旧版是"看不见却点得着"的幽灵控件）。
         //
         // 位置 / 尺寸全部写成常量：脚本按同一组常量算点击点（不写死"猜"出来的像素）。
         if self.sim_row_overflow {
@@ -944,9 +1056,9 @@ impl Windows {
             ui.window("row_win")
                 .pos(Position::Physical(ROW_WIN_POS))
                 .width(150.0)
-                .placement(Placement::Clip)
+                .hscroll(ScrollMode::NoClip)
                 .resize(false, Resize::None)
-                .title("窄窗口（row 不许突出去）")
+                .title("窄窗口 · 压缩内容")
                 .show(|w| {
                     // ① 一行：标签 + 输入框（输入框默认宽 = 主题 `input.min_w`，远超可用宽）
                     let size = w.row(|r| {
@@ -962,13 +1074,26 @@ impl Windows {
                         r.add(ColorPicker::new("row_cp", &mut self.row_color));
                     });
                     self.row_size_picker = Some(size2);
-                    // ② 绝对定位到窗口**外面**的控件（不受可用宽 clamp 约束）：
-                    //    它就是"内容溢出时那个看不见的幽灵控件"。
+                });
+            // ② 同宽同内容、水平轴改成**视口**：内容不再被压缩（自然宽），超出被裁。
+            ui.window("row_clip_win")
+                .pos(Position::Physical(ROW_CLIP_POS))
+                .width(150.0)
+                .hscroll(ScrollMode::ClipOnly)
+                .resize(false, Resize::None)
+                .title("窄窗口 · 裁切内容")
+                .show(|w| {
+                    let size = w.row(|r| {
+                        r.label("标签：");
+                        r.add(TextEditor::new("row_clip_te", &mut self.inside_text));
+                    });
+                    self.row_clip_size = Some(size);
+                    // ③ 绝对定位到窗口**外面**的控件：裁切窗里它既看不见也点不着。
                     w.add_at(
                         Position::Physical(ROW_GHOST_OFFSET),
                         TextEditor::new("ghost_te", &mut self.ghost_text).width(120.0),
                     );
-                    // ③ 窗口**里面**的正对照控件（已知矩形 ⇒ 脚本能算到点击点）。
+                    // ④ 窗口**里面**的正对照控件（已知矩形 ⇒ 脚本能算到点击点）。
                     w.add_at(
                         Position::Physical(ROW_INSIDE_OFFSET),
                         TextEditor::new("inside_te", &mut self.inside_text).width(ROW_INSIDE_W),
@@ -2922,6 +3047,14 @@ impl App for UiApp {
                 24..=26 => f.debug_inject_mouse(p, false),
                 _ => {}
             }
+            // ② 点 `palette_h_win` 的 ⌃（收起）：`vscroll` 的视口不许把固定高顶回来。
+            let fold = self.windows.pal_fold_pt.unwrap_or(Vec2::ZERO);
+            match f.frames() {
+                80..=81 => f.debug_inject_mouse(fold, false),
+                82..=83 => f.debug_inject_mouse(fold, true),
+                84..=86 => f.debug_inject_mouse(fold, false),
+                _ => {}
+            }
         }
         // ── 调试：脚本化鼠标（`--sim-menu`）──────────────────────
         // 行程：10..11 移到「视图」触发器 → 12..13 按下 → 14..15 抬起（菜单打开）
@@ -3775,6 +3908,13 @@ impl App for UiApp {
                         self.windows.shrink_after_free = Some(w.size.y);
                     } else if sim_frame >= 140 {
                         self.windows.shrink_later = Some(w.size.y);
+                        // **宽度**也必须一动不动（阶段 3 只动 y）：旧实现里"显式 `.width()`
+                        // 压过持久宽"⇒ 第二次拖柄时宽度弹回 `.width()` 的初值。
+                        self.windows.shrink_w_after = Some(w.size.x);
+                    }
+                    if sim_frame == 86 {
+                        // 阶段 3 之前的宽 = 阶段 1 拖出来的那个（判"弹回"的基准）。
+                        self.windows.shrink_w_before = Some(w.size.x);
                     }
                 }
             }
@@ -3791,6 +3931,40 @@ impl App for UiApp {
                         // 靠下 10px：必定落在轨道（而不是顶部的 thumb）。
                         w.origin.y + w.size.y - pad - 10.0,
                     ));
+                }
+            }
+            // `--sim-scroll-mode`：`palette_h_win` 的 ⌃ 点 + 收起前后高度。
+            // 点算在**第 60 帧之前**（那时窗口还是 420 高、标题栏在顶上），注入在 80..=86，
+            // 判定在 140（给足"翻转 → 下一帧重结算"的时间）。
+            if self.sim_scroll_mode && sim_frame == 60 {
+                let dump = ui.debug_dump();
+                let row_h = ui.theme().row_h;
+                let gap = ui.theme().gap;
+                // `has_close = false`（这扇窗只有标题 + ⌃）⇒ ⌃ 占最右那一格。
+                self.windows.pal_fold_pt =
+                    caption_pts(&dump, "palette_h_win", row_h, gap, false).map(|(fold, _)| fold);
+                self.windows.pal_h_before =
+                    dump.windows.iter().find(|p| p.id == "palette_h_win").map(|w| w.size.y);
+            }
+            if self.sim_scroll_mode && sim_frame >= 140 {
+                let dump = ui.debug_dump();
+                self.windows.pal_h_after =
+                    dump.windows.iter().find(|p| p.id == "palette_h_win").map(|w| w.size.y);
+                if sim_frame == 150 {
+                    let before = self.windows.pal_h_before.unwrap_or(0.0);
+                    let after = self.windows.pal_h_after.unwrap_or(0.0);
+                    // 收起后 ≈ 一行标题栏：宽高都必须**远小于**固定高（420×scale = 630）。
+                    let bar_max = ui.theme().row_h + (ui.theme().panel.padding + ui.theme().panel.border_w) * 2.0 + 8.0;
+                    let ok = before >= 400.0 && after <= bar_max;
+                    eprintln!(
+                        "sim-scroll-mode[收起 resizable+vscroll 窗]: ⌃点={:?} 收起前高={before:.0} 收起后高={after:.0}（≤{bar_max:.0}）{}",
+                        self.windows.pal_fold_pt,
+                        if ok {
+                            "[OK] `.height(420) + vscroll(Scroll) + resize` 的窗口点 ⌃ 真的收成一行标题栏（视口不再把固定高顶回来）"
+                        } else {
+                            "[FAIL] 点 ⌃ 之后窗口没收起（滚动视口把固定高又拿回来了）"
+                        }
+                    );
                 }
             }
             // `--sim-scroll-mode`：读两扇窗的**实测尺寸 + 裁剪层**（判定：按轴策略各自生效）。
@@ -3820,15 +3994,42 @@ impl App for UiApp {
                 // ClipOnly 那条轴用"scissor 宽 = 窗口宽 且 纵向铺满屏幕"来证（只裁横向）。
                 // ④ `vscroll(Scroll)` 那扇窗：视口高 = 屏幕剩下的高（远小于内容）⇒
                 //    `ScrollState.content_h > 视口高`；拖一下右侧滚动条 ⇒ `offset > 0`。
-                // ④ 调色板形态（自动宽 + 21 行）：**不许"缩成一条缝"**（宽/高都得像样）。
-                let pal = find("palette_like_win").map(|w| w.size);
-                let pal_ok = pal.is_some_and(|s| s.x >= 200.0 && s.y >= 200.0);
+                // ④ 调色板三种配置的**数字**（回答"加宽有用吗 / 加 vscroll 有用吗"）。
+                let auto = find("palette_like_win").map(|w| w.size);
+                let w320 = find("palette_w_win").map(|w| w.size);
+                let ws320 = find("palette_ws_win").map(|w| w.size);
+                let h420 = find("palette_h_win").map(|w| w.size);
+                let scroll = ui
+                    .state()
+                    .scrolls()
+                    .get("palette_ws_win/scroll")
+                    .copied();
+                let hscroll = ui
+                    .state()
+                    .scrolls()
+                    .get("palette_h_win/scroll")
+                    .copied();
+                // **自动宽窗**（内容 = 21 行 + `divider()`）：宽必须由**内容**定（~300），
+                // 不许被"分割线拿到视口宽"撑成屏幕宽（1944 = 1920 + 2×pad —— 用户实测
+                // "Gallery 被撑开得很大，并且跟随窗口大小"）。
+                let pal_ok = auto.is_some_and(|s| (240.0..=600.0).contains(&s.x) && s.y >= 200.0);
+                // `width(320)`：宽固定（320×scale + 2×pad），高仍被内容撑到很高。
+                let w_ok = w320.is_some_and(|s| (s.x - (320.0 * ui.scale() + 2.0 * 13.0)).abs() <= 4.0);
+                // `+ vscroll(Scroll)`：高被**视口**压住（≤ 屏幕高），且滚动状态有内容高。
+                let ws_ok = ws320.is_some_and(|s| s.y <= 1080.0)
+                    && scroll.is_some_and(|s| s.content_h > 0.0);
+                // `+ height(420) + vscroll(Scroll)`：外框高 = 420×scale（**有界视口**，与屏幕
+                // 剩余高无关），内容高于视口 ⇒ 可滚。
+                let h_ok = h420.is_some_and(|s| {
+                    (s.y - 420.0 * ui.scale()).abs() <= 2.0
+                        && hscroll.is_some_and(|c| c.content_h > s.y)
+                });
                 eprintln!(
-                    "sim-scroll-mode[调色板形态]: 21 行自动宽窗={pal:?} {}",
-                    if pal_ok {
-                        "[OK] 自动宽 + 21 行不会缩成一条缝"
+                    "sim-scroll-mode[调色板四态]: 自动宽={auto:?} width320={w320:?} width320+vscroll={ws320:?} height420+vscroll={h420:?} 滚动={scroll:?}/{hscroll:?} {}",
+                    if pal_ok && w_ok && ws_ok && h_ok {
+                        "[OK] 自动宽不缩缝 / width320 固定宽 / 加 vscroll 后高被视口压住 / 加 .height(420) 后外框高恒为 420×scale（可滚）"
                     } else {
-                        "[FAIL] 缩成一条缝了（宽或高 < 200）"
+                        "[FAIL] 某种配置没按预期（见上面四个尺寸）"
                     }
                 );
                 let sv = ui.state().scrolls().get("scroll_v_win/scroll").copied();
@@ -3843,6 +4044,23 @@ impl App for UiApp {
                         "[OK] 窗口内的滚动视口建成 + 点条带翻页改了 offset"
                     } else {
                         "[FAIL] 视口没建 / 条带没点到 / offset 没写回"
+                    }
+                );
+                // ③c **短内容的 `vscroll(Scroll)` 窗必须按内容定高**（不是"屏幕剩余"）：
+                //     摆在 y=60（屏幕剩余 ~1000）⇒ 撑到屏幕底就是 ~1000，按内容则 ~200。
+                //     用户实测："最开始打开调色板编辑器时，仍然会将高度撑到窗口底端"。
+                let short = find("scroll_short_win").map(|w| w.size.y);
+                let short_st = ui.state().scrolls().get("scroll_short_win/scroll").copied();
+                // 两行短标签 ≈ 48 物理高 + 标题栏 + 内边距 ⇒ 窗口 ~112（撑到屏幕底则是 ~1020）。
+                let short_ok = short.is_some_and(|h| (90.0..=320.0).contains(&h))
+                    && short_st.is_some_and(|s| s.content_h > 0.0);
+                eprintln!(
+                    "sim-scroll-mode[短内容视口]: 两行内容的 vscroll 窗高={short:?}（屏幕剩余约 {:.0}）滚动={short_st:?} {}",
+                    screen_h - SCROLL_SHORT_POS.y,
+                    if short_ok {
+                        "[OK] 没给 `.height(..)` 时视口按**内容**定高（内容矮就不撑到屏幕底）"
+                    } else {
+                        "[FAIL] 短内容窗口被撑到屏幕底 / 塌成 0 高"
                     }
                 );
                 let _ = no_clip_layer;
@@ -3865,7 +4083,7 @@ impl App for UiApp {
                 // 把点定在窗口"将要被夹走"之前的位置（实测踩过：窗外那个点偏了 44px）。
                 if sim_frame < 38 {
                     let dump = ui.debug_dump();
-                    if let Some(w) = dump.windows.iter().find(|p| p.id == "row_win")
+                    if let Some(w) = dump.windows.iter().find(|p| p.id == "row_clip_win")
                         && w.size.x > 0.0
                     {
                         let pad = ui.theme().panel.padding + ui.theme().panel.border_w;
@@ -3893,9 +4111,10 @@ impl App for UiApp {
                     self.windows.row_ghost_focus =
                         focused.as_ref().is_some_and(|f| f.contains("ghost_te"));
                     eprintln!(
-                        "sim-row-overflow: 点窗外后 focus={focused:?} occluded_hits={} 行宽={:?} 可用宽={:.0}",
+                        "sim-row-overflow: 点窗外后 focus={focused:?} occluded_hits={} 压缩窗行宽={:?} 裁切窗行宽={:?} 可用宽={:.0}",
                         ui.state().hits().occluded_hits(),
                         self.windows.row_size,
+                        self.windows.row_clip_size,
                         self.windows.row_avail_w,
                     );
                 }
@@ -4547,6 +4766,24 @@ impl App for UiApp {
                 }
             );
         }
+        // --sim-resize 阶段 3b：**第二次拖柄不许把上一次拖出来的宽度弹回**（用户实测：
+        // "拖拽缩放柄到别的地方，然后下一次点击 x 坐标弹回"）。阶段 3 只动 y ⇒ 宽度必须
+        // 一动不动地停在阶段 1 拖出来的 386 上（旧实现"显式 `.width()` 压过持久值"时弹回 326）。
+        if self.sim_resize && f.frames() == 155 {
+            let before = self.windows.shrink_w_before;
+            let after = self.windows.shrink_w_after;
+            let ok = before
+                .zip(after)
+                .is_some_and(|(a, b)| (a - b).abs() <= 0.5 && a > 350.0);
+            eprintln!(
+                "sim-resize[第二次拖柄不弹宽]: 阶段1 后={before:?} 阶段3 后={after:?} {}",
+                if ok {
+                    "[OK] 宽度停在用户拖出来的值上（没有弹回 `.width()` 的初值）"
+                } else {
+                    "[FAIL] 第二次拖柄把宽度弹回了初值（显式 `.width()` 压过了持久值）"
+                }
+            );
+        }
         // --sim-pick-save：**导出主题的端到端判定**（含"跳过阻塞对话框"）。
         // 真值看状态行：载入 / 导出成功、或"导出已取消"（`RJ_PICK_SAVE=none`）。
         if self.sim_pick_save && f.frames() == 40 {
@@ -4615,11 +4852,15 @@ impl App for UiApp {
         if self.sim_picker && f.frames() == 90 {
             eprintln!("sim-picker: demo_color = {:?}", self.top.demo_color);
         }
-        // --sim-row-overflow：三条判据（窄窗口里"不许突出去" + "幽灵控件点不到"）。
-        // 1. `row(..)` 的**结算宽** ≤ 窗口可用宽 —— 修前整行 = 标签 + 输入框自然宽之和，
-        //    会超出可用宽（控件排到窗口外面）；
-        // 2. 点窗口**内**那个控件 ⇒ 焦点必须落在它身上（正对照：守卫不能把整窗点废）；
-        // 3. 点窗口**外**那个溢出控件 ⇒ 焦点**不得**落在它身上（裁掉的部分不可命中）。
+        // --sim-row-overflow：四条判据（压缩窗"整行不突出去" + 裁切窗"内容按自然宽 +
+        // 幽灵控件点不到"）。
+        // 1. **压缩**窗 `row(..)` 的结算宽 ≤ 窗口可用宽 —— 修前整行 = 标签 + 输入框自然宽
+        //    之和，会超出可用宽（控件排到窗口外面）；
+        // 1b. 压缩窗里 `Label + ColorPicker` 那一行同样不溢出（取色器也得看可用宽）；
+        // 2. **裁切**窗同内容的行宽 **>** 可用宽 —— 这是"裁切而不是压缩"的正证据：内容按
+        //    自然宽排、超出被裁（若两窗等宽，说明 `hscroll` 没起作用）；
+        // 3. 点裁切窗**内**那个控件 ⇒ 焦点必须落在它身上（正对照：守卫不能把整窗点废）；
+        // 4. 点裁切窗**外**那个溢出控件 ⇒ 焦点**不得**落在它身上（裁掉的部分不可命中）。
         if self.windows.sim_row_overflow && f.frames() == 44 {
             let size = self.windows.row_size;
             let avail = self.windows.row_avail_w;
@@ -4629,17 +4870,23 @@ impl App for UiApp {
                 .windows
                 .row_size_picker
                 .is_some_and(|s| s.x <= avail + 0.5);
+            // ② 裁切窗：内容**不压缩**（自然宽 > 可用宽）。
+            let clip_ok = self
+                .windows
+                .row_clip_size
+                .is_some_and(|s| s.x > avail + 0.5);
             let inside_ok = self.windows.row_inside_focus;
             let ghost_ok = !self.windows.row_ghost_focus;
             eprintln!(
-                "sim-row-overflow: 行宽={:?} 取色器行宽={:?} 可用宽={avail:.0} 窗内点得到={inside_ok} 窗外点得到={} {}",
+                "sim-row-overflow: 压缩窗行宽={:?} 取色器行宽={:?} 裁切窗行宽={:?} 可用宽={avail:.0} 窗内点得到={inside_ok} 窗外点得到={} {}",
                 size,
                 self.windows.row_size_picker,
+                self.windows.row_clip_size,
                 self.windows.row_ghost_focus,
-                if row_ok && picker_ok && inside_ok && ghost_ok {
-                    "[OK] 窄窗口里两行都落在可用宽内（含取色器）+ 溢出的幽灵控件点不到（窗内的仍点得到）"
+                if row_ok && picker_ok && clip_ok && inside_ok && ghost_ok {
+                    "[OK] 压缩窗两行都落在可用宽内（含取色器）· 裁切窗按自然宽排（超出被裁）· 溢出的幽灵控件点不到（窗内的仍点得到）"
                 } else {
-                    "[FAIL] 行仍然突出去（含取色器行）/ 幽灵控件还能点 / 守卫把窗内也挡住了"
+                    "[FAIL] 压缩窗仍突出去 / 裁切窗被误压缩 / 幽灵控件还能点 / 守卫把窗内也挡住了"
                 }
             );
         }
