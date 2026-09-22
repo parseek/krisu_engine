@@ -96,11 +96,20 @@ fn main() -> Result<(), RunError> {
     app.sim_dropdown = args.iter().any(|a| a == "--sim-dropdown");
     app.sim_weight_modal = args.iter().any(|a| a == "--sim-weight-modal");
     app.sim_resize = args.iter().any(|a| a == "--sim-resize");
-    // `--sim-pick-save`：**走真实的导出按钮通路**（`export_request` → `pick_save` →
-    // `save_theme`），配合 `RJ_PICK_SAVE=<路径>` 就**不弹阻塞的另存为对话框** ——
-    // 无人值守也能端到端验证"导出主题"。没设覆盖时会弹框（无头跑不了）⇒ 本 sim 打印
-    // `[SKIP]` 而不是假装通过。
+    // `--sim-pick-save`：**走真实的导出通路**（`export_request` → `Policy::save` →
+    // `save_theme`）。选择器怎么跳过由 `filedialog::Policy` 决定（**显式 CLI**）：
+    // `--no-file-dialog` ⇒ **完全不碰 rfd**；`--pick theme-save=<路径|none>` ⇒ 预置结果。
+    // 本开关只负责"按下导出请求"，不再自己解析路径（单一机制，避免两套旁路）。
     app.sim_pick_save = args.iter().any(|a| a == "--sim-pick-save");
+    // **选择器策略**：只由**显式命令行**构造（`--no-file-dialog` / `--pick <目标>=<路径|none>`）。
+    // 用法错误 ⇒ 打清单 + 非 0 退出（静默忽略会让"以为设了路径"的测试拿不到结果还查不出原因）。
+    app.dialogs = match filedialog::Policy::from_args(&args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[args] {e}");
+            std::process::exit(1);
+        }
+    };
     app.windows.show_grip_win = app.sim_resize;
     app.sim_ta_resize = args.iter().any(|a| a == "--sim-ta-resize");
     app.windows.sim_chrome = app.sim_chrome;
@@ -1596,9 +1605,14 @@ struct UiApp {
     /// --sim-ta-resize：脚本化拖拽**行内多行 TextEditor** 的右下角缩放柄
     /// （验"申请尺寸 = 绘制尺寸 ⇒ 窗口/下面的控件跟着长" + "单行子项在行里被钉住"）。
     sim_ta_resize: bool,
-    /// --sim-pick-save：走**真实的导出通路**（`export_request` → `pick_save` →
-    /// `save_theme`）；配 `RJ_PICK_SAVE=<路径>` 即跳过阻塞的另存为对话框。
+    /// --sim-pick-save：走**真实的导出通路**（`export_request` → `Policy::save` →
+    /// `save_theme`）；选择器是否真的弹、以及预设结果，全部由 [`filedialog::Policy`] 决定
+    /// （`--no-file-dialog` 时**完全不碰 rfd**）。
     sim_pick_save: bool,
+    /// **文件选择器策略**（导入 / 导出共用）：真人用法 = 弹系统选择器；测试 = 由显式 CLI
+    /// （`--no-file-dialog` / `--pick <目标>=<路径|none>`）决定，可**完全不碰 `rfd`**。
+    /// 见 [`filedialog::Policy`]（那里说明了为什么**不用**环境变量做旁路）。
+    dialogs: filedialog::Policy,
     /// --sim-ta-resize：两个输入框的内容（多行那个要缩放；单行那个在 `min_h(60)` 行里）。
     sim_ta_text: String,
     sim_ta_single: String,
@@ -1900,6 +1914,7 @@ impl UiApp {
             sim_resize_to: None,
             sim_ta_resize: false,
             sim_pick_save: false,
+            dialogs: filedialog::Policy::interactive(),
             sim_ta_text: String::new(),
             sim_ta_single: String::new(),
             sim_ta_rect: None,
@@ -2206,7 +2221,7 @@ impl App for UiApp {
         //   ② `--font-file <路径>` → 启动期直接加载（老开关，走同一条通路）；
         //   ③ `--sim-import <路径>` → 脚本化导入（**不弹对话框**，验证字节→资源这条线）。
         if let Some(kind) = self.top.import_request.take() {
-            match filedialog::pick(kind) {
+            match self.dialogs.open(kind) {
                 Some(path) => self.apply_import(ctx, path, false),
                 None => self.top.import_status = "导入已取消".to_owned(),
             }
@@ -2215,8 +2230,13 @@ impl App for UiApp {
         // `theme_tuner.theme(..)` 与渲染用的那一份**同源**（`menu/窗口/控件` 都吃它）
         // ⇒ 导出的文件导入回来就是"现在这个样子"。
         if let Some(kind) = self.top.export_request.take() {
+            // 选择器只有一条**显式**通路：`filedialog::Policy`（`--no-file-dialog` ⇒
+            // **完全不碰 rfd**；`--pick theme-save=<路径|none>` ⇒ 预置这一次的结果）。
+            // ⚠ 刻意**不读环境变量**：那会让"导出主题"能被外部悄悄改写到任意路径
+            // （隐式、界面无异常 = 攻击入口）。见 `filedialog::Policy` 的文档。
+            let picked = self.dialogs.save(kind);
             match kind {
-                ExportKind::Theme => match filedialog::pick_save(kind) {
+                ExportKind::Theme => match picked {
                     Some(path) => {
                         let theme = self
                             .theme_tuner
@@ -2728,8 +2748,9 @@ impl App for UiApp {
             }
         }
         // ── 调试：脚本化鼠标（`--sim-pick-save`）──────────────────
-        // 第 20 帧按下「导出主题…」那条路（只记请求）：帧外处理器会调 `pick_save` ——
-        // 设了 `RJ_PICK_SAVE` 就用它（不弹框），于是"导出主题"整条通路可无人值守跑完。
+        // 第 20 帧按下「导出主题…」那条路（只记请求）：帧外处理器会走
+        // `--sim-pick-save <路径|none>`（显式 CLI ⇒ 不弹阻塞的另存为），于是"导出主题"
+        // 整条通路可无人值守跑完。缺值就什么都不做（只印用法）。
         if self.sim_pick_save && f.frames() == 20 {
             self.top.export_request = Some(ExportKind::Theme);
         }
@@ -4272,9 +4293,9 @@ impl App for UiApp {
             eprintln!(
                 "sim-pick-save: status={st:?} {}",
                 if ok {
-                    "[OK] 导出通路走通（`RJ_PICK_SAVE` 生效 ⇒ 没有弹阻塞的另存为对话框）"
+                    "[OK] 导出通路走通（`--no-file-dialog` ⇒ 完全不碰 rfd；结果由 `--pick theme-save=..` 预置）"
                 } else {
-                    "[FAIL] 没走到导出（或覆盖没生效 ⇒ 弹了对话框 / 被卡住）"
+                    "[FAIL] 没走到导出（缺 `--no-file-dialog` ⇒ 弹了阻塞的对话框 / 卡住）"
                 }
             );
         }

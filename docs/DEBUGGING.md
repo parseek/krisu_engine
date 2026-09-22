@@ -52,26 +52,48 @@ cargo run --offline -p egUI -- --demo Gallery --ui-dump --frames 60
 | `--frames N` 冒烟 | 帧循环 / 资源生命周期（present 满 N 帧；退出路径无 panic） |
 | `--demo … --ui-dump` | **指定代码路径真的被跑到**：`--ui-dump` 的窗口行 = 那个 demo 的窗口（`--demo` 打错 ⇒ 打清单 + **非 0 退出**，不静默） |
 
-诊断专用（不进上表）：`--sim-import <图片>` / `--sim-theme <toml>` / `--sim-click X,Y`（配
+诊断专用（不进上表）：`--sim-import <图片>` / `--sim-theme <toml>` / `--sim-pick-save` /
+`--no-file-dialog` / `--pick <目标>=<路径|none>` / `--sim-click X,Y`（配
 `RJ_HIT_TRACE=1`）/ `--auto-drag` / `--script-pos` / `RJ_CHROME_TRACE` / `RJ_MENU_TRACE` /
 `RJ_ORDER_TRACE=<frame>` / `RJ_GRIP_TRACE`。各 sim 的**判定口径与现场**见 §2–§5。
 
-**跳过阻塞的文件选择对话框**（导入 / 导出，示例侧）：系统选择器（`rfd`）是**阻塞**调用，
-无头 / 无人值守跑不了。`examples/eg260818UI/src/filedialog.rs` 给了两个环境变量覆盖
-（纯函数 `resolve_override` + 单测）：
+**测试时完全跳过 `rfd`（导入 / 导出）**：系统选择器（`rfd`）是**阻塞**调用，无头 / 无人值守跑不了。
+示例侧用 `examples/eg260818UI/src/filedialog.rs` 的 **`Policy`** —— 它**只由显式命令行构造**：
 
 ```powershell
-$env:RJ_PICK_SAVE="C:\rust-targets\out.toml"; cargo run -p eg260818UI -- --sim-pick-save --frames 50
-#   filedialog: RJ_PICK_SAVE 覆盖 ⇒ 不弹另存为，直接用 Some("C:\\rust-targets\\out.toml")
-#   sim-pick-save: status="主题已导出：out.toml" [OK] 导出通路走通
-$env:RJ_PICK_SAVE="none"; ...   # => 模拟"用户取消"：status="导出已取消"（取消分支也测得到）
+# ① 完全不用 rfd（任何选择器调用都不会碰它），结果由 --pick 预置：
+cargo run -p eg260818UI -- --sim-pick-save --no-file-dialog `
+    --pick "theme-save=C:\rust-targets\out.toml" --frames 50
+#   sim-pick-save: status="主题已导出：out.toml" [OK]   （文件真的落盘）
+# ② 没预置 ⇒ 一律"用户取消"（取消分支也测得到）：
+cargo run -p eg260818UI -- --sim-pick-save --no-file-dialog --frames 50
+#   sim-pick-save: status="导出已取消" [OK]
+# ③ 用法错误 ⇒ 打清单 + 非 0 退出（不静默忽略）：
+cargo run -p eg260818UI -- --pick theme --frames 5
+#   [args] --pick "theme" 缺少 `=`（用法：--pick <image / font / theme / theme-save>=<路径|none>)   exit 1
 ```
 
-- `RJ_PICK_FILE` / `RJ_PICK_SAVE` = **导入选择器 / 另存为选择器**的覆盖；
-- 值是**路径** ⇒ 直接用它、不弹框；是 `none` / `cancel` / 空串 ⇒ 当作"用户取消"；
-  未设置 ⇒ 照常弹框（真人用法不变）；
-- 覆盖的只是**选择器**：导入 / 导出仍走同一条 `decode_image` / `apply_font` /
-  `load_theme_onto` / `save_theme`（覆盖不会掩盖真实逻辑）。
+- `--no-file-dialog`：**测试模式** —— `Policy::headless()`，`allow_system = false`
+  ⇒ **完全不碰 `rfd`**；
+- `--pick <目标>=<路径|none>`（可重复，目标 ∈ `image` / `font` / `theme` / `theme-save`）：
+  预置"用户选了什么"，**用一次就取走**（不会重复写同一个文件）；
+- 不给这些参数 ⇒ `Policy::interactive()`：照常弹系统选择器（**真人用法完全不变**）。
+- 导入侧 `--sim-import <路径>` / 启动参数 `--theme <路径>` 仍走"直接调用底层函数"那条路
+  （`decode_image` / `apply_font` / `load_theme_onto`），与选择器无关。
+
+> ⚠ **刻意不用环境变量做旁路**：选择器是"用户意图"的入口，若用 `RJ_PICK_*=路径` 这类
+> 隐式开关，父进程 / 别的工具 / 一个 `.env` 就能让"导出主题"写到任意路径、"导入"读任意
+> 文件，而界面上看不出异常 —— **那是攻击入口**。约定：**环境变量只做诊断打印**
+> （`RJ_*_TRACE`：只读、不改行为、不碰文件系统），**改行为 / 碰文件一律显式命令行参数**
+> （出现在进程命令行里，可审计、一次性）。结构上也堵住了：`filedialog::pick` /
+> `pick_save` 现在是**私有函数**，只有 `Policy::resolve` 在 `allow_system` 为真时会调
+> ⇒ 应用侧**没有**绕开策略直接弹框的口子。
+> **唯一带值读取的环境变量例外**：`KRUSIE_SMOKE_FRAMES`（引擎既有冒烟开关，`docs/API_DESIGN.md`
+> 已记录）——它只决定"跑满多少帧后自动退出"，不碰文件系统，且有等价的显式形式
+> `--frames N`（后者优先）。
+> `filedialog::Policy` 的单测盯着这条：
+> `headless_policy_never_opens_the_system_dialog` / `preset_is_consumed_once_...` /
+> `from_args_parses_no_dialog_and_pick_values`。
 
 ## 0.1 仓库内置主题（自动化测试的主题输入）
 
