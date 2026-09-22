@@ -3496,7 +3496,15 @@ impl<'a> Ui<'a> {
                 (sh - top_abs).max(0.0)
             };
             let h = if fixed_h.is_some() { avail_h } else { avail_h - top_left.y - pad_total };
-            let w = width.unwrap_or(0.0) - top_left.x * 2.0;
+            // ⚠ 视口**横跨窗口内容盒**：`width` 已经是**内容宽**（`set_fixed_w` 的语义，
+            // 外框宽 = `width + 2×pad_total`），再减一次内边距会让视口窄 2×pad（实测：
+            // 条带跟着左移 26px ⇒ 脚本按"窗口右缘 − pad − 7"点的条带落空、`offset` 恒 0）。
+            // 自动宽窗口（`width == None`）用上一帧结算宽推。
+            let w = width.unwrap_or_else(|| {
+                prev_size
+                    .map(|s| (s.x - pad_total * 2.0).max(1.0))
+                    .unwrap_or(1.0)
+            });
             Some(Rect::new(
                 top_left.x,
                 top_left.y,

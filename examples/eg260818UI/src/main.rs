@@ -3786,24 +3786,16 @@ impl App for UiApp {
                 let view_h = find("scroll_v_win")
                     .map(|w| w.size.y)
                     .unwrap_or(0.0);
-                // 已**验证**的：视口建成且内容高于视口（可滚）。
-                // ⚠ 还**没验证**的：纯点击滚动条轨道翻页（脚本的条带坐标还没打准，
-                //    `offset` 仍是 0）——这里如实打印，不用"视口建成"冒充"条带可点"。
-                let viewport_ok = sv.is_some_and(|s| s.content_h > 0.0 && s.content_h > view_h);
-                let clicked = sv.is_some_and(|s| s.offset > 1.0);
+                // 视口建成（内容高于视口）+ 点条带**真的翻了一页**（`offset` 变大）。
+                let ok = sv.is_some_and(|s| s.content_h > view_h + 1.0 && s.offset > 1.0);
                 eprintln!(
                     "sim-scroll-mode[vscroll(Scroll)]: 视口高={view_h:.0} · ScrollState={sv:?} {}",
-                    if viewport_ok {
-                        "[OK] 窗口内的滚动视口建成（内容高于视口 ⇒ 有滚动条；条带点击尚未验证）"
+                    if ok {
+                        "[OK] 窗口内的滚动视口建成 + 点条带翻页改了 offset"
                     } else {
-                        "[FAIL] 视口没建（内容没进滚动沙箱 / 高没被限制）"
+                        "[FAIL] 视口没建 / 条带没点到 / offset 没写回"
                     }
                 );
-                eprintln!(
-                    "sim-scroll-mode[vscroll(Scroll)]: 条带点击后 offset={} （0 = 脚本坐标没打中，待修）",
-                    sv.map(|s| s.offset).unwrap_or(-1.0)
-                );
-                let _ = clicked;
                 let _ = no_clip_layer;
                 let _ = ca;
                 eprintln!(
@@ -4534,9 +4526,9 @@ impl App for UiApp {
         // 而不是"空着的高窗"）。用户实测："点击收起后不会收起"。
         if self.sim_chrome && f.frames() == 230 {
             let (dragged, collapsed) = (self.windows.eng_dragged_h, self.windows.eng_collapsed_h);
-            let ok = dragged.zip(collapsed).is_some_and(|(d, c)| {
-                d > 100.0 && 40.0 <= c && c <= 70.0 && c < d - 30.0
-            });
+            let ok = dragged
+                .zip(collapsed)
+                .is_some_and(|(d, c)| d > 100.0 && (40.0..=70.0).contains(&c) && c < d - 30.0);
             eprintln!(
                 "sim-chrome[收起忽略持久高]: 拖大后高={dragged:?} → 收起后高={collapsed:?} {}",
                 if ok {
