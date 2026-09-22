@@ -3455,12 +3455,16 @@ impl App for UiApp {
                 let strict = dump.windows.iter().find(|w| w.id.ends_with("strict_win"));
                 let strict_clip = strict.and_then(|w| w.clip);
                 let clip_batches = ui.state().stats.clip_batches;
-                // ① scissor == 该窗内容区（原点 + 结算尺寸）；
+                // ① scissor == 该窗**内容盒**（原点 + 内边距，扣掉两侧内边距）——
+                //    "裁切内容的绘制用 Scissor 矩形范围**应该只有内容，没有标题栏**"
+                //    （这个窗口没有标题栏 ⇒ 内容盒 = `origin + pad`、尺寸 − 2×pad）。
+                let pad = ui.theme().panel.padding + ui.theme().panel.border_w;
                 let ok_rect = strict.map(|w| (w.origin, w.size)).is_some_and(|(o, s)| {
                     strict_clip.is_some_and(|c| {
-                        (c.x - o.x).abs() <= 1.0
-                            && (c.y - o.y).abs() <= 1.0
-                            && (c.w - s.x).abs() <= 2.0
+                        (c.x - (o.x + pad)).abs() <= 1.0
+                            && (c.y - (o.y + pad)).abs() <= 1.0
+                            && (c.w - (s.x - pad * 2.0)).abs() <= 2.0
+                            && (c.h - (s.y - pad * 2.0)).abs() <= 2.0
                     })
                 });
                 // ② **跟着窗口一起走**：第 90 帧时窗口已被脚本拖动过（origin 变了），
@@ -3992,12 +3996,33 @@ impl App for UiApp {
                 // ② ClipOnly：固定视口宽 = 150×scale + 内边距；
                 let clip_ok = sb.is_some_and(|s| (s.x - want_clip).abs() <= 3.0);
                 // ③ **两条轴各自独立**（这条是旧的 `Placement::Clip` 做不到的）：NoClip 窗
-                //    **完全没有裁剪层**；ClipOnly 窗的裁剪层 x = 窗口宽（横向被裁）、
-                //    y 仍铺满屏幕（**纵向没被裁**）。
+                //    **完全没有裁剪层**；ClipOnly 窗的裁剪层 x = **内容盒宽**（不是窗口宽 ——
+                //    内容 scissor 不含内边距、**更不含标题栏**：用户要求"裁切内容的绘制用
+                //    Scissor 矩形范围应该只有内容，没有标题栏"），y 仍铺满屏幕（**纵向没被裁**）。
                 let no_clip_layer = a.is_some_and(|w| w.clip.is_none());
-                let clip_x_only = cb
-                    .zip(sb)
-                    .is_some_and(|(c, s)| (c.w - s.x).abs() <= 1.0 && c.h >= screen_h - 1.0);
+                // ⚠ 上面的 `pad` 是**两侧合计**（`want_clip` 用），内容盒的**单侧**内缩要减半。
+                let pad1 = pad * 0.5;
+                // 被裁的那条轴 ⇒ scissor 收到**内容盒**（扣两侧内边距；不是窗口矩形）；
+                // 没被裁的那条轴 ⇒ 沿用外层 / **屏幕**兜底（`clip_for_axes` 的设计：不裁 ≠ 用
+                // 窗口边界去裁）⇒ 纵向仍铺满屏幕。
+                let clip_x_only = b.zip(sb).is_some_and(|(w, s)| {
+                    let (left, right) = (w.origin.x + pad1, w.origin.x + s.x - pad1);
+                    cb.is_some_and(|c| {
+                        // **内容 scissor 必须落在内容盒里**（左缘 ≥ origin+pad、右缘 ≤
+                        // origin+size−pad）：旧实现给的是**整个窗口矩形** ⇒ 左缘 = origin
+                        // （把内边距甚至标题栏也算进去了）⇒ 这条立刻失败。
+                        // ⚠ 这个 dump 字段是**该窗最后一批**的 scissor：窗里的 `TextEditor`
+                        // 自带更窄的文本框盒 ⇒ 这里通常读到"内容盒 ∩ 文本框盒"（本例 x 从
+                        // 600 收到 225）——正好证明 `clip_and` 是**求交**而不是覆盖。
+                        c.w >= 1.0 && c.x >= left - 1.0 && c.x + c.w <= right + 2.0
+                    })
+                });
+                // **"内容 scissor 不含标题栏"**（用户要求）的正面证据：`vscroll(Scroll)` 那扇窗
+                // 的**纵向**是被裁的 ⇒ 它的 scissor 上缘必须在**标题栏之下**（下移 ≥ 一行）。
+                let bar_excluded = find("palette_h_win").is_some_and(|w| {
+                    w.clip
+                        .is_some_and(|c| (c.y - w.origin.y) >= ui.theme().row_h)
+                });
                 // ⚠ 不能用"NoClip 窗的 `clip` 是 `None`"当判据：那个字段是**该窗最后一批的
                 // scissor**，而窗里的 `TextEditor` 自带**文本框盒裁剪** ⇒ 恒为 `Some`。
                 // 所以 NoClip 那条轴用"窗口宽被内容撑过 `.width()`"来证（626 > 225），
@@ -4095,11 +4120,11 @@ impl App for UiApp {
                 let _ = ca;
                 eprintln!(
                     "sim-scroll-mode: NoClip 窗={sa:?}（期望宽 ≥ 400）· ClipOnly 窗={sb:?}（期望宽 {want_clip:.0}）\
-                     · NoClip scissor={ca:?} · ClipOnly scissor={cb:?}（期望宽=窗口宽、高≥{screen_h:.0}）{}",
-                    if noclip_ok && clip_ok && clip_x_only {
-                        "[OK] 按轴策略各自生效：NoClip 让内容定宽、ClipOnly 固定视口宽且只裁横向（纵向未被牵连）"
+                     · NoClip scissor={ca:?} · ClipOnly scissor={cb:?}（期望：落在**内容盒**内〔左缘 ≥ origin+pad、右缘 ≤ origin+size−pad〕、标题栏已被排除={bar_excluded}）{}",
+                    if noclip_ok && clip_ok && clip_x_only && bar_excluded {
+                        "[OK] 按轴策略各自生效：NoClip 让内容定宽、ClipOnly 固定视口宽且只裁横向（纵向未被牵连）+ 内容 scissor 不含标题栏"
                     } else {
-                        "[FAIL] 某条轴没按策略走（NoClip 被压窄 · ClipOnly 被撑开 · 纵向被牵连）"
+                        "[FAIL] 某条轴没按策略走（NoClip 被压窄 · ClipOnly 被撑开 · 纵向被牵连 · scissor 含标题栏）"
                     }
                 );
             }

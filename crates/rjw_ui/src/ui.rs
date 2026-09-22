@@ -3505,6 +3505,16 @@ impl<'a> Ui<'a> {
         // 当成 **win=0 内容**而撤销它的按下（实测：`hit[..] ::collapse OK` 但点不动、
         // 收起状态永远不翻转）。
         let mut size = Vec2::ZERO;
+        // **内容命令区间的右端**（见下面 `content_end = ..` 的赋值）：裁切层只盖这段。
+        let mut content_end = start;
+        // **内容原点**（窗口局部坐标）= 标题栏占位之后的游标。窗口内容盒的左上角就是它；
+        // 裁切用的 scissor 必须**只有内容**（不含标题栏 / 内边距 —— 用户要求：
+        // "裁切内容的绘制用 Scissor 矩形范围应该只有内容，没有标题栏"）。
+        let content_origin = self
+            .frames
+            .last()
+            .map(|f| f.cursor)
+            .unwrap_or(Vec2::splat(pad_total));
         // ─── `vscroll(Scroll)`：把内容录进一个**滚动视口**（窗口内滚动条）───────────
         // 视口 = 窗口内容盒（标题栏之下），高 = 固定高（`.height(..)` / 拖过）**或**
         // "窗口顶到屏幕底还剩多少"（`Scroll` 的自然含义：不许跑出屏幕，多出来的滚）。
@@ -3514,11 +3524,7 @@ impl<'a> Ui<'a> {
         // 仍然不收起"（状态翻转了、内容也没了，但那个空面板还是原来那么高）。
         let scroll_axis_on = !collapsed && (vs == ScrollMode::Scroll || hs == ScrollMode::Scroll);
         let viewport = if scroll_axis_on {
-            let top_left = self
-                .frames
-                .last()
-                .map(|f| f.cursor)
-                .unwrap_or(Vec2::splat(pad_total));
+            let top_left = content_origin;
             // ⚠ 用 `fixed_h`（**已按收起态清零**）而不是 `eff_h`：同一条"收起忽略固定高"
             // 的规则必须在这里也生效，否则视口会把忽略掉的那个高又拿回来。
             let avail_h = if let Some(h) = fixed_h {
@@ -3589,6 +3595,9 @@ impl<'a> Ui<'a> {
             }
             // 结算尺寸（装饰之前）：标题/按钮不得反过来影响窗口尺寸。
             size = ui.frames.last().expect("window frame").settle_size();
+            // **内容绘制的命令区间**（`[start, content_end)`）：裁切层只该盖**内容** ——
+            // 标题栏（`ornament_at`）与面板底色 / 边框 / 缩放柄都在这之后录，**不参与**裁切。
+            content_end = ui.painter.q.queue.len();
             // **标题栏容器**：宽 = 最终外框宽 ⇒ 按钮贴外缘、标题可按最终宽度居中/省略。
             // 插在**按下裁决之前**（裁决在 `with_id` 之后）：按钮的 `claim_press()` 必须
             // 早于窗口自己的裁决，否则"按按钮把窗口拖走"复现。
@@ -3730,19 +3739,45 @@ impl<'a> Ui<'a> {
         // ③ **该轴被用户拖过尺寸**（固定尺寸视口：内容再撑不开它，不裁就会画到面板外
         //    —— 用户实测的 TTT 窗口 bug）。
         if vs != ScrollMode::NoClip || hs != ScrollMode::NoClip {
-            let win_abs = Rect::new(
-                saved_base.x + display_pos.x,
-                saved_base.y + display_pos.y,
-                size.x,
-                size.y,
+            // **裁切矩形 = 窗口的"内容盒"**（不含标题栏、不含内边距）——用户要求：
+            // "裁切内容的绘制用 Scissor 矩形范围应该只有内容，没有标题栏"。
+            // 局部坐标 = `[content_origin, size − pad_total]`（`content_origin` 已在标题栏
+            // 占位之后取过；无标题栏时它就是 `(pad, pad)`）。
+            let content_box = Rect::new(
+                saved_base.x + display_pos.x + content_origin.x,
+                saved_base.y + display_pos.y + content_origin.y,
+                (size.x - content_origin.x - pad_total).max(1.0),
+                (size.y - content_origin.y - pad_total).max(1.0),
             );
-            let clip = clip_for_axes(saved_clip, win_abs, Rect::new(0.0, 0.0, sw, sh), vs, hs);
-            // ⚠ **只盖本窗口自己的绘制**（`d.win == z`）：本窗范围内录的**嵌套浮层**
-            // （下拉 / 取色面板 / 子菜单的 z 是 `WIN_TOPMOST`）各有自己的层级与裁剪，
-            // 被父窗口的视口 scissor 顺带裁掉就是"子窗口被不经意地裁掉"。
-            for d in &mut self.painter.q.queue[start..] {
+            let clip = clip_for_axes(saved_clip, content_box, Rect::new(0.0, 0.0, sw, sh), vs, hs);
+            // 诊断（`RJ_WINCLIP_TRACE=1`）：内容盒 scissor 的**输入与输出**——
+            // "内容 scissor 不含标题栏"这类几何争议直接看这三行，不必猜。
+            if std::env::var_os("RJ_WINCLIP_TRACE").is_some() {
+                eprintln!(
+                    "winclip[{id}] win=({:.0},{:.0},{:.0},{:.0}) content_origin=({:.0},{:.0}) box=({:.0},{:.0},{:.0},{:.0}) v={vs:?} h={hs:?} -> clip={clip:?}",
+                    saved_base.x + display_pos.x,
+                    saved_base.y + display_pos.y,
+                    size.x,
+                    size.y,
+                    content_origin.x,
+                    content_origin.y,
+                    content_box.x,
+                    content_box.y,
+                    content_box.w,
+                    content_box.h,
+                );
+            }
+            // ⚠ **只盖内容自己的绘制，且只盖本窗口**：
+            // - 区间 `[start, content_end)`：标题栏（`ornament_at`）与面板底色 / 边框 /
+            //   缩放柄都在那之后录 ⇒ 标题栏**不会**被内容 scissor 裁掉；
+            // - `d.win == z`：本窗范围内录的**嵌套浮层**（下拉 / 取色面板 / 子菜单的 z 是
+            //   `WIN_TOPMOST`）各有自己的层级与裁剪，被父窗口的视口顺带裁掉就是
+            //   "子窗口被不经意地裁掉"；
+            // - **与已有的内层裁剪求交**（`clip_and`）：内容里的文本框盒 / 内层滚动视口
+            //   必须保留自己更窄的 scissor（旧实现直接覆盖 ⇒ 内层裁剪被吃掉）。
+            for d in &mut self.painter.q.queue[start..content_end] {
                 if d.win == z {
-                    d.clip = clip;
+                    d.clip = clip_and(d.clip, clip);
                 }
             }
         }
@@ -8476,6 +8511,25 @@ fn clip_for_axes(
         out = Rect::new(x0, y0, x1 - x0, y1 - y0);
     }
     Some(out)
+}
+
+/// **两个裁剪层求交**（纯函数，可单测）：窗口的"内容盒 scissor"与命令**已经带着**的
+/// 内层裁剪（文本框盒 / 内层滚动视口）必须**求交**而不是覆盖 —— 覆盖会把内层更窄的
+/// scissor 吃掉（文字画到框外）。任一为 `None` ⇒ 取另一个。
+fn clip_and(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(a), Some(b)) => {
+            let x0 = a.x.max(b.x);
+            let y0 = a.y.max(b.y);
+            let x1 = (a.x + a.w).min(b.x + b.w);
+            let y1 = (a.y + a.h).min(b.y + b.h);
+            if x1 <= x0 || y1 <= y0 {
+                return Some(Rect::new(x0, y0, 0.0, 0.0));
+            }
+            Some(Rect::new(x0, y0, x1 - x0, y1 - y0))
+        }
+    }
 }
 
 /// **嵌套容器的内容最大宽**（纯函数，可单测）：父级可用宽扣掉本容器内边距。

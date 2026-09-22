@@ -1684,9 +1684,22 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 >   面板的绘制命令带着**外层视口**的 scissor ⇒ 面板被"不经意地裁掉"（用户截图批注）。
 >   回归守卫：`--sim-scroll-mode[子窗口不继承外层裁剪]`（嵌套窗口 `pal_inner` 的 dump
 >   `clip == None`；去掉入口重置立刻变成外层视口的 scissor ⇒ `[FAIL]`）。
+> - **裁切 scissor = 窗口的"内容盒"**（用户要求："裁切内容的**绘制用** Scissor 矩形范围应该
+>   只有内容，**没有标题栏**"）：`content_box` = 从 `content_origin`（标题栏占位之后的游标，
+>   无标题栏时 = `(pad, pad)`）起、右/下各扣一个 `pad_total`。三条细节：
+>   **①** 只盖**内容那段命令** `[start, content_end)`（`content_end` 在 `settle_size` 之后、
+>   `ornament_at` 之前取）—— 标题栏 / 面板底色 / 边框 / 缩放柄都在那之后录，**不进**内容 scissor；
+>   **②** 与命令**已经带着**的内层裁剪**求交**（`clip_and`）而不是覆盖 —— 内容里的文本框盒 /
+>   内层滚动视口有自己的、更窄的 scissor（实测：`hscroll(ClipOnly)` 窗里 600 宽的文本框盒被
+>   内容盒收到 225）；
+>   **③** 有一条轴不裁时，那条轴仍用**屏幕**兜底（`clip_for_axes` 的既有设计：不裁 ≠ 用窗口边界裁）。
+>   诊断：`RJ_WINCLIP_TRACE=1` 打印 `win / content_origin / box / v / h / -> clip`。
+>   回归守卫：`--sim-clip`（无标题栏的严格窗 ⇒ scissor = `origin+pad`、`size−2×pad`）+
+>   `--sim-scroll-mode` 的 `标题栏已被排除`（有标题栏的 `vscroll` 窗，scissor 上缘下移 ≥ `row_h`；
+>   实测 `y=428` = 原点 380 + 标题栏 39 + 间隙 9）。换回"整窗矩形"立刻两条都 `[FAIL]`。
 > - 验收：`--sim-scroll-mode`（按轴独立）—— 两扇同内容窗：`hscroll(NoClip)` 那扇**不给 `.width()`**
->   ⇒ 内容定宽 626；`hscroll(ClipOnly)` 固定 251 且 scissor = `(520, 0, 251, 1080)`
->   （宽 = 窗口、**高 = 整屏** ⇒ 只裁了横向）。`--sim-row-overflow` 则摆**同宽同内容**（`.width(150)`）
+>   ⇒ 内容定宽 626；`hscroll(ClipOnly)` 固定 251，其 scissor 的 x/宽 = **内容盒**（`origin+pad`、
+>   `size−2×pad`，落在内容盒内）。`--sim-row-overflow` 则摆**同宽同内容**（`.width(150)`）
 >   的两扇窗证明"压缩 vs 裁切"：`hscroll(NoClip)` 的行被压到 199（可用宽 225）、
 >   `hscroll(ClipOnly)` 的行**保持自然宽 282**（超出被裁）且幽灵控件点不到；
 >   同一条里还有"自动宽窗 + `divider()`"必须留在 240..600（守卫布局根）。

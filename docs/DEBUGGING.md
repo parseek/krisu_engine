@@ -55,7 +55,12 @@ cargo run --offline -p egUI -- --demo Gallery --ui-dump --frames 60
 诊断专用（不进上表）：`--sim-import <图片>` / `--sim-theme <toml>` / `--sim-pick-save` /
 `--no-file-dialog` / `--pick <目标>=<路径|none>` / `--sim-click X,Y`（配
 `RJ_HIT_TRACE=1`）/ `--auto-drag` / `--script-pos` / `RJ_CHROME_TRACE` / `RJ_MENU_TRACE` /
-`RJ_ORDER_TRACE=<frame>` / `RJ_GRIP_TRACE`。各 sim 的**判定口径与现场**见 §2–§5。
+`RJ_ORDER_TRACE=<frame>` / `RJ_GRIP_TRACE` / `RJ_WINCLIP_TRACE`。各 sim 的**判定口径与现场**见 §2–§5。
+
+⚠ **例行回归不跑"主题导入 / 导出"那两条**（用户要求"可以跳过主题导入导出测试吗" ⇒ 可以）：
+`--sim-pick-save` 会**写盘**、`--sim-import` 要外部文件路径，两者都不影响窗口几何 / 命中 / 裁剪
+这些本轮在盯的不变量；它们留在"诊断专用"里**按需单跑**（用法见下面的 rfd 段），不进 18 个 sim 的
+例行批次。
 
 **测试时完全跳过 `rfd`（导入 / 导出）**：系统选择器（`rfd`）是**阻塞**调用，无头 / 无人值守跑不了。
 示例侧用 `examples/eg260818UI/src/filedialog.rs` 的 **`Policy`** —— 它**只由显式命令行构造**：
@@ -247,6 +252,17 @@ fn update(&mut self, ctx: &mut Ctx) {
   `[子窗口不继承外层裁剪]` 录在 `vscroll` 窗里的**嵌套窗口**（`palette_h_win/pal_inner`）
   其 dump `clip` 必须是 `None`（去掉 `window_impl` 入口的 `painter.q.clip = None` ⇒ 立刻变成
   外层视口的 scissor ⇒ `[FAIL]`：这正是"子窗口被不经意地裁掉"）。
+- **裁切 scissor = 内容盒（不含标题栏）**：用户要求"裁切内容的**绘制用** Scissor 矩形范围应该
+  只有内容，没有标题栏" ⇒ `window_impl` 的按轴裁切用 `content_box`（`content_origin` 起、
+  扣掉两侧内边距），且**只盖内容那段命令**（`[start, content_end)`，标题栏 / 面板底色 /
+  缩放柄都在那之后录）+ **与内层裁剪求交**（`clip_and`，文本框盒 / 内层视口更窄的 scissor 不被吃掉）。
+  两条判定：`--sim-clip` 的 scissor 必须 = `(origin+pad, size−2×pad)`（**无标题栏**的严格窗）；
+  `--sim-scroll-mode` 里**有标题栏**的 `vscroll` 窗，scissor 上缘必须下移 ≥ `row_h`
+  （`标题栏已被排除=true`），且被裁那条轴的 scissor 必须落在内容盒内。
+  几何争议直接看诊断：`RJ_WINCLIP_TRACE=1` 打印每扇被裁窗的
+  `win / content_origin / box / v / h / -> clip`。**失败路径实测**：把 `content_box` 换回整窗矩形 ⇒
+  `--sim-clip` 读到 `(488,690,1207,125)`（整窗）而 `[FAIL]`、`--sim-scroll-mode` 读到 `x=520`（含内边距）
+  且 `标题栏已被排除=false`。
 - **窄的固定宽窗口：压缩 vs 裁切 + "幽灵控件"**（`--sim-row-overflow`）：用户实测
   "指定 `width` 里，`width` 较小的时候控件会突出去，直到你去拖拽缩放"。示例摆**同宽同内容**
   （`.width(150.0)`）的**两扇**窗，只有水平轴策略不同 —— 这就是用户给的判定表的两个格子：
