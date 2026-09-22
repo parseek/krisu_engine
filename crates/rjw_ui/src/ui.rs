@@ -910,11 +910,15 @@ impl<'a> Ui<'a> {
             }
             let was_dragging = ws.dragging;
             let a = update_drag(ws, hit, hbtn);
-            // 基准捕获：按下边沿（常规）**或**拖拽本次刚激活（兜底）。
-            // ⚠ 兜底那条必要：边沿可能丢（焦点切换 / 注入式输入 / 上一帧命中被遮挡），
-            // 此时沿用陈旧基准会算出"巨大位移"；用**当前**尺寸 + 当前鼠标补一次基准，
-            // 最坏是"这次拖拽从当前位置开始"，而不是尺寸失控。
-            if (hbtn.down_edge() || !was_dragging) && (hit || a) {
+            // 基准**只在按下边沿**捕获（`hbtn.pressed()` 也要为真）。
+            //
+            // ⚠ 曾经这里还有 `|| !was_dragging` 的"兜底补捕获"：一旦按键状态在某帧读到
+            // "未按下"（真实鼠标在窗口外、注入式输入、丢帧），`dragging` 被清掉 ⇒ 下一帧
+            // 又满足 `!was_dragging` ⇒ **拿当前尺寸 + 当前鼠标重新立基准**，于是每帧再加
+            // 一次位移 ⇒ 尺寸**无限增长**（用户实测："加了 resize Both 则无限增高"）。
+            // 现在：没有基准的那一帧就**不生效**（少走一帧），而不是重新立基准。
+            let _ = was_dragging;
+            if hbtn.down_edge() && hbtn.pressed() && hit {
                 ws.press_mouse = Some(self.mouse_screen.round());
                 ws.press_panel = Some(current);
             }
@@ -3284,11 +3288,16 @@ impl<'a> Ui<'a> {
             // **本函数前面**读过，不种这一下，第一次拖拽本帧不生效（要等下一帧）——
             // 症状正是"点击缩小窗口后不会缩小"（尤其内容比它高时，本帧仍按内容撑开）。
             if hit && self.mouse_left().down_edge() {
+                // ⚠ 两个槽的**单位不一样**、必须按各自口径写：
+                // - `window_widths` = **内容宽**（`set_fixed_w` 的语义，外框 = 内容 + 2×pad）；
+                // - `window_heights` = **外框高**（`Frame::fixed_h` 就是结算高本身）。
+                // 早先把外框宽写进内容宽槽 ⇒ 每次按下/拖拽都白涨 2×pad，**越拖越宽**
+                // （用户实测："gallery 咋变这么宽"）。
                 if resize_fixes_width(resize_axes) && explicit_w.is_none() {
                     self.state
                         .window_widths
                         .entry(id_for.to_static())
-                        .or_insert(ps.x);
+                        .or_insert((ps.x - pad_total * 2.0).max(1.0));
                 }
                 if resize_fixes_height(resize_axes) {
                     self.state
@@ -3297,8 +3306,9 @@ impl<'a> Ui<'a> {
                         .or_insert(ps.y);
                 }
             }
-            // 当前尺寸 = 屏幕上那个（宽取持久固定宽，高取持久高度 / 结算高）。
-            let cur_w = width.unwrap_or(ps.x);
+            // 当前尺寸 = 屏幕上那个（宽取持久**内容**宽 / 无 `.width()` 时由外框宽换算；
+            // 高取持久高度 = 外框高。**两者单位不同**，混用会让每拖一次涨 2×pad）。
+            let cur_w = width.unwrap_or((ps.x - pad_total * 2.0).max(1.0));
             let cur_h = self
                 .state
                 .window_heights

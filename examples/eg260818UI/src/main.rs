@@ -198,6 +198,14 @@ const SCROLL_CLIP_POS: Vec2 = Vec2::new(520.0, 470.0);
 /// `--sim-scroll-mode` 第三扇窗（`vscroll(Scroll)`）：放在**屏幕下缘附近**，
 /// 于是"屏幕剩下的高"明显小于内容高 ⇒ 视口 + 滚动条。
 const SCROLL_V_POS: Vec2 = Vec2::new(830.0, 700.0);
+/// `--sim-scroll-mode` 第四扇窗（调色板形态：21 行 `标签 + 取色器`，**自动宽、不设 resize**）。
+const PALETTE_POS: Vec2 = Vec2::new(1260.0, 120.0);
+/// 21 个取色器的 id（静态，避免每行 `format!` 分配）。
+const PALETTE_IDS: [&str; 21] = [
+    "pal_0", "pal_1", "pal_2", "pal_3", "pal_4", "pal_5", "pal_6", "pal_7", "pal_8", "pal_9",
+    "pal_10", "pal_11", "pal_12", "pal_13", "pal_14", "pal_15", "pal_16", "pal_17", "pal_18",
+    "pal_19", "pal_20",
+];
 /// 窗口**外面**那个控件（"幽灵控件"）在窗口内容坐标里的位置：x 明显超过内容宽。
 const ROW_GHOST_OFFSET: Vec2 = Vec2::new(260.0, 12.0);
 /// 窗口**里面**那个控件（正对照）在窗口内容坐标里的位置与宽（物理像素）。
@@ -646,6 +654,8 @@ struct Windows {
     /// --sim-scroll-mode 两扇窗的文本（各自独立，避免共用缓冲互相覆写）。
     scroll_text_a: String,
     scroll_text_b: String,
+    /// --sim-scroll-mode：调色板形态那扇窗的 21 个颜色。
+    pal_colors: [Color; 21],
     /// --sim-chrome 阶段 5：⌃ 按钮的**行中心**（`caption_pts` 给的是"上半"——那是为了
     /// 躲开收起态右下角的缩放柄；本轮让柄给内容让位之后，**中心也该能点**）。
     eng_center_pt: Option<Vec2>,
@@ -714,6 +724,7 @@ impl Windows {
             show_scroll_wins: false,
             scroll_text_a: String::new(),
             scroll_text_b: String::new(),
+            pal_colors: [Color::rgba_u8(110, 168, 255, 255); 21],
             eng_center_pt: None,
             eng_center_before: None,
             eng_center_after: None,
@@ -887,6 +898,19 @@ impl Windows {
                         Position::Physical(Vec2::ZERO),
                         TextEditor::new("scroll_clip_te", &mut self.scroll_text_b).width(400.0),
                     );
+                });
+            // ③ 调色板形态：**自动宽 + 21 行 `标签 + 取色器` + 不设 `.resize`** ——
+            //    用户实测："不加 resizable 则缩成一条缝"。这里量它到底多宽多高。
+            ui.window("palette_like_win")
+                .pos(Position::Physical(PALETTE_POS))
+                .title("调色板形态（21 行）")
+                .show(|w| {
+                    for (id, color) in PALETTE_IDS.iter().zip(self.pal_colors.iter_mut()) {
+                        w.row(|r| {
+                            r.label("颜色：");
+                            r.add(ColorPicker::new(id, color));
+                        });
+                    }
                 });
             // ③ `vscroll(Scroll)`：**真的滚动视口**（窗口内滚动条）——内容很高、窗口只占
             //    屏幕剩下的那点高 ⇒ 出现滚动条；拖 thumb 能改偏移（`ScrollState.offset`）。
@@ -3796,6 +3820,17 @@ impl App for UiApp {
                 // ClipOnly 那条轴用"scissor 宽 = 窗口宽 且 纵向铺满屏幕"来证（只裁横向）。
                 // ④ `vscroll(Scroll)` 那扇窗：视口高 = 屏幕剩下的高（远小于内容）⇒
                 //    `ScrollState.content_h > 视口高`；拖一下右侧滚动条 ⇒ `offset > 0`。
+                // ④ 调色板形态（自动宽 + 21 行）：**不许"缩成一条缝"**（宽/高都得像样）。
+                let pal = find("palette_like_win").map(|w| w.size);
+                let pal_ok = pal.is_some_and(|s| s.x >= 200.0 && s.y >= 200.0);
+                eprintln!(
+                    "sim-scroll-mode[调色板形态]: 21 行自动宽窗={pal:?} {}",
+                    if pal_ok {
+                        "[OK] 自动宽 + 21 行不会缩成一条缝"
+                    } else {
+                        "[FAIL] 缩成一条缝了（宽或高 < 200）"
+                    }
+                );
                 let sv = ui.state().scrolls().get("scroll_v_win/scroll").copied();
                 let view_h = find("scroll_v_win")
                     .map(|w| w.size.y)
@@ -4459,17 +4494,20 @@ impl App for UiApp {
             let before = self.sim_resize_size;
             let after = self.sim_resize_after;
             let (b, a) = (before.unwrap_or(Vec2::ZERO), after.unwrap_or(Vec2::ZERO));
-            let ok = a.x > b.x + 1.0 && a.y > b.y + 1.0;
+            // **变化量必须正好等于注入位移**（+60/+40，容差 3px）：只判"变大了"会让
+            // "每帧再加一次位移"的无限增长（用户实测："加了 resize Both 则无限增高"）
+            // 蒙混过关 —— 这条现在能抓住它。
+            let ok = (a.x - b.x - 60.0).abs() <= 3.0 && (a.y - b.y - 40.0).abs() <= 3.0;
             eprintln!(
-                "sim-resize: 拖柄前 {:.0}×{:.0} → 后 {:.0}×{:.0} {}",
+                "sim-resize: 拖柄前 {:.0}×{:.0} → 后 {:.0}×{:.0}（期望 +60/+40）{}",
                 b.x,
                 b.y,
                 a.x,
                 a.y,
                 if ok {
-                    "[OK] 宽高同调（两个轴都被拖大了）"
+                    "[OK] 宽高同调，且变化量 = 注入位移（没有每帧累加）"
                 } else {
-                    "[FAIL] 只有一条轴生效 / 柄没点到"
+                    "[FAIL] 只有一条轴生效 / 柄没点到 / 尺寸每帧累加（无限增高）"
                 }
             );
         }
@@ -4479,18 +4517,19 @@ impl App for UiApp {
                 self.windows.grip_before.unwrap_or(Vec2::ZERO),
                 self.windows.grip_after.unwrap_or(Vec2::ZERO),
             );
-            let wider = a.x > b.x + 30.0;
-            let same_h = (a.y - b.y).abs() <= 1.0;
+            // **变化量必须正好等于注入位移（+50）**：只判"变宽了"会让"每拖一次多涨 2×pad"
+            // 的混单位 bug 蒙混过关（用户实测："gallery 咋变这么宽"）。
+            let ok = (a.x - b.x - 50.0).abs() <= 3.0 && (a.y - b.y).abs() <= 1.0;
             eprintln!(
-                "sim-resize: 无 width 窗口 拖前 {:.0}×{:.0} → 拖后 {:.0}×{:.0} {}",
+                "sim-resize: 无 width 窗口 拖前 {:.0}×{:.0} → 拖后 {:.0}×{:.0}（期望宽 +50）{}",
                 b.x,
                 b.y,
                 a.x,
                 a.y,
-                if wider && same_h {
-                    "[OK] 没给 `.width()` 也能横向拖宽（且高度轴没被带上 —— Resize::Horizontal）"
+                if ok {
+                    "[OK] 没给 `.width()` 也能横向拖宽（变化量 = 位移，没有多涨内边距；高不变）"
                 } else {
-                    "[FAIL] 无 width 的窗口拖不动 / 横向拖动把高度也改了"
+                    "[FAIL] 无 width 的窗口拖不动 / 宽度多涨了（外框与内容宽混用）/ 高度被带上"
                 }
             );
         }
