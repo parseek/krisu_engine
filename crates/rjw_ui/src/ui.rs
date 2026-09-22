@@ -279,6 +279,7 @@ impl<'a> UiInit<'a> {
             place_once: None,
             cur_win_id: None,
             win_hit_bounds: None,
+            cur_win_hit_limit: None,
             z0_ranges: Vec::new(),
             segment,
             // 鼠标屏幕坐标：物理（拖拽 / IME 基准与命中测试统一物理像素，无逻辑之分）
@@ -490,6 +491,16 @@ pub struct Ui<'a> {
     /// 记录子控件命中区（而不是所有绘制命令）是**有意为之**：装饰（阴影 / 描边）
     /// 不该扩大交互范围。窗口进入时保存、退出时恢复（浮层是嵌套窗口）。
     win_hit_bounds: Option<Rect>,
+    /// **当前窗口的"可命中区域"限制**（绝对矩形；`None` = 不限制）。
+    ///
+    /// 只在窗口**内容被裁切**时设置（`window_content_clipped`：`Placement::Clip` 或
+    /// 高度已被用户拖过 ⇒ 窗口成了固定尺寸视口）：此时超出窗口矩形的子控件**画不出来**
+    /// （命令行的 clip 会裁掉它），但它们仍然登记命中区 ⇒ 窗口外面那一圈"看得见面板、
+    /// 看不见控件"的地方能点到**幽灵控件**（用户实测的"Vertical 缩放幽灵控件"）。
+    /// 命中判定加上"鼠标点必须在限制矩形内"即可：裁掉的部分不可点，可见的部分照旧可点。
+    ///
+    /// 与 [`Self::win_hit_bounds`] 一样随窗口进出保存 / 恢复（浮层是嵌套窗口）。
+    cur_win_hit_limit: Option<Rect>,
     /// **本帧 win=0（非窗口）各顶层放置的起始 `seq`**（按录制序）。由顶层放置入口在
     /// `depth == 0` 时记录（[`Self::begin_top_placement`]）。
     ///
@@ -1821,6 +1832,15 @@ impl<'a> Ui<'a> {
             && !c.contains_point(self.mouse_logical) {
                 return false;
             }
+        // **窗口自身的可命中范围**（内容被裁切时才有）：裁掉的部分不得命中 ——
+        // 否则"看不见的控件"还能点到（幽灵控件）。放在**登记命中区之前**：越界的命中
+        // 既不响应，也不会把窗口的遮挡矩形撑到窗口外面去。
+        if let Some(limit) = self.cur_win_hit_limit
+            && !limit.contains_point(self.mouse_logical)
+        {
+            self.state.occluded_hits += 1;
+            return false;
+        }
         // **窗口遮挡**（点击穿透修复）：鼠标下若有更高 z 的窗口（`win=0` 内容被任意
         // 窗口）覆盖本控件所在窗口 → 本窗口不得响应——重叠区域只让最上层窗口交互，
         // 背后窗口的控件不会误触发。窗口矩形来自 [`UiState::window_rects`]（跨帧缓存）。
@@ -2185,6 +2205,14 @@ impl<'a> Ui<'a> {
         self.begin_top_placement();
         let saved_base = self.abs_base;
         self.abs_base = saved_base + pos;
+        // **可用宽下传**（嵌套容器不许把内容排到固定宽父级外面）：
+        // 子容器自己没有固定宽时，继承父级的可用宽（扣除子容器自己的内边距）。
+        // 见 `Frame::max_w` 与 [`Self::avail_w`]。
+        let mut frame = frame;
+        if !frame.has_fixed_w() {
+            let parent_avail = self.avail_w();
+            frame.set_max_w(content_max_w(parent_avail, frame.pad_total));
+        }
         self.frames.push(frame);
         self.painter.q.depth += 1;
         f(&mut ContainerCtx { ui: self });
@@ -2294,10 +2322,15 @@ impl<'a> Ui<'a> {
         content
     }
 
-    /// 当前可用的**内容宽度**（逻辑像素）：沙箱宽 → 容器固定宽（`window_at_w` 等，
-    /// 经 `Frame::fixed_avail_w`）→ 下一子项 max 约束，取最小；无任何约束 = `None`
-    /// （内容自然宽度）。供 `LimitedInParent` 控件（如 [`crate::widgets::Label`]）自洽
-    /// 溢出（自动换行 / 省略号）。
+    /// 当前可用的**内容宽度**（物理像素）：沙箱宽 → **由内向外**第一个给出宽度约束的
+    /// 容器 frame（固定宽窗口 / 从父级继承的内容最大宽）→ 下一子项 max 约束，取最小；
+    /// 无任何约束 = `None`（内容自然宽度）。供 `LimitedInParent` 控件（如
+    /// [`crate::widgets::Label`]）自洽（自动换行 / 省略号）。
+    ///
+    /// ⚠ **必须由内向外扫整个 frame 栈**（不是只看 `frames.last()`）：`row` 是独立
+    /// frame、自己不设固定宽，只看最内层会让 `row` 里的 `Label` 拿不到外层窗口的可用宽
+    /// ⇒ 按自然宽把整行排到**固定宽窗口外面**（用户实测："指定 width 里控件会突出去，
+    /// 直到你去拖拽缩放"）。
     #[inline]
     pub fn avail_w(&self) -> Option<f32> {
         let base = self
@@ -2305,12 +2338,19 @@ impl<'a> Ui<'a> {
             .last()
             .copied()
             .flatten()
-            .or_else(|| self.frames.last().and_then(|f| f.fixed_avail_w()));
+            .or_else(|| crate::layout::stack_avail_w(&self.frames));
+        // **下一子项**的两条约束：显式 `max_size`，以及水平堆叠的**剩余宽**
+        // （一行里后面的控件拿到的可用宽必须扣掉前面已经用掉的）。
         let nm = self.frames.last().map(|f| f.next_max_w()).unwrap_or(0.0);
-        match (base, nm) {
-            (Some(b), n) if n > 0.0 => Some(b.min(n)),
-            (b, _) => b,
+        let rem = self.frames.last().and_then(|f| f.remaining_w());
+        let mut out = base;
+        if nm > 0.0 {
+            out = Some(out.map_or(nm, |b| b.min(nm)));
         }
+        if let Some(r) = rem {
+            out = Some(out.map_or(r, |b| b.min(r)));
+        }
+        out
     }
 
     /// **分割线**（绝对定位水平线）：`pos` 相对当前容器内容原点，宽 `w`（逻辑像素）。
@@ -3172,6 +3212,7 @@ impl<'a> Ui<'a> {
         };
         // 内容基准 = **本帧显示基准**（`display_pos`）——录制期的绝对空间量与几何一致。
         self.abs_base = saved_base + display_pos;
+        let saved_hit_limit = self.cur_win_hit_limit.take();
         let mut frame = Frame::new_stack(PackSide::Top, gap, pad_total);
         if let Some(w) = width {
             frame.set_fixed_w(w);
@@ -3185,6 +3226,22 @@ impl<'a> Ui<'a> {
         };
         if let Some(h) = fixed_h {
             frame.set_fixed_h(h);
+        }
+        // **可命中限制**：内容会被裁切的窗口（`Placement::Clip` / 高度已被拖过）把命中
+        // 范围也钉在窗口矩形内 ⇒ 溢出到面板外的**幽灵控件**既看不见也点不到。
+        // 用 `prev_size`（上一帧结算尺寸）：尺寸要等录完才知道，而鼠标事件本来就是针对
+        // "屏幕上已有的几何"产生的（与命中 / 拖拽 / clamp 同一口径）。
+        if window_content_clipped(strict, fixed_h)
+            && let Some(ps) = prev_size
+            && ps.x > 0.0
+            && ps.y > 0.0
+        {
+            self.cur_win_hit_limit = Some(Rect::new(
+                saved_base.x + display_pos.x,
+                saved_base.y + display_pos.y,
+                ps.x,
+                ps.y,
+            ));
         }
         self.frames.push(frame);
         self.painter.q.depth += 1;
@@ -3423,6 +3480,8 @@ impl<'a> Ui<'a> {
         self.cur_win_id = saved_win_id;
         // 恢复外层窗口的"可交互内容范围"（本窗口已并进自己的遮挡矩形）。
         self.win_hit_bounds = saved_hit_bounds;
+        // 恢复外层窗口的可命中限制（浮层 = 嵌套窗口）。
+        self.cur_win_hit_limit = saved_hit_limit;
         size
     }
 
@@ -7944,8 +8003,22 @@ fn resolve_window_resize(opt: Option<(bool, Resize)>, has_width: bool) -> (bool,
     }
 }
 
-/// **窗口内容是否强制裁剪**（纯函数，可单测）。
+/// **嵌套容器的内容最大宽**（纯函数，可单测）：父级可用宽扣掉本容器内边距。
 ///
+/// `None`（父级不限宽）/ 结果为 `<= 0` ⇒ `None`（不限）——"父级可用宽 0"不该把子项
+/// 压成 0 宽（那会让内容彻底看不见），交回原来的自然排版。
+///
+/// 这一条是"**指定 width 的窗口里，嵌套容器（`row` / `panel` / `view`）不会把内容排到
+/// 窗口外面**"的关键：子容器继承该上限后，子项被 clamp、`LimitedInParent` 控件拿到
+/// [`Ui::avail_w`] 后自动换行（用户实测："width 较小，控件会突出去，直到你去拖拽缩放"）。
+fn content_max_w(parent_avail: Option<f32>, pad_total: f32) -> Option<f32> {
+    parent_avail.and_then(|w| {
+        let inner = w - pad_total * 2.0;
+        (inner > 0.0).then_some(inner)
+    })
+}
+
+/// **窗口内容是否强制裁剪**（纯函数，可单测）。///
 /// - `strict`（`.placement(Placement::Clip)`）：应用的显式选择；
 /// - `fixed_h = Some(..)`：**高度被用户拖过**（`Resize::Both` 的柄）⇒ 窗口成了"固定
 ///   尺寸视口"，内容撑不高它；不裁剪就会画到窗口外面（用户实测的 TTT 窗口 bug）。

@@ -20,9 +20,9 @@ cargo check  --offline --workspace --all-targets          # 期望 0 warning
 cargo clippy --offline -p rjw_ui --all-targets            # 期望 0 warning
 cargo test   --offline --workspace                        # 全绿（rjw_ui 基线：332 lib + 42 doc）
 
-# 2) 交互行为：16 个脚本化仿真（判定打在 stderr，全 [OK] 才算过）
+# 2) 交互行为：17 个脚本化仿真（判定打在 stderr，全 [OK] 才算过）
 #    ⚠ 每个 sim 自己打印判定帧，`--frames` 只要"超过最后一个判定帧"；260 覆盖全部（现网最大 240）。
-foreach ($s in "drag","picker","overlap","cover","chrome","weight","shadow","clip",
+foreach ($s in "drag","picker","row-overflow","overlap","cover","chrome","weight","shadow","clip",
               "zorder","text-cull","tuner","menu","dropdown","weight-modal","resize","ta-resize") {
     cargo run --offline -p eg260818UI -- "--sim-$s" --frames 260
 }
@@ -48,7 +48,7 @@ cargo run --offline -p egUI -- --demo Gallery --ui-dump --frames 60
 | 命令 | 守什么 |
 |---|---|
 | `check` / `clippy` / `test` | 公开面没坏、单测期望（几何 / 命中 / 文本 / 主题）没变、无新增告警 |
-| 15 个 `--sim-*` | **交互行为**（拖拽 / 收起 / 遮挡 / 层级 / 裁剪 / 菜单 / 下拉 / 尺寸责任链…）；数值断言写在各 sim 的判定行里 |
+| 17 个 `--sim-*` | **交互行为**（拖拽 / 收起 / 遮挡 / 层级 / 裁剪 / 菜单 / 下拉 / 尺寸责任链 / 窄窗溢出行…）；数值断言写在各 sim 的判定行里 |
 | `--frames N` 冒烟 | 帧循环 / 资源生命周期（present 满 N 帧；退出路径无 panic） |
 | `--demo … --ui-dump` | **指定代码路径真的被跑到**：`--ui-dump` 的窗口行 = 那个 demo 的窗口（`--demo` 打错 ⇒ 打清单 + **非 0 退出**，不静默） |
 
@@ -183,6 +183,21 @@ fn update(&mut self, ctx: &mut Ctx) {
   开着），第 92 帧读 `picker_demo::popup` 窗口宽必须仍是 `picker_panel_w(主题默认入口宽)+2`
   ——旧实现（按入口实测宽 × 1.9）在这里读到 382 并 `[FAIL]`（已验证该断言可失败）。
   本 sim 在三个主题下都通过：默认 401 / `builtin:krusie-dark` 401 / `builtin:krusie-compact` 344。
+- **窄的固定宽窗口：内容"突出去"与"幽灵控件"**（`--sim-row-overflow`）：用户实测
+  "指定 `width` 里，`width` 较小的时候控件会突出去，直到你去拖拽缩放"。示例用一扇
+  `.width(150.0)` + `Placement::Clip` 的窗口做现场：
+
+  ```
+  sim-row-overflow: 行宽=Some(Vec2(199.0, 39.0)) 可用宽=225 窗内点得到=true 窗外点得到=false [OK]
+  ```
+
+  三条判据（缺一不可，否则 `[FAIL]`）：
+  1. `row(..)` 的**结算宽** ≤ 窗口内容可用宽（修前 = 标签 + 输入框的自然宽之和 ⇒ 超出去）；
+  2. 点窗口**内**那个控件 ⇒ 焦点必须落在它身上（正对照：守卫不能把整窗点废）；
+  3. 点窗口**外**那个溢出控件 ⇒ 焦点**不得**落在它身上（裁掉的部分不可命中）。
+  **两条都验过能失败**：把 `content_max_w` 改回恒 `None` ⇒ 行宽 271 > 225 ⇒ `[FAIL]`；
+  把命中限制去掉 ⇒ 窗外那个控件拿到焦点 `row_win/ghost_te` ⇒ `[FAIL]`（`occluded_hits`
+  也从 1 变 0）。
 - **重叠控件的命中归属**（"点了 A 却连 B 也触发"）：示例的 `--sim-overlap` 把鼠标压在两个
   **故意重叠**的控件交集中心（坐标由 `examples/eg260818UI/src/overlap.rs` 与绘制同源解算），
   按下 + 释放后打印

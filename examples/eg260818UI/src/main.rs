@@ -68,6 +68,7 @@ fn main() -> Result<(), RunError> {
     app.sim_overlap = args.iter().any(|a| a == "--sim-overlap");
     app.sim_cover = args.iter().any(|a| a == "--sim-cover");
     app.sim_chrome = args.iter().any(|a| a == "--sim-chrome");
+    app.windows.sim_row_overflow = args.iter().any(|a| a == "--sim-row-overflow");
     app.sim_weight = args.iter().any(|a| a == "--sim-weight");
     app.sim_shadow = args.iter().any(|a| a == "--sim-shadow");
     app.sim_clip = args.iter().any(|a| a == "--sim-clip");
@@ -162,6 +163,16 @@ const PICKER_DEMO_POS: Vec2 = Vec2::new(24.0, 150.0);
 /// `--sim-picker` 在第 88 帧把**入口色块**改成的尺寸（物理像素，故意远宽于默认）。
 /// 面板此时仍开着 ⇒ 用来钉住"**入口尺寸不影响对话框尺寸**"。
 const PICKER_BIG_TRIGGER: Vec2 = Vec2::new(200.0, 40.0);
+
+/// `--sim-row-overflow` 的窄窗口左上角（物理像素）与该窗口**外面**那个控件的偏移
+/// （内容坐标）。窗口宽固定为逻辑 150 ⇒ 内容宽 = 150 × scale，输入框默认宽远超它。
+const ROW_WIN_POS: Vec2 = Vec2::new(200.0, 620.0);
+/// 窗口**外面**那个控件（"幽灵控件"）在窗口内容坐标里的位置：x 明显超过内容宽。
+const ROW_GHOST_OFFSET: Vec2 = Vec2::new(260.0, 12.0);
+/// 窗口**里面**那个控件（正对照）在窗口内容坐标里的位置与宽（物理像素）。
+const ROW_INSIDE_OFFSET: Vec2 = Vec2::new(8.0, 60.0);
+const ROW_INSIDE_W: f32 = 120.0;
+const ROW_TE_H: f32 = 39.0;
 
 /// 取色面板里的**固定**几何常量（物理像素；与 `colorpicker/panel.rs` 同源）。
 const PICKER_PAD: f32 = 6.0;
@@ -579,6 +590,24 @@ struct Windows {
     eng_states: Vec<(bool, Vec2)>,
     /// --sim-chrome：是否打印上面的证据。
     sim_chrome: bool,
+    /// --sim-row-overflow：本窗口是否录制（固定窄宽 + `Placement::Clip` 的验收现场）。
+    sim_row_overflow: bool,
+    /// --sim-row-overflow：窄窗口里那一行的**结算尺寸**（`row(..)` 的返回值）——
+    /// 判定"整行落在窗口可用宽内"（修前 = 标签 + 输入框的自然宽之和，会超出）。
+    row_size: Option<Vec2>,
+    /// --sim-row-overflow：窗口内容的可用宽（物理像素；= `.width()` 逻辑值 × scale）。
+    row_avail_w: f32,
+    /// --sim-row-overflow 两个控件的文本（控件本身只用来产生可观测的点击）。
+    ghost_text: String,
+    inside_text: String,
+    /// --sim-row-overflow：窗口里 / 窗口外两个点击点（**物理像素**，从 dump 的窗口原点 +
+    /// 主题内边距解算 ⇒ 换主题 / 换 DPI 都对）。
+    row_inside_pt: Option<Vec2>,
+    row_ghost_pt: Option<Vec2>,
+    /// --sim-row-overflow：点窗口**内**那个控件后，焦点是否落在它身上（正对照）。
+    row_inside_focus: bool,
+    /// --sim-row-overflow：点窗口**外**那个溢出控件后，焦点是否落在它身上（必须 false）。
+    row_ghost_focus: bool,
 }
 
 impl Windows {
@@ -603,6 +632,15 @@ impl Windows {
             eng_pts: None,
             eng_states: Vec::new(),
             sim_chrome: false,
+            sim_row_overflow: false,
+            row_size: None,
+            row_avail_w: 0.0,
+            ghost_text: String::new(),
+            inside_text: String::new(),
+            row_inside_pt: None,
+            row_ghost_pt: None,
+            row_inside_focus: false,
+            row_ghost_focus: false,
         }
     }
 
@@ -708,6 +746,46 @@ impl Windows {
                 w.text_area_nw("win_b_note_area", &mut self.win_b_note_area);
             }
         });
+        // ── `--sim-row-overflow`：**窄的固定宽窗口**里的验收现场 ──────────────────
+        //
+        // 用户实测的两条 BUG：
+        // ① `.width()` 较小时，`row` 里的控件**整排突到窗口外面**（每个子项各自都没
+        //    超限，但整行超过了可用宽）——判定用 `row(..)` 的**结算宽** ≤ 窗口内容宽；
+        // ② 溢出到面板外的控件（这里是 `add_at` 放到窗口右边的编辑器）**看不见却点得着**
+        //    （`Placement::Clip` 裁掉了绘制命令，命中区还在）——判定"窗口外那个点
+        //    点不到、窗口内那个点点得到"（正反对照，避免把守卫写成"整窗不可点"）。
+        //
+        // 位置 / 尺寸全部写成常量：脚本按同一组常量算点击点（不写死"猜"出来的像素）。
+        if self.sim_row_overflow {
+            let scale = ui.scale();
+            // `.width(150.0)` = **逻辑**宽 ⇒ 内容宽 = 150 × scale（物理）。
+            self.row_avail_w = 150.0 * scale;
+            ui.window("row_win")
+                .pos(Position::Physical(ROW_WIN_POS))
+                .width(150.0)
+                .placement(Placement::Clip)
+                .resize(false, Resize::None)
+                .title("窄窗口（row 不许突出去）")
+                .show(|w| {
+                    // ① 一行：标签 + 输入框（输入框默认宽 = 主题 `input.min_w`，远超可用宽）
+                    let size = w.row(|r| {
+                        r.label("标签：");
+                        r.add(TextEditor::new("row_te", &mut self.inside_text));
+                    });
+                    self.row_size = Some(size);
+                    // ② 绝对定位到窗口**外面**的控件（不受可用宽 clamp 约束）：
+                    //    它就是"内容溢出时那个看不见的幽灵控件"。
+                    w.add_at(
+                        Position::Physical(ROW_GHOST_OFFSET),
+                        TextEditor::new("ghost_te", &mut self.ghost_text).width(120.0),
+                    );
+                    // ③ 窗口**里面**的正对照控件（已知矩形 ⇒ 脚本能算到点击点）。
+                    w.add_at(
+                        Position::Physical(ROW_INSIDE_OFFSET),
+                        TextEditor::new("inside_te", &mut self.inside_text).width(ROW_INSIDE_W),
+                    );
+                });
+        }
         // 严格裁剪窗口（Placement::Clip）：内容超出窗口被强制裁剪（Clip 沙箱）。
         ui.window("strict_win")
             .pos(Vec2::new(560.0, 460.0))
@@ -2539,6 +2617,23 @@ impl App for UiApp {
                 _ => {}
             }
         }
+        // ── 调试：脚本化鼠标（`--sim-row-overflow`）──────────────
+        // 两个点由 ui 段从 `debug_dump` 的窗口原点 + 主题内边距解算（不写死像素）：
+        // ① 窗口**里**的正确控件（正对照，必须点得到 ⇒ 证明守卫没有把整窗点废）；
+        // ② 窗口**外**的溢出控件（裁掉了 ⇒ 必须点不到；点到了就是"幽灵控件"回来了）。
+        if self.windows.sim_row_overflow {
+            let inside = self.windows.row_inside_pt.unwrap_or(Vec2::ZERO);
+            let ghost = self.windows.row_ghost_pt.unwrap_or(Vec2::ZERO);
+            match f.frames() {
+                20..=21 => f.debug_inject_mouse(inside, false),
+                22..=23 => f.debug_inject_mouse(inside, true),
+                24..=25 => f.debug_inject_mouse(inside, false),
+                32..=33 => f.debug_inject_mouse(ghost, false),
+                34..=35 => f.debug_inject_mouse(ghost, true),
+                36..=37 => f.debug_inject_mouse(ghost, false),
+                _ => {}
+            }
+        }
         // ── 调试：脚本化鼠标（`--sim-menu`）──────────────────────
         // 行程：10..11 移到「视图」触发器 → 12..13 按下 → 14..15 抬起（菜单打开）
         //      → 22..23 按下第一个菜单项（"主题调节窗口"）→ 24..25 抬起
@@ -3340,6 +3435,49 @@ impl App for UiApp {
                     }
                 }
             }
+            // `--sim-row-overflow`：① 两个点击点（窗口内 / 窗口外）从 `row_win` 的**实测
+            // 原点** + 主题内边距解算——不写死像素；② 两次点击后各看一眼**焦点**落点。
+            if self.windows.sim_row_overflow {
+                // ⚠ **每帧重算**（只在脚本还会用到点击点的那几帧）：首帧窗口还没被
+                // `WindowClamp::Screen` 夹住（引擎要上一帧尺寸才能 clamp）⇒ 只算一次会
+                // 把点定在窗口"将要被夹走"之前的位置（实测踩过：窗外那个点偏了 44px）。
+                if sim_frame < 38 {
+                    let dump = ui.debug_dump();
+                    if let Some(w) = dump.windows.iter().find(|p| p.id == "row_win")
+                        && w.size.x > 0.0
+                    {
+                        let pad = ui.theme().panel.padding + ui.theme().panel.border_w;
+                        let origin = w.origin + Vec2::splat(pad);
+                        self.windows.row_inside_pt = Some(
+                            origin
+                                + ROW_INSIDE_OFFSET
+                                + Vec2::new(ROW_INSIDE_W * 0.5, ROW_TE_H * 0.5),
+                        );
+                        // 幽灵控件宽固定 120（见 `TextEditor::width(120.0)`）。
+                        self.windows.row_ghost_pt =
+                            Some(origin + ROW_GHOST_OFFSET + Vec2::new(60.0, ROW_TE_H * 0.5));
+                    }
+                }
+                let focused = ui
+                    .state()
+                    .focused
+                    .as_ref()
+                    .map(|f| f.as_str().to_owned());
+                if sim_frame == 28 {
+                    self.windows.row_inside_focus =
+                        focused.as_ref().is_some_and(|f| f.contains("inside_te"));
+                }
+                if sim_frame == 40 {
+                    self.windows.row_ghost_focus =
+                        focused.as_ref().is_some_and(|f| f.contains("ghost_te"));
+                    eprintln!(
+                        "sim-row-overflow: 点窗外后 focus={focused:?} occluded_hits={} 行宽={:?} 可用宽={:.0}",
+                        ui.state().hits().occluded_hits(),
+                        self.windows.row_size,
+                        self.windows.row_avail_w,
+                    );
+                }
+            }
             // `--sim-zorder`：列表里"点得到"的点必须**从几何解算**——
             // 列表下方邻接的 `win_b` 会随内容长高（`TextEditor` 默认尺寸按 DPI 修正后
             // 就长高了一截），写死的 y 会被它盖住 ⇒ 点下去命中 `win_b` 的文本框：
@@ -3971,6 +4109,28 @@ impl App for UiApp {
         // 只有点击命中色块 → 面板打开 → SV 平面/色相条/滑块被拖到，颜色才会变）。
         if self.sim_picker && f.frames() == 90 {
             eprintln!("sim-picker: demo_color = {:?}", self.top.demo_color);
+        }
+        // --sim-row-overflow：三条判据（窄窗口里"不许突出去" + "幽灵控件点不到"）。
+        // 1. `row(..)` 的**结算宽** ≤ 窗口可用宽 —— 修前整行 = 标签 + 输入框自然宽之和，
+        //    会超出可用宽（控件排到窗口外面）；
+        // 2. 点窗口**内**那个控件 ⇒ 焦点必须落在它身上（正对照：守卫不能把整窗点废）；
+        // 3. 点窗口**外**那个溢出控件 ⇒ 焦点**不得**落在它身上（裁掉的部分不可命中）。
+        if self.windows.sim_row_overflow && f.frames() == 44 {
+            let size = self.windows.row_size;
+            let avail = self.windows.row_avail_w;
+            let row_ok = size.is_some_and(|s| s.x <= avail + 0.5);
+            let inside_ok = self.windows.row_inside_focus;
+            let ghost_ok = !self.windows.row_ghost_focus;
+            eprintln!(
+                "sim-row-overflow: 行宽={:?} 可用宽={avail:.0} 窗内点得到={inside_ok} 窗外点得到={} {}",
+                size,
+                self.windows.row_ghost_focus,
+                if row_ok && inside_ok && ghost_ok {
+                    "[OK] 窄窗口里整行落在可用宽内 + 溢出的幽灵控件点不到（窗内的仍点得到）"
+                } else {
+                    "[FAIL] 行仍然突出去 / 幽灵控件还能点 / 守卫把窗内也挡住了"
+                }
+            );
         }
         // --sim-zorder：先记"翻页前同一屏幕点选中的条目号"（翻页后必须更大）。
         if self.sim_zorder && f.frames() == 132 {

@@ -1044,6 +1044,11 @@ impl Sense {
   框溢出父级（`TextEditor` 踩过；正确写法见该方法的 rustdoc 示例）。
 - 膨胀语义是**申请方式**：`Expansion::{UnlimitedExpansion(默认), LimitedInParent(压到 avail_w), DisableAutoExpansion(不撑大父级)}`；
   min/max 用 `apply_constraints(desired, c)` 自己应用。
+- `Ui::avail_w()`：**由内向外**找第一个给出宽度约束的容器（固定宽窗口 / 从父级继承的内容最大宽 /
+  沙箱宽），并与"下一子项 `max_size`"和**水平行的剩余宽**取最小。⇒ `LimitedInParent` 控件
+  在 `row` 里也拿得到外层窗口的可用宽（自动换行 / 压窄），**嵌套容器不会把内容排到固定宽窗口外面**；
+  同时，**可拖拽缩放**的控件要自己把申请尺寸与下限都压到 `avail_w` / 实际申请宽以内
+  （`TextEditor` 是范例：`.resize(..)` 的下限不压住就会被主题下限撑回去）。
 - `add_at(pos, w)`：给 `Ui` 打**一次性放置覆盖**，控件的第一次申请消费它（**只在第一次**；
   控件要摆多块用 `allocate_at`）。
 - ⚠ **顺序**：先量（`text_size` / `avail_w`）→ 再申请 → 再画（`ui.painter()`，一个绘制块一个）。

@@ -12,6 +12,21 @@ use rjw_transform::Rect;
 
 use crate::widgets::SizeClass;
 
+/// **由内向外**找第一个给出内容可用宽的 frame（纯函数，可单测）。
+///
+/// `Ui::avail_w` 用它：`row` 自己不是固定宽容器，只看最内层会让 row 里的控件拿不到
+/// 外层窗口的可用宽（见 [`Frame::avail_w`] 的说明）。
+pub(crate) fn stack_avail_w(frames: &[Frame]) -> Option<f32> {
+    frames.iter().rev().find_map(|f| f.avail_w())
+}
+
+/// **自适应收窄的下限**（物理像素）：水平一行里给"下一个子项"留的余量小于它时
+/// **不再压窄**（宁可让内容溢出可见，也不把控件压成一条线 / 0 宽）。
+///
+/// 24 物理像素 ≈ 150% DPI 下 16 逻辑像素——比这更窄的控件已经点不中、看不清，
+/// 压它只会把"内容溢出"换成"控件消失"，后者更难排查。
+const ADAPT_MIN_W: f32 = 24.0;
+
 /// pack 堆叠方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackSide {
@@ -88,6 +103,15 @@ pub(crate) struct Frame {
     /// **容器固定宽度**（`window_at_w` 等；覆盖 `settle_size` 的自然宽度，
     /// 子项宽度 clamp 到该值——内容按固定宽排布、高度自然，如同 egui）。
     fixed_w: Option<f32>,
+    /// **内容最大宽**（`None` = 不限）：子项宽度 clamp 到它，但不改写 `settle_size`
+    /// 的自然宽度（容器仍按内容结算，只是不会长过这个上限）。
+    ///
+    /// 由 [`Ui::container`](crate::Ui::container) 从**父级可用宽**继承而来——这一条是
+    /// "嵌套容器（`row` / `panel` / `view`）不会把内容排到固定宽窗口外面"的机器保证：
+    /// 子项被 clamp、`Label` 这类 `LimitedInParent` 控件经 [`Self::avail_w`] 拿到该宽
+    /// 后自动换行（实测过的 bug：窄的 `.width()` 窗口里 `row` 里的控件整排突出去，
+    /// 直到把窗口拖大才看得回去）。
+    max_w: Option<f32>,
     /// **绝对放置内容的包围盒**（`*_at` / `add_at` / 控件命中区 的矩形并集；
     /// **相对容器 origin**，与 `child_rect` 同一空间）。
     ///
@@ -118,6 +142,7 @@ impl Frame {
             row_max_h: None,
             fixed_h: None,
             fixed_w: None,
+            max_w: None,
             content_bounds: None,
         }
     }
@@ -139,6 +164,7 @@ impl Frame {
             row_max_h: None,
             fixed_h: None,
             fixed_w: None,
+            max_w: None,
             content_bounds: None,
         }
     }
@@ -207,6 +233,51 @@ impl Frame {
             Some(w) if w > 0.0 => Some((w - self.pad_total * 2.0).max(0.0)),
             _ => None,
         }
+    }
+
+    /// **本容器给出的内容可用宽**（`None` = 本帧不限制宽度）：
+    /// 固定宽容器 ⇒ `fixed_avail_w`；否则继承来的 [`Self::max_w`]。
+    ///
+    /// `Ui::avail_w` 由内向外找**第一个**有值的 frame —— 于是 `row` 里的 `Label`
+    /// 也能看到外层窗口的固定宽（否则它会按自然宽把整行排到窗口外面）。
+    pub(crate) fn avail_w(&self) -> Option<f32> {
+        self.fixed_avail_w().or(match self.max_w {
+            Some(w) if w > 0.0 => Some(w),
+            _ => None,
+        })
+    }
+
+    /// 设置**内容最大宽**（见 [`Self::max_w`]；`None` / `<= 0` = 不限）。
+    pub(crate) fn set_max_w(&mut self, w: Option<f32>) {
+        self.max_w = w.filter(|w| *w > 0.0);
+    }
+
+    /// **本容器还能给下一个子项多少宽**（`None` = 不限 / 不是水平堆叠）。
+    ///
+    /// 内容盒（局部坐标）= `[pad_total, pad_total + max_w]`：
+    /// - [`PackSide::Left`]：子项向右推进 ⇒ 余量 = `pad_total + max_w - cursor.x`；
+    /// - [`PackSide::Right`]：子项向左推进 ⇒ 余量 = `cursor.x - pad_total`；
+    /// - 垂直堆叠 / 没有 `max_w` / grid ⇒ `None`。
+    ///
+    /// 这是"一行里的**最后一个**控件也得缩"的依据——只按单子项上限 clamp 不够：
+    /// 一行 `标签 + 输入框`（97 + 9 + 210 = 316）在 276 的可用宽里**每个子项都没超限**，
+    /// 但整行仍然排到窗口外面（用户实测的 BUG）。给输入框的余量 = 276 − 106 = 170
+    /// ⇒ 它缩到 170，整行正好落在可用宽内。
+    pub(crate) fn remaining_w(&self) -> Option<f32> {
+        let mw = self.max_w?;
+        let FrameKind::Stack { side, .. } = &self.kind else {
+            return None;
+        };
+        match side {
+            PackSide::Left => Some((self.pad_total + mw - self.cursor.x).max(0.0)),
+            PackSide::Right => Some((self.cursor.x - self.pad_total).max(0.0)),
+            PackSide::Top | PackSide::Bottom => None,
+        }
+    }
+
+    /// 本帧是否已**固定宽**（固定宽容器由调用方定死，嵌套容器不必再继承上限）。
+    pub(crate) fn has_fixed_w(&self) -> bool {
+        self.fixed_w.is_some()
     }
 
     /// 下一子项的 max **宽度**约束（`0` = 不约束）。
@@ -302,6 +373,20 @@ impl Frame {
         // 容器固定宽：子项宽度 clamp（内容按固定宽排布，高度自然）
         let w = match self.fixed_w {
             Some(fw) if fw > 0.0 => w.min(fw),
+            _ => w,
+        };
+        // 内容最大宽（从父级继承）：同样 clamp 子项宽度，但**不改写**结算宽 ——
+        // 嵌套容器因此不会把内容排到固定宽窗口外面（宽度收窄，`LimitedInParent`
+        // 控件经 `avail_w` 拿到该宽后自动换行 / 压窄）。
+        let w = match self.max_w {
+            Some(mw) => w.min(mw),
+            None => w,
+        };
+        // **水平堆叠的余量**：一行里"最后一个控件"也必须缩，否则整行会排到可用宽
+        // 外面（单子项各自都没超限）。只在余量还够一个像样的控件时才压——余量太小
+        // 就宁可让它溢出，也不能把控件压成 0 宽（那等于凭空消失）。
+        let w = match self.remaining_w() {
+            Some(rem) if rem < w && rem >= ADAPT_MIN_W => rem,
             _ => w,
         };
         let placed = match &mut self.kind {
@@ -760,5 +845,80 @@ mod tests {
         let mut g = Frame::new_stack(PackSide::Top, 6.0, 4.0);
         g.child_rect(300.0, 20.0);
         assert_eq!(g.settle_size(), Vec2::new(308.0, 28.0));
+    }
+
+    #[test]
+    fn max_w_clamps_children_without_changing_settled_width() {
+        // `max_w`（从父级继承的内容最大宽）：子项被 clamp，但**不改写**自然结算宽
+        // （容器仍按内容结算 ⇒ 宽度收窄而不是被撑成整宽）。
+        let mut f = Frame::new_stack(PackSide::Top, 6.0, 0.0);
+        f.set_max_w(Some(100.0));
+        assert_eq!(f.child_rect(180.0, 20.0).w, 100.0, "超宽子项被压到 max_w");
+        assert_eq!(f.child_rect(60.0, 20.0).w, 60.0, "窄子项保持自然");
+        assert_eq!(f.settle_size().x, 100.0, "结算宽 = 最宽子项（= max_w）");
+        // 无上限 ⇒ 行为不变
+        let mut g = Frame::new_stack(PackSide::Top, 6.0, 0.0);
+        assert_eq!(g.child_rect(180.0, 20.0).w, 180.0);
+    }
+
+    #[test]
+    fn horizontal_row_shrinks_the_last_child_to_the_remaining_width() {
+        // **用户实测的 BUG**：`.width()` 较小的窗口里 `row(标签 + 输入框)` 整排突出去
+        // ——每个子项各自都没超上限，但**整行**超出了可用宽。给后面的子项的余量必须
+        // 扣掉前面已经用掉的（窗口内容宽 276；标签 126 + 间距 9 ⇒ 输入框只该有 141）。
+        let mut row = Frame::new_stack(PackSide::Left, 9.0, 0.0);
+        row.set_max_w(Some(276.0));
+        assert_eq!(row.child_rect(126.0, 30.0).w, 126.0, "第一个子项拿自然宽（余量够）");
+        assert_eq!(row.remaining_w(), Some(141.0), "余量 = 276 − (126 + 9)");
+        assert_eq!(row.child_rect(300.0, 30.0).w, 141.0, "第二个子项缩到余量");
+        assert!(row.settle_size().x <= 276.0, "整行落在可用宽内：{}", row.settle_size().x);
+    }
+
+    #[test]
+    fn tiny_remainder_keeps_the_child_visible() {
+        // 余量太小（< `ADAPT_MIN_W`）⇒ **不压**：宁可溢出可见，也不把控件压成一条线。
+        // （`max_w` 的"单个子项不许超内容盒"仍然独立生效——那是另一条规则。）
+        let mut row = Frame::new_stack(PackSide::Left, 9.0, 0.0);
+        row.set_max_w(Some(276.0));
+        row.child_rect(260.0, 20.0);
+        assert!(row.remaining_w().unwrap() < 24.0, "前置条件：余量已很小");
+        assert_eq!(row.child_rect(200.0, 20.0).w, 200.0, "余量太小 ⇒ 保持自然宽（不消失）");
+    }
+
+    #[test]
+    fn remaining_w_follows_side_and_padding() {
+        // 左推：内容盒 = [pad, pad + max_w]；右推（自右向左长）：余量在光标左侧。
+        let mut left = Frame::new_stack(PackSide::Left, 0.0, 4.0);
+        left.set_max_w(Some(100.0));
+        assert_eq!(left.remaining_w(), Some(100.0), "起点：pad + max_w − pad = max_w");
+        left.child_rect(40.0, 10.0);
+        assert_eq!(left.remaining_w(), Some(60.0));
+        let mut right = Frame::new_stack(PackSide::Right, 0.0, 4.0);
+        right.set_max_w(Some(100.0));
+        assert_eq!(right.remaining_w(), Some(0.0), "右推起点在内容盒右缘 ⇒ 余量 0");
+        // 垂直堆叠没有"同行余量"概念
+        let mut top = Frame::new_stack(PackSide::Top, 0.0, 0.0);
+        top.set_max_w(Some(100.0));
+        assert_eq!(top.remaining_w(), None);
+    }
+
+    #[test]
+    fn stack_avail_w_takes_the_innermost_constraint() {
+        // `Ui::avail_w` 的基础：由内向外找**第一个**给出宽度的 frame —— `row`（无约束）
+        // 里面也能看到外层固定宽窗口的内容宽。
+        let window = {
+            let mut f = Frame::new_stack(PackSide::Top, 6.0, 4.0);
+            f.set_fixed_w(120.0); // 内容宽 = 112
+            f
+        };
+        let row = Frame::new_stack(PackSide::Left, 6.0, 0.0); // 自己不设约束
+        let frames = [window, row];
+        assert_eq!(stack_avail_w(&frames), Some(112.0));
+        // 沙箱 / 固定宽都有时，最内层的那个胜（这里是 row 继承来的 max_w）
+        let mut row2 = Frame::new_stack(PackSide::Left, 6.0, 0.0);
+        row2.set_max_w(Some(50.0));
+        assert_eq!(stack_avail_w(&[window, row2]), Some(50.0));
+        // 谁都没约束 ⇒ None（自动宽窗口的自然排版）
+        assert_eq!(stack_avail_w(&[Frame::new_stack(PackSide::Top, 0.0, 0.0)]), None);
     }
 }

@@ -335,6 +335,9 @@ impl<'a> TextEditor<'a> {
             self.width.map_or(dw, |w| w.to_physical(scale)),
             self.height.map_or(dh, |h| h.to_physical(scale)),
         );
+        // **不许突出去**：父级给了可用宽（窄窗口 / `row` 里）就压到它 —— 否则
+        // "文本编辑框比窗口还宽、整排控件排到窗口外面"（用户实测的 BUG）。
+        let default = self.clamp_to_avail(ui, default);
         // 责任链 / 用户拖拽持久值：只有可缩放控件才有那条跨帧记录。
         let persisted = (self.resize != Resize::None).then(|| ui.resolved_size(self.id, default));
         let size = resolve_editor_size(
@@ -343,7 +346,23 @@ impl<'a> TextEditor<'a> {
             self.max_size,
             persisted,
         );
+        let size = self.clamp_to_avail(ui, size);
         ui.allocate(size)
+    }
+
+    /// **把尺寸压到父级可用宽以内**（`avail_w` 为 `None` = 不限制 ⇒ 原样返回）。
+    ///
+    /// 宽高**分开**处理：可用宽只约束宽度轴；高度不是"父级可用宽"能管的（那是
+    /// `row` 的行高 / 窗口高度的事）。
+    ///
+    /// ⚠ 必须**同时**用在申请尺寸**和** `.resize(..)` 的**下限**上：只压申请尺寸时，
+    /// 下面的 `area_rect = resolved.max(min)` 会用主题下限（`input.min_w`）把框**再撑
+    /// 回去**，于是"申请 141、画 210"——照样突出去（实测就是这一条）。
+    fn clamp_to_avail(&self, ui: &Ui, size: Vec2) -> Vec2 {
+        match ui.avail_w() {
+            Some(avail) if avail > 0.0 => Vec2::new(size.x.min(avail), size.y),
+            _ => size,
+        }
     }
 
     /// **本控件的尺寸下限**（物理像素）：显式 `.min_size(..)` 优先，否则给了
@@ -379,7 +398,14 @@ impl Widget for TextEditor<'_> {
             // 缩放柄路径：尺寸责任链 + 拖拽（核心只负责绘制文本）。
             // 下限与 `allocate_rect` **同源**（都不调 `.min_size` ⇒ 主题下限：
             // 最小宽 + 一行文字高）——两处不一致就会"申请尺寸有下限、拖拽却能拖到 0"。
-            let min = self.min_size.unwrap_or_else(|| default_min(&ui.theme().input));
+            // ⚠ 下限同样要压住：`area_rect = resolved.max(min)` 会用主题下限
+            // （`input.min_w`）把框**再撑回去**（申请 141、画 210 —— 实测就是这条）。
+            // 压的依据是**实际申请到的宽**（`rect.w`）而**不是** `avail_w()`：申请已经
+            // 推进过行光标，此刻 `avail_w()` 可能是"剩下的 0"（那样等于没压）。
+            let min = self
+                .min_size
+                .unwrap_or_else(|| default_min(&ui.theme().input));
+            let min = Vec2::new(min.x.min(rect.w), min.y);
             if self.multiline {
                 ui.resizable_text_area_at(self.id, rect, self.value, min, self.resize);
             } else {
