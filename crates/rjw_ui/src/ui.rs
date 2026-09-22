@@ -2594,6 +2594,7 @@ impl<'a> Ui<'a> {
         let st = self.state.scrolls.entry(abs.to_static()).or_default();
         st.offset = offset_px;
         st.content_h = content_size.y;
+        st.content_w = content_size.x;
         self.painter.q.clip = saved_clip;
         view_size
     }
@@ -3523,6 +3524,13 @@ impl<'a> Ui<'a> {
         // `set_fixed_h(视口高 + pad)` 把窗口重新顶高 ⇒ 用户实测的"resizable 窗口点 ⌃
         // 仍然不收起"（状态翻转了、内容也没了，但那个空面板还是原来那么高）。
         let scroll_axis_on = !collapsed && (vs == ScrollMode::Scroll || hs == ScrollMode::Scroll);
+        // 该滚动容器的**跨帧状态**（上一帧的内容尺寸）：视口宽 / 内容定高 / 自动宽窗口的
+        // 结算都用它（`ScrollState` 是 `Copy` 的 ⇒ 拷出来用，不与后面的 `&mut self` 打架）。
+        let prev_scroll = self
+            .state
+            .scrolls
+            .get(format!("{}/scroll", id_for.as_str()).as_str())
+            .copied();
         let viewport = if scroll_axis_on {
             let top_left = content_origin;
             // ⚠ 用 `fixed_h`（**已按收起态清零**）而不是 `eff_h`：同一条"收起忽略固定高"
@@ -3538,8 +3546,7 @@ impl<'a> Ui<'a> {
                 // 出来的内容高，与视口无关）——首次会话未知 ⇒ 先按屏幕剩余，次帧收敛。
                 let top_abs = saved_base.y + display_pos.y;
                 let screen_avail = (sh - top_abs).max(0.0);
-                let key = format!("{}/scroll", id_for.as_str());
-                match self.state.scrolls.get(key.as_str()).map(|s| s.content_h) {
+                match prev_scroll.map(|s| s.content_h) {
                     Some(ch) if ch > 0.0 => screen_avail.min(ch + top_left.y + pad_total),
                     _ => screen_avail,
                 }
@@ -3548,11 +3555,18 @@ impl<'a> Ui<'a> {
             // ⚠ 视口**横跨窗口内容盒**：`width` 已经是**内容宽**（`set_fixed_w` 的语义，
             // 外框宽 = `width + 2×pad_total`），再减一次内边距会让视口窄 2×pad（实测：
             // 条带跟着左移 26px ⇒ 脚本按"窗口右缘 − pad − 7"点的条带落空、`offset` 恒 0）。
-            // 自动宽窗口（`width == None`）用上一帧结算宽推。
+            //
+            // **自动宽窗口**（`width == None`）的视口宽：首选取**内容自己的自然宽**
+            // （上一帧 `ScrollState.content_w`），其次上一帧结算宽反推，首帧用**屏幕剩余宽**
+            // 当引导值 —— **绝不能是 1px**：视口 1px 宽 ⇒ 内容按 1px 折行（`Label` 一个字
+            // 一行、`row` 里的控件被压到下限）⇒ 窗口塌成 `2×pad` 的一条缝，下一帧照它再算
+            // ⇒ **永远一条缝**（用户实测："调色板编辑器在不指定 width 的情况下无法使用"）。
             let w = width.unwrap_or_else(|| {
-                prev_size
-                    .map(|s| (s.x - pad_total * 2.0).max(1.0))
-                    .unwrap_or(1.0)
+                prev_scroll
+                    .map(|s| s.content_w)
+                    .filter(|w| *w > 0.0)
+                    .or_else(|| prev_size.map(|s| (s.x - pad_total * 2.0).max(1.0)))
+                    .unwrap_or_else(|| (sw - (saved_base.x + display_pos.x)).max(1.0))
             });
             Some(Rect::new(
                 top_left.x,
@@ -3586,6 +3600,22 @@ impl<'a> Ui<'a> {
                             }
                         },
                     );
+                    // **自动宽窗口必须"看见"内容**（设计理念：**无顾虑地使用** —— 不写
+                    // `.width(..)` 也要能用）：`scroll_at_axes` 是沙箱、**自己不 note**
+                    // （它不知道调用方要不要这块占位），于是窗口帧的 `max_child.x` 恒 0 ⇒
+                    // 窗口宽 = `2×pad` 的一条缝、内容按它折行。用刚写回的 `content_w/h`
+                    // 补一条内容矩形 ⇒ 窗口撑到**内容的自然尺寸**（高那条会被上面的
+                    // `set_fixed_h`/视口覆盖，不影响定高视口）。
+                    if width.is_none()
+                        && let Some(fr) = ui.frames.last_mut()
+                        && let Some(st) = ui
+                            .state
+                            .scrolls
+                            .get(format!("{}/scroll", id_for.as_str()).as_str())
+                            .copied()
+                    {
+                        fr.note_content(Rect::new(vp.x, vp.y, st.content_w, st.content_h));
+                    }
                 } else {
                     let mut w = Window { ui: &mut *ui };
                     if !collapsed {
@@ -6211,8 +6241,25 @@ impl std::fmt::Display for UiDebugDump {
 }
 
 /// **窗口责任链 builder**：[`Ui::window`] 返回。选项链式设置（`.pos` / `.width` /
-/// `.level` / `.placement` / `.style` / `.clamp` / `.title` / `.close_button` / `.collapsible`）
-/// 后以 `.show(f)` 终结执行。
+/// `.height` / `.level` / `.placement` / `.style` / `.clamp` / `.resizable` / `.vscroll` /
+/// `.title` / `.close_button` / `.collapsible`）后以 `.show(f)` 终结执行。
+///
+/// # 设计理念：**无顾虑地使用**
+///
+/// **什么都不写也必须是对的**：位置自动级联、宽高**由内容撑开**（`pad + 内容 + pad`）、
+/// 不裁切、无装饰、不抢焦点。只有**想控制**时才写：
+///
+/// | 想要 | 写什么 | 之后谁定尺寸 |
+/// |---|---|---|
+/// | 固定宽 / 高 | `.width(w)` / `.height(h)` | 应用（**初始值**，见下） |
+/// | 长内容 + 滚动条 | `.vscroll(ScrollMode::Scroll)`（+ `.height(h)` 给有界视口） | 内容（视口高 = `min(内容, 屏幕剩余)`） |
+/// | 裁剪 / 换行二选一 | `.hscroll(ScrollMode::{ClipOnly, NoClip})` | 同上 |
+/// | 让用户拖大小 | `.resizable(true)` | **用户**（拖过即持久，`.width()/.height()` 只是初值） |
+///
+/// ⚠ **不许出现"必须写某个选项否则坏掉"的组合**：任何"本帧用上一帧结果反推尺寸"的解算都
+/// 必须有**不依赖上一帧**的引导值（典例：自动宽窗口的滚动视口首帧曾取 1px ⇒ 内容按 1px
+/// 折行 ⇒ 窗口塌成一条缝、且**永远**是缝）。完整理念与四条硬规矩见
+/// `docs/UI_ARCHITECTURE.md` §0。
 pub struct WindowBuilder<'ui, 'a> {
     ui: &'ui mut Ui<'a>,
     id: &'ui str,

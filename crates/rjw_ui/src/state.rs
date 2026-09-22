@@ -96,6 +96,12 @@ pub struct ScrollState {
     pub offset: f32,
     /// 内容总高（逻辑像素；clamp 上限 = max(0, content_h - view_h)）。
     pub content_h: f32,
+    /// **内容总宽**（物理像素；= 内容帧结算宽，与可视区无关）。
+    ///
+    /// 用途：**自动宽窗口**（没写 `.width(..)`）的滚动视口宽只能取"内容自己的自然宽" ——
+    /// 用可视区宽反过来当视口宽会自我强化（首帧 1px ⇒ 内容按 1px 折行 ⇒ 永远一条缝）。
+    /// 见 `window_impl` 的视口宽解算与 `docs/UI_ARCHITECTURE.md`「无顾虑地使用」。
+    pub content_w: f32,
 }
 
 /// UI 帧性能统计（`Ui::finish` / `Ui::end_frame` 各阶段耗时，µs）。

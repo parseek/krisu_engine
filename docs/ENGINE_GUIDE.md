@@ -1741,6 +1741,14 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 - 实现：`window_impl` 先把内容基线让给标题栏占位，再 `frame.set_fixed_h(视口高 + pad)` 并
   `scroll_at_axes(..)`（滚动容器 id 用**相对名** `"scroll"` —— 外面已经 `with_id(window)`，
   写 `{id}::scroll` 会变成 `win/win::scroll`）。
+- **自动宽窗口的视口宽**（没写 `.width(..)`）按 ① 上一帧 `ScrollState.content_w`（**内容自己的
+  自然宽**）→ ② 上一帧结算宽反推 → ③ 首帧 **屏幕剩余宽** 取值。⚠ 首帧**绝不能给 1px**：
+  视口 1px ⇒ 内容按 1px 折行 ⇒ 窗口塌成 `2×pad` 的一条缝，下一帧照它再算 ⇒ **永远一条缝**
+  （用户实测："调色板编辑器在不指定 width 的情况下无法使用"）。
+- **自动宽窗口必须"看见"内容**：`scroll_at_axes` 是沙箱、**自己不 note**（调用方才知道要不要
+  这块占位）⇒ `window_impl` 在 `width.is_none()` 时用 `(视口位置, ScrollState.content_w/h)`
+  往窗口帧补一条 `note_content` —— 窗口于是撑到**内容的自然尺寸**（高度那条会被定高视口的
+  `set_fixed_h` 覆盖，不影响有界视口）。
 - ⚠ **收起态不建视口**（`!collapsed`）：收起 = 一行标题栏，而视口会 `set_fixed_h(视口高 + pad)`
   把窗口重新顶高 ⇒ 用户实测"resizable 的窗口点 ⌃ 仍然不收起"（状态翻转了、内容也没了，
   但那个空面板还是原来那么高）。同理视口高取 `fixed_h`（**已按收起态清零**）而不是原始

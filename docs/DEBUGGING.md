@@ -248,6 +248,11 @@ fn update(&mut self, ctx: &mut Ctx) {
   `[vscroll(Scroll)]` 视口建成 + 点条带翻页改了 `offset`；
   `[短内容视口]` **两行内容**的 `vscroll` 窗必须是 112 高（**按内容定高**），
   去掉 `min(内容高, 屏幕剩余)` 立刻回到 1020（= 屏幕剩余，用户实测的"撑到窗口底端"）；
+  `[无 width 也要能用]` **不写 `.width()`** 的 21 行调色板（`.height(420)+vscroll`）必须
+  308×630（宽 = 内容自然宽 282 + 2×pad）；去掉 `window_impl` 里那条 `note_content` ⇒
+  立刻变成 **26 宽的一条缝**（`[FAIL]`，正是用户"不指定 width 就无法使用"）；
+  `[无 width/height 也要能用]` **两个都不给**时：宽同上、高**自动撑开**到屏幕剩余
+  （实测 320 = 1080 − 760）且 `content_h > 视口高`（可滚）；
   `[收起 resizable+vscroll 窗]` 点 ⌃ 后 630 → 52（收起态不建视口、也不给柄）；
   `[子窗口不继承外层裁剪]` 录在 `vscroll` 窗里的**嵌套窗口**（`palette_h_win/pal_inner`）
   其 dump `clip` 必须是 `None`（去掉 `window_impl` 入口的 `painter.q.clip = None` ⇒ 立刻变成

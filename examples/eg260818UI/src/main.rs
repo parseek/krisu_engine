@@ -216,6 +216,12 @@ const PALETTE_WS_POS: Vec2 = Vec2::new(1600.0, 640.0);
 /// 放空白带 ⇒ 窗口不会被 `WindowClamp::Screen` 挪走（尺寸断言与位置无关，但位置变了会
 /// 让"视口高"这类**依赖屏幕剩余高**的量跟着变，所以两样都不依赖才稳）。
 const PALETTE_H_POS: Vec2 = Vec2::new(660.0, 380.0);
+/// **不给 `.width()`** 的调色板（`.height(420) + vscroll(Scroll)`）—— 用户的典例：
+/// 自动宽窗口必须先按**内容自然宽**撑开（首帧视口宽不能是 1px，否则窗口成一条缝）。
+const PALETTE_AUTO_POS: Vec2 = Vec2::new(1200.0, 60.0);
+/// **width / height 都不给**的调色板（`vscroll(Scroll)`）：宽 = 内容自然宽、高 = 自动撑开到
+/// 屏幕剩余（内容更高 ⇒ 可滚）。放屏幕下半段 ⇒ "屏幕剩余"明显小于内容 ⇒ 断言可判别。
+const PALETTE_AUTO2_POS: Vec2 = Vec2::new(1200.0, 760.0);
 /// 21 个取色器的 id（静态，避免每行 `format!` 分配）。
 const PALETTE_IDS: [&str; 21] = [
     "pal_0", "pal_1", "pal_2", "pal_3", "pal_4", "pal_5", "pal_6", "pal_7", "pal_8", "pal_9",
@@ -681,6 +687,10 @@ struct Windows {
     /// 第三份（自动宽那扇窗）与第四份（`.height()` 那扇窗）。
     pal_colors3: [Color; 21],
     pal_colors4: [Color; 21],
+    /// 第五份：**不给 `.width()`** 的调色板（用户的典例）。
+    pal_colors5: [Color; 21],
+    /// 第六份：**width / height 全不给**的调色板。
+    pal_colors6: [Color; 21],
     /// --sim-scroll-mode：`palette_h_win`（`.height(420) + vscroll(Scroll) + resize`）的
     /// ⌃ 按钮点 —— 点它之后窗口必须**收起成一行标题栏**。
     ///
@@ -766,6 +776,8 @@ impl Windows {
             pal_colors2: [Color::rgba_u8(110, 168, 255, 255); 21],
             pal_colors3: [Color::rgba_u8(110, 168, 255, 255); 21],
             pal_colors4: [Color::rgba_u8(110, 168, 255, 255); 21],
+            pal_colors5: [Color::rgba_u8(110, 168, 255, 255); 21],
+            pal_colors6: [Color::rgba_u8(110, 168, 255, 255); 21],
             pal_fold_pt: None,
             pal_h_before: None,
             pal_h_after: None,
@@ -1017,6 +1029,38 @@ impl Windows {
                             i.label("子窗口内容");
                         });
                     for (id, color) in PALETTE_IDS.iter().zip(self.pal_colors4.iter_mut()) {
+                        w.row(|r| {
+                            r.label("颜色：");
+                            r.add(ColorPicker::new(id, color));
+                        });
+                    }
+                });
+            // ③e **不给 `.width()`** 的调色板（用户的典例）：`vscroll(Scroll)` + `.height(420)`
+            //     必须**自动撑开**到内容的自然宽 —— "不明确 width/height 时，手动调整大小前
+            //     仍要能自动撑开"（设计理念：**无顾虑地使用**）。旧实现首帧视口宽 = 1px ⇒
+            //     内容按 1 个字折行、窗口成一条缝 ⇒ "不指定 width 就无法使用"。
+            ui.window("palette_auto_win")
+                .pos(Position::Physical(PALETTE_AUTO_POS))
+                .height(420.0)
+                .vscroll(ScrollMode::Scroll)
+                .title("调色板（不给 width + height 420）")
+                .show(|w| {
+                    for (id, color) in PALETTE_IDS.iter().zip(self.pal_colors5.iter_mut()) {
+                        w.row(|r| {
+                            r.label("颜色：");
+                            r.add(ColorPicker::new(id, color));
+                        });
+                    }
+                });
+            // ③f **width / height 都不给**（用户 WIP 里正在试的组合）：宽 = 内容自然宽、
+            //     高 = **自动撑开**到屏幕剩余（内容更高 ⇒ 滚动条），即"手动调整大小前仍然
+            //     自己撑开"。判据见 `[无 width/height 也要能用]`。
+            ui.window("palette_auto2_win")
+                .pos(Position::Physical(PALETTE_AUTO2_POS))
+                .vscroll(ScrollMode::Scroll)
+                .title("调色板（width / height 全不给）")
+                .show(|w| {
+                    for (id, color) in PALETTE_IDS.iter().zip(self.pal_colors6.iter_mut()) {
                         w.row(|r| {
                             r.label("颜色：");
                             r.add(ColorPicker::new(id, color));
@@ -4034,6 +4078,14 @@ impl App for UiApp {
                 let w320 = find("palette_w_win").map(|w| w.size);
                 let ws320 = find("palette_ws_win").map(|w| w.size);
                 let h420 = find("palette_h_win").map(|w| w.size);
+                // ③e **不给 `.width()`** 的调色板：宽必须自己撑到内容的自然宽（与 `width320`
+                //     那扇窗同量级），高 = `.height(420)×scale`，且内容可滚。
+                let auto_v = find("palette_auto_win").map(|w| w.size);
+                let auto_v_scroll = ui
+                    .state()
+                    .scrolls()
+                    .get("palette_auto_win/scroll")
+                    .copied();
                 let scroll = ui
                     .state()
                     .scrolls()
@@ -4059,12 +4111,52 @@ impl App for UiApp {
                     (s.y - 420.0 * ui.scale()).abs() <= 2.0
                         && hscroll.is_some_and(|c| c.content_h > s.y)
                 });
+                // ③e **不给 `.width()`**：宽自己撑到内容自然宽（与 width320 同量级；
+                //     旧实现首帧视口 1px ⇒ 窗口宽 ~27 ⇒ 一条缝），高 = 420×scale，可滚。
+                let auto_v_ok = auto_v.is_some_and(|s| {
+                    (240.0..=600.0).contains(&s.x)
+                        && (s.y - 420.0 * ui.scale()).abs() <= 2.0
+                        && auto_v_scroll.is_some_and(|c| c.content_h > s.y)
+                });
                 eprintln!(
                     "sim-scroll-mode[调色板四态]: 自动宽={auto:?} width320={w320:?} width320+vscroll={ws320:?} height420+vscroll={h420:?} 滚动={scroll:?}/{hscroll:?} {}",
                     if pal_ok && w_ok && ws_ok && h_ok {
                         "[OK] 自动宽不缩缝 / width320 固定宽 / 加 vscroll 后高被视口压住 / 加 .height(420) 后外框高恒为 420×scale（可滚）"
                     } else {
                         "[FAIL] 某种配置没按预期（见上面四个尺寸）"
+                    }
+                );
+                eprintln!(
+                    "sim-scroll-mode[无 width 也要能用]: 自动宽调色板={auto_v:?} 滚动={auto_v_scroll:?} {}",
+                    if auto_v_ok {
+                        "[OK] 不给 `.width()` 时窗口自己撑到内容自然宽 + `.height(420)` 定高（**无顾虑地使用**）"
+                    } else {
+                        "[FAIL] 不给 `.width()` 就用不了（窗口塌成一条缝 / 高度没钉住 / 内容不可滚）"
+                    }
+                );
+                // ③f **width / height 全不给**：宽 = 内容自然宽、高 = **自动撑开**到屏幕剩余
+                //     （内容更高 ⇒ 可滚）。判据里"高 ≈ 屏幕剩余"这条就是"自动撑开"的证据
+                //     （旧实现首帧视口 1px ⇒ 宽 26 的缝、高也可能被内容压塌）。
+                let auto2 = find("palette_auto2_win").map(|w| (w.origin, w.size));
+                let auto2_st = ui
+                    .state()
+                    .scrolls()
+                    .get("palette_auto2_win/scroll")
+                    .copied();
+                let auto2_ok = auto2.zip(auto2_st).is_some_and(|((o, s), c)| {
+                    let remain = screen_h - o.y;
+                    (240.0..=600.0).contains(&s.x)          // 宽 = 内容自然宽
+                        && c.content_h > s.y + 1.0          // 内容高于视口 ⇒ 真的可滚
+                        && s.y <= remain + 2.0              // 不超出屏幕
+                        && s.y >= remain * 0.9              // **自动撑开**到屏幕剩余（不是半截/一条缝）
+                });
+                eprintln!(
+                    "sim-scroll-mode[无 width/height 也要能用]: 全自动调色板={auto2:?} 滚动={auto2_st:?} 屏幕剩余≈{:.0} {}",
+                    auto2.map(|(o, _)| screen_h - o.y).unwrap_or(0.0),
+                    if auto2_ok {
+                        "[OK] width / height 都不给也**自动撑开**（宽 = 内容自然宽、高长到屏幕底再滚）"
+                    } else {
+                        "[FAIL] 不指定 width/height 就用不了（塌成一条缝 / 没撑开 / 内容被裁）"
                     }
                 );
                 // ③d **子窗口（嵌套窗口）不继承外层裁剪层**：`pal_inner` 录在一个
