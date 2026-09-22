@@ -666,6 +666,10 @@ struct Windows {
     row_size: Option<Vec2>,
     /// --sim-row-overflow：窗口内容的可用宽（物理像素；= `.width()` 逻辑值 × scale）。
     row_avail_w: f32,
+    /// --sim-row-overflow：`Label + ColorPicker` 那一行的结算尺寸（同上，判定不溢出）。
+    row_size_picker: Option<Vec2>,
+    /// --sim-row-overflow：取色器的颜色（演示行用）。
+    row_color: Color,
     /// --sim-row-overflow 两个控件的文本（控件本身只用来产生可观测的点击）。
     ghost_text: String,
     inside_text: String,
@@ -721,6 +725,8 @@ impl Windows {
             shrink_later: None,
             sim_row_overflow: false,
             row_size: None,
+            row_size_picker: None,
+            row_color: Color::rgba_u8(110, 168, 255, 255),
             row_avail_w: 0.0,
             ghost_text: String::new(),
             inside_text: String::new(),
@@ -924,6 +930,14 @@ impl Windows {
                         r.add(TextEditor::new("row_te", &mut self.inside_text));
                     });
                     self.row_size = Some(size);
+                    // ①b 同一扇窗里再放一行 **`Label + ColorPicker`**（用户截图里的调色板
+                    //    形态）：取色器的自然宽取自主题 `input.min_w`，如果它**不看
+                    //    `avail_w`**，这一行同样会突到窗口外面（与 `TextEditor` 不对称）。
+                    let size2 = w.row(|r| {
+                        r.label("颜色：");
+                        r.add(ColorPicker::new("row_cp", &mut self.row_color));
+                    });
+                    self.row_size_picker = Some(size2);
                     // ② 绝对定位到窗口**外面**的控件（不受可用宽 clamp 约束）：
                     //    它就是"内容溢出时那个看不见的幽灵控件"。
                     w.add_at(
@@ -4571,16 +4585,22 @@ impl App for UiApp {
             let size = self.windows.row_size;
             let avail = self.windows.row_avail_w;
             let row_ok = size.is_some_and(|s| s.x <= avail + 0.5);
+            // ①b `Label + ColorPicker` 那一行同样不许溢出（取色器也必须尊重可用宽）。
+            let picker_ok = self
+                .windows
+                .row_size_picker
+                .is_some_and(|s| s.x <= avail + 0.5);
             let inside_ok = self.windows.row_inside_focus;
             let ghost_ok = !self.windows.row_ghost_focus;
             eprintln!(
-                "sim-row-overflow: 行宽={:?} 可用宽={avail:.0} 窗内点得到={inside_ok} 窗外点得到={} {}",
+                "sim-row-overflow: 行宽={:?} 取色器行宽={:?} 可用宽={avail:.0} 窗内点得到={inside_ok} 窗外点得到={} {}",
                 size,
+                self.windows.row_size_picker,
                 self.windows.row_ghost_focus,
-                if row_ok && inside_ok && ghost_ok {
-                    "[OK] 窄窗口里整行落在可用宽内 + 溢出的幽灵控件点不到（窗内的仍点得到）"
+                if row_ok && picker_ok && inside_ok && ghost_ok {
+                    "[OK] 窄窗口里两行都落在可用宽内（含取色器）+ 溢出的幽灵控件点不到（窗内的仍点得到）"
                 } else {
-                    "[FAIL] 行仍然突出去 / 幽灵控件还能点 / 守卫把窗内也挡住了"
+                    "[FAIL] 行仍然突出去（含取色器行）/ 幽灵控件还能点 / 守卫把窗内也挡住了"
                 }
             );
         }
