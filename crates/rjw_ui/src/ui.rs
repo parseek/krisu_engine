@@ -3212,6 +3212,12 @@ impl<'a> Ui<'a> {
         // （浮层是嵌套窗口 ⇒ 保存/恢复，浮层的内容不该算进外层窗口）。
         let saved_hit_bounds = self.win_hit_bounds.take();
         let saved_clip = self.painter.q.clip;
+        // **窗口不继承外层的裁剪层**（与"窗口是布局根"同一条边界规则）：窗口是**浮层** ——
+        // 它的内容（以及它内部开的浮层：下拉 / 取色面板 / 子菜单）不该被外层沙箱裁掉。
+        // 历史 bug：`vscroll(Scroll)` 窗口里开一个取色面板，面板的绘制命令带着**外层视口**
+        // 的 scissor ⇒ 面板被"不经意地"裁掉（用户截图批注："子窗口被不经意地裁掉"）。
+        // 本函数末尾恢复：外层沙箱后续的内容仍要按它的 scissor 走。
+        self.painter.q.clip = None;
         // 位置经**责任链**解析（脚本处理器 → 用户拖拽状态 → 传入 pos，见 pos_handler）
         let origin = self.resolve_pos(&id_for, pos);
         let start = self.painter.q.queue.len();
@@ -3731,8 +3737,13 @@ impl<'a> Ui<'a> {
                 size.y,
             );
             let clip = clip_for_axes(saved_clip, win_abs, Rect::new(0.0, 0.0, sw, sh), vs, hs);
+            // ⚠ **只盖本窗口自己的绘制**（`d.win == z`）：本窗范围内录的**嵌套浮层**
+            // （下拉 / 取色面板 / 子菜单的 z 是 `WIN_TOPMOST`）各有自己的层级与裁剪，
+            // 被父窗口的视口 scissor 顺带裁掉就是"子窗口被不经意地裁掉"。
             for d in &mut self.painter.q.queue[start..] {
-                d.clip = clip;
+                if d.win == z {
+                    d.clip = clip;
+                }
             }
         }
         // 背景 + 边框（win = z，画在窗口子控件之下；radius > 0 走圆角双层矩形）
@@ -3773,6 +3784,8 @@ impl<'a> Ui<'a> {
         for d in &mut self.painter.q.queue[start..] {
             d.translate(display_pos);
         }
+        // 恢复外层的**裁剪层**（见入口处的说明：窗口不继承外层的裁剪）。
+        self.painter.q.clip = saved_clip;
         self.painter.q.cur_win = saved_win;
         self.cur_win_id = saved_win_id;
         // 恢复外层窗口的"可交互内容范围"（本窗口已并进自己的遮挡矩形）。

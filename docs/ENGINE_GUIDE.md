@@ -1677,6 +1677,13 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 >   根 frame 的固定宽 = **视口宽**（那是给 `win=0` 顶层内容用的），漏进窗口里会让自动宽窗口的
 >   `divider()` / `Label` 拿到"可用宽 = 1920" ⇒ **整窗被撑成屏幕宽、还跟着主窗口大小变**
 >   （用户实测："Gallery 被撑开得很大，并且跟随窗口大小；疑似是分割线的问题"——正是分割线）。
+> - **窗口也不继承外层的裁剪层**（同一条边界规则的绘制侧）：`window_impl` 入口把
+>   `painter.q.clip` 置 `None`（末尾恢复外层），且窗口按轴裁切时**只盖自己的绘制**
+>   （`d.win == z`）。窗口是**浮层** —— 它内部开的浮层（下拉 / 取色面板 / 子菜单 / 子窗口）
+>   不该被外层沙箱的 scissor 裁掉。历史 bug：`vscroll(Scroll)` 窗口里开一个取色面板，
+>   面板的绘制命令带着**外层视口**的 scissor ⇒ 面板被"不经意地裁掉"（用户截图批注）。
+>   回归守卫：`--sim-scroll-mode[子窗口不继承外层裁剪]`（嵌套窗口 `pal_inner` 的 dump
+>   `clip == None`；去掉入口重置立刻变成外层视口的 scissor ⇒ `[FAIL]`）。
 > - 验收：`--sim-scroll-mode`（按轴独立）—— 两扇同内容窗：`hscroll(NoClip)` 那扇**不给 `.width()`**
 >   ⇒ 内容定宽 626；`hscroll(ClipOnly)` 固定 251 且 scissor = `(520, 0, 251, 1080)`
 >   （宽 = 窗口、**高 = 整屏** ⇒ 只裁了横向）。`--sim-row-overflow` 则摆**同宽同内容**（`.width(150)`）

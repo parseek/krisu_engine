@@ -243,7 +243,10 @@ fn update(&mut self, ctx: &mut Ctx) {
   `[vscroll(Scroll)]` 视口建成 + 点条带翻页改了 `offset`；
   `[短内容视口]` **两行内容**的 `vscroll` 窗必须是 112 高（**按内容定高**），
   去掉 `min(内容高, 屏幕剩余)` 立刻回到 1020（= 屏幕剩余，用户实测的"撑到窗口底端"）；
-  `[收起 resizable+vscroll 窗]` 点 ⌃ 后 630 → 52（收起态不建视口、也不给柄）。
+  `[收起 resizable+vscroll 窗]` 点 ⌃ 后 630 → 52（收起态不建视口、也不给柄）；
+  `[子窗口不继承外层裁剪]` 录在 `vscroll` 窗里的**嵌套窗口**（`palette_h_win/pal_inner`）
+  其 dump `clip` 必须是 `None`（去掉 `window_impl` 入口的 `painter.q.clip = None` ⇒ 立刻变成
+  外层视口的 scissor ⇒ `[FAIL]`：这正是"子窗口被不经意地裁掉"）。
 - **窄的固定宽窗口：压缩 vs 裁切 + "幽灵控件"**（`--sim-row-overflow`）：用户实测
   "指定 `width` 里，`width` 较小的时候控件会突出去，直到你去拖拽缩放"。示例摆**同宽同内容**
   （`.width(150.0)`）的**两扇**窗，只有水平轴策略不同 —— 这就是用户给的判定表的两个格子：

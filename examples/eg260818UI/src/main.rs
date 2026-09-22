@@ -1006,6 +1006,16 @@ impl Windows {
                 .collapsible(true, None)
                 .title("调色板（width 320 + height 420 + vscroll）")
                 .show(|w| {
+                    // **嵌套窗口**（子窗口录在一个 `vscroll(Scroll)` 窗口里）：它的绘制
+                    // **不该**被外层滚动视口裁掉（用户截图批注："子窗口被不经意地裁掉"）。
+                    // 判定见下面的 `[子窗口不继承外层裁剪]`。
+                    w.ui_mut()
+                        .window("pal_inner")
+                        .pos(Position::Physical(Vec2::new(8.0, 8.0)))
+                        .title("子窗口")
+                        .show(|i| {
+                            i.label("子窗口内容");
+                        });
                     for (id, color) in PALETTE_IDS.iter().zip(self.pal_colors4.iter_mut()) {
                         w.row(|r| {
                             r.label("颜色：");
@@ -4030,6 +4040,24 @@ impl App for UiApp {
                         "[OK] 自动宽不缩缝 / width320 固定宽 / 加 vscroll 后高被视口压住 / 加 .height(420) 后外框高恒为 420×scale（可滚）"
                     } else {
                         "[FAIL] 某种配置没按预期（见上面四个尺寸）"
+                    }
+                );
+                // ③d **子窗口（嵌套窗口）不继承外层裁剪层**：`pal_inner` 录在一个
+                //     `vscroll(Scroll)` 窗口里，它自己的绘制命令必须**不带**外层视口的
+                //     scissor（`clip == None`）—— 否则取色面板 / 子窗被"不经意地裁掉"
+                //     （用户截图批注）。⚠ 嵌套窗口的 dump id 是**绝对 ID**
+                //     （`palette_h_win/pal_inner`）⇒ 用 `ends_with` 找。
+                let inner = dump.windows.iter().find(|w| w.id.ends_with("pal_inner"));
+                let inner_clip = inner.and_then(|w| w.clip);
+                let inner_ok = inner.is_some() && inner_clip.is_none();
+                eprintln!(
+                    "sim-scroll-mode[子窗口不继承外层裁剪]: pal_inner={:?}（外层视口={:?}）{}",
+                    inner_clip,
+                    find("palette_h_win").and_then(|w| w.clip),
+                    if inner_ok {
+                        "[OK] 嵌套窗口的绘制不带外层滚动视口的 scissor（浮层不被父窗口裁掉）"
+                    } else {
+                        "[FAIL] 子窗口继承了外层的裁剪层（被父窗口/视口裁掉）"
                     }
                 );
                 let sv = ui.state().scrolls().get("scroll_v_win/scroll").copied();
