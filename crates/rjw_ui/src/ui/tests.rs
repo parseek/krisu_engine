@@ -1196,6 +1196,24 @@ fn window_resize_switch_resolves_old_default_and_explicit_false() {
 }
 
 #[test]
+fn resize_axes_pick_the_axes_that_the_user_takes_over() {
+    // **轴 → "谁接管这一轴"** 的机器化表格（`Resize::Vertical` 是本轮新增的变体）：
+    // 拖过的轴由用户接管（宽度进 `window_widths`、高度进 `window_heights`，且固定轴
+    // 不参与内容撑开；高度被拖过还会让窗口成为固定尺寸视口 ⇒ `window_content_clipped`）。
+    assert!(resize_fixes_width(Resize::Horizontal) && !resize_fixes_height(Resize::Horizontal));
+    assert!(!resize_fixes_width(Resize::Vertical) && resize_fixes_height(Resize::Vertical));
+    assert!(resize_fixes_width(Resize::Both) && resize_fixes_height(Resize::Both));
+    assert!(!resize_fixes_width(Resize::None) && !resize_fixes_height(Resize::None));
+    // `Vertical` 也能出现在"显式允许"的位置上（不再只能 Horizontal / Both）。
+    assert_eq!(
+        resolve_window_resize(Some((true, Resize::Vertical)), false),
+        (true, Resize::Vertical)
+    );
+    // 没给 `.width()` + `Vertical` ⇒ 宽度轴仍由内容决定（`width.is_some()` 才走旧默认）。
+    assert_eq!(resolve_window_resize(None, false).1, Resize::Horizontal);
+}
+
+#[test]
 fn window_content_clips_when_height_is_user_fixed() {
     // **内容裁剪的触发条件**：
     // ① 应用显式 `.placement(Placement::Clip)`；

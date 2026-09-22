@@ -817,6 +817,10 @@ impl<'a> Ui<'a> {
     /// 持久尺寸由调用方写入（推荐 [`UiState::sizes`]）；可缩放 widget 的 `size()`
     /// 优先读持久值，配合 [`crate::widgets::Widget::resizable`] 声明。
     /// `window(width)` / `Placement::Clip` 的宽度缩放即基于本原语。
+    ///
+    /// = [`Self::resize_handle_hit`]（命中 + 光标，**应在内容之前**）+ 本体的拖拽应用。
+    /// 需要"让内容里的控件优先"的调用方（窗口右下角柄 vs 面板内最后一个控件的柄重叠）
+    /// 要把这两步**拆开**：命中登记早、应用晚（见 [`Self::window_impl`]）。
     pub fn resize_handle(
         &mut self,
         id: &str,
@@ -825,18 +829,66 @@ impl<'a> Ui<'a> {
         min: Vec2,
         cursor: crate::UiCursor,
     ) -> Option<Vec2> {
+        let hit = self.resize_handle_hit(id, &handle, cursor);
+        self.resize_handle_apply(id, current, min, cursor, hit)
+    }
+
+    /// [`Self::resize_handle`] 的**上半**：命中判定 + 光标（登记命中区）。
+    ///
+    /// ⚠ **登记顺序就是优先级**：控件级遮挡按"谁后登记谁在上"判定 ⇒ 想让内容里的控件
+    /// 压过窗口自己的柄，窗口必须在**内容之前**调本方法（后登记的内容控件因此获胜）。
+    /// ⚠ **本方法不置位 `press_claimed`**（认领在 [`Self::resize_handle_apply`]）：
+    /// 窗口路径要在内容之后凭 `!press_claimed` 判断"内容有没有抢走这次按下"，若这里就
+    /// 认领，窗口会把自己挡住（实测：`--sim-resize` 变成"柄点不动"）。
+    pub(crate) fn resize_handle_hit(
+        &mut self,
+        id: &str,
+        handle: &Rect,
+        cursor: crate::UiCursor,
+    ) -> bool {
         let abs = self.id_for(id);
-        let hhit = self.hit_abs(&abs, &handle);
+        let hhit = self.hit_abs(&abs, handle);
+        if hhit {
+            self.set_cursor(cursor);
+        }
+        hhit
+    }
+
+    /// [`Self::resize_handle`] 的**下半**：把拖拽落到尺寸上（`hit` 来自上半）。
+    ///
+    /// 调用方通常**只看 `!press_claimed` 再调**：内容里的控件已经认领这次按下时，
+    /// 外层（窗口）的柄必须让位——否则"点面板内最后一个控件的缩放柄"会连带把窗口也缩了。
+    pub(crate) fn resize_handle_apply(
+        &mut self,
+        id: &str,
+        current: Vec2,
+        min: Vec2,
+        cursor: crate::UiCursor,
+        hit: bool,
+    ) -> Option<Vec2> {
+        let abs = self.id_for(id);
         let hbtn = self.mouse_left();
-        if hbtn.down_edge() && hhit {
+        if hbtn.down_edge() && hit {
             // 缩放柄自身有拖拽语义：阻止外层窗口/面板把本次按下当作拖拽基准。
             self.press_claimed = true;
         }
         let mut new = current;
         let active = {
             let ws = self.state.widgets.entry(abs.to_static()).or_default();
-            let a = update_drag(ws, hhit, hbtn);
-            if hbtn.down_edge() && hhit {
+            // **松手即清基准**：基准属于"某一次按住"，跨次复用会让下一次拖拽以上一次的
+            // 基准结算 ⇒ 尺寸每帧按位移**连乘**下去（用户实测："窗口收缩高度应当为恒定值"：
+            // 往上收缩时高度一档一档掉到下限，明明鼠标已经停了）。
+            if !hbtn.pressed() {
+                ws.press_mouse = None;
+                ws.press_panel = None;
+            }
+            let was_dragging = ws.dragging;
+            let a = update_drag(ws, hit, hbtn);
+            // 基准捕获：按下边沿（常规）**或**拖拽本次刚激活（兜底）。
+            // ⚠ 兜底那条必要：边沿可能丢（焦点切换 / 注入式输入 / 上一帧命中被遮挡），
+            // 此时沿用陈旧基准会算出"巨大位移"；用**当前**尺寸 + 当前鼠标补一次基准，
+            // 最坏是"这次拖拽从当前位置开始"，而不是尺寸失控。
+            if (hbtn.down_edge() || !was_dragging) && (hit || a) {
                 ws.press_mouse = Some(self.mouse_screen.round());
                 ws.press_panel = Some(current);
             }
@@ -846,9 +898,18 @@ impl<'a> Ui<'a> {
                 let d = (self.mouse_screen - pm).round();
                 new = Vec2::new((base.x + d.x).max(min.x), (base.y + d.y).max(min.y));
             }
+            if std::env::var_os("RJ_GRIP_TRACE").is_some() {
+                eprintln!(
+                    "grip[{id}] hit={hit} edge={} drag={a} cur={current:?} press_m={:?} press_p={:?} mouse={:?} -> new={new:?}",
+                    hbtn.down_edge(),
+                    ws.press_mouse,
+                    ws.press_panel,
+                    self.mouse_screen
+                );
+            }
             a
         };
-        if active || hhit {
+        if active {
             self.set_cursor(cursor);
         }
         active.then_some(new)
@@ -3050,7 +3111,17 @@ impl<'a> Ui<'a> {
         let id_for = self.id_for(id);
         // 固定宽优先用**持久值**（缩放柄结果，跨帧保持；首次 = 传入 width）。统一在此
         // 读取——`window_at_w` / `modal_at_w` / `WindowBuilder::width` 都不必各自处理。
-        let width = width.map(|w| *self.state.window_widths.get(id_for.as_str()).unwrap_or(&w));
+        //
+        // ⚠ **没有 `.width()` 也能拖宽**：只读 `width.map(..)` 时，`window_widths` 会被
+        // 写进去却**没人读** ⇒ `Resize::Horizontal` / `Both` 的**宽度轴完全无效**（用户
+        // 实测："resize Horizontal 不在设置 width 的情况下无法缩放"；`Resize::Both` 的
+        // 高度轴之所以照旧能用，是因为 `fixed_h` 是独立读的）。现在：拖过就有持久宽，
+        // 语义与高度一致——**拖过就由用户接管**（固定轴不再参与内容撑开）。
+        let persisted_w = self.state.window_widths.get(id_for.as_str()).copied();
+        let width = match width {
+            Some(w) => Some(persisted_w.unwrap_or(w)),
+            None => persisted_w,
+        };
         
         // z-order：首次分配 max+1；点击置顶在拖拽判定处处理
         let z = {
@@ -3132,9 +3203,15 @@ impl<'a> Ui<'a> {
         //
         // `(allow, axes)`：`None` = 旧行为（**有 `.width(..)` 就能横向拖**）；
         // `allow = false` ⇒ 不画柄也不响应拖拽（`.width(..)` 仍作布局固定宽）；
-        // `axes = Both` ⇒ 宽高同调（`↖↘` 光标）。
+        // `axes`：`Horizontal` 只调宽 / `Vertical` 只调高 / `Both` 宽高同调（光标随之）。
         let (allow_resize, resize_axes) = resolve_window_resize(chrome.resize, width.is_some());
         let resize_on = allow_resize && resize_axes != Resize::None;
+        // **窗口柄：命中在这里（内容之前），应用推迟到内容 + 标题栏之后** ——
+        // 面板内最后一个控件的缩放柄（如 `TextEditor::resize(Both)`）常常和窗口柄叠在
+        // 同一个右下角：内容后登记 ⇒ 控件级遮挡上它在上；应用再等 `!press_claimed` ⇒
+        // "点控件的柄"不会连带把窗口也缩了（用户实测："在文本编辑器控件上缩放柄无法使用"）。
+        // 同一机制修掉收起态里"窗口柄抢 ⌃/✕ 按钮"的既有缺陷（按钮在装饰段里 claim）。
+        let mut grip = None;
         if resize_on
             && let Some(ps) = prev_size
         {
@@ -3143,6 +3220,12 @@ impl<'a> Ui<'a> {
             let hw = style.grip.extent().max(14.0);
             let handle = Rect::new(base_pos.x + ps.x - hw, base_pos.y + ps.y - hw, hw, hw);
             let h_id = format!("{id}::resize");
+            let cursor = match resize_axes {
+                Resize::Both => crate::UiCursor::NwseResize,
+                Resize::Vertical => crate::UiCursor::NsResize,
+                _ => crate::UiCursor::EwResize,
+            };
+            let hit = self.resize_handle_hit(&h_id, &handle, cursor);
             // 当前尺寸 = 屏幕上那个（宽取持久固定宽，高取持久高度 / 结算高）。
             let cur_w = width.unwrap_or(ps.x);
             let cur_h = self
@@ -3151,31 +3234,15 @@ impl<'a> Ui<'a> {
                 .get(id_for.as_str())
                 .copied()
                 .unwrap_or(ps.y);
-            let cursor = if resize_axes == Resize::Both {
-                crate::UiCursor::NwseResize
-            } else {
-                crate::UiCursor::EwResize
-            };
-            if let Some(new_size) = self.resize_handle(
-                &h_id,
-                handle,
+            grip = Some((
+                h_id,
                 Vec2::new(cur_w, cur_h),
+                cursor,
+                hit,
                 // 最小尺寸：宽 120；高至少装得下一行 + 上下内边距（拖到 0 高的窗口
                 // 会变成"一条线"，既点不中柄也看不出是什么）。
                 Vec2::new(120.0, (self.theme.row_h + pad_total * 2.0).max(40.0)),
-                cursor,
-            ) {
-                // 新尺寸下帧生效（`width` / 高度于本函数开头读取）——与旧版一致，避免
-                // 同帧内布局尺寸与 clamp 尺寸互相矛盾。
-                if resize_axes != Resize::None {
-                    self.state.window_widths.insert(id_for.to_static(), new_size.x);
-                }
-                if resize_axes == Resize::Both {
-                    self.state
-                        .window_heights
-                        .insert(id_for.to_static(), new_size.y);
-                }
-            }
+            ));
         }
         let btn = self.mouse_left();
         // 窗口遮挡：被更高 z 的窗口覆盖的区域，本窗口不响应拖拽 / 置顶 /
@@ -3217,9 +3284,9 @@ impl<'a> Ui<'a> {
         if let Some(w) = width {
             frame.set_fixed_w(w);
         }
-        // **高度固定**（只有"宽高同调"拖拽过的窗口才会走到这里）：高度被拖过之后由
-        // 用户接管 —— 与宽度同理（固定轴不参与内容撑开；要裁剪配 `Placement::Clip`）。
-        let fixed_h = if resize_axes == Resize::Both {
+        // **高度固定**（"只调高"或"宽高同调"拖过的窗口）：高度被拖过之后由用户接管
+        // —— 与宽度同理（固定轴不参与内容撑开；要裁剪配 `Placement::Clip`）。
+        let fixed_h = if resize_fixes_height(resize_axes) {
             self.state.window_heights.get(id_for.as_str()).copied()
         } else {
             None
@@ -3328,6 +3395,26 @@ impl<'a> Ui<'a> {
         self.abs_base = saved_base;
         // 记录窗口尺寸（按 id 持久；点击置顶 z 变化后下帧 prev_size 仍可取）。
         self.state.window_sizes.insert(id_for.to_static(), size);
+        // ─── ①b 窗口缩放柄的**应用**（内容 + 标题栏之后）────────────────────
+        // 命中早在内容之前就算过（`grip.3`，为的是把命中区登记顺序排在内容之前 ⇒
+        // 内容里的控件在控件级遮挡上获胜）；这里只在**没人认领这次按下**时把拖拽落到
+        // 尺寸上：`TextEditor` 自己的缩放柄认领了就轮不到窗口。
+        if let Some((h_id, cur, cursor, grip_hit, min)) = grip
+            && !self.press_claimed
+            && let Some(new_size) =
+                self.resize_handle_apply(&h_id, cur, min, cursor, grip_hit)
+        {
+            // 新尺寸下帧生效（`width` / 高度于本函数开头读取）——与旧版一致，避免
+            // 同帧内布局尺寸与 clamp 尺寸互相矛盾。
+            if resize_fixes_width(resize_axes) {
+                self.state.window_widths.insert(id_for.to_static(), new_size.x);
+            }
+            if resize_fixes_height(resize_axes) {
+                self.state
+                    .window_heights
+                    .insert(id_for.to_static(), new_size.y);
+            }
+        }
         // ─── ② 内容录完后：按下裁决 ──────────────────────────────────────
         // 窗口内子控件（文本框选择 / 滑块 / 滚动条）在录制期可能已声明本次按下
         // （`press_claimed`）——此时**清除**拖拽基准，否则 `update_drag` 已置
@@ -8001,6 +8088,23 @@ fn resolve_window_resize(opt: Option<(bool, Resize)>, has_width: bool) -> (bool,
         Some((allow, axes)) => (allow, axes),
         None => (has_width, Resize::Horizontal),
     }
+}
+
+/// **该轴向是否让"宽度"由用户接管**（拖过即固定宽；纯函数，可单测）。
+///
+/// `Horizontal` / `Both` ⇒ `true`；`Vertical` / `None` ⇒ `false`（宽度仍由内容决定）。
+#[inline]
+fn resize_fixes_width(axes: Resize) -> bool {
+    matches!(axes, Resize::Horizontal | Resize::Both)
+}
+
+/// **该轴向是否让"高度"由用户接管**（拖过即固定高；纯函数，可单测）。
+///
+/// `Vertical` / `Both` ⇒ `true`（高度跨帧持久于 `UiState::window_heights`，窗口成为
+/// 固定尺寸视口 ⇒ 内容被裁切 / 可配滚动）；`Horizontal` / `None` ⇒ `false`。
+#[inline]
+fn resize_fixes_height(axes: Resize) -> bool {
+    matches!(axes, Resize::Vertical | Resize::Both)
 }
 
 /// **嵌套容器的内容最大宽**（纯函数，可单测）：父级可用宽扣掉本容器内边距。

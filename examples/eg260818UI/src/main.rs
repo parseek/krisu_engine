@@ -96,6 +96,12 @@ fn main() -> Result<(), RunError> {
     app.sim_dropdown = args.iter().any(|a| a == "--sim-dropdown");
     app.sim_weight_modal = args.iter().any(|a| a == "--sim-weight-modal");
     app.sim_resize = args.iter().any(|a| a == "--sim-resize");
+    // `--sim-pick-save`：**走真实的导出按钮通路**（`export_request` → `pick_save` →
+    // `save_theme`），配合 `RJ_PICK_SAVE=<路径>` 就**不弹阻塞的另存为对话框** ——
+    // 无人值守也能端到端验证"导出主题"。没设覆盖时会弹框（无头跑不了）⇒ 本 sim 打印
+    // `[SKIP]` 而不是假装通过。
+    app.sim_pick_save = args.iter().any(|a| a == "--sim-pick-save");
+    app.windows.show_grip_win = app.sim_resize;
     app.sim_ta_resize = args.iter().any(|a| a == "--sim-ta-resize");
     app.windows.sim_chrome = app.sim_chrome;
     app.sim_click = args
@@ -167,6 +173,11 @@ const PICKER_BIG_TRIGGER: Vec2 = Vec2::new(200.0, 40.0);
 /// `--sim-row-overflow` 的窄窗口左上角（物理像素）与该窗口**外面**那个控件的偏移
 /// （内容坐标）。窗口宽固定为逻辑 150 ⇒ 内容宽 = 150 × scale，输入框默认宽远超它。
 const ROW_WIN_POS: Vec2 = Vec2::new(200.0, 620.0);
+
+/// `--sim-resize` 阶段 2 的窗口（**故意不给 `.width()`**）：位置取空白带 —— 它的**右下角**
+/// （缩放柄所在处）不能被任何更高 z 的窗口压住（`icons` y ≤ 575 / `strict_win` y ≥ 690 /
+/// `chishi` x ≤ 499 都要避开），否则 `window_occluded` 会让柄判不中（实测踩过两次）。
+const GRIP_WIN_POS: Vec2 = Vec2::new(500.0, 590.0);
 /// 窗口**外面**那个控件（"幽灵控件"）在窗口内容坐标里的位置：x 明显超过内容宽。
 const ROW_GHOST_OFFSET: Vec2 = Vec2::new(260.0, 12.0);
 /// 窗口**里面**那个控件（正对照）在窗口内容坐标里的位置与宽（物理像素）。
@@ -590,6 +601,32 @@ struct Windows {
     eng_states: Vec<(bool, Vec2)>,
     /// --sim-chrome：是否打印上面的证据。
     sim_chrome: bool,
+    /// --sim-resize 阶段 2：`grip_win`（**没有 `.width()`** 的那个窗口）的柄中心、
+    /// 拖之前 / 之后的结算尺寸。
+    grip_pt: Option<Vec2>,
+    grip_before: Option<Vec2>,
+    grip_after: Option<Vec2>,
+    /// --sim-resize 阶段 2：**冻结的拖拽目标点**（帧 60 记一次）。
+    ///
+    /// ⚠ 必须冻结：柄会随窗口长大而移动，每帧重算目标 = 鼠标"追着柄跑" ⇒ 位移逐帧累加
+    /// （阶段 1 第一版就踩过这个坑）。收缩方向更明显：柄朝鼠标方向移动 ⇒ 高度一档一档
+    /// 掉到下限，看起来像"收缩高度不是恒定值"。
+    grip_to: Option<Vec2>,
+    /// --sim-resize 阶段 3：**冻结的收缩目标点**（帧 90 记一次；同上）。
+    resize_up: Option<Vec2>,
+    /// --sim-resize 阶段 3：**收缩高度**现场（用户实测："窗口收缩高度应当为恒定值"）：
+    /// `(松手后一帧的高度, 再等若干帧之后的高度)` —— 两者必须相等（不许回弹 / 抖动），
+    /// 且必须 ≥ 引擎的恒定下限（`row_h + 2×pad`）。
+    shrink_after_free: Option<f32>,
+    shrink_later: Option<f32>,
+    /// --sim-resize 阶段 2：是否录 `grip_win` 那扇窗口（由 App 侧按 `--sim-resize` 置位）。
+    show_grip_win: bool,
+    /// --sim-chrome 阶段 5：⌃ 按钮的**行中心**（`caption_pts` 给的是"上半"——那是为了
+    /// 躲开收起态右下角的缩放柄；本轮让柄给内容让位之后，**中心也该能点**）。
+    eng_center_pt: Option<Vec2>,
+    /// --sim-chrome 阶段 5：点中心之前 / 之后的引擎收起状态（必须不同 = 真的翻转过）。
+    eng_center_before: Option<bool>,
+    eng_center_after: Option<bool>,
     /// --sim-row-overflow：本窗口是否录制（固定窄宽 + `Placement::Clip` 的验收现场）。
     sim_row_overflow: bool,
     /// --sim-row-overflow：窄窗口里那一行的**结算尺寸**（`row(..)` 的返回值）——
@@ -632,6 +669,17 @@ impl Windows {
             eng_pts: None,
             eng_states: Vec::new(),
             sim_chrome: false,
+            grip_pt: None,
+            grip_before: None,
+            grip_after: None,
+            grip_to: None,
+            resize_up: None,
+            show_grip_win: false,
+            eng_center_pt: None,
+            eng_center_before: None,
+            eng_center_after: None,
+            shrink_after_free: None,
+            shrink_later: None,
             sim_row_overflow: false,
             row_size: None,
             row_avail_w: 0.0,
@@ -746,6 +794,19 @@ impl Windows {
                 w.text_area_nw("win_b_note_area", &mut self.win_b_note_area);
             }
         });
+        // ── `--sim-resize` 阶段 2：**没有 `.width()` 也要能拖宽** ────────────────
+        // 用户实测："resize Horizontal 不在设置 width 的情况下无法缩放"——根因是持久宽
+        // （`window_widths`）只在 `width.map(..)` 里被读 ⇒ 拖了也被丢掉。这里故意**不写**
+        // `.width()`，只开 `Resize::Horizontal`：拖右 +50 之后宽必须变大、**高不变**。
+        if self.show_grip_win {
+            ui.window("grip_win")
+                .pos(Position::Physical(GRIP_WIN_POS))
+                .resize(true, Resize::Horizontal)
+                .title("没有 width，也能拖宽")
+                .show(|w| {
+                    w.label("只有宽度轴可拖（Resize::Horizontal）");
+                });
+        }
         // ── `--sim-row-overflow`：**窄的固定宽窗口**里的验收现场 ──────────────────
         //
         // 用户实测的两条 BUG：
@@ -1535,6 +1596,9 @@ struct UiApp {
     /// --sim-ta-resize：脚本化拖拽**行内多行 TextEditor** 的右下角缩放柄
     /// （验"申请尺寸 = 绘制尺寸 ⇒ 窗口/下面的控件跟着长" + "单行子项在行里被钉住"）。
     sim_ta_resize: bool,
+    /// --sim-pick-save：走**真实的导出通路**（`export_request` → `pick_save` →
+    /// `save_theme`）；配 `RJ_PICK_SAVE=<路径>` 即跳过阻塞的另存为对话框。
+    sim_pick_save: bool,
     /// --sim-ta-resize：两个输入框的内容（多行那个要缩放；单行那个在 `min_h(60)` 行里）。
     sim_ta_text: String,
     sim_ta_single: String,
@@ -1835,6 +1899,7 @@ impl UiApp {
             sim_resize_after: None,
             sim_resize_to: None,
             sim_ta_resize: false,
+            sim_pick_save: false,
             sim_ta_text: String::new(),
             sim_ta_single: String::new(),
             sim_ta_rect: None,
@@ -2536,6 +2601,7 @@ impl App for UiApp {
             // —— 按钮若缩回内容右缘（旧行为，差 `pad + 4`），这两下就落空了。
             let (fold_p, close_p) = self.windows.chrome_pts.unwrap_or((Vec2::ZERO, Vec2::ZERO));
             let eng_p = self.windows.eng_pts.unwrap_or(Vec2::ZERO);
+            let eng_c = self.windows.eng_center_pt.unwrap_or(eng_p);
             let away = Vec2::new(1800.0, 1050.0);
             if f.frames() == 12 {
                 eprintln!("sim-chrome: scale={scale} ⌃={fold_p:?} ×={close_p:?}");
@@ -2561,6 +2627,11 @@ impl App for UiApp {
                 106..=107 => f.debug_inject_mouse(eng_p, false),
                 112..=113 => f.debug_inject_mouse(eng_p, true),
                 114..=115 => f.debug_inject_mouse(eng_p, false),
+                // 阶段 5：点同一个 ⌃ 的**行中心**——收起态里窗口右下角的缩放柄正压在这里，
+                // 旧实现（柄先跑）会把这次按下抢走 ⇒ 状态不翻转。本轮"柄让位给内容/按钮"
+                // 之后必须照常翻转（`!press_claimed` 才应用窗口柄）。
+                140..=141 => f.debug_inject_mouse(eng_c, true),
+                142..=143 => f.debug_inject_mouse(eng_c, false),
                 _ => {
                     f.debug_inject_mouse(away, false);
                     // 应用侧重开 / 展开（引擎不替应用决定"何时重开"）。
@@ -2609,11 +2680,33 @@ impl App for UiApp {
             // **冻结目标点**（帧 8 记录）：柄随窗口长大而移动，每帧重算目标 = 鼠标被
             // "追着拖"，位移逐帧累加（第一版就这么错：拖 +60 结果宽了 +180）。
             let to = self.sim_resize_to.unwrap_or(Vec2::new(p.x + 60.0, p.y + 40.0));
+            // 阶段 2 的点（没有 `.width()` 的那个窗口的柄）；冻结成"右移 50"。
+            let gp = self.windows.grip_pt.unwrap_or(Vec2::ZERO);
+            let gto = self
+                .windows
+                .grip_to
+                .unwrap_or(Vec2::new(gp.x + 50.0, gp.y));
+            // 阶段 3 的目标：同一个柄**只往上**（收缩高度）；已冻结。
+            let up = self
+                .windows
+                .resize_up
+                .unwrap_or(Vec2::new(p.x, p.y - 40.0));
             match f.frames() {
                 10..=11 => f.debug_inject_mouse(p, false),
                 12..=13 => f.debug_inject_mouse(p, true),
                 14..=19 => f.debug_inject_mouse(to, true),
                 20..=24 => f.debug_inject_mouse(to, false),
+                // 阶段 2：**横向**拖 `grip_win` 的柄（只右移，不碰 y）⇒ 只该宽变。
+                62..=63 => f.debug_inject_mouse(gp, false),
+                64..=65 => f.debug_inject_mouse(gp, true),
+                66..=71 => f.debug_inject_mouse(gto, true),
+                72..=76 => f.debug_inject_mouse(gto, false),
+                // 阶段 3：**向上收缩** `img_box_fill` 的高度（用户实测："窗口收缩高度
+                // 应当为恒定值"）：只动 y（−40），松手后高度必须停在拖出来的值上。
+                90..=91 => f.debug_inject_mouse(p, false),
+                92..=93 => f.debug_inject_mouse(p, true),
+                94..=99 => f.debug_inject_mouse(up, true),
+                100..=104 => f.debug_inject_mouse(up, false),
                 _ => {}
             }
         }
@@ -2633,6 +2726,12 @@ impl App for UiApp {
                 36..=37 => f.debug_inject_mouse(ghost, false),
                 _ => {}
             }
+        }
+        // ── 调试：脚本化鼠标（`--sim-pick-save`）──────────────────
+        // 第 20 帧按下「导出主题…」那条路（只记请求）：帧外处理器会调 `pick_save` ——
+        // 设了 `RJ_PICK_SAVE` 就用它（不弹框），于是"导出主题"整条通路可无人值守跑完。
+        if self.sim_pick_save && f.frames() == 20 {
+            self.top.export_request = Some(ExportKind::Theme);
         }
         // ── 调试：脚本化鼠标（`--sim-menu`）──────────────────────
         // 行程：10..11 移到「视图」触发器 → 12..13 按下 → 14..15 抬起（菜单打开）
@@ -3426,12 +3525,56 @@ impl App for UiApp {
                 self.windows.chrome_pts = caption_pts(&dump, "win_a", row_h, gap, true);
                 self.windows.eng_pts = caption_pts(&dump, ENG_COLLAPSE_WIN, row_h, gap, false)
                     .map(|(fold, _)| fold);
+                // 阶段 5 的点 = 同一个 ⌃ 的**行中心**（`caption_pts` 给的是 `row_h*0.25`，
+                // 即行上半；中心还要再往下 `row_h*0.25`）。
+                self.windows.eng_center_pt = self
+                    .windows
+                    .eng_pts
+                    .map(|p| Vec2::new(p.x, p.y + row_h * 0.25));
                 // **引擎托管收起**的证据：每帧记 `(UiState 里的收起状态, dump 尺寸)`
                 // —— 状态与几何必须**同步**变（只记变化点，避免几百条重复）。
                 if let Some(w) = dump.windows.iter().find(|p| p.id == ENG_COLLAPSE_WIN) {
                     let now = (ui.state().is_collapsed(ENG_COLLAPSE_WIN), w.size);
                     if self.windows.eng_states.last() != Some(&now) {
                         self.windows.eng_states.push(now);
+                    }
+                }
+            }
+            // `--sim-resize` 阶段 2：`grip_win`（没有 `.width()`）的柄中心 + 拖前后尺寸。
+            // 位置从 dump 解算（窗口首帧还没被 clamp ⇒ 只信 frame ≥ 2 的值）。
+            if self.sim_resize && sim_frame >= 2 {
+                let dump = ui.debug_dump();
+                if let Some(w) = dump.windows.iter().find(|p| p.id == "grip_win") {
+                    self.windows.grip_pt =
+                        Some(Vec2::new(w.origin.x + w.size.x - 8.0, w.origin.y + w.size.y - 8.0));
+                    if sim_frame == 60 {
+                        self.windows.grip_before = Some(w.size);
+                        self.windows.grip_after = Some(w.size);
+                        // 目标点**冻结**（见 `grip_to` 的说明）。
+                        if let Some(p) = self.windows.grip_pt {
+                            self.windows.grip_to = Some(Vec2::new(p.x + 50.0, p.y));
+                        }
+                    } else if sim_frame > 60 {
+                        self.windows.grip_after = Some(w.size);
+                    }
+                }
+            }
+            // `--sim-resize` 阶段 3：收缩高度之后，高度必须是**恒定值**（松手当帧与
+            // 若干帧之后相同）——"窗口收缩高度应当为恒定值"（用户实测）。
+            if self.sim_resize && sim_frame >= 86 {
+                let dump = ui.debug_dump();
+                if let Some(w) = dump.windows.iter().find(|p| p.id == "img_box_fill") {
+                    if sim_frame == 90
+                        && let Some(p) = self.sim_resize_pt
+                    {
+                        // 阶段 3 的**冻结**收缩目标（只上移 40）：柄会随高度一起上移，
+                        // 每帧重算目标 = 鼠标追着柄跑 ⇒ 高度一档一档掉到下限。
+                        self.windows.resize_up = Some(Vec2::new(p.x, p.y - 40.0));
+                    }
+                    if sim_frame == 106 {
+                        self.windows.shrink_after_free = Some(w.size.y);
+                    } else if sim_frame >= 140 {
+                        self.windows.shrink_later = Some(w.size.y);
                     }
                 }
             }
@@ -4086,6 +4229,55 @@ impl App for UiApp {
                 }
             );
         }
+        // --sim-resize 阶段 2：**没有 `.width()` 的窗口也能拖宽**，且**只**宽变（高不变）。
+        if self.sim_resize && f.frames() == 80 {
+            let (b, a) = (
+                self.windows.grip_before.unwrap_or(Vec2::ZERO),
+                self.windows.grip_after.unwrap_or(Vec2::ZERO),
+            );
+            let wider = a.x > b.x + 30.0;
+            let same_h = (a.y - b.y).abs() <= 1.0;
+            eprintln!(
+                "sim-resize: 无 width 窗口 拖前 {:.0}×{:.0} → 拖后 {:.0}×{:.0} {}",
+                b.x,
+                b.y,
+                a.x,
+                a.y,
+                if wider && same_h {
+                    "[OK] 没给 `.width()` 也能横向拖宽（且高度轴没被带上 —— Resize::Horizontal）"
+                } else {
+                    "[FAIL] 无 width 的窗口拖不动 / 横向拖动把高度也改了"
+                }
+            );
+        }
+        // --sim-resize 阶段 3：**收缩高度 = 恒定值**（松手当帧 vs 40 帧后必须相同）。
+        if self.sim_resize && f.frames() == 150 {
+            let free = self.windows.shrink_after_free;
+            let later = self.windows.shrink_later;
+            let ok = free.zip(later).is_some_and(|(a, b)| (a - b).abs() <= 0.5);
+            eprintln!(
+                "sim-resize: 收缩高度 松手后={free:?} 40 帧后={later:?} {}",
+                if ok {
+                    "[OK] 收缩后的窗口高度是恒定值（不回弹 / 不抖动）"
+                } else {
+                    "[FAIL] 收缩后的高度变了（回弹 / 抖动 ⇒ 高度不是恒定值）"
+                }
+            );
+        }
+        // --sim-pick-save：**导出主题的端到端判定**（含"跳过阻塞对话框"）。
+        // 真值看状态行：载入 / 导出成功、或"导出已取消"（`RJ_PICK_SAVE=none`）。
+        if self.sim_pick_save && f.frames() == 40 {
+            let st = &self.top.import_status;
+            let ok = st.contains("主题已导出") || st.contains("导出已取消");
+            eprintln!(
+                "sim-pick-save: status={st:?} {}",
+                if ok {
+                    "[OK] 导出通路走通（`RJ_PICK_SAVE` 生效 ⇒ 没有弹阻塞的另存为对话框）"
+                } else {
+                    "[FAIL] 没走到导出（或覆盖没生效 ⇒ 弹了对话框 / 被卡住）"
+                }
+            );
+        }
         // --sim-import：打印导入结果 + 应用侧真的拿到了什么（字体族 / 背景纹理尺寸）——
         // 覆盖"字节 → 纹理 / 字体"这条线（**不含**真人点系统选择器那一步：阻塞对话框在
         // 无头环境里没法跑，而且那一步没有引擎逻辑）。
@@ -4258,6 +4450,34 @@ impl App for UiApp {
             );
         }
 
+        // --sim-chrome 阶段 5：点 ⌃ 的**行中心**也必须能收起。中心点落在收起态窗口右下角
+        // 的**缩放柄**上（`caption_pts` 之所以只点"上半"，就是为了躲它）——本轮把窗口柄的
+        // **应用**推迟到内容 + 标题栏之后（且只在 `!press_claimed` 时），语义上"控件/按钮
+        // 优先"。这条是**回归守卫**：中心照旧可点（不断言"修前必挂"——修前靠控件级遮挡
+        // 也能赢，但那是两套机制碰巧一致）。
+        if self.sim_chrome && (f.frames() == 138 || f.frames() == 160) {
+            let now = self.windows.eng_states.last().map(|(c, _)| *c).unwrap_or(false);
+            if f.frames() == 138 {
+                self.windows.eng_center_before = Some(now);
+            } else {
+                self.windows.eng_center_after = Some(now);
+                let ok = self
+                    .windows
+                    .eng_center_before
+                    .zip(self.windows.eng_center_after)
+                    .is_some_and(|(a, b)| a != b);
+                eprintln!(
+                    "sim-chrome[柄让位]: 点 ⌃ 行中心 前={:?} 后={:?} {}",
+                    self.windows.eng_center_before,
+                    self.windows.eng_center_after,
+                    if ok {
+                        "[OK] 收起态里点 ⌃ 的**行中心**也能翻转（缩放柄与按钮重叠时按钮照常生效）"
+                    } else {
+                        "[FAIL] 行中心点不动（按下被缩放柄抢走 / 按钮没响应）"
+                    }
+                );
+            }
+        }
         // --sim-cover：**被上层窗口盖住的控件不该收到按下**。
         // 判定口径（两段各管一处修复，见 `cover` 模块文档）：
         // - `covered_drags`：被盖住却还带着拖拽状态进来（错误认领的按下会一直拖到释放）

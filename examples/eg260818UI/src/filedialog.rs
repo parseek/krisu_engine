@@ -79,11 +79,48 @@ impl ImportKind {
     }
 }
 
+/// **导入选择器的环境变量覆盖**（见 [`resolve_override`]）。
+pub const ENV_PICK_OPEN: &str = "RJ_PICK_FILE";
+/// **导出（另存为）选择器的环境变量覆盖**。
+pub const ENV_PICK_SAVE: &str = "RJ_PICK_SAVE";
+
+/// **要不要跳过阻塞的系统对话框**（纯函数，可单测）：`None` = 没设置（照常弹框）。
+///
+/// 值有三种写法：
+/// - **路径** ⇒ 直接用它（`Some(Some(path))`）——按钮那条真实通路**不再阻塞**，
+///   无头 / 脚本 / 无人值守都能跑完整流程（"用户选了什么"由外部注入）；
+/// - `none` / `cancel` / 空串 ⇒ 模拟"用户取消"（`Some(None)`）——**测取消路径**也
+///   不用真人（取消后的状态行文案 / 不炸的分支最容易被漏测）；
+/// - 未设置 ⇒ `None`，照常弹 `rfd`。
+///
+/// ⚠ 覆盖的是**选择器**，不是通路：导入 / 导出仍然走同一个 `decode_image` /
+/// `apply_font` / `load_theme_onto` / `save_theme` ⇒ 覆盖不会掩盖真实逻辑。
+pub fn resolve_override(var: Option<&str>) -> Option<Option<PathBuf>> {
+    let raw = var?;
+    let t = raw.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("cancel") {
+        return Some(None);
+    }
+    Some(Some(PathBuf::from(t)))
+}
+
+/// 读环境变量版的 [`resolve_override`]。
+fn env_override(name: &str) -> Option<Option<PathBuf>> {
+    resolve_override(std::env::var(name).ok().as_deref())
+}
+
 /// **弹系统文件选择器**（阻塞；用户取消 ⇒ `None`）。
 ///
 /// `title` / 过滤器按类型给：只列该类型 ⇒ 选错类型的概率大幅下降（仍会校验，
 /// 见 [`ImportKind::from_path`] 的调用点）。
+///
+/// **可以跳过**：设 `RJ_PICK_FILE=<路径>` ⇒ 直接用该路径（不弹框）；设
+/// `RJ_PICK_FILE=none` ⇒ 直接当作"用户取消"。见 [`resolve_override`]。
 pub fn pick(kind: ImportKind) -> Option<PathBuf> {
+    if let Some(v) = env_override(ENV_PICK_OPEN) {
+        eprintln!("filedialog: {ENV_PICK_OPEN} 覆盖 ⇒ 不弹选择器，直接用 {v:?}");
+        return v;
+    }
     let (title, filter) = match kind {
         ImportKind::Image => ("导入图片（当窗口背景纹理）", "图片"),
         ImportKind::Font => ("导入字体（ttf / otf / ttc）", "字体"),
@@ -98,7 +135,12 @@ pub fn pick(kind: ImportKind) -> Option<PathBuf> {
 /// **弹系统"另存为"选择器**（阻塞；用户取消 ⇒ `None`）。
 ///
 /// 写文件走 [`save_theme`]；与导入共用同一套扩展名与错误显示口径。
+/// **可以跳过**：`RJ_PICK_SAVE=<路径>` / `=none`（同 [`pick`]）。
 pub fn pick_save(kind: ExportKind) -> Option<PathBuf> {
+    if let Some(v) = env_override(ENV_PICK_SAVE) {
+        eprintln!("filedialog: {ENV_PICK_SAVE} 覆盖 ⇒ 不弹另存为，直接用 {v:?}");
+        return v;
+    }
     let (title, filter, exts, default_name) = match kind {
         ExportKind::Theme => (
             "导出主题（TOML）",
@@ -175,4 +217,29 @@ pub fn apply_font(text: &mut Text, path: &Path) -> Result<Vec<String>, String> {
 /// 人类可读的文件名（状态行显示用）。
 pub fn file_label(path: &Path) -> String {
     path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_override_parses_path_cancel_and_unset() {
+        // 没设置 ⇒ 照常弹框（`None`）
+        assert_eq!(resolve_override(None), None);
+        // 路径 ⇒ 直接用（含相对路径 / 带空格的路径，原样返回）
+        assert_eq!(
+            resolve_override(Some("C:/tmp/my theme.toml")),
+            Some(Some(PathBuf::from("C:/tmp/my theme.toml")))
+        );
+        // `none` / `cancel` / 空串（含仅空白）⇒ 模拟"用户取消"
+        for v in ["none", "NONE", "cancel", "  ", ""] {
+            assert_eq!(resolve_override(Some(v)), Some(None), "值 {v:?} 应判为取消");
+        }
+        // 前后空白要去掉（命令行里复制粘贴常带空格）
+        assert_eq!(
+            resolve_override(Some("  a.png  ")),
+            Some(Some(PathBuf::from("a.png")))
+        );
+    }
 }

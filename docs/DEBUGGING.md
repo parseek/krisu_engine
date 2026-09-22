@@ -54,7 +54,24 @@ cargo run --offline -p egUI -- --demo Gallery --ui-dump --frames 60
 
 诊断专用（不进上表）：`--sim-import <图片>` / `--sim-theme <toml>` / `--sim-click X,Y`（配
 `RJ_HIT_TRACE=1`）/ `--auto-drag` / `--script-pos` / `RJ_CHROME_TRACE` / `RJ_MENU_TRACE` /
-`RJ_ORDER_TRACE=<frame>`。各 sim 的**判定口径与现场**见 §2–§5。
+`RJ_ORDER_TRACE=<frame>` / `RJ_GRIP_TRACE`。各 sim 的**判定口径与现场**见 §2–§5。
+
+**跳过阻塞的文件选择对话框**（导入 / 导出，示例侧）：系统选择器（`rfd`）是**阻塞**调用，
+无头 / 无人值守跑不了。`examples/eg260818UI/src/filedialog.rs` 给了两个环境变量覆盖
+（纯函数 `resolve_override` + 单测）：
+
+```powershell
+$env:RJ_PICK_SAVE="C:\rust-targets\out.toml"; cargo run -p eg260818UI -- --sim-pick-save --frames 50
+#   filedialog: RJ_PICK_SAVE 覆盖 ⇒ 不弹另存为，直接用 Some("C:\\rust-targets\\out.toml")
+#   sim-pick-save: status="主题已导出：out.toml" [OK] 导出通路走通
+$env:RJ_PICK_SAVE="none"; ...   # => 模拟"用户取消"：status="导出已取消"（取消分支也测得到）
+```
+
+- `RJ_PICK_FILE` / `RJ_PICK_SAVE` = **导入选择器 / 另存为选择器**的覆盖；
+- 值是**路径** ⇒ 直接用它、不弹框；是 `none` / `cancel` / 空串 ⇒ 当作"用户取消"；
+  未设置 ⇒ 照常弹框（真人用法不变）；
+- 覆盖的只是**选择器**：导入 / 导出仍走同一条 `decode_image` / `apply_font` /
+  `load_theme_onto` / `save_theme`（覆盖不会掩盖真实逻辑）。
 
 ## 0.1 仓库内置主题（自动化测试的主题输入）
 

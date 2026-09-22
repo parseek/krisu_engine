@@ -86,6 +86,8 @@ pub enum UiCursor {
     Grabbing,
     /// 水平双向箭头（↔；滑块 / 拖拽调值手柄 / 窗口宽度缩放柄）。
     EwResize,
+    /// 垂直双向箭头（↕；窗口高度缩放柄）。
+    NsResize,
     /// 对角线双向箭头（↖↘；可调整大小的 TextArea 右下角缩放柄）。
     NwseResize,
 }
@@ -98,6 +100,7 @@ impl UiCursor {
             UiCursor::Grab => winit::window::CursorIcon::Grab,
             UiCursor::Grabbing => winit::window::CursorIcon::Grabbing,
             UiCursor::EwResize => winit::window::CursorIcon::EwResize,
+            UiCursor::NsResize => winit::window::CursorIcon::NsResize,
             UiCursor::NwseResize => winit::window::CursorIcon::NwseResize,
         }
     }
@@ -127,15 +130,21 @@ pub enum Placement {
 /// **可调整尺寸控件的缩放方向**（取代旧的 `show_handle: bool` 裸布尔）。
 ///
 /// 用于 [`Ui::resizable_text_input_at`](crate::Ui::resizable_text_input_at) /
-/// [`Ui::resizable_text_area_at`](crate::Ui::resizable_text_area_at)。
+/// [`Ui::resizable_text_area_at`](crate::Ui::resizable_text_area_at)，以及
+/// [`WindowBuilder::resize`](crate::WindowBuilder::resize)（窗口右下角柄）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Resize {
     /// **不显示缩放柄**（尺寸只由尺寸责任链 / 持久值决定）。
     #[default]
     None,
-    /// 显示右下角缩放柄，**只可调宽**（单行输入框；`↔` 光标）。
+    /// 显示右下角缩放柄，**只可调宽**（单行输入框 / 窗口宽度；`↔` 光标）。
     Horizontal,
-    /// 显示右下角缩放柄，**宽高同调**（多行 TextArea；`⤡` 光标）。
+    /// 显示右下角缩放柄，**只可调高**（窗口高度；`↕` 光标）。
+    ///
+    /// 窗口专用语义：宽度仍由内容决定（自动宽），拖出来的高度**跨帧持久**
+    /// （`UiState::window_heights`）——与 [`Self::Both`] 的高度轴一致。
+    Vertical,
+    /// 显示右下角缩放柄，**宽高同调**（多行 TextArea / 窗口；`⤡` 光标）。
     Both,
 }
 
