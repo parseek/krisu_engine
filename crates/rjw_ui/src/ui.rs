@@ -3384,7 +3384,13 @@ impl<'a> Ui<'a> {
         // `vscroll(Scroll)` 的**视口高**在下面算（要等标题栏占位之后才拿得到内容原点）；
         // 这里先记下"该轴是滚动视口"，`set_fixed_h` 在那里做。
         // **高度**：`Vertical` 或 `Both` 拖过 ⇒ 由用户接管。
-        let fixed_h = if resize_fixes_height(resize_axes) {
+        // ⚠ **收起态例外**：收起就是"只剩一行标题栏"，此时**必须忽略持久高** ——
+        // 否则"先拖高过、再点 ⌃"会得到一扇**空着的高窗**（用户实测："点击收起后不会
+        // 收起"，截图里就是一扇没有内容的 527 高窗）。展开时持久高照旧生效。
+        let collapsed_now = chrome.collapsed(self.state, id_for.as_str());
+        let fixed_h = if collapsed_now {
+            None
+        } else if resize_fixes_height(resize_axes) {
             self.state.window_heights.get(id_for.as_str()).copied()
         } else {
             None

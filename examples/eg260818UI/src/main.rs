@@ -652,6 +652,13 @@ struct Windows {
     /// --sim-chrome 阶段 5：点中心之前 / 之后的引擎收起状态（必须不同 = 真的翻转过）。
     eng_center_before: Option<bool>,
     eng_center_after: Option<bool>,
+    /// --sim-chrome 阶段 6：`img_box_fill` 的 `(原点, 尺寸)`（缩放柄坐标从它解算）。
+    eng_rect: Option<(Vec2, Vec2)>,
+    /// --sim-chrome 阶段 6：拖大之后 / 点 ⌃ 收起之后的高度（断言收起 ≈ 一行标题栏）。
+    eng_dragged_h: Option<f32>,
+    eng_collapsed_h: Option<f32>,
+    /// --sim-chrome 阶段 6：**冻结**的拖拽目标（柄随尺寸移动 ⇒ 每帧重算会追着拖）。
+    eng_drag_to: Option<Vec2>,
     /// --sim-row-overflow：本窗口是否录制（固定窄宽 + `Placement::Clip` 的验收现场）。
     sim_row_overflow: bool,
     /// --sim-row-overflow：窄窗口里那一行的**结算尺寸**（`row(..)` 的返回值）——
@@ -706,6 +713,10 @@ impl Windows {
             eng_center_pt: None,
             eng_center_before: None,
             eng_center_after: None,
+            eng_rect: None,
+            eng_dragged_h: None,
+            eng_collapsed_h: None,
+            eng_drag_to: None,
             shrink_after_free: None,
             shrink_later: None,
             sim_row_overflow: false,
@@ -2699,6 +2710,12 @@ impl App for UiApp {
             let (fold_p, close_p) = self.windows.chrome_pts.unwrap_or((Vec2::ZERO, Vec2::ZERO));
             let eng_p = self.windows.eng_pts.unwrap_or(Vec2::ZERO);
             let eng_c = self.windows.eng_center_pt.unwrap_or(eng_p);
+            // 阶段 6：`img_box_fill` 右下角的**缩放柄**中心（`Resize::Both`）。
+            let eng_grip = self
+                .windows
+                .eng_rect
+                .map(|(o, s)| Vec2::new(o.x + s.x - 8.0, o.y + s.y - 8.0))
+                .unwrap_or(eng_p);
             let away = Vec2::new(1800.0, 1050.0);
             if f.frames() == 12 {
                 eprintln!("sim-chrome: scale={scale} ⌃={fold_p:?} ×={close_p:?}");
@@ -2729,6 +2746,25 @@ impl App for UiApp {
                 // 之后必须照常翻转（`!press_claimed` 才应用窗口柄）。
                 140..=141 => f.debug_inject_mouse(eng_c, true),
                 142..=143 => f.debug_inject_mouse(eng_c, false),
+                // 阶段 6：**先确定地展开 → 把高度拖大 → 再点 ⌃** ——
+                // 持久高不能让收起后的窗口"空着不倒"（用户实测："点击收起后不会收起"）。
+                // 展开走**公开状态 API**（`set_collapsed(.., false)`）而不是再点一次 ⌃：
+                // 收起态里窗口柄正压在 ⌃ 上，靠点击会随"谁赢"而抖（见 ui 段的调用）。
+                190..=191 => f.debug_inject_mouse(eng_grip, false),
+                192..=193 => {
+                    self.windows.eng_drag_to = Some(Vec2::new(eng_grip.x, eng_grip.y + 40.0));
+                    f.debug_inject_mouse(eng_grip, true)
+                }
+                194..=199 => {
+                    let to = self.windows.eng_drag_to.unwrap_or(eng_grip);
+                    f.debug_inject_mouse(to, true)
+                }
+                200..=204 => {
+                    let to = self.windows.eng_drag_to.unwrap_or(eng_grip);
+                    f.debug_inject_mouse(to, false)
+                }
+                210..=211 => f.debug_inject_mouse(eng_p, true),
+                212..=213 => f.debug_inject_mouse(eng_p, false),
                 _ => {
                     f.debug_inject_mouse(away, false);
                     // 应用侧重开 / 展开（引擎不替应用决定"何时重开"）。
@@ -3632,6 +3668,10 @@ impl App for UiApp {
             // ⚠ 旧版这里用 `220*scale + pad`（**内容**右缘）算 —— 那套坐标在按钮右移到外框
             // 右缘之后就点不准了，所以脚本必须跟着"外框"口径走，而不是继续写死数字。
             if self.sim_chrome {
+                // 阶段 6 的前置：**确定地展开**（见注入段注释）。
+                if sim_frame == 184 {
+                    ui.state_mut().set_collapsed(ENG_COLLAPSE_WIN, false);
+                }
                 let dump = ui.debug_dump();
                 let (row_h, gap) = (ui.theme().row_h, ui.theme().gap);
                 // 两个窗口的按钮中心都用**同一个口径**（引擎的 `title_bar_layout`）：
@@ -3650,9 +3690,15 @@ impl App for UiApp {
                 // **引擎托管收起**的证据：每帧记 `(UiState 里的收起状态, dump 尺寸)`
                 // —— 状态与几何必须**同步**变（只记变化点，避免几百条重复）。
                 if let Some(w) = dump.windows.iter().find(|p| p.id == ENG_COLLAPSE_WIN) {
-                    let now = (ui.state().is_collapsed(ENG_COLLAPSE_WIN), w.size);
+                    self.windows.eng_rect = Some((w.origin, w.size));                    let now = (ui.state().is_collapsed(ENG_COLLAPSE_WIN), w.size);
                     if self.windows.eng_states.last() != Some(&now) {
                         self.windows.eng_states.push(now);
+                    }
+                    if sim_frame == 207 {
+                        self.windows.eng_dragged_h = Some(w.size.y);
+                    }
+                    if sim_frame == 220 {
+                        self.windows.eng_collapsed_h = Some(w.size.y);
                     }
                 }
             }
@@ -4481,6 +4527,22 @@ impl App for UiApp {
                     "[OK] 纯点击不改尺寸（没有跳回上一次拖之前的值）"
                 } else {
                     "[FAIL] 第二次点击把尺寸改了（瞬移）"
+                }
+            );
+        }
+        // --sim-chrome 阶段 6：**拖高过之后点 ⌃，必须真的收起**（= 一行标题栏，
+        // 而不是"空着的高窗"）。用户实测："点击收起后不会收起"。
+        if self.sim_chrome && f.frames() == 230 {
+            let (dragged, collapsed) = (self.windows.eng_dragged_h, self.windows.eng_collapsed_h);
+            let ok = dragged.zip(collapsed).is_some_and(|(d, c)| {
+                d > 100.0 && 40.0 <= c && c <= 70.0 && c < d - 30.0
+            });
+            eprintln!(
+                "sim-chrome[收起忽略持久高]: 拖大后高={dragged:?} → 收起后高={collapsed:?} {}",
+                if ok {
+                    "[OK] 收起后真的只剩一行标题栏（持久高不参与收起态）"
+                } else {
+                    "[FAIL] 收起后仍是原来的高 / 空着不倒（持久高把收起态撑住了）"
                 }
             );
         }
