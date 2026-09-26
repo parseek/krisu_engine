@@ -1,11 +1,46 @@
-//! `ui` 模块的单元测试（从 `ui.rs` 拆出；无 GPU 依赖的纯逻辑回归）。
+//! `ui` 模块的单元测试（独立文件；无 GPU 依赖的纯逻辑回归）。
 //!
-//! 这些测试原本内联在 `ui.rs` 末尾（约 700 行），拆出后 `ui.rs` 只留生产代码。
+//! 测试针对**内部实现细节**（纯函数与引擎语义），所以用 `use super::*` + 各子模块 glob
+//! 拿回拆分前的"同模块可见"集合（见 `ui.rs` 的「子模块与重导出」）。
 //! 覆盖：文本编辑原语 / 对齐转换 / 内容签名 / 组排序 / 命令分桶等价性 /
-//! 窗口限位与拖拽 / 命中与焦点 / 字符边界安全等——全部不需要 GPU。
+//! 窗口限位与拖拽 / 命中与焦点 / 字符边界安全等——全部不需要 GPU；
+//! `widget_boundary_guard` 守 `widgets/` 的公开面边界（`docs/UI_ARCHITECTURE.md` §2.5.4）。
 
 use super::*;
-use crate::draw::{PanelCmdCtx, push_panel_img_cmds};
+// 生产代码已拆到 `ui/` 子模块（见 `ui.rs` 的「子模块与重导出」）：测试要碰内部实现细节，
+// 因此把各子模块的 `pub(super)` 项一并 glob 进来，等价于拆分前的「同模块可见」。
+use super::chrome::*;
+use super::cmds::*;
+use super::commit::*;
+use super::interaction::full_w_target;
+use super::interaction::center_offset;
+use super::namespace::*;
+use super::scroll::*;
+use super::window::*;
+use std::sync::Arc;
+
+use glam::Vec2;
+use rjw_color::Color;
+use rjw_text::{Align, VisualLine};
+use rjw_transform::Rect;
+
+use crate::draw::{
+    CornerRadius, DrawKind, ImageBg, Position, Size, TextAlign,
+    TextVAlign,
+    UiDraw,
+    screen_fixed_tf, text_block_offset,
+};
+// 顶点收集 / 合批机制（原在 `ui.rs`，见 `gpu_batch` 模块文档）。
+use crate::gpu_batch::{
+    cmd_sig_hash, safe_line_slice,
+};
+use crate::edit::insert_char_at;
+use crate::focus::FocusKind;
+use crate::id::IdAbsolute;
+use crate::state::{UiState, WidgetState};
+use crate::style::PanelStyle;
+use crate::view::{clip_for_view, ViewMode};
+use crate::draw::{PanelCmdCtx, TextRamp, push_panel_img_cmds};
 use crate::gpu_batch::{GROUP_GRAPHIC, GROUP_TEXT};
 use crate::edit::{remove_at, remove_before};
 
@@ -66,6 +101,7 @@ fn cmd_sig_invalidates_on_content_change() {
         elem: 0,
         rect: Rect::new(0.0, 0.0, 10.0, 10.0),
         clip: None,
+        full_w: false,
         kind: DrawKind::Solid(Color::rgba_u8(10, 20, 30, 255)),
     };
     fn sig(d: &UiDraw) -> u64 {
@@ -79,7 +115,7 @@ fn cmd_sig_invalidates_on_content_change() {
     let hovered = UiDraw { kind: DrawKind::Solid(Color::rgba_u8(11, 20, 30, 255)), ..base.clone() };
     assert_ne!(sig(&base), sig(&hovered), "颜色变化必须改变签名");
     // 文本内容变化 → 签名变化（传入值改变必须使缓存失效）
-    let text_kind = |s: &str| DrawKind::Text {
+    let text_kind = |s: &str, ramp: Option<TextRamp>| DrawKind::Text {
         text: s.into(),
         size: 14.0,
         color: Color::WHITE,
@@ -88,10 +124,24 @@ fn cmd_sig_invalidates_on_content_change() {
         family: None,
         clip: None,
         buf: None,
+        ramp,
     };
-    let t1 = UiDraw { kind: text_kind("on"), ..base.clone() };
-    let t2 = UiDraw { kind: text_kind("off"), ..base.clone() };
+    let t1 = UiDraw { kind: text_kind("on", None), ..base.clone() };
+    let t2 = UiDraw { kind: text_kind("off", None), ..base.clone() };
     assert_ne!(sig(&t1), sig(&t2), "文本内容变化必须改变签名");
+    // **渐变（`ramp`）必须进签名**：只改两色 / 方向、命令其余内容不变时，窗口顶点缓存
+    // 也要失效重建 —— 与"漏哈希颜色 ⇒ 交互变色不刷新"是同一类坑（见 `cmd_sig` 文档）。
+    let ramp_a = TextRamp::horizontal(Color::RED, Color::BLUE);
+    let ramp_b = TextRamp::horizontal(Color::BLUE, Color::RED);
+    let ramp_v = TextRamp::vertical(Color::RED, Color::BLUE);
+    let with_a = UiDraw { kind: text_kind("on", Some(ramp_a)), ..base.clone() };
+    let with_a2 = UiDraw { kind: text_kind("on", Some(ramp_a)), ..base.clone() };
+    let with_b = UiDraw { kind: text_kind("on", Some(ramp_b)), ..base.clone() };
+    let with_v = UiDraw { kind: text_kind("on", Some(ramp_v)), ..base.clone() };
+    assert_eq!(sig(&with_a), sig(&with_a2), "同渐变签名确定（缓存可复用）");
+    assert_ne!(sig(&t1), sig(&with_a), "加渐变必须改变签名");
+    assert_ne!(sig(&with_a), sig(&with_b), "渐变的两色变化必须改变签名");
+    assert_ne!(sig(&with_a), sig(&with_v), "渐变的**方向**变化必须改变签名");
 }
 
 #[test]
@@ -162,6 +212,7 @@ fn cmd_sig_covers_image_fields() {
         elem: 0,
         rect: Rect::new(0.0, 0.0, 100.0, 50.0),
         clip: None,
+        full_w: false,
         kind: DrawKind::Image(bg),
     };
     let base = ImageBg::new(7, Vec2::new(64.0, 64.0));
@@ -205,6 +256,7 @@ fn draw_kind_group_graphic_before_text() {
             valign: TextVAlign::Center,
             clip: None,
             buf: None,
+            ramp: None,
         }
         .group(),
         1
@@ -216,7 +268,10 @@ fn draw_kind_group_graphic_before_text() {
             win: 0,
             elem: 1,
             rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-            clip: None,                kind: DrawKind::Text {                    text: "t".into(),
+            clip: None,
+            full_w: false,
+            kind: DrawKind::Text {
+                    text: "t".into(),
                 size: 14.0,
                 color: Color::WHITE,
                 align: TextAlign::Left,
@@ -224,9 +279,11 @@ fn draw_kind_group_graphic_before_text() {
                 valign: TextVAlign::Center,
                 clip: None,
                 buf: None,
+                ramp: None,
             },
         },
         UiDraw {
+        full_w: false,
             depth: 0,
             seq: 1,
             win: 0,
@@ -236,6 +293,7 @@ fn draw_kind_group_graphic_before_text() {
             clip: None,
         },
         UiDraw {
+        full_w: false,
             depth: 0,
             seq: 3,
             win: 1,
@@ -250,7 +308,10 @@ fn draw_kind_group_graphic_before_text() {
             win: 1,
             elem: 2,
             rect: Rect::new(0.0, 0.0, 1.0, 1.0),
-            clip: None,                kind: DrawKind::Text {                    text: "w".into(),
+            clip: None,
+            full_w: false,
+            kind: DrawKind::Text {
+                    text: "w".into(),
                 size: 14.0,
                 color: Color::WHITE,
                 align: TextAlign::Left,
@@ -258,6 +319,7 @@ fn draw_kind_group_graphic_before_text() {
                 valign: TextVAlign::Center,
                 clip: None,
                 buf: None,
+                ramp: None,
             },
         }];
     cmds.sort_by_key(|d| (d.win, d.depth, d.elem, d.kind.group(), d.seq));
@@ -296,6 +358,7 @@ fn bucket_cmds_equals_full_sort() {
                     family: None,
                     clip: None,
                     buf: None,
+                    ramp: None,
                 }
             };
             UiDraw {
@@ -305,6 +368,7 @@ fn bucket_cmds_equals_full_sort() {
                 elem: seq,
                 rect: Rect::ZERO,
                 clip: None,
+                full_w: false,
                 kind,
             }
         })
@@ -637,6 +701,7 @@ fn overlapping_elements_follow_record_order() {
     let mut cmds = [
         // 元素 A（先录）：文字
         UiDraw {
+        full_w: false,
             depth: 1,
             seq: 1,
             win: 1,
@@ -651,11 +716,13 @@ fn overlapping_elements_follow_record_order() {
                 valign: TextVAlign::Center,
                 clip: None,
                 buf: None,
+                ramp: None,
             },
             clip: None,
         },
         // 元素 B（后录）：图形——应覆盖 A 的文字
         UiDraw {
+        full_w: false,
             depth: 1,
             seq: 2,
             win: 1,
@@ -671,6 +738,7 @@ fn overlapping_elements_follow_record_order() {
     // 元素内：同一 elem 的图形先于文字
     let mut inner = [
         UiDraw {
+        full_w: false,
             depth: 1,
             seq: 3,
             win: 1,
@@ -685,10 +753,12 @@ fn overlapping_elements_follow_record_order() {
                 valign: TextVAlign::Center,
                 clip: None,
                 buf: None,
+                ramp: None,
             },
             clip: None,
         },
         UiDraw {
+        full_w: false,
             depth: 1,
             seq: 2,
             win: 1,
@@ -1115,6 +1185,89 @@ fn scroll_thumb_respects_minimum_and_roundtrips() {
     assert_eq!(scroll_offset_for_thumb(50.0, 0.0, 900.0), 0.0);
 }
 
+// ─── 单轴溢出策略：入参转换 / 横向几何 / 滚轮映射 ─────────────────
+
+#[test]
+fn scroll_param_accepts_bool_and_tri_state() {
+    use ScrollMode::*;
+    // `bool`：`true` = 视口 + 滚动条；`false` = 不裁（内容自然尺寸 / 按给定宽压缩）。
+    assert_eq!(true.scroll_mode(), Scroll);
+    assert_eq!(false.scroll_mode(), NoClip);
+    // 三态原样透传（低层逃生舱：只裁不滚的 `ClipOnly` 只能这么写）。
+    for m in [NoClip, ClipOnly, Scroll] {
+        assert_eq!(m.scroll_mode(), m, "三态必须原样透传：{m:?}");
+    }
+    // `.vscroll(..)` / `.hscroll(..)` 收 `impl ScrollParam` ⇒ 两种写法都能编过。
+    fn takes_param(m: impl ScrollParam) -> ScrollMode {
+        m.scroll_mode()
+    }
+    assert_eq!(takes_param(true), Scroll);
+    assert_eq!(takes_param(ClipOnly), ClipOnly);
+}
+
+#[test]
+fn scrollbar_rects_h_is_bottom_capsule_with_air() {
+    let view = Rect::new(100.0, 50.0, 200.0, 300.0);
+    let (strip, track) = scrollbar_rects_h(&view, 200.0);
+    // 条带 = **底缘**全宽（占位 / 命中 / 翻页热区）。
+    assert_eq!(
+        strip,
+        Rect::new(100.0, 50.0 + 300.0 - SCROLLBAR_W, 200.0, SCROLLBAR_W)
+    );
+    // 可见滑块**居中**于条带 ⇒ 上下各留白（不得贴边）。
+    assert_eq!(track.h, SCROLLBAR_BAR_W);
+    assert_eq!(track.y, strip.y + (SCROLLBAR_W - SCROLLBAR_BAR_W) * 0.5);
+    assert!(track.y > strip.y && track.y + track.h < strip.y + strip.h);
+    assert_eq!(track.y - strip.y, SCROLLBAR_W - (track.y + track.h - strip.y));
+    // 左右留白（胶囊两端不贴可视区边缘）。
+    assert_eq!(track.x, strip.x + SCROLLBAR_MARGIN);
+    assert_eq!(track.x + track.w, strip.x + strip.w - SCROLLBAR_MARGIN);
+    // 极窄可视区不 panic、不溢出（轨道宽至少 1px）。
+    let (_, tiny) = scrollbar_rects_h(&Rect::new(0.0, 0.0, 4.0, 10.0), 4.0);
+    assert_eq!(tiny.w, 1.0);
+}
+
+#[test]
+fn scrollbar_corner_yields_to_the_other_axis() {
+    // 两条轴同时溢出：纵向条带矮 `SCROLLBAR_W`、横向条带窄 `SCROLLBAR_W`——拐角互让，
+    // 两条带**互不重叠**（谁都不会把对方的滑块吃掉）。
+    let view = Rect::new(10.0, 20.0, 200.0, 150.0);
+    let (v_strip, _) = scrollbar_rects(&view, view.h - SCROLLBAR_W);
+    let (h_strip, _) = scrollbar_rects_h(&view, view.w - SCROLLBAR_W);
+    assert_eq!(v_strip.h, view.h - SCROLLBAR_W);
+    assert_eq!(h_strip.w, view.w - SCROLLBAR_W);
+    // 竖条下缘 = 横条上缘；横条右缘 ≤ 竖条左缘 ⇒ 交集为空。
+    assert_eq!(v_strip.y + v_strip.h, h_strip.y);
+    assert!(h_strip.x + h_strip.w <= v_strip.x + 1e-3);
+}
+
+#[test]
+fn scroll_axes_avail_w_only_opens_up_for_a_scrolling_horizontal_axis() {
+    // 横向**滚动**才取消折行：内容保持自然宽，才有横向溢出可滚。
+    assert_eq!(scroll_axes_avail_w(ScrollMode::Scroll, 240.0), None);
+    // 压缩 / 只裁：保持上报视口宽 ⇒ 既有折行行为逐像素不变。
+    assert_eq!(scroll_axes_avail_w(ScrollMode::NoClip, 240.0), Some(240.0));
+    assert_eq!(scroll_axes_avail_w(ScrollMode::ClipOnly, 240.0), Some(240.0));
+}
+
+#[test]
+fn wheel_axes_maps_wheel_onto_the_axis_that_can_scroll() {
+    use ScrollMode::*;
+    // 两轴都可滚：各归各（x 正 = 往右 ⇒ `offset_x` 增大；y 正 = 往上 ⇒ `offset_y` 减小）。
+    assert_eq!(wheel_axes(1.0, 0.0, false, Scroll, Scroll), (40.0, 0.0));
+    assert_eq!(wheel_axes(0.0, 1.0, false, Scroll, Scroll), (0.0, -40.0));
+    // 只有横向可滚：纵向滚轮也交给它（普通鼠标滚横向列表的常见 UX）。
+    assert_eq!(wheel_axes(0.0, -1.0, false, NoClip, Scroll), (40.0, 0.0));
+    // 只有纵向可滚：横向滚轮交给它。
+    assert_eq!(wheel_axes(1.0, 0.0, false, Scroll, NoClip), (0.0, 40.0));
+    // Shift 把纵向滚轮改作横向（Shift + 向下滚 ⇒ 往右滚）。
+    assert_eq!(wheel_axes(0.0, -1.0, true, Scroll, Scroll), (40.0, 0.0));
+    // **不可滚的轴**（`NoClip` / `ClipOnly`）不吃增量。
+    assert_eq!(wheel_axes(1.0, 1.0, false, ClipOnly, ClipOnly), (0.0, 0.0));
+    // 无增量 = 无变化。
+    assert_eq!(wheel_axes(0.0, 0.0, false, Scroll, Scroll), (0.0, 0.0));
+}
+
 #[test]
 fn window_chrome_bar_and_collapse_flags() {
     // **默认零影响**：不调 `.title` / `.close_button` / `.collapsible` ⇒ 不画标题栏 ——
@@ -1177,40 +1330,128 @@ fn window_chrome_bar_and_collapse_flags() {
 }
 
 #[test]
+fn full_w_expands_to_the_content_width_but_never_shrinks() {
+    // `ui.divider()` / 水平 `Divider` 的"满宽"回填：从自己的 x 一直到内容盒右缘。
+    assert_eq!(full_w_target(13.0, 120.0, 618.0), 605.0, "120 占位 ⇒ 拉到内容盒右缘");
+    assert_eq!(full_w_target(0.0, 50.0, 618.0), 618.0);
+    // **只增不减**：容器比线还窄时保持原宽（绝不把线拉成 0）。
+    assert_eq!(full_w_target(13.0, 200.0, 100.0), 200.0);
+    // 线已经在内容盒外面（x > content_w）⇒ 仍不缩。
+    assert_eq!(full_w_target(700.0, 60.0, 618.0), 60.0);
+    // 退化内容宽 ⇒ 保持原宽。
+    assert_eq!(full_w_target(10.0, 40.0, 0.0), 40.0);
+}
+
+
+#[test]
+fn namespace_size_accounts_for_the_packing_gap() {
+    // `namespace` 的返回值 = "正文推进了父光标多少"：`child_rect` 每次推进 `高 + gap`
+    // ⇒ 高度必须扣掉末尾那一项 gap（否则每个区块都多算一行间距）。
+    assert_eq!(namespace_size(Vec2::new(0.0, 0.0), Vec2::new(0.0, 30.0), 6.0), Vec2::new(0.0, 24.0));
+    assert_eq!(
+        namespace_size(Vec2::new(10.0, 10.0), Vec2::new(50.0, 40.0), 6.0),
+        Vec2::new(40.0, 24.0),
+        "宽取光标推进量（父容器的子项框），高扣一项 gap"
+    );
+    // 空正文：前后一致 ⇒ (0,0)。
+    assert_eq!(namespace_size(Vec2::new(3.0, 3.0), Vec2::new(3.0, 3.0), 6.0), Vec2::ZERO);
+    // 只有绝对定位（`*_at` 不占光标）⇒ 也是 (0,0)：没有"占光标"的内容就没有尺寸。
+    assert_eq!(namespace_size(Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0.0), Vec2::ZERO);
+    // 负推进（理论上不该发生）被夹到 0，不产生负尺寸。
+    assert_eq!(namespace_size(Vec2::new(5.0, 5.0), Vec2::new(0.0, 0.0), 6.0), Vec2::ZERO);
+}
+
+#[test]
+fn namespace_current_prefix_composition() {
+    // `namespace` 依赖的命名空间语义（本 API 不引入新机制，钉住它即可）：
+    // ① 嵌套顺序拼接；② 退出后回到父前缀；③ 同名相对 id 在不同命名空间下得到不同绝对 id。
+    let mut st = crate::id::IdStack::new();
+    st.push("a".into());
+    assert_eq!(st.id_for("kw".into()).as_str(), "a/kw");
+    st.push("b".into());
+    assert_eq!(st.id_for("kw".into()).as_str(), "a/b/kw");
+    st.pop();
+    assert_eq!(st.id_for("kw".into()).as_str(), "a/kw", "退出内层命名空间后回到父前缀");
+    st.pop();
+    // 栈空时零拷贝借用（`namespace` 不开容器 ⇒ 顶层调用不应多一次分配）。
+    let abs = st.id_for("kw".into());
+    assert_eq!(abs.as_str(), "kw");
+    assert!(matches!(abs, crate::id::IdAbsolute { .. }), "顶层仍是有效绝对 id");
+    // 两个命名空间下的同名控件得到**不同**状态键（这就是 `namespace` 的全部目的）。
+    let mut l = crate::id::IdStack::new();
+    l.push("left".into());
+    let left = l.id_for("kw".into()).as_str().to_owned();
+    let mut r = crate::id::IdStack::new();
+    r.push("right".into());
+    let right = r.id_for("kw".into()).as_str().to_owned();
+    assert_ne!(left, right);
+}
+
+#[test]
 fn window_resize_switch_resolves_old_default_and_explicit_false() {
     // **没设 `.resize(..)` = 旧行为**：有 `.width(..)` 就能横向拖，没有就不出来柄。
     // （这是"新开关不改变既有窗口行为"的机器化保证。）
     assert_eq!(resolve_window_resize(None, false), (false, Resize::Horizontal));
     assert_eq!(resolve_window_resize(None, true), (true, Resize::Horizontal));
-    // **显式关闭**：`resize(false, Resize::None)` ⇒ 不画柄、不响应拖拽（但 `.width(..)`
-    // 仍是布局固定宽）——菜单 / 下拉浮层用它换"固定宽但尺寸不可拖"。
-    assert_eq!(resolve_window_resize(Some((false, Resize::None)), true), (false, Resize::None));
-    // **显式开启**：宽高同调（`Both`）；`allow=false` 时轴怎么写都不生效（不画不拖）。
-    assert_eq!(resolve_window_resize(Some((true, Resize::Both)), false), (true, Resize::Both));
-    assert_eq!(resolve_window_resize(Some((false, Resize::Both)), true), (false, Resize::Both));
-    // 只否允许、轴仍留 Horizontal：等价"不能拖但语义上还是横轴"。
+    // **显式关闭**：`resize(false)` ⇒ 不画柄、不响应拖拽（但 `.width(..)` 仍是布局固定宽）
+    // ——菜单 / 下拉浮层用它换"固定宽但尺寸不可拖"。
     assert_eq!(
-        resolve_window_resize(Some((false, Resize::Horizontal)), true),
-        (false, Resize::Horizontal)
+        resolve_window_resize(Some((false, resolve_resizable_axes(false, true))), true),
+        (false, Resize::None)
+    );
+    // **显式开启**：轴按判定表推导（`WindowBuilder::show` 就是这么把 `bool` 展开的）。
+    assert_eq!(
+        resolve_window_resize(Some((true, resolve_resizable_axes(true, true))), false),
+        (true, Resize::Both)
+    );
+    assert_eq!(
+        resolve_window_resize(Some((true, resolve_resizable_axes(true, false))), true),
+        (true, Resize::Horizontal)
     );
 }
 
 #[test]
 fn resize_axes_pick_the_axes_that_the_user_takes_over() {
-    // **轴 → "谁接管这一轴"** 的机器化表格（`Resize::Vertical` 是本轮新增的变体）：
+    // **轴 → "谁接管这一轴"** 的机器化表格（`Resize::Vertical` 是既有的变体；窗口 builder
+    // 已只能收 `bool` —— 本表仍覆盖它，防"控件级轴向"将来接回窗口时漏判）：
     // 拖过的轴由用户接管（宽度进 `window_widths`、高度进 `window_heights`，且固定轴
     // 不参与内容撑开；高度被拖过还会让窗口成为固定尺寸视口 ⇒ `window_content_clipped`）。
     assert!(resize_fixes_width(Resize::Horizontal) && !resize_fixes_height(Resize::Horizontal));
     assert!(!resize_fixes_width(Resize::Vertical) && resize_fixes_height(Resize::Vertical));
     assert!(resize_fixes_width(Resize::Both) && resize_fixes_height(Resize::Both));
     assert!(!resize_fixes_width(Resize::None) && !resize_fixes_height(Resize::None));
-    // `Vertical` 也能出现在"显式允许"的位置上（不再只能 Horizontal / Both）。
+    // 纯函数仍按轴原样处理（`Vertical` 已无 builder 入口，但语义不能漂）。
     assert_eq!(
         resolve_window_resize(Some((true, Resize::Vertical)), false),
         (true, Resize::Vertical)
     );
-    // 没给 `.width()` + `Vertical` ⇒ 宽度轴仍由内容决定（`width.is_some()` 才走旧默认）。
+    // 没给 `.width()` + 没设 `.resize(..)` ⇒ 宽度轴仍由内容决定（`width.is_some()` 才走旧默认）。
     assert_eq!(resolve_window_resize(None, false).1, Resize::Horizontal);
+}
+
+#[test]
+fn resize_bool_derives_the_axes_from_the_vertical_viewport() {
+    use ScrollMode::*;
+    // 本轮起窗口层只有 `.resize(bool)`：允许的轴一律由"垂直轴有没有视口"推导。
+    // 垂直轴**不是**视口 ⇒ 只有水平（拖高没意义：内容当帧就把它顶回去）。
+    assert!(!v_axis_is_viewport(None, false));
+    assert_eq!(
+        resolve_resizable_axes(true, v_axis_is_viewport(None, false)),
+        Resize::Horizontal
+    );
+    // `.height(..)` / `.placement(Clip)`（调用方并进第二个参数）⇒ 垂直 + 水平。
+    assert_eq!(
+        resolve_resizable_axes(true, v_axis_is_viewport(None, true)),
+        Resize::Both
+    );
+    // `.vscroll(NoClip)` 不算视口；`ClipOnly` / `Scroll` 算（两种写法等价：`bool` 只是糖）。
+    assert!(!v_axis_is_viewport(Some(NoClip), false));
+    assert!(v_axis_is_viewport(Some(ClipOnly), false));
+    assert!(v_axis_is_viewport(Some(Scroll), false));
+    assert!(v_axis_is_viewport(Some(Scroll), true), "显式滚 + 固定高仍算视口");
+    // `resize(false)` ⇒ 不画不响应（轴无所谓）。
+    assert_eq!(resolve_resizable_axes(false, true), Resize::None);
+    assert_eq!(resolve_resizable_axes(false, false), Resize::None);
 }
 
 #[test]
@@ -1530,6 +1771,22 @@ fn submit_order_puts_a_scrollbar_above_its_own_items() {
 }
 
 #[test]
+fn submit_order_puts_a_horizontal_scrollbar_above_its_own_items() {
+    // 现场 = `.hscroll(true)` 的窗口：内容（place 1，elem ≥ 1）+ **竖条**（轨道/滑块）+
+    // **横条**（轨道/滑块）。两条轴各自取 `next_seq()`、`elem = elem_hint()` ⇒ 横条同样排在
+    // 自家内容**之上**（否则横条被内容盖住 = 又变成"闪烁"）；横条最后录制 ⇒ 拐角归它。
+    let mut bars = [cq(0, 1, 1), cq(0, 1, 2), cq(0, 1, 3), cq(0, 1, 4)];
+    bars.sort_unstable_by_key(crate::gpu_batch::submit_sort_key);
+    let order: Vec<u32> = bars.iter().map(|q| q.2).collect();
+    assert_eq!(order, vec![1, 2, 3, 4], "内容 → 竖条（轨道/滑块）→ 横条（轨道/滑块）");
+    // 反例：横条若用 `elem = 0`（当成"容器装饰"），会被自家内容盖住。
+    let mut broken = [cq(0, 1, 0), cq(0, 1, 0), cq(0, 1, 1), cq(0, 1, 2)];
+    broken.sort_unstable_by_key(crate::gpu_batch::submit_sort_key);
+    let broken_order: Vec<u32> = broken.iter().map(|q| q.2).collect();
+    assert_eq!(broken_order, vec![0, 0, 1, 2], "elem=0 的横条排在内容之前 = 被盖住");
+}
+
+#[test]
 fn submit_order_still_keeps_windows_above_non_window_content() {
     // `win` 仍是第一位：非窗口内容（0）恒在窗口（≥1）之下——本修复不得动摇这条
     // （窗口 z 序 / 遮挡语义都建立在它上面）。
@@ -1548,10 +1805,23 @@ fn submit_order_still_keeps_windows_above_non_window_content() {
 /// 用源码文本做"明显越界"的机器检查——它守的是粗线条（原始绘制队列 / 播放头 / crate 私有
 /// 字段 / 跨层依赖 / `ui_mut`），**不替代 review**。失败信息直接指向 §2.5 与判据编号。
 ///
+/// **装饰容器的垂直居中偏移**：让 `ui.foldable(id, "标题")` 与
+/// `ui.foldable_custom(id, |t| { t.label("标题"); })` **长得一样**。
+///
+/// 文本标题的文字是 `TextVAlign::Center`（居中于标题行）；自定义标题里的控件是**普通控件**
+/// （从容器顶排）⇒ 不补这一步两者差 `(row_h − 行高) / 2`。实测（`row_h`=39 物理、行高=21）：
+/// `center_offset(39, 21) == 9`，而两行的自定义标题（内容 54 > 盒 39）为 `0`（不居中、撑开）。
+#[test]
+fn center_offset_centers_shorter_content_only() {
+    assert_eq!(center_offset(39.0, 21.0), 9.0, "单行内容 ⇒ 下移 9 物理像素（与文本标题对齐）");
+    assert_eq!(center_offset(39.0, 39.0), 0.0, "等高等 ⇒ 不动");
+    assert_eq!(center_offset(39.0, 54.0), 0.0, "内容更高 ⇒ 不居中（负数被夹到 0）");
+    assert_eq!(center_offset(0.0, 21.0), 0.0, "盒为 0 ⇒ 不动");
+}
+
 /// 白名单（`ALLOW`）**必须逐条写理由**，否则守卫会退化成噪音。
 #[test]
-fn widget_boundary_guard() {
-    // 全部控件源码（`include_str!` 相对本文件 `src/ui/tests.rs` ⇒ `../widgets/…`）。
+fn widget_boundary_guard() {    // 全部控件源码（`include_str!` 相对本文件 `src/ui/tests.rs` ⇒ `../widgets/…`）。
     const FILES: &[(&str, &str)] = &[
         ("button.rs", include_str!("../widgets/button.rs")),
         ("checkbox.rs", include_str!("../widgets/checkbox.rs")),
@@ -1564,9 +1834,11 @@ fn widget_boundary_guard() {
         ("dropdown.rs", include_str!("../widgets/dropdown.rs")),
         ("fontmodal.rs", include_str!("../widgets/fontmodal.rs")),
         ("label.rs", include_str!("../widgets/label.rs")),
+        ("label_ex.rs", include_str!("../widgets/label_ex.rs")),
         ("menu.rs", include_str!("../widgets/menu.rs")),
         ("menubar.rs", include_str!("../widgets/menubar.rs")),
         ("numberinput.rs", include_str!("../widgets/numberinput.rs")),
+        ("scrollarea.rs", include_str!("../widgets/scrollarea.rs")),
         ("segmented.rs", include_str!("../widgets/segmented.rs")),
         ("slider.rs", include_str!("../widgets/slider.rs")),
         ("texteditor.rs", include_str!("../widgets/texteditor.rs")),

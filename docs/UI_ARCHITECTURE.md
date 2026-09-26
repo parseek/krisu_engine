@@ -11,23 +11,28 @@
 ## 0. 设计理念：**无顾虑地使用**（use without concern）
 
 **不写任何选项时，窗口 / 控件必须自己看起来是对的。** 应用只在**想要控制**时才写
-`.width()` / `.height()` / `.pos()` / `.vscroll(..)` / `.resizable(..)`。任何"**必须写某个
+`.width()` / `.height()` / `.pos()` / `.vscroll(..)` / `.hscroll(..)` / `.resize(..)`。任何"**必须写某个
 选项否则坏掉**"的组合都是**缺陷**，不是"用法要求"。
 
 由此推出的四条硬规矩（改引擎时必须守住，改坏了就是这一条被违反）：
 
 1. **未指定的轴 = 由内容定**（自动撑开）：不写 `.width()` ⇒ 宽 = 内容自然宽（`pad + 内容 + pad`）；
-   不写 `.height()` ⇒ 高 = 内容高（`vscroll(Scroll)` 时再与"屏幕剩余"取 min ⇒ 矮内容不撑满、
+   不写 `.height()` ⇒ 高 = 内容高（`vscroll(true)` 时再与"屏幕剩余"取 min ⇒ 矮内容不撑满、
    高内容长到屏幕底再滚）。写了 ⇒ **固定**；用户拖过 ⇒ **持久值接管**（`.width()/.height()`
    只是**初始值**）。这条链是**单向**的：内容 → 显式 → 用户拖拽，越靠后越优先。
 2. **不许有"自我强化"的塌陷**：任何"本帧用上一帧结果反推本帧尺寸"的解算都必须有一个
    **不依赖上一帧**的引导值。反例（实测过两次）：滚动视口在**首帧**取 1px ⇒ 内容按 1px 折行
    ⇒ 窗口 = `2×pad` ⇒ 下一帧照它再算 ⇒ **永远一条缝**（用户："调色板编辑器在不指定 width 的
    情况下无法使用"）。引导值一律取**屏幕剩余**，随后收敛到内容尺寸。
-3. **不写选项不该改变别人的行为**：不调 `.resizable(..)` / `.vscroll(..)` 时，窗口与"没这个
-   特性之前"逐像素一致（老语义由 `resolve_*` 纯函数显式表达，不靠默认值暗改）。
+3. **不写选项不该改变别人的行为**：不调 `.resize(..)` / `.vscroll(..)` / `.hscroll(..)` 时，
+   窗口与"没这个特性之前"逐像素一致（老语义由 `resolve_*` 纯函数显式表达，不靠默认值暗改）。
 4. **诊断先于猜测**：几何争议（"标题栏算不算进 scissor"、"谁把宽度撑大了"）必须能用
    `--ui-dump` / `RJ_*_TRACE` 看到数字，而不是靠读代码推断。规则见 `docs/DEBUGGING.md`。
+
+> **横向滚动的一条附加硬规矩**：`hscroll(true)`（= `Scroll`）的那条轴**不上报可用宽**
+> （`scroll_axes_avail_w`）⇒ 子项保持**自然宽、不折行**。这是"内容真的能横着滚"的前提：
+> 一旦上报可用宽，`LimitedInParent` 控件就把自己压进视口 ⇒ 内容永远不溢出、横条永远不出现。
+> 要按窗口宽折行就写 `hscroll(false)`（默认）。
 
 > 验收这类理念不能靠"看着像"——每个反例都要落成一条 sim 判据（见 `docs/DEBUGGING.md` §2：
 > `[无 width 也要能用]` / `[短内容视口]` / `[调色板四态]` / `[第二次拖柄不弹宽]`）。
@@ -41,10 +46,12 @@
    │  UiAdd（容器闭包内 &mut Ui 的方法表）/ Ui::*  →  add/add_at(Widget)
    ▼
 ┌─ rjw_ui ────────────────────────────────────────────────────────────────┐
-│ ui.rs            Ui：录制 + 布局 + 命中 + 帧级结算 + 提交编排              │
-│                  7805 行 / 123 pub fn / 39 字段                          │
+│ ui.rs            Ui 模块根：`Ui` 结构 + 常量 + `begin`/帧状态搬运       │
+│                  733 行 / 39 字段 + 13 个 ui/ 子模块（分工见 §5.7）      │
+│ ui/*.rs          facade / prims / interaction / scroll / panel / window /│
+│                  chrome / containers / builders / controls / textedit /  │
+│                  commit / cmds —— 按职责分包，公开路径逐字不变            │
 │ widgets/         Widget::ui 单方法协议 + 属性 builder（17 文件 4.1k 行）  │
-│ ui.rs[5646..]    遗留 *_at 控件（button_at/slider_at/text_input_at/…）     │
 │ layout hit focus edit view id   纯逻辑，不依赖 Ui                         │
 │ painter/         Painter + DrawQueue（绘制原语与播放头，3D 无关）          │
 │ draw.rs          UiDraw 命令 + 单位换算 + Gradient/Icon/ImageBg           │
@@ -152,7 +159,7 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 | `layout` / `hit` / `focus` / `edit` / `id` / `view` | 纯逻辑内核（**无 `Ui`、可单测**）：光标与结算 / 命中与遮挡 / 焦点链 / 文本编辑状态机 / ID / 裁剪分层 | 拿 `Ui`、画东西、持久状态 |
 | `style.rs` / `theme_toml.rs` | 主题令牌 + 序列化 | 行为 |
 | `state.rs` | **跨帧**状态（`UiState` + 9 个模块**视图**，见 §5.3） | 每帧事实（那在 `Ui`） |
-| `ui.rs`（`Ui`） | **每帧事实 + 编排**：录制序、容器 / 窗口、布局责任链、命中裁决、z-order、提交、诊断 | 实现控件**外观**（那是 `widgets/`）；push 原始绘制队列 / 调 `next_seq` |
+| `ui.rs` + `ui/*`（`Ui`） | **每帧事实 + 编排**：录制序、容器 / 窗口、布局责任链、命中裁决、z-order、提交、诊断（子模块分工见 §5.7） | 实现控件**外观**（那是 `widgets/`）；push 原始绘制队列 / 调 `next_seq` |
 | `widgets/` | **控件**：`Widget::ui` 协议、每控件状态、外观、交互语义；**只用公开面** | 读 `ui.theme` 字段 / 写引擎状态（`ui.theme.x = ..`）/ 调 `UiAdd::ui_mut()` / 碰 `tess` / `gpu_batch` / `painter.q` |
 | `UiAdd` | 容器闭包内的便捷方法 | 被**控件**调用（`ui_mut()` 只属于容器包装：`Panel` / `Pack` / `Grid` / `Window` / `Scroll` / `FlexCtx` / `ViewCtx`，以及本身就是容器的 `MenuCtx` / `MenuBar`） |
 
@@ -174,7 +181,7 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 2. **每帧 vs 跨帧**：`Ui` 的字段是每帧重建的事实；`UiState` 是跨帧持久。别把跨帧值塞进 `Ui`（每帧重建 = 丢），也别把每帧值塞进 `UiState`（会残留）。
 3. **公开面只暴露"语义"，不暴露"事实"**：新增公开 API 必须能写出"控件作者为什么需要它"。**"只有让某次搬运能编译"是唯一理由 ⇒ 拒绝**——要么把该件的**职责**判给正确的一层，要么在正确的一层补**语义化**原语（例：需要"播放头" ⇒ 给 `Painter` 补一个 push 原语，而不是公开 `Ui::next_seq`）。
 4. **控件不得写引擎**：要传配置就给函数参数（`&InputStyle`），不许 `ui.theme.x = ..`。
-5. **引擎不得画控件**：`ui.rs` 里不得 push 原始队列 / 调 `next_seq`；要画就走 `Painter` 原语。
+5. **引擎不得画控件**：`ui/*` 里不得 push 原始队列 / 调 `next_seq`；要画就走 `Painter` 原语。
 6. **`ui_mut()` 只属于容器**；控件走申请 / 交互 / 绘制原语。
 7. **搬运提交只改结构、不改行为**：同一提交不夹带视觉 / 交互变更；行为改动单独提交并由 `--sim-*` 守着（15+1 个仿真是"零行为变化"的证据）。
 
@@ -186,9 +193,9 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 | 2 | 控件**写引擎帧内主题**把样式传给引擎里的核心 | `texteditor.rs:377` `mem::replace(&mut ui.theme.input, style)`、`:393` 还原 | 4 | 核心改为收 `&InputStyle` 参数（D3 第一步）——**尚未修**，注释已指向本条 |
 | 3 | 控件调 `UiAdd::ui_mut()` | `fontmodal.rs:148/195`（要 `child_rect` / `cursor_pos` / `wrap_buffer` / `push_*`） | 6 | **记为 D4 已知缺口**：`UiAdd` 目前不提供这些"组合控件自己排版"的原语；本轮只清理 `ui.theme`（#1），要把它们做成公开 compose 面是独立一轮。`MenuCtx` / `MenuBar` 的 `ui_mut` 是**容器**实现 ⇒ 白名单 |
 | 4 | 控件读引擎几何事实表 | 曾 `menu.rs:377` `ui.state().window_rects` | 2/3 | ✅ **已修**：`UiState::windows()` 模块视图新增只读 `rects()`（与 `debug_dump` 同口径），`menu.rs` 改用它 |
-| 5 | 引擎自己画控件外观（原始队列 + `next_seq`） | `ui.rs::draw_check_common` | 5 | 改走 `Painter` / 公开矩形原语（D2 第一步） |
-| 6 | 文本编辑核心（~1000 行）住在 `ui.rs` | `ui.rs::text_input_core` / `text_area_impl` | 5 | 搬进 `widgets/texteditor.rs`（D3） |
-| 7 | 公开绘制面不完整：`Ui::push_draw` 与 `ellipsized` 是 `pub(crate)` | `ui.rs:1310` / `:1559` | 3 | **记为已知缺口**：第三方"组合控件"（如 `ColorPicker` 那种自绘面板）目前写不出来；补公开面是独立一轮（D4），不在搬运算内 |
+| 5 | 引擎自己画控件外观（原始队列 + `next_seq`） | `ui/controls.rs::draw_check_common` | 5 | 改走 `Painter` / 公开矩形原语（D2 第一步） |
+| 6 | 文本编辑核心（~1000 行）住在引擎侧 | `ui/textedit.rs::text_input_core` / `text_area_impl` | 5 | 搬进 `widgets/texteditor.rs`（D3） |
+| 7 | 公开绘制面不完整：`Ui::push_draw` 与 `ellipsized` 是 `pub(crate)` | `ui/prims.rs::push_draw` / `ui/prims.rs::ellipsized` | 3 | **记为已知缺口**：第三方"组合控件"（如 `ColorPicker` 那种自绘面板）目前写不出来；补公开面是独立一轮（D4），不在搬运算内 |
 
 ### 2.5.4 边界守卫（机器可查）
 
@@ -247,14 +254,16 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 （`width(220.0)`、`radius(6.0)`），不是实现者的工具。它成立的前提是上面三条被遵守——
 糖只负责"调用点少写几个字"，单位解释一律发生在 API 边界。
 
-**兑现方式（本轮的证据）**：`crates/rjw_ui/src` 现有 **70 处** `to_physical` 全在边界
-（`ui.rs` 33 / `painter/prim.rs` 8 / `widgets/*` 18 / `draw.rs` 定义与单测）；**没有**任何
+**兑现方式（本轮的证据）**：`crates/rjw_ui/src` 现有 **86 处** `to_physical` 全在边界
+（`ui/*` 13 子模块 34 / `painter/prim.rs` 9 / `widgets/*` 21 / `draw.rs` 定义与单测 22）；
+**没有**任何
 `Size::from(..)`；`Size<..>` / `Position<..>` 类型的字段**全部**是 builder 的
 `Option<Size<..>>`（转发例外），内部状态（`UiState` / `UiFrameState`）**不存单位**——
 一律物理像素。新控件照 `WIDGET_GUIDE.md` §3 的写法写即自动合规。
 
 ### 5.1 两套控件 API 并存
-`widgets/`（17 文件 3.7k 行，`Widget::ui` 单方法协议）与 `ui.rs[5646..]` 的遗留
+`widgets/`（17 文件 3.7k 行，`Widget::ui` 单方法协议）与 `ui/controls.rs` +
+`ui/textedit.rs` 的遗留
 `*_at` 控件（`button_at` / `slider_at` / `checkbox_at` / `radio_at` / `combo` /
 `text_input_at` / `text_area_impl` …）**同时对外暴露**，`UiAdd` 再用 ~330 行
 一行转发把两边的名字对齐。同一能力有三条入口（`Ui::button` / `Ui::button_at` /
@@ -315,18 +324,28 @@ UI 占 0.83ms。**当前 UI 不是瓶颈**——这一轮优化的价值全在"�
 > 几处都是**加** API、没有新增"第三条入口"。
 
 ### 5.2 文本框没有搬进 `widgets/`
-`ui.rs` 里 `text_input_at` + `text_area_impl` 约 **1000 行**（含 IME 候选框、选择、
+`ui/textedit.rs` 里 `text_input_core` + `text_area_impl` 约 **1000 行**（含 IME 候选框、选择、
 剪贴板、换行、滚动条），是唯一没被提取的控件主体。`edit.rs` 已经把纯逻辑拆干净了，
-但**绘制与交互仍在 `ui.rs` 中央**——这是 `ui.rs` 变胖的最大单一贡献者。
+但**绘制与交互仍在引擎侧**——这是 `ui/` 变胖的最大单一贡献者。
 
-### 5.3 `Ui` 39 字段 / `UiState` 42 字段（其中 20 张 ID 表）→ **已按模块公开**
+### 5.3 `Ui` 39 字段 / `UiState` 43 字段（其中 21 张 ID 表）→ **已按模块公开**
 `Ui` 每帧重建，字段是"帧内事实 + 一次性覆盖 + 光标意图 + 责任链"的混合体；
 `UiState` 里 `widgets / radio_groups / panel_pos / window_z / window_rects /
 window_origins / grid_cells / text_buffers / window_quads / z0_quads / scrolls /
 window_widths / window_sizes / window_heights / panel_sizes / sizes / window_fx /
-debug_submit / debug_clip / widget_strs` 共 **20 张以 ID 或 z 为键的表**并存。
+debug_submit / debug_clip / widget_strs / folded` 共 **21 张以 ID 或 z 为键的表**（外加
+`auto_pos` 这张 id→位置的自动级联表；再外加 `collapsed` / `hit_regions` 等同族集合）并存。
 它们的字段注释都在解释"为什么不能用另一张表"（z vs id、帧 vs 跨帧、局部 vs 绝对）——
 文档很完整，但这本身就是**状态空间过大的信号**。
+
+> **本轮新增**：`folded`（**区块折叠状态**：绝对 ID → `bool` 的**表**，服务 `ui.foldable(..)`）
+> 与窗口的 `collapsed` **刻意分开**：键空间通常不重叠，但语义不同（窗口收起改整窗尺寸与缩放
+> 链路，区块折叠只是"本帧不录制正文"），合成一张表会让同名窗口 / 区块互相干扰、且任一侧都
+> 无法独立演进。它是**表而不是集合**：曾经的 `HashSet`（只记"折叠"）无法表达"用户已经展开"，
+> 于是 `open(false)`（默认折叠）的区块**点开后下一帧又折回去**；现在表里存**明确态**
+> （`false` = 记住展开），`Foldable` 在首帧把 `open(..)` 的默认态落盘 ⇒ `is_folded` 与画面
+> 从第一帧起同口径。新增一张表时**必须**一并加进 `reset_windows()`（单测
+> `reset_clears_every_module_after_dirtying` 会当场抓出漏清）。
 
 > **进展（C：模块化 + pub 化）**：`UiState` 的 42 个字段现在按关注点分成 **9 个模块**，
 > 以**公开只读视图**的形式对外（`state.frame() / widgets() / windows() / texts() /
@@ -370,6 +389,62 @@ win=0 内容穿透 ⇒ 用户看到的"可拖动面板闪烁 / ScrollBar 闪烁"
 教训（写进 `DEBUGGING.md` §8.3）：**排序键少一维时，症状是"闪烁"而不是"顺序乱"**，
 而且只有内容在动的地方才看得见——所以先看**引擎自己的提交序**（`RJ_ORDER_TRACE`），
 不要靠截图猜。
+
+### 5.7 `ui.rs` 拆分（已落地）
+
+`ui.rs` 曾 **8871 行**（全仓最大文件），现拆成**模块根 + 15 个子模块**；公开路径
+（`rjw_ui::Ui` / `crate::ui::UiAdd` / `ui::WindowBuilder` …）逐字不变：
+
+| 子模块 | 行数 | owns |
+|---|---|---|
+| `ui/facade.rs` | 511 | 状态 / 主题访问、帧级事实搬运、光标意图、焦点注册、诊断（`debug_dump` / `window_order` / `window_under_mouse`） |
+| `ui/prims.rs` | 786 | 绘制原语（调试图元 / 圆角 / 渐变 / 图标 / 背景图 / panel / shadow / grip）、文本度量与排版缓冲缓存、`label_at` / `label_wrap_at`、`From<Align>` |
+| `ui/interaction.rs` | 625 | 命中（`hit_abs` 家族）、申请（`allocate*`）、`interact`、`view_at`、容器原语、`avail_w`、`divider_at` |
+| `ui/scroll.rs` | 632 | ScrollView（`scroll_at` / `scroll_axes_at` / `list_at`）、滚动条 + 滚动几何纯函数 |
+| `ui/panel.rs` | 308 | 面板（`panel_at` / `drag_panel_at` / `panel_impl`）、位置 / 尺寸责任链、`with_id` / `id_for` |
+| `ui/window.rs` | 1106 | `window_impl` / `menu_bar` / `modal_impl` + 窗口几何纯函数（溢出策略 / 裁剪 / 限位） |
+| `ui/chrome.rs` | 244 | 标题栏（条高 / 布局解算 / 绘制 / `RJ_CHROME_TRACE`） |
+| `ui/containers.rs` | 750 | `UiAdd` trait + 容器类型 + 诊断快照 + 容器入口（`pack_at` / `flex_at` / `grid_at` / `min_size` / `max_size`） |
+| `ui/builders.rs` | 459 | `WindowBuilder` / `PanelBuilder` / `ModalBuilder` / `RowBuilder` / `WindowChrome` + builder 入口 |
+| `ui/controls.rs` | 565 | 遗留 `*_at` 控件（滑块 / 勾选 / 单选 / 勾选绘制 / 缩放柄 / 文本框包装） |
+| `ui/textedit.rs` | 1037 | 文本编辑核心（单行 + 多行：选择 / 剪贴板 / IME / 换行 / 滚动条） |
+| `ui/commit.rs` | 876 | `finish` / `end_frame` / 提交单元与计划缓存 / 批次冲刷 / Debug 叠加 / 光标定夺与复位 |
+| `ui/cmds.rs` | 673 | 命令 → 几何（镶嵌 / 内容签名 / 字形四边形）+ 拖拽激活与键盘帧末 |
+| `ui/foldable.rs` | 516 | **可收缩区块**（`Foldable` / `FoldState` / `Ui::foldable` / `Ui::foldable_custom`）+ 标题行几何与翻转判据纯函数（`fold_state` / `fold_should_toggle` / `fold_header_w` / `fold_icon_rect` / `fold_label_rect` / `fold_guide_rect`）+ **标题=标准容器**（自定义标题在"固定宽 / 高度自然"的装饰容器里跑，`Ui::ornament_entry_natural_h` 返回内容高、标题行据此加高）+ 正文缩进与引导线 / 渐隐 + `RJ_FOLD_TRACE` 诊断 |
+| `ui/namespace.rs` | 105 | **ID 命名空间区块**（`Namespace` / `Ui::namespace`）+ 结算纯函数（`namespace_size`） |
+| `ui.rs`（根） | 739 | 常量、`UiInit`、`Ui` 结构、`begin` 与帧状态搬运、子模块声明与重导出 |
+
+**本轮定的三条规矩**：
+
+1. **子模块私有 + 根重导出**：`mod` 全部私有，公开类型经 `ui.rs` 的 `pub use` /
+   `pub(crate) use` 重导出（`UiAdd` / `WindowBuilder` / `Panel` / `WindowChrome` …）
+   ⇒ `crate::ui::X` 与 `rjw_ui::X` 两条路径都不变，`lib.rs` 的 `pub use` 无需改动。
+2. **可见性只用 `pub(super)`**：`impl Ui` 可以写在同 crate 任何模块（§5.1 的搬运配方），
+   子模块是 `crate::ui` 的后代 ⇒ 仍直接读写 `Ui` 的私有字段；真正需要跨子模块共享的
+   只有 **42 处 `fn` / `const`**（外加 25 处需跨文件构造的结构体字段），它们提到
+   **`pub(super)`**（= `pub(in crate::ui)`），**不开 `pub(crate)` 后门**，公开面一个
+   字节没变。收敛方式：搬运时先统一提升，再全部降为私有、按编译器报错逐项提升——
+   两轮收敛到 0 错误（`cargo check --all-targets`）。
+3. **搬运提交只改结构**：拆分前后 `fn` 定义 **284 = 284**、类型 / 常量 **36 = 36**
+   （按名字与重数逐项相同，脚本核对）；覆盖校验 = 8871 行中 8870 行按行搬入子模块，
+   唯一"丢弃"的是 `impl Ui<'_> {` 那一行（由包装代替）；`cargo test -p rjw_ui` 与
+   拆分前基线同为 **352 通过 / 3 失败**（那 3 个 `style.rs` 失败在拆分**前**就存在，
+   与本次无关），`cargo clippy --workspace --all-targets` 零警告；**22 个 `--sim-*`
+   全 `[OK]`**（含 `--sim-clip` / `--sim-cover` / `--sim-dropdown` / `--sim-menu` /
+   `--sim-resize` / `--sim-tuner` / `--sim-weight-modal` 的数值断言）。
+
+> **本轮新增控件（`LabelEx`）**：`crates/rjw_ui/src/widgets/label_ex.rs` —— 高度自定义标签
+> （整组 `TextStyle` + 字段级覆盖 + **首末两色渐变**）。它**只走公开面**（判据：
+> `widget_boundary_guard` 的 `FILES` 已补 `label_ex.rs`）：`Ui::cache_buffer_styled` /
+> `Ui::text_size_styled`（本轮由 `pub(crate)` 提为 `pub` 的"控件作者公开面"，与
+> `text_size` / `wrap_buffer` 同级）、`Ui::push_text_rect_ramp`、`crate::edit::ellipsize`；
+> 不读 `ui.theme.` 字段、不碰 painter 队列 / `tess` / `gpu_batch`。支撑改动落在**引擎侧**：
+> 绘制命令 `DrawKind::Text` 增 `ramp: Option<TextRamp>`（`TextRamp` = 首末两色 + 轴 + **域**
+> `Glyph` / `Line` / `Frame`；逐字形四角取顶点色，**域与采样点都在文本视觉原点系**、
+> 采样用**未裁剪**字形几何 ⇒ 裁剪不改变颜色；⇒ `cmd_sig_hash` **必须**一起哈希）、
+> 排版缓存键由五元组提为 `state::TextKey`（有名字段：字号 / 行高 / 行距 / 字体族 / 字重 /
+> 斜体 / 拉伸 / 字距 / 换行宽 / 版本；**颜色与对齐不进**——它们属绘制期）。改键的动机与
+> §5.6 的教训同源：**少一个字段 = 改了样式不刷新**。
 
 ---
 
@@ -446,8 +521,9 @@ BatchPlan { texture, clip, geom: Geom, elements: Vec<u32> }
 
 ### 6.4 可维护性优先级（不阻塞性能，但建议排进近期）
 
-1. **把 `text_input_at` / `text_area_impl`（~1000 行）搬进 `widgets/textinput.rs`**——
-   收益最直接（`ui.rs` 掉 13%），风险低（纯搬家 + 保持 `Ui::text_input_at` 为薄包装）。
+1. **把 `ui/textedit.rs`（`text_input_core` / `text_area_impl`，~1000 行）搬进
+   `widgets/textinput.rs`**——收益最直接（`ui/` 掉约 12%），风险低（纯搬家 + 保持
+   `Ui::text_input_at` 为薄包装）。
 2. **收敛控件 API**：遗留 `*_at` 保留为薄包装，但把"实现"统一到 `widgets/`，
    让 `UiAdd` 只剩一层。
 3. **`Ui` 字段分块**：把"帧内事实 / 一次性覆盖 / 光标意图"拆成内嵌 struct，

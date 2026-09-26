@@ -8,16 +8,40 @@
 //! - `--ui-dump`：每帧把引擎状态（`Ui::debug_dump`）打到 stderr。
 //! - `--frames N` 由运行时自己解析（不经过这里）。
 
+use rjw_krusie::prelude::Color;
+use rjw_krusie::ui::{FoldableStyle, Theme};
+
 pub mod app;
 
 fn main() -> Result<(), app::RunError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let mut app = app::RJWApp::default();
-    app.register_demo(app::hellowindow::HelloWindow);
-    app.register_demo(app::base_information::BaseInformation);
-    app.register_demo(app::color_picker::ColorPicker::default());
-    app.register_demo(app::gallery::Gallery::default());
+    // `--sim-fold`：Gallery 换成"脚本化自证"形态（顶层 `Foldable::custom` 现场 + 注入点击）。
+    app.sim_fold = args.iter().any(|a| a == "--sim-fold");
+    app.register_demo(false, app::hellowindow::HelloWindow);
+    app.register_demo(false, app::base_information::BaseInformation::default());
+    app.register_demo(false, app::color_picker::ColorPicker::default());
+    app.register_demo(false, app::theme_editor::ThemeEditor::default());
+    app.register_demo(
+        true,
+        if app.sim_fold {
+            app::gallery::Gallery::new_sim_fold()
+        } else {
+            app::gallery::Gallery::default()
+        },
+    );
+
+    app.global.theme = Theme::dark().with_font_family("Sarasa Mono SC").with_border_w(0.);
+    // `--fold-style`：给区块标题行换一套"类按钮"观感 + 打开正文上下端的渐隐提示
+    // （`FoldableStyle::button_like` / `with_body_fade`）—— 用于目视核对。
+    if args.iter().any(|a| a == "--fold-style") {
+        let p = app.global.theme.palette();
+        app.global.theme = app.global.theme.clone().with_foldable(
+            FoldableStyle::button_like(&p)
+                .with_body_fade(12.0, Color::rgba_u8(0, 0, 0, 90)),
+        );
+    }
 
     app.ui_dump = args.iter().any(|a| a == "--ui-dump");
     if let Some(needle) = flag_value(&args, "--demo") {

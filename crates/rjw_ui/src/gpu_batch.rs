@@ -862,6 +862,7 @@ pub(crate) fn cmd_sig_hash(
             family,
             clip,
             buf: _,
+            ramp,
         } => {
             2u8.hash(h);
             text.hash(h);
@@ -872,6 +873,17 @@ pub(crate) fn cmd_sig_hash(
             family.hash(h);
             // 文本缓存版本号影响排版结果，必须包含在签名中
             TEXT_LINE_HEIGHT_VERSION.hash(h);
+            // **首末两色渐变**（渲染相关 ⇒ 必须入签名）：只改两色 / 方向而命令内容不变时，
+            // 窗口顶点缓存必须失效重建（否则"改了渐变文字不刷新"，与历史上漏哈希颜色同一类坑）。
+            match ramp {
+                Some(r) => {
+                    1u8.hash(h);
+                    color_bits(r.from).hash(h);
+                    color_bits(r.to).hash(h);
+                    (r.axis as u8).hash(h);
+                }
+                None => 0u8.hash(h),
+            }
             if let Some(c) = clip {
                 c.x.to_bits().hash(h);
                 c.y.to_bits().hash(h);

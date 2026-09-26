@@ -22,13 +22,19 @@ use crate::widgets::SizeClass;
 /// 容器借宽。历史 bug：根 frame 的固定宽 = 视口宽（那是给 `win=0` 顶层内容用的），
 /// 自动宽窗口里的 `ui.divider()` 于是拿到"可用宽 = 视口宽（1920）"⇒ 整窗被撑成
 /// 屏幕宽（用户实测："Gallery 被撑开得很大，并且跟随窗口大小；疑似是分割线的问题"）。
+///
+/// **例外：窗口的 `pass_through_w`**（[`Frame::set_pass_through_w`]）—— 自动宽窗口**本帧已有宽度**
+/// （`.width()` / 用户拖过 / 上一帧自然宽）时，把它当作"容器内容宽"报出去。这不是"借窗口外面的宽"，
+/// 而是"窗口自己已知的宽"：`ui.foldable(..)` 的标题行、`ui.divider()` 这类**整格容器**
+/// 因此能**首帧就铺满**（否则它们只能等第一帧结算完才知道有多宽 —— 表现为"标题行缩在半截 /
+/// 线短一截"）。
 pub(crate) fn stack_avail_w(frames: &[Frame]) -> Option<f32> {
     for f in frames.iter().rev() {
         if let Some(w) = f.avail_w() {
             return Some(w);
         }
         if f.is_layout_root() {
-            return None;
+            return f.pass_through_w();
         }
     }
     None
@@ -70,7 +76,15 @@ pub(crate) enum FrameKind {
 /// 用于 [`Ui::child_rect`](crate::Ui::child_rect) / [`UiAdd::add`](crate::UiAdd::add)：
 /// - [`Child::Expand`]（默认）：子项尺寸计入父级 `max_child`（Stack 撑大父级 / Grid 扩格）；
 /// - [`Child::Fit`]：**不撑大父级**——按自身尺寸放置，溢出由控件自洽
-///   （对应 [`crate::widgets::Expansion::DisableAutoExpansion`]）。
+///   （对应 [`crate::widgets::Expansion::DisableAutoExpansion`]）；
+/// - [`Child::Fill`]：**宽度铺满（按申请宽画），但宽度不计入父级**；**高度照常参与**。
+///
+/// [`Child::Fill`] 的用途是"**整格装饰**"（`divider` 的线、`foldable` 的标题行）：
+/// 它们天生要铺满可用宽，**不该成为容器宽的决定者**。让它们参与宽度结算会在
+/// **带 `vscroll` 的自动宽窗口**里形成**正反馈锁定** —— 滚动视口的宽首帧取"屏幕剩余宽"
+/// （见 `window_impl`），标题行/线按它铺满 ⇒ 内容宽 = 视口宽 ⇒ 下一帧视口仍按内容反推
+/// ⇒ 窗口一打开就被撑到屏幕大小（用户实测："分割线会默认水平撑开到屏幕大小 …… 而是
+/// **其他内容有多少就该多宽**"）。`Fill` 让"其他内容"独自决定容器宽，装饰跟着铺满即可。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Child {
     /// 撑大父级（默认）。
@@ -78,6 +92,8 @@ pub enum Child {
     Expand,
     /// 不撑大父级（限制在父级可用空间内，内容自洽）。
     Fit,
+    /// **宽度铺满、但宽度不计入父级**（高度照常计入）——整格装饰（分割线 / 区块标题行）。
+    Fill,
 }
 
 /// 容器布局帧（`Ui` 内部维护一个栈）。
@@ -130,9 +146,27 @@ pub(crate) struct Frame {
     /// 超出部分由外层裁剪）。`fixed_w` / `max_w` / `remaining_w` 的 clamp 全部跳过 ——
     /// 这正是"**裁切**内容"与"**压缩**内容"的分界（用户要的 egui 语义）。
     clip_w: bool,
+    /// **自动换行（`row` 的折行）的行宽上限**（内容盒宽，**不含** `pad_total`；`None` = 不折行）。
+    ///
+    /// 只在 [`PackSide::Left`] 生效，见 [`Self::set_wrap`] 与 [`Self::child_rect_inner`]
+    /// 的折行分支。**语义是"禁压缩、只换行"**：开启后 [`Self::remaining_w`] 返回 `None`
+    /// （否则子项会被压扁而不是换行），子项按自然宽申请，塞不下就收行。
+    wrap_w: Option<f32>,
+    /// **折行的行间距**（物理像素；只在 `wrap_w` 开启时有意义）。
+    line_gap: f32,
+    /// **当前行已见的最大子项高**（折行时收行用：`cursor.y += line_h + line_gap`）。
+    line_h: f32,
+    /// **当前行是否已放过子项**（空行不折：否则首个子项比行宽还宽时会先折出一个空行）。
+    line_used: bool,
     /// **本 frame 是"布局根"**（见 [`Self::set_layout_root`]）：`avail_w` 的向外扫描
     /// **到此为止** —— 窗口的内容宽只能由它自己给（`fixed_w` / 内容自然宽）。
     layout_root: bool,
+    /// **布局根自己已知的内容宽**（只有窗口 frame 会用；见 [`stack_avail_w`] 的"例外"）。
+    ///
+    /// 自动宽窗口在录制**之前**就知道自己的内容宽（`.width()` / 用户拖过的持久宽 / 上一帧结算宽）
+    /// ⇒ 把 `fixed_w - 2×pad_total`（面板内容宽）放这里，让 `ui.foldable(..)` 的标题行、
+    /// `ui.divider()` 这类**整格容器**首帧就铺满。`None` = 不知道 ⇒ 维持旧行为（自然宽）。
+    pass_through_w: Option<f32>,
     /// **绝对放置内容的包围盒**（`*_at` / `add_at` / 控件命中区 的矩形并集；
     /// **相对容器 origin**，与 `child_rect` 同一空间）。
     ///
@@ -165,7 +199,12 @@ impl Frame {
             fixed_w: None,
             max_w: None,
             clip_w: false,
+            wrap_w: None,
+            line_gap: 0.0,
+            line_h: 0.0,
+            line_used: false,
             layout_root: false,
+            pass_through_w: None,
             content_bounds: None,
         }
     }
@@ -189,7 +228,12 @@ impl Frame {
             fixed_w: None,
             max_w: None,
             clip_w: false,
+            wrap_w: None,
+            line_gap: 0.0,
+            line_h: 0.0,
+            line_used: false,
             layout_root: false,
+            pass_through_w: None,
             content_bounds: None,
         }
     }
@@ -279,9 +323,45 @@ impl Frame {
         })
     }
 
+    /// **本容器每侧的内边距总量**（`pad_total`）：内容盒 = 盒矩形内缩它 ——
+    /// `ui.divider()` 的"满宽"（[`crate::Ui::expand_pending_full_w`]）用它把线段右缘对齐到
+    /// **内容盒右缘**（不是盒子右缘 ⇒ 分割线两端各内缩一个内边距）。
+    #[inline]
+    pub(crate) fn pad_total(&self) -> f32 {
+        self.pad_total
+    }
+
+    /// 固定宽与内容最大宽（**诊断用**；语义见 [`Self::fixed_w`] / [`Self::max_w`]）。
+    /// `RJ_FOLD_TRACE` 的"frame 栈"诊断用它解释"标题行/分割线为什么拿到这个宽"。
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn width_debug(&self) -> (Option<f32>, Option<f32>) {
+        (self.fixed_w, self.max_w)
+    }
+
     /// 设置**内容最大宽**（见 [`Self::max_w`]；`None` / `<= 0` = 不限）。
     pub(crate) fn set_max_w(&mut self, w: Option<f32>) {
         self.max_w = w.filter(|w| *w > 0.0);
+    }
+
+    /// **开启 / 关闭自动换行**（`row` 的折行；只在 [`PackSide::Left`] 生效）。
+    ///
+    /// `limit` = **行宽上限**（内容盒宽，不含 `pad_total`；`None` / `<= 0` = 不折行）；
+    /// `line_gap` = 行间距（物理像素）。语义：
+    ///
+    /// - **只换行、不压缩**（[`Self::remaining_w`] 随之返回 `None`）：子项按自然宽申请，
+    ///   `cursor.x + w > pad + limit` 且**本行已有子项**时收行 ⇒ 新行；
+    /// - **行内左上角对齐**：行高 = 该行已见最大子项高（单遍流式的必然——先放的子项不会
+    ///   因为后放的高子项而重新居中）；行高不小于 `force_h_all`（`row` 的标准行高）；
+    /// - **空行不折**：首个子项比行宽还宽时，它自己占一行并溢出（不会先折出一个空行、
+    ///   也不会死循环）；
+    /// - 结算尺寸：靠 [`Self::content_bounds`]（每个子项都 `note_content`）自动包住多行，
+    ///   另外把**最后一行的底**并进高度（`Child::Fit` 子项不进包围盒）。
+    pub(crate) fn set_wrap(&mut self, limit: Option<f32>, line_gap: f32) {
+        self.wrap_w = limit.filter(|w| *w > 0.0);
+        self.line_gap = line_gap.max(0.0);
+        self.line_h = 0.0;
+        self.line_used = false;
     }
 
     /// **宽度轴当视口**（`clip_w`）：子项**按自然宽排布、不压缩**，超出由外层裁掉。
@@ -306,6 +386,16 @@ impl Frame {
         self.layout_root
     }
 
+    /// **布局根自己已知的宽度**（窗口内容宽；见 [`stack_avail_w`] 的"例外"）。
+    pub(crate) fn pass_through_w(&self) -> Option<f32> {
+        self.pass_through_w
+    }
+
+    /// 设"布局根自己已知的宽度"（窗口 frame 用；`None` = 不知道 ⇒ 维持旧行为）。
+    pub(crate) fn set_pass_through_w(&mut self, w: Option<f32>) {
+        self.pass_through_w = w.filter(|w| *w > 0.0);
+    }
+
     /// **本容器还能给下一个子项多少宽**（`None` = 不限 / 不是水平堆叠）。
     ///
     /// 内容盒（局部坐标）= `[pad_total, pad_total + max_w]`：
@@ -318,6 +408,12 @@ impl Frame {
     /// 但整行仍然排到窗口外面（用户实测的 BUG）。给输入框的余量 = 276 − 106 = 170
     /// ⇒ 它缩到 170，整行正好落在可用宽内。
     pub(crate) fn remaining_w(&self) -> Option<f32> {
+        // **折行开启时不报余量**：折行的语义是"塞不下就换行"，若同时报余量，子项会被
+        // 压扁（`LimitedInParent` 按余量换行 / 省略）而不是换到下一行 —— 两者是"挤压"
+        // 与"换行"两种互斥策略（未开启折行的 `row` 保持原来的挤压语义）。
+        if self.wrap_w.is_some() {
+            return None;
+        }
         let mw = self.max_w?;
         let FrameKind::Stack { side, .. } = &self.kind else {
             return None;
@@ -373,14 +469,14 @@ impl Frame {
     /// 本便捷入口只给本模块单测用。
     #[cfg(test)]
     pub(crate) fn child_rect(&mut self, w: f32, h: f32) -> Rect {
-        self.child_rect_inner(w, h, true)
+        self.child_rect_inner(w, h, Child::Expand)
     }
 
     /// 同 [`Self::child_rect`]，但 `expands = false` 时该子项**不撑大父级**
     /// （`max_child` 不更新、grid 不扩格）——`DisableAutoExpansion` 控件语义：
     /// 内容按自身尺寸放置，溢出由控件自身自洽（noclip / 省略）。
-    pub(crate) fn child_rect_exp(&mut self, w: f32, h: f32, expands: bool) -> Rect {
-        self.child_rect_inner(w, h, expands)
+    pub(crate) fn child_rect_exp(&mut self, w: f32, h: f32, child: Child) -> Rect {
+        self.child_rect_inner(w, h, child)
     }
 
     /// **外部放置**（嵌套容器结算后补记）：按 Stack 语义推进光标 + 更新 `max_child`
@@ -406,7 +502,10 @@ impl Frame {
     }
 
     /// `child_rect` 公共实现（`track_max`：是否更新 `max_child` / 扩展 grid 单元格）。
-    fn child_rect_inner(&mut self, w: f32, h: f32, track_max: bool) -> Rect {
+    fn child_rect_inner(&mut self, w: f32, h: f32, child: Child) -> Rect {
+        // 三态：`Expand` 全参与；`Fit` 完全不参与；`Fill` **只参与高度**（宽度铺满但不算内容宽）。
+        let track_h = child != Child::Fit;
+        let track_w = child == Child::Expand;
         let w = w.max(0.0);
         let h = h.max(0.0);
         let w = if self.next_max.x > 0.0 { w.min(self.next_max.x).max(self.next_min.x) } else { w.max(self.next_min.x) };
@@ -455,36 +554,62 @@ impl Frame {
         }
         let placed = match &mut self.kind {
             FrameKind::Stack { side, gap } => {
+                // ── **自动换行**（`Left` + `set_wrap` 开启）────────────────────────────
+                // 必须在取 `local` **之前**做：收行会改 `cursor`，否则这一子项会落在上一行。
+                // 语义（见 `Frame::set_wrap`）：只换行不压缩；**空行不折**（超宽子项自己占
+                // 一行并溢出，不会先折出空行、也不会死循环）。
+                if *side == PackSide::Left
+                    && let Some(limit) = self.wrap_w
+                    && self.line_used
+                    && self.cursor.x + w > self.pad_total + limit
+                {
+                    self.cursor.y += self.line_h + self.line_gap;
+                    self.cursor.x = self.pad_total;
+                    self.line_h = 0.0;
+                    self.line_used = false;
+                }
                 let local = self.cursor;
                 match side {
                     PackSide::Top => {
                         self.cursor.y += h + *gap;
-                        if track_max {
-                            self.max_child.x = self.max_child.x.max(w);
+                        if track_h {
                             self.max_child.y = self.max_child.y.max(h);
+                        }
+                        if track_w {
+                            self.max_child.x = self.max_child.x.max(w);
                         }
                     }
                     PackSide::Left => {
                         self.cursor.x += w + *gap;
-                        if track_max {
-                            self.max_child.x = self.max_child.x.max(w);
+                        // 行状态：行高 = 该行**已见**最大子项高（行内左上角对齐 —— 先放的
+                        // 子项不会因为后放的高子项而重新居中，这是单遍流式的必然）。
+                        self.line_h = self.line_h.max(h);
+                        self.line_used = true;
+                        if track_h {
                             self.max_child.y = self.max_child.y.max(h);
+                        }
+                        if track_w {
+                            self.max_child.x = self.max_child.x.max(w);
                         }
                     }
                     // Bottom/Right：**负向推进**——子项落在 y/x ≤ 0 的负区，
                     // 故 pack 的 0 边（`pos` 锚定边）即下/右边；首个子项贴该边。
                     PackSide::Bottom => {
                         self.cursor.y -= h + *gap;
-                        if track_max {
-                            self.max_child.x = self.max_child.x.max(w);
+                        if track_h {
                             self.max_child.y = self.max_child.y.max(h);
+                        }
+                        if track_w {
+                            self.max_child.x = self.max_child.x.max(w);
                         }
                     }
                     PackSide::Right => {
                         self.cursor.x -= w + *gap;
-                        if track_max {
-                            self.max_child.x = self.max_child.x.max(w);
+                        if track_h {
                             self.max_child.y = self.max_child.y.max(h);
+                        }
+                        if track_w {
+                            self.max_child.x = self.max_child.x.max(w);
                         }
                     }
                 }
@@ -493,20 +618,20 @@ impl Frame {
             }
             FrameKind::Grid { cols, cell } => {
                 // 渐进扩展 cell：容纳当前子项（缓存值不足时本帧就地扩大，位置即时一致）。
-                if track_max {
-                    if w > cell.x {
-                        cell.x = w;
-                    }
-                    if h > cell.y {
-                        cell.y = h;
-                    }
+                if track_w && w > cell.x {
+                    cell.x = w;
+                }
+                if track_h && h > cell.y {
+                    cell.y = h;
                 }
                 let col = self.count % *cols;
                 let row = self.count / *cols;
                 self.count += 1;
-                if track_max {
-                    self.max_child.x = self.max_child.x.max(w);
+                if track_h {
                     self.max_child.y = self.max_child.y.max(h);
+                }
+                if track_w {
+                    self.max_child.x = self.max_child.x.max(w);
                 }
                 Rect::new(
                     self.pad_total + col as f32 * cell.x,
@@ -516,14 +641,20 @@ impl Frame {
                 )
             }
         };
-        // **每处子项矩形都进内容包围盒**（仅 `Child::Expand`——`Fit` /
-        // `DisableAutoExpansion` 的语义就是"**不**撑大父级"）。
+        // **内容包围盒**按三态记：
+        // - `Expand`：整块记（撑宽 + 撑高）；
+        // - `Fill`：**只记高度**（宽记 0）——"宽度铺满"是装饰的观感，不该让容器变宽；
+        // - `Fit`：完全不记（`DisableAutoExpansion` 的语义就是"不撑大父级"）。
         // grid 的自然尺寸是"列数 × 单元格缓存"，单元格比子项窄时（内容刚变宽、
         // 缓存还是上一帧的值）会**低估**子项范围 ⇒ 子项"长到容器外"，交互随之失真。
         // ⚠ 必须在此处（布局期、与鼠标无关）记，不能在命中测试里记——否则容器尺寸
         // 会随鼠标位置变化。
-        if track_max {
-            self.note_content(placed);
+        match child {
+            Child::Expand => self.note_content(placed),
+            Child::Fill => {
+                self.note_content(Rect::new(placed.x, placed.y, 0.0, placed.h));
+            }
+            Child::Fit => {}
         }
         placed
     }
@@ -543,14 +674,18 @@ impl Frame {
             None => h,
         };
         // 宽度**不再有"最小宽"这一档**：固定宽（`fixed_w`）与视口（`clip_w`）已经覆盖
-        // "内容压缩"与"内容裁切"两种语义（用户给的判定表，见 `WindowBuilder::resizable`）。
+        // "内容压缩"与"内容裁切"两种语义（用户给的判定表，见 `WindowBuilder::resize`）。
         Vec2::new(size.x, h)
     }
 
     fn settle_size_inner(&self) -> Vec2 {
         let natural = self.natural_size();
+        // **折行**：最后一行的高度也要算进容器 —— `Child::Fit`（`DisableAutoExpansion`）
+        // 子项**不进** `content_bounds`，只靠包围盒会漏掉最后一行（历史同类：
+        // "容器比内容矮" ⇒ 后面控件与它重叠）。
+        let tail = self.wrap_tail_h();
         let Some(b) = self.content_bounds else {
-            return natural;
+            return Vec2::new(natural.x, natural.y.max(tail));
         };
         // 内容包围盒的**右下角** + 另一侧 padding（左上溢出无法让容器"向左上长"，
         // 那部分仍旧溢出——但**往右/往下**放的内容一律被包住）。
@@ -568,9 +703,19 @@ impl Frame {
             if self.fixed_h.is_some() {
                 natural.y
             } else {
-                natural.y.max(far.y)
+                natural.y.max(far.y).max(tail)
             },
         )
+    }
+
+    /// **折行时"最后一行的底"**（含下内边距；未折行 / 空容器 = `0`）。
+    ///
+    /// 折行的 `cursor.y` 停在**最后一行顶**（只有收行才推进），故末行底 = `cursor.y + line_h`。
+    fn wrap_tail_h(&self) -> f32 {
+        if self.wrap_w.is_none() || self.count == 0 {
+            return 0.0;
+        }
+        self.cursor.y + self.line_h + self.pad_total
     }
 
     fn natural_size(&self) -> Vec2 {
@@ -809,7 +954,7 @@ mod tests {
         // （Stack 的光标照常前进 → 高度仍会长；这里是**宽**不被撑开。）
         let mut f = Frame::new_stack(PackSide::Top, 0.0, 0.0);
         f.child_rect(50.0, 20.0);
-        f.child_rect_exp(400.0, 20.0, false); // Fit：故意超宽
+        f.child_rect_exp(400.0, 20.0, Child::Fit); // Fit：故意超宽
         assert_eq!(f.settle_size().x, 50.0, "Fit 子项不撑宽容器");
         assert!(f.content_bounds().is_none_or(|b| b.max().x <= 50.0));
         // 对照组：Expand 的超宽子项**必须**撑宽容器（否则内容长到外面）
@@ -844,9 +989,96 @@ mod tests {
         assert_eq!(g.child_rect(30.0, 16.0).h, 26.0, "行等高优先于一次性 flex 高");
     }
 
+    /// **`row` 自动换行**（`set_wrap`）：塞不下就收行（`y += 行高 + 行间距`）⇒ 新行沿 X 继续。
     #[test]
-    fn row_multiline_child_grows_the_row() {
-        // 多行子项（`SizeClass::Multiline`）：标准行高只是**下限**，可以撑高整行。
+    fn wrap_moves_overflowing_children_to_the_next_line() {
+        let mut f = Frame::new_stack(PackSide::Left, 10.0, 0.0);
+        f.set_wrap(Some(100.0), 5.0);
+        // 行 1：0..40 与 50..90（90 ≤ 100）；再放一个 40 会到 140 ⇒ 收行。
+        assert_eq!(f.child_rect(40.0, 20.0), Rect::new(0.0, 0.0, 40.0, 20.0));
+        assert_eq!(f.child_rect(40.0, 20.0), Rect::new(50.0, 0.0, 40.0, 20.0));
+        assert_eq!(
+            f.child_rect(40.0, 20.0),
+            Rect::new(0.0, 25.0, 40.0, 20.0),
+            "放不下 ⇒ 收行（y += 行高 20 + 行间距 5）、回到行首"
+        );
+        assert_eq!(f.child_rect(40.0, 20.0), Rect::new(50.0, 25.0, 40.0, 20.0), "新行沿 X 继续");
+        // 结算：宽 = 最长行右缘（90）；高 = 两行 20 + 行间距 5 = 45。
+        assert_eq!(f.settle_size(), Vec2::new(90.0, 45.0));
+    }
+
+    /// 未开启折行 ⇒ **逐位不变**（折行不得改现有 `row` 的行为：回归防线）。
+    #[test]
+    fn no_wrap_keeps_the_single_line_behaviour() {
+        let mut f = Frame::new_stack(PackSide::Left, 10.0, 0.0);
+        assert_eq!(f.child_rect(40.0, 20.0), Rect::new(0.0, 0.0, 40.0, 20.0));
+        assert_eq!(f.child_rect(40.0, 20.0), Rect::new(50.0, 0.0, 40.0, 20.0));
+        assert_eq!(
+            f.child_rect(40.0, 20.0),
+            Rect::new(100.0, 0.0, 40.0, 20.0),
+            "没开折行 ⇒ 一直在同一行（旧行为）"
+        );
+        assert_eq!(f.settle_size(), Vec2::new(140.0, 20.0));
+        assert_eq!(f.remaining_w(), None, "没设 max_w ⇒ 本来就不报余量");
+    }
+
+    /// **空行不折**：首个子项比行宽还宽 ⇒ 它自己占第一行并溢出（不折出空行、不死循环）。
+    #[test]
+    fn wrap_never_breaks_on_an_empty_line() {
+        let mut f = Frame::new_stack(PackSide::Left, 10.0, 0.0);
+        f.set_wrap(Some(30.0), 5.0);
+        assert_eq!(
+            f.child_rect(100.0, 20.0),
+            Rect::new(0.0, 0.0, 100.0, 20.0),
+            "超宽子项仍落在首行（否则会先折出一个空行）"
+        );
+        assert_eq!(
+            f.child_rect(20.0, 20.0),
+            Rect::new(0.0, 25.0, 20.0, 20.0),
+            "它之后的子项才折（首行右缘已超上限）"
+        );
+    }
+
+    /// 行高 = 本行**最高**子项（行内左上角对齐）；折行开启时**不报行内余量**（禁用挤压）。
+    #[test]
+    fn wrap_line_height_is_the_tallest_child_and_disables_squeeze() {
+        let mut f = Frame::new_stack(PackSide::Left, 4.0, 0.0);
+        f.set_wrap(Some(80.0), 0.0);
+        assert_eq!(f.child_rect(40.0, 20.0), Rect::new(0.0, 0.0, 40.0, 20.0));
+        assert_eq!(
+            f.child_rect(30.0, 30.0),
+            Rect::new(44.0, 0.0, 30.0, 30.0),
+            "同行的矮子顶对齐（先放的不因后放的高子项而重新居中）"
+        );
+        assert_eq!(
+            f.child_rect(40.0, 10.0),
+            Rect::new(0.0, 30.0, 40.0, 10.0),
+            "行高 = 本行最高 30（行间距 0）"
+        );
+        assert_eq!(
+            f.remaining_w(),
+            None,
+            "折行开启 ⇒ 不报行内余量（否则 `Label` 会被压扁而不是换行）"
+        );
+    }
+
+    /// 折行与 `force_h_all`（`row` 的标准行高）叠加：行高 ≥ 标准高。
+    #[test]
+    fn wrap_respects_the_standard_row_height() {
+        let mut f = Frame::new_stack(PackSide::Left, 6.0, 0.0);
+        f.set_force_h_all(26.0);
+        f.set_wrap(Some(50.0), 4.0);
+        assert_eq!(f.child_rect(30.0, 16.0), Rect::new(0.0, 0.0, 30.0, 26.0), "单行子项钉标准高");
+        assert_eq!(
+            f.child_rect(30.0, 16.0),
+            Rect::new(0.0, 30.0, 30.0, 26.0),
+            "折行 ⇒ y = 行高 26 + 行间距 4"
+        );
+        assert_eq!(f.settle_size().y, 56.0, "两行：26 + 4 + 26（上下 padding 为 0）");
+    }
+
+    #[test]
+    fn row_multiline_child_grows_the_row() {        // 多行子项（`SizeClass::Multiline`）：标准行高只是**下限**，可以撑高整行。
         let mut f = Frame::new_stack(PackSide::Left, 6.0, 0.0);
         f.set_force_h_all(26.0);
         f.set_next_class(SizeClass::Multiline);

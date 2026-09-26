@@ -91,6 +91,8 @@ pub struct NumberInput<'a, T: SliderValue = f32> {
     pub max: Option<T>,
     /// 拖拽**精度**：每物理像素数值（默认：浮点 `0.01` = 每像素 ±0.01、整数 `1`；`≤ 0` = 不吸附）。
     pub step: T,
+    /// 默认速度倍率（默认 10：细调）。
+    pub speed: f32,
     /// 按住 **Shift** 拖拽的速度倍率（默认 10：细调）。
     pub shift_speed: f32,
     /// 按住 **Ctrl** 拖拽的速度倍率（默认 0.1：精调）。
@@ -108,6 +110,7 @@ impl<'a, T: SliderValue + PartialOrd> NumberInput<'a, T> {
             min: None,
             max: None,
             step: T::default_step(),
+            speed: 0.1,
             shift_speed: 10.0,
             ctrl_speed: 0.1,
         }
@@ -142,6 +145,12 @@ impl<'a, T: SliderValue + PartialOrd> NumberInput<'a, T> {
     /// 它也决定**显示小数位**（`0.01` ⇒ 2 位、`0.001` ⇒ 3 位——颜色通道那种更细的场景显式覆盖）。
     pub fn step(mut self, step: T) -> Self {
         self.step = step;
+        self
+    }
+
+    /// 默认速度倍率（默认 10：细调）。
+    pub fn speed(mut self, s: f32) -> Self {
+        self.speed = s;
         self
     }
 
@@ -405,7 +414,7 @@ impl<T: SliderValue + PartialOrd> Widget for NumberInput<'_, T> {
                 self.ctrl_speed
             } else {
                 1.0
-            };
+            } * self.speed;
             let speed_f = f64::from(speed);
             let ws = ui.state_mut().widget(&drag_id);
             dragging = update_drag(ws, grip_hit, btn);

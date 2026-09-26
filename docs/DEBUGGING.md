@@ -54,7 +54,9 @@ cargo run --offline -p egUI -- --demo Gallery --ui-dump --frames 60
 
 诊断专用（不进上表）：`--sim-import <图片>` / `--sim-theme <toml>` / `--sim-pick-save` /
 `--no-file-dialog` / `--pick <目标>=<路径|none>` / `--sim-click X,Y`（配
-`RJ_HIT_TRACE=1`）/ `--auto-drag` / `--script-pos` / `RJ_CHROME_TRACE` / `RJ_MENU_TRACE` /
+`RJ_HIT_TRACE=1`）/ `--auto-drag` / `--script-pos` / `RJ_CHROME_TRACE` / `RJ_FOLD_TRACE` /
+`RJ_LABEL_TRACE` / `RJ_RAMP_TRACE` / `RJ_ROW_TRACE` /
+`RJ_MENU_TRACE` /
 `RJ_ORDER_TRACE=<frame>` / `RJ_GRIP_TRACE` / `RJ_WINCLIP_TRACE`。各 sim 的**判定口径与现场**见 §2–§5。
 
 ⚠ **例行回归不跑"主题导入 / 导出"那两条**（用户要求"可以跳过主题导入导出测试吗" ⇒ 可以）：
@@ -179,6 +181,13 @@ ui[frame=21 scale=1.50 viewport=(1920,1080) mouse=(1180,200) in_win=true focus=N
 | **裁剪位置不对**（裁多了/裁少了/整块不见） | `clip=` 的矩形 vs 该窗 `origin` + `size` | 不等 ⇒ `batch_scissor` 的映射错了（窗口 FX 变换 / anchor）；`clip` 为空 ⇒ 空 scissor 会**整条跳过**（不是"不裁"） |
 | **圆角被切平**（窗口拖到视口边缘时边框变方） | 是不是把环境裁剪又写回几何切割了 | 环境裁剪应走 batch scissor（`UiBatch.clip`），几何保持原形——见 `docs/ENGINE_GUIDE.md` §18.20 |
 | **draw call 变多** | `[perf] clip_batches=` 与 `cmds/wins` | 每个**不同** scissor 至少要一段（一次 draw 一个 scissor）；`clip_batches` 远大于窗口数 ⇒ 控件给自己套了太多层裁剪 |
+| **区块（`foldable`）标题缩在半截 / 正文悬空** | `RJ_FOLD_TRACE=1`（每个区块一行：`folded` + 标题**宽×高** + `body_h` + `indent/guide_w/fade_h`） | 宽 ≈ `pad*2+icon`（几十像素）⇒ `avail_w` 与"最宽子项"都没线索（容器里还没有别的子项 / 自定义标题闭包整排溢出）；`body_h` 对但正文看着悬空 ⇒ 父 `gap` 被多推进一次（`container_scope` 没套） |
+| **区块点不开 / 一次点击翻两次** | 同上的 `folded=` 逐帧变化，配 `--sim-fold`（脚本化点击 + 引擎状态自校准） | `folded` 在**释放帧**又翻一次 ⇒ 判据里混入了 `Response::clicked`（它只在释放帧成立）；点开后下一帧又折回默认 ⇒ `UiState::folded` 不是**明确态表**（`open(false)` 的默认值把"用户展开"盖掉） |
+| **标签的字重 / 斜体 / 渐变不生效，或高度突然变一截** | `RJ_LABEL_TRACE=1`（每个 `LabelEx` 一行：`size / weight / italic / spacing / line_h / tint / ramp / wrap / rect`） | `weight=400` 而代码写了 `.weight(BOLD)` ⇒ 样式压根没到（或字体无该字重，由 cosmic-text 回落）；`tint` 是主题色 ⇒ `.tint(..)` 被漏掉；`ramp=None` ⇒ 只写了 `.gradient(..)` 之外的东西（`ui.colored_label` 是单色）；**`line_h` 随帧变化**（如 30 → 36）⇒ 换行判定把"窗口宽已知"当成了"要换行"（应与 `Label` 同口径：文本不超宽就不换行、行高 = 字号） |
+| **改了颜色 / 渐变但画面不刷新** | 同上的 `ramp=`，配 `ui/tests.rs` 的签名回归两条 | 命令内容签名没覆盖该字段（`gpu_batch::cmd_sig_hash`）⇒ 窗口顶点缓存永不失效（历史同类坑：交互变色不刷新） |
+| **`row` 没折行 / 折得不对** | `RJ_ROW_TRACE=1`（每个"请求了折行的" row 一行：`explicit` / `avail` / `limit` / `std_h` / `line_gap` / `size` / 折行） | 没有该行 ⇒ **压根没请求折行**（没写 `.wrap_w(..)` / `.wrap()`，旧行为就是"压窄"）；`limit=None` ⇒ `.wrap()` 但父级本帧没有可用宽（自动宽窗口首帧）；`explicit` 有值而 `limit` 更小 ⇒ 被**父级可用宽**压小（嵌套在窄容器里）；`折行=否` 而 `size.x > limit` ⇒ 子项各自比行宽还宽（**空行不折**，它自己占一行并溢出） |
+| **带 `vscroll` 的自动宽窗口一打开就被撑到屏幕宽**（里面的分割线 / 区块标题行看起来"铺满整屏"） | `--ui-dump` 看窗口 `size`（修好后 = **内容自然宽**） | 视口宽**首帧**取 `sw - 窗口 x`（屏幕剩余宽，为的是不让视口塌成 1px），而"**整格装饰**"（`divider()` 的线 / `foldable` 的标题行）按它铺满**并参与容器宽结算** ⇒ 内容宽 = 视口宽 ⇒ 下一帧视口又按内容反推 ⇒ **正反馈锁定**。**已修**：给布局契约加了第三态 `Child::Fill`（**宽度铺满但宽度不计入父级**，高度照常），两个"整格装饰"都改用它 ⇒ 容器宽由**其他内容**决定、装饰照样铺满（实测 Gallery：窗口宽 1920 → 683）。若又见到撑宽，先查"新写的整格装饰"是不是又用了 `Child::Expand` 去铺满 |
+| **渐变随控件位置 / 裁剪变化，或整段变成纯色** | `RJ_RAMP_TRACE=1`（每个带渐变的文本命令一行：`mode / axis / frame 域 / lines`） | `frame` 域与文本内容尺寸**对不上**（动辄几百上千）⇒ 采样域被算进了窗口 / 绝对坐标（应留在**文本视觉原点系**，见 `ENGINE_GUIDE` 的文本四条）；整段纯 `from` / `to` ⇒ 域退化或被 clamp；**滚动 / 裁切时渐变变** ⇒ 采样点用了裁剪后的角点（应用**未裁剪**字形几何取"字形内归一化位置"）；多行时"短行只吃到半条"是 `Frame` 域的**应有**语义 ⇒ 换 `.gradient_line(..)` / `.gradient_glyph(..)` |
 
 ---
 
@@ -253,10 +262,31 @@ fn update(&mut self, ctx: &mut Ctx) {
   立刻变成 **26 宽的一条缝**（`[FAIL]`，正是用户"不指定 width 就无法使用"）；
   `[无 width/height 也要能用]` **两个都不给**时：宽同上、高**自动撑开**到屏幕剩余
   （实测 320 = 1080 − 760）且 `content_h > 视口高`（可滚）；
-  `[收起 resizable+vscroll 窗]` 点 ⌃ 后 630 → 52（收起态不建视口、也不给柄）；
+  `[收起 vscroll+resize 窗]` 点 ⌃ 后 630 → 52（收起态不建视口、也不给柄）；
   `[子窗口不继承外层裁剪]` 录在 `vscroll` 窗里的**嵌套窗口**（`palette_h_win/pal_inner`）
   其 dump `clip` 必须是 `None`（去掉 `window_impl` 入口的 `painter.q.clip = None` ⇒ 立刻变成
   外层视口的 scissor ⇒ `[FAIL]`：这正是"子窗口被不经意地裁掉"）。
+  **横向滚动**（本轮新增，两条判定）：
+
+  ```
+  sim-scroll-mode[横向滚动·窗口]: 内容宽=Some(600.0) 视口宽=225
+      状态=Some(ScrollState { offset: 0.0, offset_x: 225.0, content_h: 39.0, content_w: 600.0 })
+      翻页前焦点=Some("scroll_h_win/scroll/scroll_h_te") 翻页后焦点=Some("scroll_h_win/scroll/scroll_h_probe") [OK]
+  sim-scroll-mode[横向滚动·ScrollArea]: 视口宽=225 builder(视口=Some(225.0), 内容=Some(600.0))
+      滚动=Some(ScrollState { offset_x: 225.0, .. }) [OK]
+  ```
+
+  现场：`scroll_h_win` = `.width(150.0).hscroll(true)`（固定宽视口 + 底部横条），内容 = 一行
+  400 逻辑宽的 `TextEditor` + **压在同一行上的探针**（x = 1.2 × 视口宽、后录制 ⇒ 遮挡上它赢）；
+  另一处是 **`ScrollArea` builder**（win=0 顶层容器，位置写常量 ⇒ 脚本按同一常量算点）。
+  脚本三段：① 30..=35 在探针像素上点一次（**负对照** —— 那时内容还没滚进来，命中只能落在
+  400 宽的长行上，绝不能是探针）；② 44..=49 点底缘条带的**轨道**（滑块长只有视口宽的 ~37%
+  ⇒ 取视口 `0.9` 宽处必在轨道上）⇒ 翻一页 `offset_x += 视口宽`；③ 52..=57 点**同一个像素**
+  ⇒ 这次必须命中探针（`abs_base` 与内容一起平移 ⇒ 命中跟着走）。
+  ⚠ 两个踩过的坑：**焦点是单槽状态** —— 后面别的窗口按钮（帧 80 的 ⌃）会把它清掉，所以窗口级
+  焦点断言必须在帧 58（紧跟正对照），不能在帧 158；**win=0 的容器会被任意窗口遮挡**
+  （`window_occluded` 的 `z = 0` 规则）⇒ `ScrollArea` 的位置必须落在**所有窗口矩形之外**
+  （第一版放进 `palette_h_win` 的覆盖区：条带恒点不中、`offset_x` 恒 0）。
 - **裁切 scissor = 内容盒（不含标题栏）**：用户要求"裁切内容的**绘制用** Scissor 矩形范围应该
   只有内容，没有标题栏" ⇒ `window_impl` 的按轴裁切用 `content_box`（`content_origin` 起、
   扣掉两侧内边距），且**只盖内容那段命令**（`[start, content_end)`，标题栏 / 面板底色 /
@@ -278,11 +308,11 @@ fn update(&mut self, ctx: &mut Ctx) {
   ```
 
   判据五条（缺一不可，否则 `[FAIL]`）：
-  1. `hscroll(NoClip)`（**压缩**）窗的 `row(..)` 结算宽 ≤ 窗口内容可用宽（199 ≤ 225；
+  1. `hscroll(false)`（= `NoClip`，**压缩**）窗的 `row(..)` 结算宽 ≤ 窗口内容可用宽（199 ≤ 225；
      修前 = 标签 + 输入框的自然宽之和 ⇒ 超出去）；
   2. 同一扇窗里 `Label + ColorPicker` 那一行同样不溢出（取色器也得看可用宽）；
-  3. `hscroll(ClipOnly)`（**裁切**）窗里同一行**保持自然宽**（282 > 225 ⇒ 内容没被压缩，
-     与 1 成对照：若两窗等宽说明 `hscroll` 没起作用）；
+  3. `hscroll(ScrollMode::ClipOnly)`（**只裁不滚**）窗里同一行**保持自然宽**（282 > 225 ⇒ 内容
+     没被压缩，与 1 成对照：若两窗等宽说明 `hscroll` 没起作用）；
   4. 点裁切窗**内**那个控件 ⇒ 焦点必须落在它身上（正对照：守卫不能把整窗点废）；
   5. 点裁切窗**外**那个溢出控件 ⇒ 焦点**不得**落在它身上（裁掉的部分不可命中）。
   **失败路径都验过**：把 `content_max_w` 改回恒 `None` ⇒ 压缩窗行宽 271 > 225 ⇒ `[FAIL]`；
@@ -425,7 +455,7 @@ fn update(&mut self, ctx: &mut Ctx) {
      内容右缘比**外框右缘**又少一个 `pad`，旧实现还额外留 4px ⇒ ✕ 离窗口右缘 `pad + 4`
      （实测 win_a @150% DPI：✕ 右缘 340 / 外框 358，**偏左 18px**）；而 18 = `pad + 4` 又
      恰好等于面板右上圆角半径（12 逻辑），于是"看起来差不多"，掩盖了很久。
-     现在按钮走 `Ui::add_at` **绝对定位在外框坐标系**（`ui.rs::title_bar_layout` 纯函数 +
+     现在按钮走 `Ui::add_at` **绝对定位在外框坐标系**（`ui/chrome.rs::title_bar_layout` 纯函数 +
      单测），贴右缘；脚本的点击点也改成 `right = origin.x + size.x`（外框右缘）。
   2. **收起态里缩放柄会盖到按钮上**：窗口只有一行高时，右下角柄的命中区
      （`GripStyle::extent()`，本机 150% DPI 实测 `35×35`、起点 `y = 723`）往左上延伸到

@@ -120,7 +120,13 @@ impl Widget for Divider {
         if ui.culled(rect) {
             return Response { rect, culled: true, ..Default::default() };
         }
+        // 水平线在**容器内**（深度 > 0）会满宽：先按占位宽画，再把这条命令标成**待定满宽** ——
+        // 所属容器结算尺寸后回填成"容器内容宽"（与 `ui.divider()` 走同一条通路）。
+        // `win=0` 顶层不标（根 frame 的固定宽是视口宽，会把线画成整屏 —— 历史 BUG）。
         ui.painter().solid(divider_line(rect, self.axis, t, m), c);
+        if self.axis == DividerAxis::Horizontal && ui.painter_depth() > 0 {
+            ui.mark_last_full_w();
+        }
         Response { rect, ..Default::default() }
     }
 }

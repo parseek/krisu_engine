@@ -13,9 +13,7 @@ impl app::Demo for HelloWindow {
     }
 
     fn demo(&mut self, ui: &mut app::Ui, enable: &mut bool, global: &mut app::global::GlobalData) {
-        ui.window(std::any::type_name::<Self>())
-        .title(TITLE)
-        .close_button(enable)
+        super::demo_window(ui, std::any::type_name::<Self>(), TITLE, enable)
         .show(|ui| {
             ui.label("Hello world!!!");
             ui.label("(●'◡'●)");

@@ -8,6 +8,7 @@ use rjw_transform::Rect;
 use crate::draw::{Size, TextAlign, TextVAlign};
 use rjw_text::Align;
 use crate::ui::Ui;
+use super::label_ex::LabelEx;
 use super::{Response, Widget};
 
 // ─── Label ──────────────────────────────────────────────────────
@@ -32,6 +33,22 @@ pub struct Label<'a> {
 impl<'a> Label<'a> {
     pub fn new(text: &'a str) -> Self {
         Self { text, color: None, font_size: None, font_family: None, wrap: None, ellipsis: false }
+    }
+
+    /// **扩展标签**（[`LabelEx`]）：需要**整组 [`TextStyle`](crate::text::TextStyle)** /
+    /// 字重 / 斜体 / 字距 / 行高 / **首末两色渐变**这类逐标签样式时用它——本控件刻意只保留
+    /// "最简 + 主题回落"。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{Label, UiAdd};
+    /// # fn demo(ui: &mut rjw_ui::Ui) {
+    /// Label::ex("彩色渐变标题")
+    ///     .gradient(rjw_color::Color::RED, rjw_color::Color::YELLOW)
+    ///     .show(ui);
+    /// # }
+    /// ```
+    pub fn ex(text: &'a str) -> LabelEx<'a> {
+        LabelEx::new(text)
     }
 
     /// 文本颜色（默认 `Theme::label.color`）。

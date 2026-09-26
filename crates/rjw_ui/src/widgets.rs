@@ -14,6 +14,9 @@
 //!   [`button`]`::Button` / [`checkbox`]`::Checkbox` / [`divider`]`::Divider` /
 //!   [`slider`]`::Slider`——`Option` 覆盖字段 + 链式 setter，未设置的属性回落到全局
 //!   [`Theme`](crate::style::Theme)；
+//! - **容器 builder**：[`scrollarea`]`::ScrollArea`（`Ui::scroll_area(id, size)` /
+//!   [`crate::UiAdd::scroll_area`]）——把 [`Ui::scroll_axes_at`](crate::Ui::scroll_axes_at)
+//!   的"视口 + 两条轴策略"收成责任链，返回 [`crate::ScrollOutcome`]；
 //! - 内置**组合控件**：`numberinput`（[`NumberInput`]）/ `colorpicker`（[`ColorPicker`]）
 //!   / `fontmodal`（[`FontModal`]），由基础原语组合而成，同时是"跨 crate 自定义控件"
 //!   的真实范例；
@@ -300,8 +303,11 @@ mod divider;
 pub mod dropdown;
 mod fontmodal;
 mod label;
+mod label_ex;
 pub mod menu;
 mod numberinput;
+/// **滚动容器 builder**（`Ui::scroll_area(..).vscroll(..).hscroll(..).show(f)`）。
+mod scrollarea;
 mod slider;
 mod texteditor;
 pub(crate) mod title_button;
@@ -326,9 +332,11 @@ pub use menu::{
 pub use menubar::MenuBar;
 pub use segmented::Segmented;
 pub use label::Label;
+pub use label_ex::LabelEx;
 pub use numberinput::{GRIP_W, NumberInput};
+pub use scrollarea::ScrollArea;
 pub use slider::{Slider, SliderValue};
-pub use texteditor::TextEditor;
+pub use texteditor::{TextEditor, TextVAlignMode};
 
 // ─── 统一响应 ───────────────────────────────────────────────────
 

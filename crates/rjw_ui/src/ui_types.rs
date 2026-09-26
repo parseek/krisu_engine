@@ -12,6 +12,8 @@
 //! | [`Level`] | 窗口层级（点击是否置顶） |
 //! | [`Placement`] | 窗口内容排布（Expand / Clip） |
 //! | [`Resize`] | 可调整尺寸控件的缩放方向（取代 `show_handle: bool`） |
+//! | [`ScrollMode`] / [`ScrollParam`] | 单轴溢出策略（三态）与统一入参（`bool` / `ScrollMode`） |
+//! | [`ScrollOutcome`] | 滚动容器结算结果（视口 + 内容尺寸） |
 //! | [`WindowOptions`] / [`PanelOptions`] | 责任链 builder 的数据载体 |
 //!
 //! 注：诊断快照（`UiWindowInfo` / `UiDebugDump`）与 builder 本体留在 `ui.rs`——
@@ -138,9 +140,56 @@ pub enum ScrollMode {
     ClipOnly,
     /// **裁切 + 滚动条**（滚轮 / 拖 thumb / 点轨道）。
     ///
-    /// 当前实现覆盖**垂直轴**；`hscroll(Scroll)` 暂按 `ClipOnly` 处理并打印一次提示
-    /// （水平滚动条 + `ScrollState` 的第二条轴还没做，见 `docs/UI_NEEDS.md`）。
+    /// 两条轴**各自独立**且都真的实现了：`vscroll(Scroll)` 与 `hscroll(Scroll)` 都会
+    /// 建视口 + 画该轴的滚动条（见 [`ScrollState::offset`](crate::ScrollState::offset) /
+    /// [`offset_x`](crate::ScrollState::offset_x)）。
     Scroll,
+}
+
+/// **单轴滚动开关的统一入参**（[`WindowBuilder::vscroll`](crate::WindowBuilder::vscroll) /
+/// [`hscroll`](crate::WindowBuilder::hscroll) / [`ScrollArea`](crate::ScrollArea) 都用它）。
+///
+/// 两个实现：
+/// - `bool`：`true` = [`ScrollMode::Scroll`]（视口 + 滚动条），`false` = [`ScrollMode::NoClip`]
+///   （不裁 —— 内容自然尺寸撑开 / 按给定宽压缩）；
+/// - [`ScrollMode`]：三态原样透传（低层逃生舱：只裁不滚的 [`ScrollMode::ClipOnly`]
+///   只能这么写，或由 `Placement::Clip` / "该轴被用户拖过"解算出来）。
+///
+/// 例：`.vscroll(true)` ≡ `.vscroll(ScrollMode::Scroll)`、`.hscroll(false)` ≡
+/// `.hscroll(ScrollMode::NoClip)`。
+pub trait ScrollParam: Copy {
+    /// 归一成三态 [`ScrollMode`]。
+    fn scroll_mode(self) -> ScrollMode;
+}
+
+impl ScrollParam for ScrollMode {
+    #[inline]
+    fn scroll_mode(self) -> ScrollMode {
+        self
+    }
+}
+
+impl ScrollParam for bool {
+    #[inline]
+    fn scroll_mode(self) -> ScrollMode {
+        if self { ScrollMode::Scroll } else { ScrollMode::NoClip }
+    }
+}
+
+/// **滚动容器的结算结果**（[`Ui::scroll_axes_at`](crate::Ui::scroll_axes_at) /
+/// [`ScrollArea::show`](crate::ScrollArea::show) 返回）。
+///
+/// - [`Self::view`]：**视口**尺寸（调用方传进来的可用区，物理像素）；
+/// - [`Self::content`]：**内容**结算尺寸（物理像素；超出视口的部分靠滚动看）。
+///
+/// 为什么单列一个结构体：`Ui::scroll_at` 的既有签名只能回一个 `Vec2`（视口），而
+/// "内容到底多宽多高"是布局决策的真正常用量（要不要给滚动条、视口该多大）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollOutcome {
+    /// 视口尺寸（物理像素）。
+    pub view: Vec2,
+    /// 内容结算尺寸（物理像素；可大于视口）。
+    pub content: Vec2,
 }
 
 /// **窗口内容排布方式**（取代旧的 `.strict()` 开关）。
@@ -188,8 +237,9 @@ pub enum Resize {
 /// - `placement`：内容排布（默认 [`Placement::Expand`]；[`Placement::Clip`] = 严格裁剪）；
 /// - `style`：逐窗口样式覆盖（默认 `None` = 全局 `Theme::panel`）；
 /// - `clamp`：位置约束模式（默认 [`WindowClamp::Screen`]：窗口整体不跑出屏幕）；
-/// - `resize`：**拖拽缩放** `(是否允许拖动, 允许的轴)`；`None` = 旧行为
-///   （**有 `.width(..)` 就能横向拖** —— 见 [`WindowBuilder::resize`](crate::WindowBuilder::resize)）。
+/// - `resize`：**能不能拖拽改大小**（只有布尔；轴由 `vscroll` / `.height(..)` 推导 ——
+///   见 [`WindowBuilder::resize`](crate::WindowBuilder::resize)）；`None` = 旧行为
+///   （**有 `.width(..)` 就能横向拖**）。
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
     /// 窗口左上角；**`None`（默认）= 引擎自动分配**（级联 + 跨帧记忆，Win32
@@ -204,23 +254,11 @@ pub struct WindowOptions {
     pub placement: Placement,
     pub style: Option<PanelStyle>,
     pub clamp: WindowClamp,
-    /// `(allow, axes)`：`allow = false` ⇒ 既**不画缩放柄**也**不响应拖拽**
-    /// （`.width(..)` 仍作为布局固定宽生效，菜单 / 下拉浮层就是这么用的）；
-    /// `axes = Resize::Both` ⇒ 右下角柄**宽高同调**（高度跨帧持久）。
-    ///
-    /// ⚠ **两条轴由 [`WindowBuilder::resizable`](crate::WindowBuilder::resizable) 推导**
-    /// （egui 语义）：一旦调了它，本字段被推导结果**覆盖**（见那里的判定表）。
-    pub resize: Option<(bool, Resize)>,
-    /// **只给一个"能不能拖大小"的布尔**（egui 风：[`WindowBuilder::resizable`]
-    /// (crate::WindowBuilder::resizable)）——允许的**轴**由 `vscroll` / `height` 推导：
-    ///
-    /// | `vscroll`（垂直轴是视口 / 有固定高） | 允许的轴 | 水平轴内容 |
-    /// |---|---|---|
-    /// | 是 | **垂直 + 水平** 都能拖 | `hscroll` ⇒ **裁切**；否则**压缩** |
-    /// | 否 | **只有水平**能拖（高度由内容定） | 同上 |
-    ///
-    /// `Some(false)` = 不画柄也不响应；`None`（默认）= 退回 [`Self::resize`] 的老语义。
-    pub resizable: Option<bool>,
+    /// **能不能拖拽改大小**（[`WindowBuilder::resize`](crate::WindowBuilder::resize) 的入参）：
+    /// `Some(false)` = 不画柄也不响应拖拽（`.width(..)` 仍作布局固定宽，菜单 / 下拉浮层用）；
+    /// `Some(true)` = 画柄 + 可拖，允许的**轴**按判定表推导（有视口 ⇒ 垂直 + 水平，否则只有
+    /// 水平）；`None`（默认）= **旧语义**："有 `.width(..)` 就能横向拖"。
+    pub resize: Option<bool>,
     /// **内容子项间距**（[`WindowBuilder::gap`](crate::WindowBuilder::gap)；`None` = 用
     /// [`Theme::gap`](crate::Theme::gap)）。
     ///
@@ -247,7 +285,6 @@ impl Default for WindowOptions {
             style: None,
             clamp: WindowClamp::Screen,
             resize: None,
-            resizable: None,
             gap: None,
             vscroll: None,
             hscroll: None,

@@ -1606,7 +1606,7 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 | **标题行贴窗口顶边** | 录标题行**之前**把内容光标抬到 `y = 0`（x 保持内容左缘）⇒ 标题 / ▲ / ✕ **上移一个 `pad_total`**，下一个内容行自然落在「条下沿 + `gap`」——即**下面的内容与窗口高度各少一个 `pad_total`**（用户实测："可以往上抬"） |
 | 通条底色 + 分隔线 | 整窗宽矩形，高 = `title_bar_h(row_h)` = **一行**（`title_bar_h` 是纯函数、可单测），底边那条就是面板边框色的 1px 分隔线；圆角取面板**上面两角**，与面板边框**连续**（不会"标题栏把上边框啃掉"）。⚠ 条只是**背景装饰、不裁剪内容**：标题 / ▲ / ✕（边长 `row_h - 2`）允许**比条高再高一点**（用户明确要求） |
 | 标题栏空白处仍可拖窗 | 只有 `×` / `⌃` 上的按下会 `claim_press()`（与滑块 / 滚动条同一机制）——点按钮不会顺带把窗口拖走 |
-| **caption 按钮贴窗口外框右缘（Windows 风格）** | 按钮**不在"行"里排**，而是用 `Ui::add_at` **绝对定位在窗口外框坐标系**（窗口帧局部 `(0,0)` = 外框左上角）⇒ 簇右缘 = **外框右缘 − `TITLE_BUTTON_INSET`（0）**、`y = 0`、高 `row_h`。落点由纯函数 `ui.rs::title_bar_layout`（可单测）解算（见下）；`✕` 恒在**最右**（顺序 `[⌃][✕]`）。⚠ 旧实现把按钮当行内子项、用 `spacer = 内容宽 − 标题宽` 推到**内容**右缘 ⇒ 永远差 `pad + 4`（实测 win_a @150% DPI：✕ 右缘 340 / 外框 358 ⇒ 偏左 18px），且 spacer 随文本测量漂 |
+| **caption 按钮贴窗口外框右缘（Windows 风格）** | 按钮**不在"行"里排**，而是用 `Ui::add_at` **绝对定位在窗口外框坐标系**（窗口帧局部 `(0,0)` = 外框左上角）⇒ 簇右缘 = **外框右缘 − `TITLE_BUTTON_INSET`（0）**、`y = 0`、高 `row_h`。落点由纯函数 `ui/chrome.rs::title_bar_layout`（可单测）解算（见下）；`✕` 恒在**最右**（顺序 `[⌃][✕]`）。⚠ 旧实现把按钮当行内子项、用 `spacer = 内容宽 − 标题宽` 推到**内容**右缘 ⇒ 永远差 `pad + 4`（实测 win_a @150% DPI：✕ 右缘 340 / 外框 358 ⇒ 偏左 18px），且 spacer 随文本测量漂 |
 | 贴外缘 + 圆角要一起处理 | 最右按钮的**右上角取面板右上圆角**（`TitleIconButton::corners(..)`）⇒ 贴外缘时不会方角戳出圆角轮廓（Windows 11 的 caption 高亮同样跟窗口圆角走）；没开 `.style(radius)` 时面板圆角 0 = 纯直角贴角 |
 | 自动宽窗口 | 没有 `.width()` 就没有"外框右缘"可贴 ⇒ 簇**跟随标题**（`cluster_x = pad + title_w + gap`），外框宽由内容推导（与旧版自动宽窗口一致） |
 | `×` 的关闭语义 | `*open = false` 时**整窗短路**：不录制、不写原点 / 尺寸、**不占遮挡矩形**（不会留下"看不见却挡点击"的窗口）；下一帧起彻底消失，**重开是应用的责任** |
@@ -1632,7 +1632,7 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 
 | 规则 | 位置 | 说明 |
 |---|---|---|
-| `Ui::avail_w()` **由内向外**扫 frame 栈 | `ui.rs::avail_w` / `layout.rs::stack_avail_w` | 只看 `frames.last()` 时，`row`（自身不设固定宽）里的控件拿不到外层窗口的可用宽 ⇒ `Label` 不换行、按自然宽排 |
+| `Ui::avail_w()` **由内向外**扫 frame 栈 | `ui/interaction.rs::avail_w` / `layout.rs::stack_avail_w` | 只看 `frames.last()` 时，`row`（自身不设固定宽）里的控件拿不到外层窗口的可用宽 ⇒ `Label` 不换行、按自然宽排 |
 | 水平行的**剩余宽**参与约束 | `Frame::remaining_w` | 一行里**后面的**控件可用宽 = `内容盒右缘 − 光标`（左推）/ 光标 − 内容盒左缘（右推）。只按"单子项 ≤ max_w"不够：标签 126 + 间距 9 + 输入框 210 每个都没超 276，**整行**却超了 |
 | 嵌套容器**继承**父级内容最大宽 | `Ui::container` → `Frame::set_max_w` | 子 frame 自己没固定宽时继承（扣掉自己的内边距）⇒ 子项被 clamp、`LimitedInParent` 控件拿到 `avail_w` 后自动换行。**只改上限，不改写结算宽**（容器仍按内容结算，不会被撑成整宽） |
 
@@ -1655,7 +1655,9 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 把窗口的遮挡矩形撑到窗口外面**（同一条守卫顺带修掉"遮挡矩形随溢出内容变大"）。
 未裁切的窗口（`Placement::Expand`）**不变**：溢出内容看得见就还能点（见 §"看得见就能点"）。
 
-**按轴的溢出策略（`.vscroll` / `.hscroll`）**：`ScrollMode::{NoClip(默认), ClipOnly, Scroll}`，
+**按轴的溢出策略（`.vscroll` / `.hscroll`）**：入参是 **`impl ScrollParam`** —— `bool`
+（`true` = `Scroll`（视口 + 滚动条）/ `false` = `NoClip`）或三态
+`ScrollMode::{NoClip(默认), ClipOnly, Scroll}`（低层逃生舱：只裁不滚只能写 `ClipOnly`），
 两条轴**各自独立** —— 这是旧的 `Placement::Clip`（一体化）做不到的：只裁横向的窗口，
 纵向仍能由内容撑高。**"压缩内容"与"裁切内容"就是这条轴的分界**（用户给的判定表）：
 
@@ -1663,12 +1665,28 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 |---|---|---|---|
 | `NoClip`（默认） | `.width(..)` / 拖出来的值 = **固定宽** | 不裁（可见、可点） | **压缩**：被 `fixed_w` / `max_w` / `remaining_w` 压进可用宽（`Label` 换行 / 省略号） |
 | `ClipOnly` | 固定 = `.width(..)` / 拖出来的值 | 裁掉（`clip_for_axes` 只收窄该轴） | **裁切**：`Frame::set_clip_w(true)` ⇒ 三条 clamp 全跳过，子项按**自然宽**排 |
-| `Scroll`（垂直） | 同 `ClipOnly`，且内容包进 `scroll_at_axes` 视口（滚动条 + 滚轮） | 裁掉 + 可滚 | 同 `ClipOnly` |
-| `Scroll`（水平） | ⚠ **暂按 `ClipOnly` 处理并打印一次提示**（水平滚动条 / `offset_x` 还没做，见 `UI_NEEDS.md`） | 裁掉 | 同 `ClipOnly` |
+| `Scroll`（垂直） | 同 `ClipOnly`，且内容包进 `scroll_at_axes` 视口（右侧滚动条 + 滚轮） | 裁掉 + 可滚 | 同 `ClipOnly` |
+| `Scroll`（水平，**本轮补齐**） | 同 `ClipOnly`，且内容包进 `scroll_at_axes` 视口（**底部横条** + 滚轮 / Shift+滚轮） | 裁掉 + 可滚 | 同 `ClipOnly`，且**不折行**（见下） |
 
 解算顺序（纯函数 `resolve_scroll_mode`，单测 `scroll_mode_resolution_prefers_explicit_then_legacy_then_dragged`）：
 **显式设置 > `Placement::Clip` > "该轴被用户拖过尺寸"**；都没有 ⇒ `NoClip`
 （与不加本 API 之前逐像素一致；"拖过高度的轴自动成为视口"这条既有行为由第 3 条保住）。
+
+> **横向滚动的四条硬规矩**（`--sim-scroll-mode[横向滚动·窗口]` / `[横向滚动·ScrollArea]` 守着）：
+> 1. **`h == Scroll` 的那条轴不上报可用宽**（`scroll_axes_avail_w`）—— 否则
+>    `LimitedInParent` 控件（`Label` 折行 / 省略）会把自己压进视口 ⇒ **永远没有横向溢出**、
+>    横条永远不出现。代价（写进文档）：该轴的子项按**自然宽**排、**不折行**；要折行用
+>    `hscroll(false)`。
+> 2. **两条轴都溢出时拐角互让**：竖条带高 `view.h − SCROLLBAR_W`、横条带宽 `view.w − SCROLLBAR_W`
+>    （两个几何纯函数收"长度"参数即可，不新增签名）⇒ 两条带不重叠。
+> 3. **只有 `Scroll` 那条轴画条 / 吃滚轮**（`ClipOnly` 是"只裁不滚"）；滚轮映射见纯函数
+>    `wheel_axes`：横向取 `wheel.x`，**Shift + 滚轮**改作横向，"只有一条轴可滚"时纵向滚轮
+>    交给它。
+> 4. **命中跟着偏移走**：`abs_base`（点击 / 焦点描边 / IME 光标）与内容命令**同时**平移
+>    `(offset_x, offset)` ⇒ 横滚之后同一个屏幕像素命中的是**滚进来**的控件。sim 用**同一个
+>    像素**做正 / 负对照（翻页前点不到探针、翻页后命中探针）。
+>
+> 状态：`ScrollState::{offset, offset_x, content_h, content_w}`（物理像素、整像素步进）。
 
 > - **命中**跟着裁切走：只有"会被裁的那条轴"把命中限制收到窗口矩形内（`cur_win_hit_limit` +
 >   `clip_for_axes`），另一条轴继续按屏幕兜底 ⇒ `NoClip` 轴溢出可见就还能点（幽灵控件那条规则
@@ -1697,12 +1715,17 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 >   回归守卫：`--sim-clip`（无标题栏的严格窗 ⇒ scissor = `origin+pad`、`size−2×pad`）+
 >   `--sim-scroll-mode` 的 `标题栏已被排除`（有标题栏的 `vscroll` 窗，scissor 上缘下移 ≥ `row_h`；
 >   实测 `y=428` = 原点 380 + 标题栏 39 + 间隙 9）。换回"整窗矩形"立刻两条都 `[FAIL]`。
-> - 验收：`--sim-scroll-mode`（按轴独立）—— 两扇同内容窗：`hscroll(NoClip)` 那扇**不给 `.width()`**
+> - 验收：`--sim-scroll-mode`（按轴独立）—— 两扇同内容窗：`hscroll(false)` 那扇**不给 `.width()`**
 >   ⇒ 内容定宽 626；`hscroll(ClipOnly)` 固定 251，其 scissor 的 x/宽 = **内容盒**（`origin+pad`、
 >   `size−2×pad`，落在内容盒内）。`--sim-row-overflow` 则摆**同宽同内容**（`.width(150)`）
->   的两扇窗证明"压缩 vs 裁切"：`hscroll(NoClip)` 的行被压到 199（可用宽 225）、
+>   的两扇窗证明"压缩 vs 裁切"：`hscroll(false)` 的行被压到 199（可用宽 225）、
 >   `hscroll(ClipOnly)` 的行**保持自然宽 282**（超出被裁）且幽灵控件点不到；
 >   同一条里还有"自动宽窗 + `divider()`"必须留在 240..600（守卫布局根）。
+>   **横向滚动**另有三段判定：`[横向滚动·窗口]`（`.hscroll(true)`：内容 600 > 视口 225、
+>   点横条轨道 ⇒ `offset_x += 视口宽`、**同一像素**翻页前点不到探针 / 翻页后命中探针）、
+>   `[横向滚动·ScrollArea]`（builder 同通路）。⚠ win=0 的容器**会被任意窗口遮挡**
+>   （`window_occluded` 的 `z = 0` 规则）⇒ 现场位置必须落在所有窗口矩形之外，否则条带恒点不中
+>   （实测踩过：放进 `palette_h_win` 覆盖区里 ⇒ `offset_x` 恒 0）。
 
 **缩放柄令牌**（固定宽窗口右下角那个"拖拽按钮"）：
 
@@ -1725,11 +1748,14 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 > 斜线在 `size*count` 的小方框里间距不到 1px，羽化会把它们糊成一片。`GripStyle::extent()`
 > （命中区下限的来源）同步按 1.5× 算。
 
-**窗口内的滚动视口（`vscroll(Scroll)` + `.height(..)`）**：
+**窗口内的滚动视口（`vscroll(true)` / `hscroll(true)` + `.height(..)` / `.width(..)`）**：
 
 - `.height(h)` = **固定高**（外框高，物理；逻辑值 `×scale`）—— 长内容窗口（列表 / 调色板 /
   日志）要的是"有界的视口"，而不是"被内容撑到和屏幕一样高"。`.width(320.0).height(420.0)
-  .vscroll(Scroll)` ⇒ 视口 420 逻辑高 + 滚动条（实测外框高 = `420 × scale`）。
+  .vscroll(true)` ⇒ 视口 420 逻辑高 + 滚动条（实测外框高 = `420 × scale`）。
+- **横向同理**：`.width(200.0).hscroll(true)` ⇒ 视口 = 内容盒宽（`.width` 的逻辑值 ×scale）、
+  内容保持**自然宽**、超出由**底部横条**滚。⚠ 自动宽窗口 + `hscroll(true)` 时窗口会撑到内容的
+  自然宽 ⇒ 本来就不溢出 ⇒ **不会有横条**（那不是 bug：横滚要有"被窗口钉住的视口宽"才成立）。
 - 不给 `.height(..)` 时视口高 = **`min(内容需要的总高, 屏幕剩余)`** —— "按内容定高、不许跑出屏幕"。
   只用"屏幕剩余"会把**内容很矮**的窗口也撑到屏幕底（两行内容的窗口 ≈ 1000 高的大空面板）；
   内容高从**上一帧**的滚动状态读（`ScrollState.content_h`，与视口无关；首次未知 ⇒ 先按屏幕
@@ -1756,39 +1782,40 @@ if !open && ui.button("reopen_a", "显示窗口 A").clicked() { open = true; }
 
 
 
-### 拖拽缩放（窗口）：`resizable(bool)` + 轴向推导
+### 拖拽缩放（窗口）：`resize(bool)` + 轴向推导
 
 ```rust
 // egui 风：只给"能不能拖大小"，轴自己推导（见下表）
-ui.window("palette").width(320.0).height(420.0).vscroll(ScrollMode::Scroll)
-    .resizable(true).show(|w| ..);                 // 垂直 + 水平都能拖，水平压缩
-ui.window("list").width(320.0).vscroll(ScrollMode::Scroll)
-    .resizable(true).hscroll(ScrollMode::ClipOnly).show(|w| ..); // 水平改成裁切
-// 低层显式版（`.resizable(..)` 覆盖它）
-ui.window("w").width(200.0).resize(true, Resize::Both).show(|w| ..);
-ui.window("popup").width(300.0).resize(false, Resize::None).show(|w| ..);
+ui.window("palette").width(320.0).height(420.0).vscroll(true)
+    .resize(true).show(|w| ..);                 // 垂直 + 水平都能拖，水平压缩
+ui.window("list").width(320.0).vscroll(true)
+    .resize(true).hscroll(true).show(|w| ..);   // 水平改成横滚（自然宽 + 底部横条）
+ui.window("popup").width(300.0).resize(false).show(|w| ..);   // 固定宽但不画柄、不可拖
 ```
 
-**判定表**（`.resizable(allow)`；纯函数 `resolve_resizable_axes` / `v_axis_is_viewport`）：
+**判定表**（`.resize(allow: bool)`；纯函数 `resolve_resizable_axes` / `v_axis_is_viewport`）：
 
-| 垂直轴是视口？（`.vscroll(ClipOnly/Scroll)` 或给了 `.height(..)`） | 允许的轴 | 水平轴内容 |
+| 垂直轴是视口？（`.vscroll(非 NoClip)` / 给了 `.height(..)` / `.placement(Clip)`） | 允许的轴 | 水平轴内容 |
 |---|---|---|
-| 是 | **垂直 + 水平** | `hscroll` 非 `NoClip` ⇒ 裁切；否则压缩 |
+| 是 | **垂直 + 水平** | `hscroll(true)` ⇒ 横滚（自然宽 + 横条）；否则按宽压缩 |
 | 否（高度由内容定） | **只有水平**（拖高没意义：内容当帧就顶回来） | 同上 |
 
-`.resizable(false)` ⇒ `Resize::None`（不画柄也不响应）。**`allow = false` ⇒ 收起态**：整条
+⚠ **窗口层不再能显式指定轴**（本轮起只有 `bool`）：想要"只可调高"就给窗口一个纵向视口
+（`.height(..)` / `.vscroll(true)`）。`Resize` 枚举仍服务**控件级**缩放
+（`TextEditor::resize(..)` / `resizable_text_*_at`）。
+
+`.resize(false)` ⇒ `Resize::None`（不画柄也不响应）。**`allow = false` ⇒ 收起态**：整条
 缩放链路关闭 —— 收起 = 一行标题栏（没有尺寸可调），而柄的命中区（右下角 14~35px 方块）
 会压住标题栏最右那两个按钮、按下种子还会把"收起后的那一行高"写进 `window_heights`
 （`or_insert` 是永久的）⇒ 用户实测两条症状："**resizable 的窗口在点击收起按钮时仍然不会
 收起**"（短窗口里 ⌃ 被柄抢走）与"**点一下柄就弹回/跳回去了**"（展开回来成一条缝）。
 
-| 低层写法 | 效果 |
+| 写法 | 效果 |
 |---|---|
 | **不调 `.resize(..)`** | **旧行为**：有 `.width(..)` 就能横向拖（右下角柄），没有就不出柄 |
-| `.resize(false, ..)` | **不画柄、不响应拖拽**；`.width(..)` 仍是布局固定宽（菜单 / 下拉浮层用） |
-| `.resize(true, Resize::Horizontal)` | 只调宽（`↔` 光标） |
-| `.resize(true, Resize::Vertical)` | 只调高（`↕` 光标）：宽度仍由内容决定，拖出的高度跨帧持久 |
-| `.resize(true, Resize::Both)` | **宽高同调**（`↖↘` 光标）：高度跨帧持久于 `UiState::window_heights`，被拖过之后由用户接管（内容不再撑高；**并且内容自动裁剪**，见下） |
+| `.resize(false)` | **不画柄、不响应拖拽**；`.width(..)` 仍是布局固定宽（菜单 / 下拉浮层用） |
+| `.resize(true)` + **无**垂直视口 | 只调宽（`↔` 光标） |
+| `.resize(true)` + 垂直视口（`.height(..)` / `.vscroll(..)` / `Placement::Clip`） | **宽高同调**（`↖↘` 光标）：高度跨帧持久于 `UiState::window_heights`，被拖过之后由用户接管（内容不再撑高；**并且内容自动裁剪**，见下） |
 
 > ⚠ **尺寸是"持久优先"**（`.width(..)` / `.height(..)` 只是**初始值**）：
 > `window_impl` 里 `width = persisted_w.or(explicit_w)`、`eff_h = persisted_h.or(explicit_h)`，
@@ -1912,7 +1939,7 @@ ui.menu_bar("menubar", vec2(620.0, 12.0), |bar| {   // 位置 = 栏左上角（�
 | **点栏外** | 收起（栏外 = 既不在**栏矩形**内、也不在下拉面板矩形内、也不在触发器上）——纯函数 `widgets::menubar::menu_bar_should_close`，逐组合单测 |
 | 点栏内空白 / 竖分割线 / 栏里的别的控件 | **不收起**（"栏 = 一行容器"带来的语义；旧实现只认"落在某个触发器上"，会误关） |
 | **Esc** | 收起。应用自己的 Esc 语义先看 `UiState::menu_open()`（菜单开着那一帧别抢） |
-| 下拉面板 | 一个 [`Level::Normal`] + **`WindowClamp::Locked`** + **`.resize(false, Resize::None)`** 的浮层窗口（点它不置顶、**拖不动、也没有缩放柄**），且 z 落在**浮层区间**（`WIN_TOPMOST` 基址 + 嵌套层数，见 §18.15「分层 z」） |
+| 下拉面板 | 一个 [`Level::Normal`] + **`WindowClamp::Locked`** + **`.resize(false)`** 的浮层窗口（点它不置顶、**拖不动、也没有缩放柄**），且 z 落在**浮层区间**（`WIN_TOPMOST` 基址 + 嵌套层数，见 §18.15「分层 z」） |
 | 触发器交互 | `allocate_sense(.., Sense::DRAG)`：占光标 + 命中 + 按下认领一次做完（按下不会被外层当成拖拽基准） |
 | 触发器几何 | 宽 = **文字实测宽 + 2 × `Theme::menubar.trigger_pad_x`**，高 = `Theme::row_h`；栏高 = `row_h + 2 × Theme::menubar.padding`；子项间距 = `Theme::menubar.gap`（默认 2 —— 菜单条要**紧**，不是工具栏的 `Theme::gap`） |
 
@@ -2224,12 +2251,12 @@ sim-theme: ② 导入前 row_h=26 → 引擎侧 row_h=27（期望 27）[OK] 导�
 ### 18.17 维护约定（对 AI）
 
 - 布局 / 命中 / 状态机是**纯逻辑**（`layout.rs` / `hit.rs` / `state.rs` / `focus.rs`），改动后跑 `cargo test -p rjw_ui`（无 GPU 依赖）。
-- 新增控件 = 在 `ui.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。
+- 新增控件 = 在 `ui/controls.rs` 加 `Ui::xxx_at` 实现 + 在 `ui::UiAdd` trait 里加便捷方法默认实现（Panel / Pack / Grid 等全部容器自动获得，无需改宏）。
 - **新增控件优先做成 `Widget`**（`impl Widget for Xxx`）：那样 `UiAdd::add` / `add_at` 天然可用
   （`Dropdown` / `Segmented` / `NumberInput` 都是这条路）。**别为同一种控件开两个入口**
   （`Ui::xxx_at` 只作为"显式 rect / 容器内占光标"的内部或糖入口，见 `Ui::combo_at`）。
 - **下拉 / 菜单类浮层一律走 `widgets::menu::popup_show`**（唯一实现）：哨兵 z、锁定位置、
-  `.resize(false, Resize::None)`、面板样式、宽度收敛、点外 / Esc / 点项的收起判定都在那里。
+  `.resize(false)`、面板样式、宽度收敛、点外 / Esc / 点项的收起判定都在那里。
   复制一份浮层录制代码 = 迟早出现"两套菜单观感不一致"（本轮就是来消除这个的）。
 - 浮层的**几何**要能被脚本算出来：新增/改动行高或内边距时，同步改 `menu::item_h` /
   `menu::popup_padding`（公开助手），别让脚本自己抄一遍公式。
@@ -2247,6 +2274,32 @@ sim-theme: ② 导入前 row_h=26 → 引擎侧 row_h=27（期望 27）[OK] 导�
   就加**代理模块**（`weight_serde` / `align_serde`）或 `serde(skip)`（不可移植的值）。
 - 新增**交互**控件时必须调用 `register_focus(&id_for, rect, FocusKind::X)`（键盘导航 / 焦点描边；`id_for = ui.id_for(id)` 为**绝对 ID**）；需要 Enter/Space 激活的控件用 `key_click(&id_for, kind)` 合成点击。持久状态一律经 `state_mut().widget(&id_for)` 读写（绝对 ID）。
 - 绘制命令坐标语义：**相对当前容器 origin 的局部坐标**，容器弹出时统一平移；命中测试用 `abs_base + 局部`。新增容器时务必保持该约定。
+- **"区块 / 命名空间"这两类容器不另开 frame**（`ui/foldable.rs` / `ui/namespace.rs`）：
+  - `ui.foldable(id, label)`：标题行占一整行（高 `Theme::row_h`、宽由 `fold_header_w` 三级决定：`avail_w` → **同容器已排布内容的最宽宽** → 兜底 120 —— 自动宽窗口首帧 `avail_w` 还是 `None`，少了第二条它就会缩成半截），**正文录在父 frame 里**（与标题同级 ⇒ 父 `gap` 自动生效）并处在**本区块的 ID 命名空间**内（`with_id`）；**折叠 = 正文完全不录制**（不占高 / 不进命中表 / 不产生顶点），状态由 `UiState::folded`（**绝对 ID → bool 的表，存明确态**：无记录 = 首次，由 `open(..)` 决定并在首帧落盘；有记录 = 用户 / 应用已定，`set_folded(id,false)` 是**记住展开**而不是"清除记录"）**引擎托管**，点标题当帧只写状态、**下一帧**才改布局（与窗口 ⌃ 同口径）。折叠**不清**正文内部的跨帧状态（滚动 / 焦点 / 文本缓冲原地保留）。正文整体按 `body_indent` 缩进 —— 实现是**录正文期间把当前 frame 的光标 `x` 与内容最大宽一起右移**（录完还原 `x`、保留 `y` 推进），于是命令 / 命中区 / `last_interact_rect` 全部由光标与 `abs_base` 派生、天然一致；换成"录完再整体平移命令"会让命中区差一个 `indent`（"看得见点不着"）。
+  - `ui.namespace(id, |ui| ...)`：**只做** `IdStack::push(id)` —— 不推 frame、不加内边距、不裁剪、不 `note_content`；父光标由正文各项自己推进（**不要**再 `place_external`，否则推进两次）。
+  - 两者给用户闭包的参数是 [`PackEntry`](crate::PackEntry)（实现 `UiAdd` + `Deref` 到 `Ui`）——因为 `Ui` 自身**不实现** `UiAdd`，裸 `&mut Ui` 会让 `ui.row(..)` / `ui.label(..)` 无法解析（这条同样适用于任何"给用户一个排版上下文"的新容器）。
+  - 自定义标题（`Foldable::custom` / `foldable_custom`）跑在 `ornament_entry_natural_h` 里（**固定宽 = 标题文本区宽、高度自然、不 `note_content`**）⇒ 标题内容绝不反过来撑大容器，但**自己长高**（`Row` / 多行 ⇒ 返回的内容高把标题行矩形加高、父光标补推同样多，正文随之让位）——这就是"标题可以视作一个标准容器"。内容必须从**文本区**（`pad_x + icon_w` 之后）起排，否则压住 ▶ / ▼。标题行交互用 `Sense::DRAG`（按下被认领 ⇒ 不拖动外层窗口），**翻转判定 = 按下边沿 + 命中，或 `key_click`**，且必须放在 `interact` **之后**（否则标题里的勾选框点一下会连带折叠）；⚠ **不要**把 `Response::clicked` 并进判据——它在**释放帧**成立，与按下边沿叠加会让一次点击翻两次（脚本化点击按 t 按下 / t+1 释放 ⇒ 净效果为零）。
+- **文本样式 / 渐变 / 换行**（`LabelEx`，见 `crates/rjw_ui/src/widgets/label_ex.rs`）四条硬约定：
+  - **排版看缓冲、绘制看顶点色**：字号 / 行高 / 行距 / 字体族 / 字重 / 斜体 / 拉伸 / 字距进
+    **排版缓存键**（`state::TextKey`）；**颜色 / 渐变 / 水平对齐不进**（颜色走顶点色、水平对齐
+    由 `TextAlign` 在绘制期算 anchor）。键漏一个字段 = "改了字重文字不刷新"。
+  - **测量与绘制必须是同一个 `Arc<Buffer>`**：`push_text_rect_ramp(.., buf: Some(..))` ——
+    传 `None` 会让 `draw_text_quads` 回落到 `cache_buffer(text, size, family)`，逐标签的字重 /
+    斜体 / 字距 / 行高**全丢**（文字与占用矩形对不上）。
+  - **渐变是逐字形逐顶点的顶点色**（`DrawKind::Text.ramp` = `TextRamp`：首末两色 + 横/纵 + **域**）：
+    域与采样点**都在文本视觉原点系**（与 `rjw_text` 字形 `top_left` 同系，也是
+    `geo.content_size` / `first_line_top` 所在的系）。**不要**往窗口 / 绝对坐标换算 —— 曾经用
+    `block_tl + pr - anchor_px` 当原点，而 `block_tl` **本身就是绝对坐标**（命令在容器弹出时
+    已 `translate`）⇒ 白加了一个 `pr` ⇒ 渐变随控件在窗口里的位置整体平移，靠右 / 靠下时偏移
+    数百像素、被 clamp 成纯 `from` 色（用户报的"渐变不是一成不变的，某些情况下会变化"，
+    纵向最明显）。**域三档**：`Glyph`（该字形自身）/ `Line`（该行，**默认**）/
+    `Frame`（整块，即"Text 域"）；`Line` 用 `Text::lines` 的排版元数据算行盒（**不遍历字形**）。
+    **采样点必须用未裁剪的字形几何**取"顶点在字形内的归一化位置"⇒ **裁剪不改变颜色**
+    （裁剪只少画一部分顶点；用裁剪后的角点取色会让同一字形在被裁前后颜色不同）。
+    `ramp`（含 `mode`）**必须进内容签名**：改色 / 改方向 / 改域都要重建窗口顶点缓存。
+  - **换行判定决定行高**：只有"文本真的超宽"（或显式 `.wrap(..)`）才按换行排版 ⇒ 行高 =
+    字号 × `Theme::line_spacing`；否则行高 = 字号（与 `Label` 同口径）。把 `avail_w` 无条件
+    当换行宽，会让**自动宽窗口首帧 30 → 次帧 36** 抖一下（`RJ_LABEL_TRACE` 一眼可见）。
 - **半透明与元素序**（两条都会静默毁掉画面）：
   - `tess::push_rounded_rect` / `push_rounded_ring` / `push_convex` 的硬体 alpha **就是调用方给的颜色 alpha**（羽化环从它降到 0）——**不要写死 `alpha = 1`**：曾导致所有半透明圆角矩形 / 图标渲染成不透明（取色器 `#6EA8FF0A` 色块实测像素 = 纯色）。
   - 组合控件里"画在自家背景之上"的装饰（手柄 / 箭头 / 分隔线）必须传 `ui.elem_hint()` 作为 `elem`（`push_panel_like` 的 `elem` 参数、`push_draw` 的第 3 个参数）：**元素序小的先画**，写死 `0`/`1` 会被本控件自己的背景或文本框整块盖住（`NumberInput` 的拖拽手柄、`ColorPicker` 的展开箭头都曾因此消失）。用绘制器（`ui.painter()`）时这条是**默认正确**的——原语各自取当时的 `elem_hint()`，要"压住自家已有内容"就**再取一次** painter（见 §18.18）。
@@ -2255,6 +2308,19 @@ sim-theme: ② 导入前 row_h=26 → 引擎侧 row_h=27（期望 27）[OK] 导�
 - **可拖拽容器**（窗口 / 面板）另有一条硬约定：`abs_base` 必须等于本帧实际平移量（`display_pos`），且**交互（命中 / 拖拽基准 / clamp）先于内容录制求解**——命中矩形取**上一帧结算尺寸**（`UiState::window_sizes` / `panel_sizes`，鼠标事件正是针对屏幕上那个矩形产生的）。若像早期实现那样"`abs_base` 用上一帧位置、几何用本帧位置"，拖拽期间一切走 `abs_base` 的绝对空间量（文本 `box_clip`、IME 光标、滑块基准）都会落后一帧（快速拖动时文字被裁 / 点击偏移）。位置求解复用 `ui::resolve_drag`（纯函数，可单测）。
 - 网格 cell 缓存（`UiState::grid_cells`）保证跨帧布局稳定；无缓存首帧渐进扩展，次帧起稳定。
 - **缓存了 UV / 图集区域的跨帧缓存，键里必须并入 `DynamicAtlas::revision()`**（`rjw_ui` 的窗口顶点缓存、`rjw_ui` 的 win=0 子槽缓存即如此）：`generation()` 只覆盖"重排搬动"，漏掉"逐出 + 空闲槽位被复用"——此时旧 UV 采样到别的字形像素（"陈旧文字 / 背景消失"），而内容签名不变 ⇒ 缓存永不失效。校验区域用 `region_peek()`（**不刷新寿命**，别用 `region()`——那会保活被校验的条目）。
+- **"宽度要等容器结算才知道"的东西**（目前唯一用户：容器内的水平**分割线**）：
+  `UiDraw::full_w` 标记 + `Ui::expand_pending_full_w(start, content_w)` 在**容器结算之后**回填
+  `rect.w`。三条硬约束：① **只增不减**（容器比线窄时保持原宽，绝不把控件拉成 0）；
+  ② 回填**立即清零标记** ⇒ 进 `finish` / 顶点缓存的命令里恒为 `false`（不进内容签名、
+  外层容器不会重复拉伸）；③ `win=0` 顶层**不标记**（根 frame 的固定宽是视口宽，
+  拿它会把线画成整屏 —— 历史 BUG，见 `layout::stack_avail_w`）。诊断 `RJ_DIVIDER_TRACE=1`。
+- **区块级容器（`foldable` 正文 / `namespace`）不另开顶层放置**：`Ui::container_scope` 期间
+  `begin_top_placement` 不新开 —— 否则正文首项前面会多带一个父 frame 的 `gap`
+  （用户可见："展开的内容看起来悬空"），并且空 `namespace` 会留下一个空缓存槽。
+- **多行文本编辑的垂直对齐**（`TextVAlignMode`）：文字 / 光标 / 选择 / IME / 点击行号**共用
+  同一个 `v_offset`**（`ui/textedit.rs::text_v_offset`）—— 分开算过一次，症状是"文字掉到框底、
+  光标还在顶部、点文字点不中"。默认 `TopLeft`（`InputStyle::padding_y` 垫高，**框拉高时位置
+  不变**），可选 `CenterLeft`（内容装得下才居中）。
 
 ### 18.18 绘制器（`Painter` / `DrawQueue`）：录制状态从 `Ui` 里抽出来
 

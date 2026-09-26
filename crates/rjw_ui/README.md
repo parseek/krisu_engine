@@ -135,6 +135,7 @@ ui.finish();
 |---|---|---|
 | `panel` | 无（纯背景 + 边框） | `()` |
 | `label` | 无（纯文本） | `()` |
+| `label_ex`（`Label::ex` / `ui.label_ex` / `ui.colored_label`） | 无（纯文本） | `Response`（`rect` = 占用矩形）。**扩展标签**：整组 `TextStyle`（`.style(..)`）+ 字段级糖（`.font_size` / `.font_family` / `.weight` / `.italic` / `.stretch` / `.letter_spacing` / `.line_height` / `.align` / `.valign` / `.wrap` / `.ellipsis` / `.tint`）+ **首末两色渐变**（`.gradient` / `.gradient_v` / `.gradient_axis` + 域 `.gradient_mode(Glyph｜Line｜Frame)` / `.gradient_glyph` / `.gradient_line` / `.gradient_text`；默认 `Line`，单行时与整块逐像素相同）；裸 `Ui` 用 `.show(ui)`、容器里用 `.show_in(ui)` 或 `ui.add(..)`。字段级 > `.style` > `Theme::label` |
 | `button` | hover / 按下 | `ButtonState`（`.clicked()` 等） |
 | `slider` | 拖拽标记 + 值 | `f32`（更新后的值） |
 | `checkbox` | 勾选值 | `CheckboxState`（`.checked()` / `.toggled()`） |
@@ -174,6 +175,54 @@ ui.add(ColorPicker::new("tint", &mut color).alpha(true)); // 面板里多一行 
 - `grid_at(pos, cols, |g| ...)`：均匀单元格网格，尺寸 = 最大子控件自然尺寸
 - `flex_at(pos, total_h, weights, |f, i| ...)`：固定总高按权重等分
 - `row(|r| ...)`：水平等高管线，占一行
+- `row_wrap(max_w, |r| ...)`：**自动换行的水平行**（等价 `row_builder().wrap_w(max_w).show(..)`）：塞不下就收行、行内左上角对齐、**只换行不压缩**
+- `foldable(id, label)`：**可收缩区块**（标题行 + 可折叠正文；默认折叠，点标题翻转）
+- `namespace(id, |ui| ...)`：**只加 ID 前缀**（不新增容器、不占额外光标）
+
+### 可收缩区块（`foldable`）
+
+```rust
+ui.foldable("perf", "性能统计").show(|ui| {
+    ui.label(&format!("FPS {fps}"));      // 折叠时这段**完全不录制**
+});
+ui.foldable("advanced", "高级").open(true).show(|ui| { /* 首次就展开 */ });
+
+// 标题 = 标准容器：里面可放任意控件（它们自己认领按下，不会连带折叠标题）；
+// 只固定宽、高度自然 ⇒ 放 Row / 多行内容时标题块自己长高、正文随之让位。
+ui.foldable_custom("filters", |t| {
+    t.label("过滤");
+    t.row(|r| { r.checkbox_mut("all", "全选", &mut all); });
+}).show(|ui| { ui.text_input("kw", &mut kw); });
+```
+
+- 标题行 = 一整行（高 `Theme::row_h`、宽铺满容器内容宽）：▶ / ▼ + 文本；**点它即翻转**（当帧
+  几何不变、**下一帧**生效，与窗口 ⌃ 同口径）；`Tab` 可聚焦、`Enter` / `Space` 翻转；
+- **默认折叠**（首次只见标题行）；`.open(true)` 只影响**从未被点过**的区块 —— 首帧把默认态
+  落盘到 `UiState::folded`（**绝对 ID → bool 的表**，存"明确态"）⇒ 默认折叠的区块点开后
+  **不会**被默认值折回去；
+- **折叠 = 正文完全不录制**（不占高 / 不进命中表 / 不产生顶点）；正文内部的跨帧状态
+  （滚动偏移 / 输入内容 / 焦点）**不清**，展开回来还是原样；
+- **折叠状态引擎托管**（`UiState::folded`）：应用不必多一个 `bool` 字段 —— 要读 / 改用
+  `UiState::{is_folded, set_folded, toggle_folded}`（`set_folded(id, false)` = 记住展开）；
+  `reset()` 一并清空（各区块回到自己的 `open(..)` 默认态）；
+- 正文录在**本区块的 ID 命名空间**里、并整体按 `FoldableStyle::body_indent` 缩进
+  （缩进同时作用于绘制与命中 ⇒ "点得到的就是看得见的"，容器尺寸不变）⇒ 两个区块里的同名
+  控件互不干扰、正文的归属一眼可见；
+- 样式取 `Theme::foldable`（`FoldableStyle`：常态透明底 + 悬停 / 按下高亮 + ▶ / ▼ 颜色 / 字号；
+  正文左缘竖引导线 `guide*`；可选"上下端阴影渐隐" `.with_body_fade(h, color)`；
+  标题"类按钮"块状外观 `FoldableStyle::button_like(&palette)`）。
+  `RJ_FOLD_TRACE=1` 打印每个区块的折叠态与几何（宽 / 高 / 缩进 / 渐隐）。
+
+### 命名空间（`namespace`）
+
+```rust
+ui.namespace("left",  |ui| { ui.text_input("kw", &mut left);  });   // 键 = "left/kw"
+ui.namespace("right", |ui| { ui.text_input("kw", &mut right); });   // 键 = "right/kw"
+```
+
+**不做任何布局**（没有背景 / 内边距 / 裁剪，也不另开 frame）——正文与"不用它"时逐像素
+相同，只是内部控件的**绝对 ID** 多了 `id/` 前缀；返回正文结算尺寸（`Vec2`）。窗口 / 面板 /
+滚动容器 / grid / 区块各自已是命名空间边界，本入口给"只想要 ID 隔离、不要容器"的场合。
 
 ## 绘制原语（圆角 / 渐变 / 矢量图标）
 

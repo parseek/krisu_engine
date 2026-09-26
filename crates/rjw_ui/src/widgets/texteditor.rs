@@ -51,6 +51,24 @@ use crate::draw::{CornerRadius, Size};
 use crate::style::{Brush, InputStyle};
 use crate::ui::{Resize, Ui};
 
+/// **多行文本编辑器的垂直对齐**（默认 [`Self::TopLeft`]）。
+///
+/// - [`Self::TopLeft`]（**默认**）：文字与光标都从文本框上缘往下垫 [`InputStyle::padding_y`]
+///   开始 —— **框被拉高时位置不变**（"文字 / 光标往下拉几个像素"的顶对齐，用户要点）；
+/// - [`Self::CenterLeft`]：内容（文字 + 光标 + 选择 + 点击行号）整体在框内**垂直居中**，
+///   且只在"内容装得下"时居中（装不下 = 顶对齐 + 可滚动）。
+///
+/// ⚠ **光标永远与文字用同一个偏移**：只挪文字会让"看得见的位置"点不中、光标悬在别处
+/// （本轮踩过的坑）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TextVAlignMode {
+    /// 顶对齐 + `padding_y` 垫高（默认；拉高文本框**不影响**文字位置）。
+    #[default]
+    TopLeft,
+    /// 垂直居中（第一行与单行输入框同高同心；光标 / 点击一起走）。
+    CenterLeft,
+}
+
 // ─── TextEditor ─────────────────────────────────────────────────
 
 /// **文本编辑器**（单行 / 多行；属性化 builder）。
@@ -60,10 +78,11 @@ use crate::ui::{Resize, Ui};
 /// | 属性 | 方法 | 说明 |
 /// |---|---|---|
 /// | 矩形 | [`at`](Self::at) | 显式 `Rect`（绝对定位，不占容器光标） |
-/// | 尺寸 | [`width`](Self::width) / [`height`](Self::height) | 自动申请时的宽 / 高（默认：单行 `min_w`×`height`；多行 `max(min_w,200)`×`90`，**逻辑像素**） |
+/// | 尺寸 | [`width`](Self::width) / [`height`](Self::height) | 自动申请时的宽 / 高（默认：**宽两者同源** `max(min_w, 200)`、高单行 `height` / 多行 `90`，**逻辑像素**） |
 /// | 下限 / 上限 | [`min_size`](Self::min_size) / [`max_size`](Self::max_size) | 申请尺寸的 clamp（**物理像素**） |
 /// | 多行 | [`multiline`](Self::multiline) | `Enter` 换行 / `↑↓` 跨行 / 垂直滚动 |
 /// | 换行 | [`no_wrap`](Self::no_wrap) | 多行**不自动换行**（横向滚动跟随光标） |
+/// | **垂直对齐** | [`valign`](Self::valign) | [`TextVAlignMode::TopLeft`]（**默认**，框拉高时文字/光标不动）/ [`TextVAlignMode::CenterLeft`]（居中，光标一起走） |
 /// | 缩放柄 | [`resize`](Self::resize) | `Resize::None`（默认）/ `Horizontal` / `Both` |
 /// | 字号 / 字体 | [`font_size`](Self::font_size) / [`font_family`](Self::font_family) | |
 /// | 颜色 | [`text_color`](Self::text_color) / [`caret_color`](Self::caret_color) / [`selection_color`](Self::selection_color) / [`preedit_color`](Self::preedit_color) | |
@@ -80,6 +99,8 @@ pub struct TextEditor<'a> {
     multiline: bool,
     /// 多行是否自动换行（单行恒不换行；`.no_wrap()` 置 `false`）。
     wrap: bool,
+    /// **垂直对齐**（默认 [`TextVAlignMode::TopLeft`]；见该枚举的文档）。
+    valign: TextVAlignMode,
     /// 右下角缩放柄（`None` = 无）。
     resize: Resize,
     /// 自动申请时的宽 / 高（`None` = 主题默认公式）。
@@ -113,6 +134,7 @@ impl<'a> TextEditor<'a> {
             rect: None,
             multiline: false,
             wrap: true,
+            valign: TextVAlignMode::TopLeft,
             resize: Resize::None,
             width: None,
             height: None,
@@ -149,6 +171,22 @@ impl<'a> TextEditor<'a> {
     /// 多行**不自动换行**（行宽不限，超出内容区横向滚动跟随光标；显式 `\n` 分行）。
     pub fn no_wrap(mut self) -> Self {
         self.wrap = false;
+        self
+    }
+
+    /// **垂直对齐**（默认 [`TextVAlignMode::TopLeft`]；见该枚举的文档）。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{TextEditor, TextVAlignMode};
+    /// # let mut note = String::new();
+    /// // 高文本框 + 内容垂直居中（文字与光标一起走）：
+    /// TextEditor::new("note", &mut note)
+    ///     .multiline()
+    ///     .height(180.0)
+    ///     .valign(TextVAlignMode::CenterLeft);
+    /// ```
+    pub fn valign(mut self, v: TextVAlignMode) -> Self {
+        self.valign = v;
         self
     }
 
@@ -320,16 +358,17 @@ impl<'a> TextEditor<'a> {
     /// 框自己溢出父级（用户报的"下面的控件不会跟着下去"）。
     fn allocate_rect(&self, ui: &mut Ui, style: &InputStyle) -> Rect {
         let scale = ui.scale();
-        let (dw, dh) = if self.multiline {
-            // ⚠ 必须 `× scale`：`style.*` 已经是**物理像素**（主题在下传前被 DPI 预乘），
-            // 而这两个默认值是**逻辑像素**——混用会让不同 DPI 下默认尺寸不一致
-            // （150% 下曾是 90 物理像素 = 60 逻辑像素，比文档写的 90 逻辑像素小 1/3）。
-            (
-                style.min_w.max(MULTILINE_DEF_W * scale),
-                MULTILINE_DEF_H * scale,
-            )
+        // **宽：单行与多行同源**（用户要求"单行多行尽量等宽"）：都取
+        // `max(InputStyle::min_w, 编辑器默认宽 × scale)`。此前单行只用 `min_w`（150% DPI 下
+        // 315 物理像素）、多行用 `max(min_w, 200 逻辑像素)`（300）⇒ 同一窗口里两个框天然不等宽。
+        // ⚠ 仍要 `× scale`：`style.*` 已经是**物理像素**（主题在下传前被 DPI 预乘），
+        // 而默认宽是**逻辑像素** —— 混用会让不同 DPI 下默认尺寸不一致。
+        let dw = style.min_w.max(EDITOR_DEF_W * scale);
+        // 多行默认高 = `MULTILINE_DEF_H`（**逻辑像素**；文案见常量文档）。
+        let dh = if self.multiline {
+            MULTILINE_DEF_H * scale
         } else {
-            (style.min_w, style.height)
+            style.height
         };
         let default = Vec2::new(
             self.width.map_or(dw, |w| w.to_physical(scale)),
@@ -394,6 +433,9 @@ impl Widget for TextEditor<'_> {
         // 样式覆盖经**帧内主题**下传：核心读 `ui.theme.input`，因此这里临时替换、
         // 调用后还原——调用方看到的主题不变（帧内后续控件不受影响）。
         let saved = std::mem::replace(&mut ui.theme.input, style);
+        // **垂直对齐模式**同样配对下传 / 还原（`text_area_impl` 是公开 API，不能加参数；
+        // 见 `Ui::text_valign` 的字段文档）。
+        let saved_valign = std::mem::replace(&mut ui.text_valign, self.valign);
         if self.resize != Resize::None {
             // 缩放柄路径：尺寸责任链 + 拖拽（核心只负责绘制文本）。
             // 下限与 `allocate_rect` **同源**（都不调 `.min_size` ⇒ 主题下限：
@@ -417,16 +459,23 @@ impl Widget for TextEditor<'_> {
             ui.text_input_core(self.id, rect, self.value);
         }
         ui.theme.input = saved;
+        ui.text_valign = saved_valign;
         Response { rect, ..Default::default() }
     }
 }
 
 // ─── 尺寸解算（纯函数，可单测） ─────────────────────────────────
 
-/// 多行编辑器**默认宽**（**逻辑像素**；`allocate_rect` 里 × scale ⇒ 物理像素）。
-const MULTILINE_DEF_W: f32 = 200.0;
+/// **编辑器默认宽**（**逻辑像素**；单行与多行**同源**，`allocate_rect` 里 × scale ⇒ 物理像素）。
+///
+/// 为什么不按行数分两个默认宽：同一个界面里"单行输入框"与"多行文本框"通常并排出现，
+/// 两个不同的默认宽会让它们**看起来不是一组控件**（用户实测："单行多行尽量等宽"）。
+const EDITOR_DEF_W: f32 = 200.0;
 
-/// 多行编辑器**默认高**（**逻辑像素**；同 [`MULTILINE_DEF_W`]）。
+/// 多行编辑器**默认高**（**逻辑像素**）：一个"能写几行"的文本框（不是一行高）。
+///
+/// 一行高的多行框看起来与单行输入框无异，但用户要的是"多行就是多行"；**垂直位置**由
+/// [`TextVAlignMode`] 决定（默认顶对齐 + `padding_y` 垫高，框拉高时文字不动）。
 const MULTILINE_DEF_H: f32 = 90.0;
 
 /// **开了 `.resize(..)` 且没调 `.min_size(..)` 时的默认下限**（物理像素）：

@@ -207,9 +207,26 @@ const SCROLL_V_POS: Vec2 = Vec2::new(830.0, 700.0);
 /// 没有 `.height(..)` 时视口必须**按内容**定高（min(内容高, 屏幕剩余)），不许撑到屏幕底
 /// （用户实测："最开始打开调色板编辑器时，仍然会将高度撑到窗口底端，直到手动拉开大小"）。
 const SCROLL_SHORT_POS: Vec2 = Vec2::new(830.0, 60.0);
+/// `--sim-scroll-mode`：**横向滚动**那扇窗（`.width(150) + .hscroll(true)`）的位置 ——
+/// 摆在 `SCROLL_CLIP`(520,470) 之下、`SCROLL_V`(830,700) 左侧的空白带，且**底部横条**
+/// 所在的那条线不被任何更高 z 的窗口压住（否则 `window_occluded` 会让点按落空）。
+const SCROLL_H_POS: Vec2 = Vec2::new(520.0, 610.0);
+/// `--sim-scroll-mode`：**`ScrollArea` builder** 那处现场（win=0 顶层容器，与窗口级对照）——
+/// 摆在 `img_box_fill`(24,840 + 326×130) 右侧、`strict_win`(y ≥ 690) 左下角的空白带：
+/// **win=0 内容会被任意窗口遮挡**（`window_occluded`：`z = 0` 被所有窗口挡），所以位置
+/// 必须落在所有窗口矩形之外，否则点不中条带（实测：放到 `palette_h_win` 覆盖区里 ⇒ 恒 0）。
+const SCROLL_AREA_POS: Vec2 = Vec2::new(360.0, 985.0);
+/// 横向滚动现场的**可视区宽**（逻辑像素；录制与脚本坐标解算共用 ⇒ 不写死像素）。
+const SCROLL_H_VIEW_W: f32 = 150.0;
+/// 横滚现场里"探针"控件在**内容坐标**里的位置（物理像素）：x = `1.2 × 视口宽` ⇒ 横滚
+/// **一页**（偏移 += 视口宽）之后它才进视口；y = 0（与 400 宽长行**同一行、压在上面**：
+/// 探针后录制 ⇒ 控件级遮挡上它赢）——这样"探针所在的那一行的中心"可以直接从窗口底缘
+/// 解算（`底缘 − 行高/2`），脚本不必知道标题栏高度。
+fn scroll_h_probe_pos(view_w: f32) -> Vec2 {
+    Vec2::new(view_w * 1.2, 0.0)
+}
 /// `--sim-scroll-mode` 第四扇窗（调色板形态：21 行 `标签 + 取色器`，**自动宽、不设 resize**）。
-const PALETTE_POS: Vec2 = Vec2::new(1260.0, 120.0);
-/// 另外两种调色板配置的位置（`.width(320)` / `.width(320)+vscroll`）。
+const PALETTE_POS: Vec2 = Vec2::new(1260.0, 120.0);/// 另外两种调色板配置的位置（`.width(320)` / `.width(320)+vscroll`）。
 const PALETTE_W_POS: Vec2 = Vec2::new(1600.0, 120.0);
 const PALETTE_WS_POS: Vec2 = Vec2::new(1600.0, 640.0);
 /// `.width(320) + .height(420) + vscroll(Scroll)` 那扇窗（**回答"长内容窗口怎么办"**）：
@@ -680,6 +697,15 @@ struct Windows {
     /// --sim-scroll-mode 两扇窗的文本（各自独立，避免共用缓冲互相覆写）。
     scroll_text_a: String,
     scroll_text_b: String,
+    /// --sim-scroll-mode 横向现场：400 逻辑宽的长行（`scroll_h_te`）与**探针**（`scroll_h_probe`）。
+    scroll_text_h: String,
+    scroll_h_probe: String,
+    /// `ScrollArea` 里的 400 逻辑宽长行。
+    area_text: String,
+    /// --sim-scroll-mode `ScrollArea` 现场：builder 返回的 `(视口宽, 内容宽)`（录制期写入，
+    /// 帧末断言读回 —— 与 `row_size` 等同一套"观测缓冲"口径）。
+    area_view_w: Option<f32>,
+    area_content_w: Option<f32>,
     /// --sim-scroll-mode：调色板形态那扇窗的 21 个颜色。
     pal_colors: [Color; 21],
     /// 另两种调色板配置各用一份（避免同一 id 的取色器状态互相干扰）。
@@ -772,6 +798,11 @@ impl Windows {
             show_scroll_wins: false,
             scroll_text_a: String::new(),
             scroll_text_b: String::new(),
+            scroll_text_h: String::new(),
+            scroll_h_probe: String::new(),
+            area_text: String::new(),
+            area_view_w: None,
+            area_content_w: None,
             pal_colors: [Color::rgba_u8(110, 168, 255, 255); 21],
             pal_colors2: [Color::rgba_u8(110, 168, 255, 255); 21],
             pal_colors3: [Color::rgba_u8(110, 168, 255, 255); 21],
@@ -912,14 +943,15 @@ impl Windows {
         // ── `--sim-resize` 阶段 2：**没有 `.width()` 也要能拖宽** ────────────────
         // 用户实测："resize Horizontal 不在设置 width 的情况下无法缩放"——根因是持久宽
         // （`window_widths`）只在 `width.map(..)` 里被读 ⇒ 拖了也被丢掉。这里故意**不写**
-        // `.width()`，只开 `Resize::Horizontal`：拖右 +50 之后宽必须变大、**高不变**。
+        // `.width()`，只开 `.resize(true)`：垂直轴不是视口（没 `.height()` / 没 vscroll）
+        // ⇒ 判定表给**只有水平**能拖 —— 拖右 +50 之后宽必须变大、**高不变**。
         if self.show_grip_win {
             ui.window("grip_win")
                 .pos(Position::Physical(GRIP_WIN_POS))
-                .resize(true, Resize::Horizontal)
+                .resize(true)
                 .title("没有 width，也能拖宽")
                 .show(|w| {
-                    w.label("只有宽度轴可拖（Resize::Horizontal）");
+                    w.label("只有宽度轴可拖（判定表：垂直轴不是视口）");
                 });
         }
         // ── `--sim-scroll-mode`：**按轴**的溢出策略验收现场 ──────────────────────
@@ -1014,7 +1046,8 @@ impl Windows {
                 .vscroll(ScrollMode::Scroll)
                 // 与用户现场一致（egUI 的调色板窗）：可拖大小 + 可收起 ⇒ "收起"必须
                 // 真的把它收成一行标题栏（引擎侧的固定高不得把视口又顶回 420）。
-                .resize(true, Resize::Both)
+                // `.height(420)` ⇒ 垂直轴是视口 ⇒ `.resize(true)` 允许**垂直 + 水平**。
+                .resize(true)
                 .collapsible(true, None)
                 .title("调色板（width 320 + height 420 + vscroll）")
                 .show(|w| {
@@ -1074,7 +1107,7 @@ impl Windows {
                 .width(140.0)
                 .vscroll(ScrollMode::Scroll)
                 // 关掉窗口自己的缩放柄：右下角要留给**滚动条**（否则点下去是在拖窗口尺寸）。
-                .resize(false, Resize::None)
+                .resize(false)
                 .title("vscroll(Scroll)")
                 .show(|w| {
                     for i in 0..12 {
@@ -1092,15 +1125,62 @@ impl Windows {
                     w.label("第 0 行");
                     w.label("第 1 行");
                 });
+            // ③g **横向滚动**（本轮新增）：`.width(150) + .hscroll(true)` —— 固定宽视口 +
+            //     **底部横条**；内容保持**自然宽、不折行**（才有横向溢出可滚）。
+            //     内容 = 一行 400 逻辑宽的编辑器 + **压在同一行上的探针**（x = 1.2 × 视口宽、
+            //     后录制 ⇒ 遮挡上它赢）：探针**只有横滚一页之后**才进视口 ⇒ 脚本可做
+            //     正 / 负对照（命中真的跟着 `offset_x` 平移，而不是"看不见却点得着"）。
+            ui.window("scroll_h_win")
+                .pos(Position::Physical(SCROLL_H_POS))
+                .width(SCROLL_H_VIEW_W)
+                .hscroll(true)
+                // 关掉窗口缩放柄：底部那一块要留给横条（点下去不该是在拖窗口尺寸）。
+                .resize(false)
+                .title("hscroll(true)")
+                .show(|w| {
+                    let vw = SCROLL_H_VIEW_W * w.ui_mut().scale();
+                    w.add_at(
+                        Position::Physical(Vec2::ZERO),
+                        TextEditor::new("scroll_h_te", &mut self.scroll_text_h).width(400.0),
+                    );
+                    w.add_at(
+                        Position::Physical(scroll_h_probe_pos(vw)),
+                        TextEditor::new("scroll_h_probe", &mut self.scroll_h_probe).width(40.0),
+                    );
+                });
+            // ④ **`ScrollArea` builder**（容器级横滚）：与窗口级共用同一实现
+            //    （`scroll_at_axes`），但入口是 `widgets::ScrollArea` —— 这条现场证明
+            //    "builder 也真的能横滚"（内容宽 > 视口宽 + 点轨道翻页改了 `offset_x`）。
+            //
+            // ⚠ 放 **win=0 顶层**（不套窗口）并显式给 `pos`：滚动沙箱**自己不 note 内容**
+            //    （它是"可视区"语义，占位由调用方给），套进自动宽窗口会让窗口塌成一条缝；
+            //    位置写常量 ⇒ 脚本按同一常量算点（不依赖 dump）。
+            let vw = SCROLL_H_VIEW_W * ui.scale();
+            let out = ui
+                .scroll_area("area_h", Size::Physical(Vec2::new(vw, 60.0)))
+                .pos(Position::Physical(SCROLL_AREA_POS))
+                .vscroll(true)
+                .hscroll(true)
+                .show(|s| {
+                    s.add_at(
+                        Position::Physical(Vec2::ZERO),
+                        TextEditor::new("area_te", &mut self.area_text).width(400.0),
+                    );
+                });
+            self.area_view_w = Some(out.view.x);
+            self.area_content_w = Some(out.content.x);
         }
         // ── `--sim-row-overflow`：**窄的固定宽窗口**里的验收现场 ──────────────────
         //
         // 用户给的判定表（egui 语义）：同宽同内容下，**水平轴的策略**决定"压缩"还是"裁切"：
-        // ① `.hscroll(NoClip)` = **压缩**内容 ⇒ `row` 里整排控件缩进可用宽（每个子项各自
-        //    都没超限，但整行超过可用宽 ⇒ 必须按余量压最后一个 —— 用户实测的 BUG）；
-        // ② `.hscroll(ClipOnly)` = **裁切**内容 ⇒ 子项按**自然宽**排（不压缩），超出部分
-        //    被裁掉；此时溢出到窗口外的控件（`add_at` 到右边）**看不见也点不着**
+        // ① `.hscroll(false)`（= `NoClip`）= **压缩**内容 ⇒ `row` 里整排控件缩进可用宽（每个
+        //    子项各自都没超限，但整行超过可用宽 ⇒ 必须按余量压最后一个 —— 用户实测的 BUG）；
+        // ② `.hscroll(ScrollMode::ClipOnly)` = **裁切**内容 ⇒ 子项按**自然宽**排（不压缩），
+        //    超出部分被裁掉；此时溢出到窗口外的控件（`add_at` 到右边）**看不见也点不着**
         //    （旧版是"看不见却点得着"的幽灵控件）。
+        //
+        // （真**横向滚动条**的现场在 `--sim-scroll-mode`：`.hscroll(true)` 会让窗口进滚动
+        //   沙箱，这一组"压缩 vs 裁切"的尺寸判据要的就是**不进沙箱**的那两条路径。）
         //
         // 位置 / 尺寸全部写成常量：脚本按同一组常量算点击点（不写死"猜"出来的像素）。
         if self.sim_row_overflow {
@@ -1110,8 +1190,8 @@ impl Windows {
             ui.window("row_win")
                 .pos(Position::Physical(ROW_WIN_POS))
                 .width(150.0)
-                .hscroll(ScrollMode::NoClip)
-                .resize(false, Resize::None)
+                .hscroll(false)
+                .resize(false)
                 .title("窄窗口 · 压缩内容")
                 .show(|w| {
                     // ① 一行：标签 + 输入框（输入框默认宽 = 主题 `input.min_w`，远超可用宽）
@@ -1129,12 +1209,12 @@ impl Windows {
                     });
                     self.row_size_picker = Some(size2);
                 });
-            // ② 同宽同内容、水平轴改成**视口**：内容不再被压缩（自然宽），超出被裁。
+            // ② 同宽同内容、水平轴改成**只裁不滚**的视口：内容不再被压缩（自然宽），超出被裁。
             ui.window("row_clip_win")
                 .pos(Position::Physical(ROW_CLIP_POS))
                 .width(150.0)
                 .hscroll(ScrollMode::ClipOnly)
-                .resize(false, Resize::None)
+                .resize(false)
                 .title("窄窗口 · 裁切内容")
                 .show(|w| {
                     let size = w.row(|r| {
@@ -1155,10 +1235,12 @@ impl Windows {
                 });
         }
         // 严格裁剪窗口（Placement::Clip）：内容超出窗口被强制裁剪（Clip 沙箱）。
+        // ⚠ `Placement::Clip` 让**两条轴都是视口** ⇒ `.resize(true)` 的判定表给
+        // **垂直 + 水平**（内容被裁 ⇒ 拖高真的生效）。
         ui.window("strict_win")
             .pos(Vec2::new(560.0, 460.0))
             .placement(Placement::Clip)
-            .resize(true, Resize::Both)
+            .resize(true)
             .show(|w| {
             w.label("严格裁剪窗口（内容超出被裁）");
             w.add(Label::new(
@@ -1233,13 +1315,16 @@ impl Windows {
                     });
                     w.label("本体 Tile 1:1");
                 });
-            // **宽高同调**（`resize(true, Resize::Both)`）：右下角柄拖宽拖高，高度跨帧
+            // **宽高同调**（`.resize(true)` + 垂直视口）：右下角柄拖宽拖高，高度跨帧
             // 持久于 `UiState::window_heights`（高度一旦被拖过就由用户接管，内容不再撑高）。
+            // ⚠ **垂直轴先得是视口**（判定表的条件）：`.vscroll(true)` 给它一个纵向视口 ——
+            // 内容矮时不会出现滚动条（视口按内容定高），但"拖高"从此真的生效。
             // 这也是"斜线缩放柄"的主要展示窗口（柄形状由主题调节窗口的「拖拽柄」选）。
             ui.window("img_box_fill")
                 .pos(Vec2::new(16.0, 560.0))
                 .width(200.0)
-                .resize(true, Resize::Both)
+                .vscroll(true)
+                .resize(true)
                 .title("TTT（可拖宽拖高）")
                 // **引擎托管的收起**（`None`）：应用**不必**自己持有一个 `bool`，点 ⌃ 由引擎
                 // 按窗口绝对 ID 翻转（存 `UiState::collapsed`）；应用要读 / 代码收起时用
@@ -1912,6 +1997,15 @@ struct UiApp {
     /// --sim-scroll-mode：`vscroll(Scroll)` 那扇窗**右侧滚动条**上的抓取点（从 dump 的窗口
     /// 矩形 + 主题内边距解算 ⇒ 不写死像素）。
     scroll_thumb_pt: Option<Vec2>,
+    /// --sim-scroll-mode 横向现场：底部横条的**翻页点**与探针的**点击点**（物理像素；
+    /// 同样从 dump 的窗口矩形 + 主题内边距解算）。
+    hsc_page_pt: Option<Vec2>,
+    hsc_probe_pt: Option<Vec2>,
+    /// --sim-scroll-mode 横向现场：**横滚之前**点探针像素时的文本焦点（必须不是探针 ——
+    /// 负对照：内容没滚进来之前那个像素上什么都没有）。
+    hsc_focus_before: Option<String>,
+    /// --sim-scroll-mode `ScrollArea` 现场：builder 返回的 `(视口宽, 内容宽)` 与横条翻页点。
+    area_page_pt: Option<Vec2>,
     /// **文件选择器策略**（导入 / 导出共用）：真人用法 = 弹系统选择器；测试 = 由显式 CLI
     /// （`--no-file-dialog` / `--pick <目标>=<路径|none>`）决定，可**完全不碰 `rfd`**。
     /// 见 [`filedialog::Policy`]（那里说明了为什么**不用**环境变量做旁路）。
@@ -2219,6 +2313,10 @@ impl UiApp {
             sim_pick_save: false,
             sim_scroll_mode: false,
             scroll_thumb_pt: None,
+            hsc_page_pt: None,
+            hsc_probe_pt: None,
+            hsc_focus_before: None,
+            area_page_pt: None,
             dialogs: filedialog::Policy::interactive(),
             sim_ta_text: String::new(),
             sim_ta_single: String::new(),
@@ -3024,7 +3122,8 @@ impl App for UiApp {
         }
         // ── 调试：脚本化鼠标（`--sim-resize`）──────────────────────
         // 拖 `img_box_fill` 的右下角柄（**斜向**拖 +60/+40）⇒ 宽高都该变大
-        // （`.resize(true, Resize::Both)`）。坐标 = 窗口原点 + 结算尺寸 − 半个柄。
+        // （该窗有 `.vscroll(true)` ⇒ 垂直轴是视口 ⇒ `.resize(true)` 判成**宽高同调**）。
+        // 坐标 = 窗口原点 + 结算尺寸 − 半个柄。
         if self.sim_resize {
             let p = self.sim_resize_pt.unwrap_or(Vec2::ZERO);
             // **冻结目标点**（帧 8 记录）：柄随窗口长大而移动，每帧重算目标 = 鼠标被
@@ -3107,6 +3206,32 @@ impl App for UiApp {
                 80..=81 => f.debug_inject_mouse(fold, false),
                 82..=83 => f.debug_inject_mouse(fold, true),
                 84..=86 => f.debug_inject_mouse(fold, false),
+                _ => {}
+            }
+            // ③ **横向**现场（三段，同一像素做正 / 负对照）：
+            //    ① 30..=35 横滚**之前**点探针像素 ⇒ 那里什么都没有（负对照，焦点不该是探针）；
+            //    ② 44..=49 点底部横条的**轨道** ⇒ 翻一页（`offset_x += 视口宽`）；
+            //    ③ 52..=57 点**同一个**像素 ⇒ 这次必须命中探针（内容真的横移了、命中跟着走）。
+            let page = self.hsc_page_pt.unwrap_or(Vec2::ZERO);
+            let probe = self.hsc_probe_pt.unwrap_or(Vec2::ZERO);
+            match f.frames() {
+                30..=31 => f.debug_inject_mouse(probe, false),
+                32..=33 => f.debug_inject_mouse(probe, true),
+                34..=35 => f.debug_inject_mouse(probe, false),
+                44..=45 => f.debug_inject_mouse(page, false),
+                46..=47 => f.debug_inject_mouse(page, true),
+                48..=49 => f.debug_inject_mouse(page, false),
+                52..=53 => f.debug_inject_mouse(probe, false),
+                54..=55 => f.debug_inject_mouse(probe, true),
+                56..=57 => f.debug_inject_mouse(probe, false),
+                _ => {}
+            }
+            // ④ `ScrollArea` builder 现场：点它的横条轨道翻页（容器级横滚同一实现）。
+            let apage = self.area_page_pt.unwrap_or(Vec2::ZERO);
+            match f.frames() {
+                60..=61 => f.debug_inject_mouse(apage, false),
+                62..=63 => f.debug_inject_mouse(apage, true),
+                64..=65 => f.debug_inject_mouse(apage, false),
                 _ => {}
             }
         }
@@ -3991,6 +4116,61 @@ impl App for UiApp {
                     ));
                 }
             }
+            // `--sim-scroll-mode`：**横向**现场的点（同样每帧只解一次、只信 frame ≥ 2）。
+            //
+            // - 横条**翻页点**：条带 = 视口底缘 14px 高 ⇒ 取 `底缘 − pad − 7`（条带中线）；
+            //   x 取视口 `0.9` 宽处 —— 滑块长只有视口宽的 ~37%（内容 400 逻辑 / 视口 150）
+            //   ⇒ 那里必是**轨道**（点一下翻一页，`offset_x += 视口宽`）。
+            // - **探针点**：x = 视口 `0.35` 宽（横滚一页后正好落在探针 0.2~0.47 视口宽内）；
+            //   y = `底缘 − 行高/2`（内容只有一行 ⇒ 视口高 = 行高）。
+            if self.sim_scroll_mode && sim_frame >= 2 && self.hsc_page_pt.is_none() {
+                let dump = ui.debug_dump();
+                let pad = ui.theme().panel.padding + ui.theme().panel.border_w;
+                let vw = SCROLL_H_VIEW_W * ui.scale();
+                let row_h = ui.theme().input.height;
+                if let Some(w) = dump.windows.iter().find(|p| p.id == "scroll_h_win") {
+                    let bottom = w.origin.y + w.size.y - pad;
+                    self.hsc_page_pt =
+                        Some(Vec2::new(w.origin.x + pad + vw * 0.9, bottom - 7.0));
+                    self.hsc_probe_pt =
+                        Some(Vec2::new(w.origin.x + pad + vw * 0.35, bottom - row_h * 0.5));
+                }
+                // `ScrollArea` 是 **win=0** 顶层容器：位置是常量 ⇒ 点直接从常量算
+                // （不必经 dump）：条带中线 = `pos.y + 视口高 − 7`。
+                self.area_page_pt = Some(Vec2::new(
+                    SCROLL_AREA_POS.x + vw * 0.9,
+                    SCROLL_AREA_POS.y + 60.0 - 7.0,
+                ));
+            }
+            // `--sim-scroll-mode` 横向现场：**负对照**的焦点（帧 40 = 负对照点击之后、
+            // 点横条翻页之前）—— 那个像素上此刻什么都没有 ⇒ 焦点不能是探针。
+            if self.sim_scroll_mode && sim_frame == 40 {
+                self.hsc_focus_before = ui.debug_dump().text_focus;
+            }
+            // `--sim-scroll-mode` **横向（窗口级）** 判定：紧跟正对照点击之后（帧 58）——
+            // 焦点是**单槽状态**，后面别的窗口按钮（帧 80.. ⌃）会把它清掉，到帧 158 就只能
+            // 读到 `None`（实测踩过），所以窗口级的焦点断言必须在这里。
+            if self.sim_scroll_mode && sim_frame == 58 {
+                let dump = ui.debug_dump();
+                let vw = SCROLL_H_VIEW_W * ui.scale();
+                let st_h = ui.state().scrolls().get("scroll_h_win/scroll").copied();
+                let probe_id = "scroll_h_win/scroll/scroll_h_probe";
+                let win_ok = st_h.is_some_and(|s| s.content_w > vw + 1.0 && s.offset_x > 1.0);
+                let focus_ok = dump.text_focus.as_deref() == Some(probe_id);
+                let neg_ok = self.hsc_focus_before.as_deref() != Some(probe_id);
+                eprintln!(
+                    "sim-scroll-mode[横向滚动·窗口]: 内容宽={:?} 视口宽={vw:.0} 状态={st_h:?} \
+                     翻页前焦点={:?} 翻页后焦点={:?} {}",
+                    st_h.map(|s| s.content_w),
+                    self.hsc_focus_before,
+                    dump.text_focus,
+                    if win_ok && focus_ok && neg_ok {
+                        "[OK] `.hscroll(true)` 建成横向视口 + 点轨道翻页改了 offset_x + 同一像素（翻页前点不到探针／翻页后命中探针）= 命中跟着内容平移"
+                    } else {
+                        "[FAIL] 横条没点到 / offset_x 没写回 / 命中没跟着平移"
+                    }
+                );
+            }
             // `--sim-scroll-mode`：`palette_h_win` 的 ⌃ 点 + 收起前后高度。
             // 点算在**第 60 帧之前**（那时窗口还是 420 高、标题栏在顶上），注入在 80..=86，
             // 判定在 140（给足"翻转 → 下一帧重结算"的时间）。
@@ -4021,6 +4201,30 @@ impl App for UiApp {
                             "[OK] `.height(420) + vscroll(Scroll) + resize` 的窗口点 ⌃ 真的收成一行标题栏（视口不再把固定高顶回来）"
                         } else {
                             "[FAIL] 点 ⌃ 之后窗口没收起（滚动视口把固定高又拿回来了）"
+                        }
+                    );
+                }
+                // ④ **`ScrollArea` builder**（容器级横滚）：与窗口级共用同一实现
+                //     （`scroll_at_axes`）—— 这里证明"builder 也真的能横滚"
+                //     （内容宽 > 视口宽 + 点轨道翻页改了 `offset_x`）。
+                if sim_frame == 158 {
+                    let vw = SCROLL_H_VIEW_W * ui.scale();
+                    let st_area = ui.state().scrolls().get("area_h").copied();
+                    let area_ok = st_area.is_some_and(|s| s.offset_x > 1.0)
+                        && self
+                            .windows
+                            .area_content_w
+                            .zip(self.windows.area_view_w)
+                            .is_some_and(|(c, v)| c > v + 1.0);
+                    eprintln!(
+                        "sim-scroll-mode[横向滚动·ScrollArea]: 视口宽={vw:.0} \
+                         builder(视口={:?}, 内容={:?}) 滚动={st_area:?} {}",
+                        self.windows.area_view_w,
+                        self.windows.area_content_w,
+                        if area_ok {
+                            "[OK] `ScrollArea` builder 与窗口级同通路：内容自然宽（不折行）+ 横条翻页改了 offset_x"
+                        } else {
+                            "[FAIL] builder 路径没横滚（内容没超出 / 条带没点到）"
                         }
                     );
                 }

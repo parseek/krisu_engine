@@ -15,6 +15,98 @@ use crate::id::IdAbsolute;
 /// 静态标签缓存全部冲掉，避免每帧全部重新整形（抖动）。
 pub const TEXT_BUFFER_CACHE_CAP: usize = 256;
 
+// ─── 文本排版缓存键 ────────────────────────────────────────────
+
+/// **文本排版缓存键**（[`UiState::text_buffers`] 的键）：一切**影响排版结果**的输入。
+///
+/// # 为什么从元组改成结构体
+///
+/// 键原先是一个五元组（`文本 / 字号 / 字体族 / 换行宽 / (行距倍率, 全局字重, 版本)`）——
+/// 它只覆盖 `Label` 当时能表达的样式。`LabelEx` 带来**逐标签**的字重 / 斜体 / 拉伸 /
+/// 字距 / 行高 / 行距，再往元组里塞就是"八层嵌套、读写都要数位置"；而**漏一个字段 =
+/// 改样式后复用旧排版**（表现为"改了字重文字不刷新"，与"漏进内容签名"是同一类坑），
+/// 所以列成有名字段。
+///
+/// # 口径
+///
+/// - **只放排版相关的量**：颜色 / 渐变 / 水平对齐**不进键**（它们不改整形结果，属绘制期——
+///   水平对齐由 `TextAlign` 在绘制时算 anchor，见 `Ui::push_text_rect`）；
+/// - **字体族必须单独进键**：`rjw_text` 的 `attrs` 摘要**不含族名**（只哈希
+///   weight/style/stretch/metadata），只靠摘要会漏掉"同字重不同字体族"；
+/// - `line_height` / `line_space` **分别进键**（不预先折算"有效行高"：折算在 `rjw_text`
+///   内部，这里只做等价性判定）；
+/// - `version` = [`TEXT_LINE_HEIGHT_VERSION`](crate::ui::TEXT_LINE_HEIGHT_VERSION)：
+///   行高策略变更时整表自动失效。
+///
+/// ⚠ **覆盖范围 = `TextStyle` 的排版字段**。若有人用 `TextStyle::attrs(..)` 塞进
+/// `font_features` / `text_decoration` 一类本键未覆盖的字段，缓存不会因它们失效
+/// （逃生舱的代价，已在 `LabelEx::style` 文档里写明）。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TextKey {
+    text: String,
+    /// 字号（物理像素，已取整）位模式。
+    size_bits: u32,
+    /// 换行宽度（物理像素，已取整；`0` = 不换行）位模式。
+    wrap_bits: u32,
+    /// **显式行高**（物理像素）位模式；`None` = 由 `line_space` / 字号推导。
+    line_height_bits: Option<u32>,
+    /// 行距：`(0 = Px / 1 = Multiple, 值位模式)`；`None` = 引擎默认。
+    line_space: Option<(u8, u32)>,
+    /// 字体族（`Name` 取名字；`Serif` 一类具名族取判别串）。
+    family: Option<String>,
+    /// 字重（`Weight::0`）。
+    weight: u16,
+    /// 斜体判别（0 = Normal / 1 = Italic / 2 = Oblique）。
+    italic: u8,
+    /// 拉伸判别（cosmic-text `Stretch` 九档）。
+    stretch: u8,
+    /// 字距（EM）位模式。
+    letter_spacing_bits: Option<u32>,
+    /// 排版版本号（[`TEXT_LINE_HEIGHT_VERSION`](crate::ui::TEXT_LINE_HEIGHT_VERSION)）。
+    version: u8,
+}
+
+impl TextKey {
+    /// 从**归一后的文本样式**构造（`text` 原文；`style.size` / `wrap_px` 均为**物理像素**）。
+    pub(crate) fn new(text: &str, style: &rjw_text::TextStyle, wrap_px: f32) -> Self {
+        use rjw_text::cosmic_text::{FamilyOwned, Stretch, Style};
+        let attrs = &style.attrs;
+        Self {
+            text: text.to_owned(),
+            size_bits: style.size.round().to_bits(),
+            wrap_bits: wrap_px.round().max(0.0).to_bits(),
+            line_height_bits: style.line_height.map(|v| v.round().to_bits()),
+            line_space: style.line_space.map(|ls| match ls {
+                rjw_text::LineSpace::Px(v) => (0u8, v.to_bits()),
+                rjw_text::LineSpace::Multiple(v) => (1u8, v.to_bits()),
+            }),
+            family: Some(match &attrs.family_owned {
+                FamilyOwned::Name(n) => n.to_string(),
+                other => format!("{other:?}"),
+            }),
+            weight: attrs.weight.0,
+            italic: match attrs.style {
+                Style::Normal => 0,
+                Style::Italic => 1,
+                Style::Oblique => 2,
+            },
+            stretch: match attrs.stretch {
+                Stretch::UltraCondensed => 0,
+                Stretch::ExtraCondensed => 1,
+                Stretch::Condensed => 2,
+                Stretch::SemiCondensed => 3,
+                Stretch::Normal => 4,
+                Stretch::SemiExpanded => 5,
+                Stretch::Expanded => 6,
+                Stretch::ExtraExpanded => 7,
+                Stretch::UltraExpanded => 8,
+            },
+            letter_spacing_bits: attrs.letter_spacing_opt.map(|l| l.0.to_bits()),
+            version: crate::ui::TEXT_LINE_HEIGHT_VERSION,
+        }
+    }
+}
+
 /// 单个交互控件的持久状态（按 ID 存放于 [`UiState::widgets`]，跨帧保留）。
 #[derive(Clone, Debug, Default)]
 pub struct WidgetState {
@@ -84,6 +176,14 @@ pub struct WidgetState {
     /// ⚠ 绝不能借用 `UiState::combo_open`——那是**父下拉**的槽位，早期"菜单里嵌 `Dropdown`"
     /// 的做法正是被它覆盖，症状是"点一下整条 popup 消失"。
     pub(crate) submenu_open: bool,
+    /// **最近一次交互矩形**（**绝对逻辑屏幕坐标**；[`Ui::interact`](crate::Ui::interact) 写入）。
+    ///
+    /// 用途：**诊断 / 测试**要按名字拿到"这个控件这帧在屏幕上的哪"——例如脚本化点击
+    /// （`--sim-*`）先读它再注入，而不是把手算的坐标写死（主题 / 布局一改就失效）。
+    /// 只由 [`Ui::interact`](crate::Ui::interact) 维护（`hit_abs` 的调用方），不参与布局。
+    ///
+    /// `None` = 还没交互过（纯展示控件 / 只经 `allocate` 的路径）。
+    pub(crate) last_interact_rect: Option<Rect>,
 }
 
 /// 滚动容器状态（`UiState.scrolls`，跨帧持久）。
@@ -94,6 +194,13 @@ pub struct ScrollState {
     /// 每个元素绘制取整时**整体刚性移动**——否则相邻元素取整相位不同步，拖动
     /// 滚动条时内容相对位置逐帧交替（"抖动"，如勾选框的蓝色填充块）。
     pub offset: f32,
+    /// **横向滚动偏移**（物理像素，已 clamp；`offset` 的横向兄弟）。
+    ///
+    /// 与 `offset` 同一口径：整物理像素步进（滚轮 / 拖 thumb 均取整）⇒ 内容按
+    /// `offset_x / scale` 逻辑平移后**整体刚性移动**（非整数 DPI 下不抖）。
+    /// 只有"横向是滚动视口"的容器会用到它（窗口 `.hscroll(true)` /
+    /// [`crate::ScrollArea`]，见 `Ui::scroll_axes_at`）。
+    pub offset_x: f32,
     /// 内容总高（逻辑像素；clamp 上限 = max(0, content_h - view_h)）。
     pub content_h: f32,
     /// **内容总宽**（物理像素；= 内容帧结算宽，与可视区无关）。
@@ -402,11 +509,11 @@ pub struct UiState {
     /// 重新整形的抖动。
     ///
     /// 版本号用于强制刷新缓存（如行高计算方式变更），避免新旧缓存混用导致布局错乱；
-    /// 末元组是**换行行距倍率位 + 全局字重 + 版本号**——行距（[`crate::Theme::line_spacing`]）
-    /// 与字重（[`crate::Theme::font_weight`]）都是运行时可变主题令牌，必须进键
+    /// 键是 [`TextKey`]（**有名字段的排版输入**：文本 / 字号 / 换行宽 / 行高 / 行距 /
+    /// 对齐 / 字体族 / 字重 / 斜体 / 拉伸 / 字距 / 版本）——`Theme::line_spacing` 与
+    /// `Theme::font_weight` 这类**运行时可变主题令牌**由调用方折算进样式后自然进键
     /// （不同行距 / 字重各自缓存，不会复用旧排版：字重会改字形**与步进宽度**）。
-    pub(crate) text_buffers:
-        HashMap<(String, u32, Option<String>, u32, (u32, u16, u8)), (Arc<Buffer>, u64)>,
+    pub(crate) text_buffers: HashMap<TextKey, (Arc<Buffer>, u64)>,
     /// 帧计数（光标闪烁相位用）。
     pub frame: u64,
     /// 上一帧是否处于 IME 组合中（text_input 退格判定用）：
@@ -493,7 +600,9 @@ pub struct UiState {
     /// **窗口 z → 最近一次提交的批次 scissor**（[`crate::UiBatch::clip`]；`flush_seg` 写）。
     /// 与 `debug_submit` 同源，回答"这一窗的裁剪到底是多少"。
     pub(crate) debug_clip: HashMap<u32, Rect>,
-    /// **滚动容器状态**：`scroll_at` 的 **绝对 ID** → (偏移, 内容高)，跨帧持久。
+    /// **滚动容器状态**：[`Ui::scroll_at`](crate::Ui::scroll_at) /
+    /// [`Ui::scroll_axes_at`](crate::Ui::scroll_axes_at) / [`Ui::scroll_area`](crate::Ui::scroll_area)
+    /// 的**绝对 ID** → [`ScrollState`]（两轴偏移 + 内容尺寸），跨帧持久。
     pub(crate) scrolls: HashMap<IdAbsolute<'static>, ScrollState>,
     /// **下拉菜单展开状态**：当前展开的 [`Dropdown`](crate::Dropdown)（或
     /// [`Ui::combo_at`](crate::Ui::combo_at) 糖）的 **绝对 ID**（`None` = 全部收起）。
@@ -516,6 +625,26 @@ pub struct UiState {
     /// 就用 [`Self::is_collapsed`] / [`Self::set_collapsed`] / [`Self::toggle_collapsed`]，
     /// [`Self::reset`] 一并清空。
     pub collapsed: std::collections::HashSet<IdAbsolute<'static>>,
+    /// **引擎托管的"折叠区块"状态**（[`Ui::foldable`](crate::Ui::foldable) 的每个区块
+    /// **绝对 ID → 是否折叠**）。
+    ///
+    /// 与 [`Self::collapsed`]（窗口的"只留标题栏"）**分开存**：键空间通常不重叠（窗口 id /
+    /// 区块 id），但语义不同——窗口收起会改窗口的整个尺寸与缩放链路，区块折叠只是
+    /// "本帧不录制正文"。合成一张表会让"窗口与同名区块互相干扰"，且任一侧将来要加语义
+    /// （如折叠动画相位）都无法独立演进。
+    ///
+    /// **为什么是"值"而不是"折叠集合"**（历史：曾是 `HashSet`，只记"折叠"）：那种表示下
+    /// "表里没有"同时意味着"从未出现"与"用户刚展开"，于是 `Foldable::open(false)`（默认
+    /// 折叠）的区块**点开后下一帧又折回去**——展开这个事实无处安放。现在表里存**明确态**：
+    /// - **无记录 = 首次**：由 [`Foldable::open`](crate::Foldable::open) 的默认值决定，
+    ///   并由 `Foldable` 在首帧**落盘**（于是 [`Self::is_folded`] 与画面始终同口径）；
+    /// - **有记录 = 用户 / 应用已定**：点标题翻转即写它，`open(..)` 从此不再干预。
+    ///
+    /// 点标题当帧只写状态、**下一帧**才改变布局（与窗口 `collapsed` 同一口径：本帧的几何
+    /// 在录制开头就定了）。应用想读 / 改直接用 [`Self::is_folded`] / [`Self::set_folded`] /
+    /// [`Self::toggle_folded`]（"全部展开 / 折叠"、恢复上次集合），[`Self::reset`] 一并清空
+    /// （清空 = 回到各区块自己的 `open(..)` 默认态）。
+    pub folded: std::collections::HashMap<IdAbsolute<'static>, bool>,
     /// **颜色选择器的全局跨帧数据**（呈现模式 / 替补输入缓冲 / 展开的面板 / HSV 缓存）。
     ///
     /// 类型定义在**控件自己的模块**里（[`crate::widgets::ColorPickerState`]，见
@@ -743,6 +872,39 @@ impl UiState {
         now
     }
 
+    /// **某区块（[`Ui::foldable`](crate::Ui::foldable)）是否折叠**（正文是否被隐藏）。
+    ///
+    /// ⚠ `id` 是区块的**绝对 ID**（顶层 = `.foldable("perf", ..)` 里的名字；嵌套容器 / 区块
+    /// 里会被加前缀，与引擎写入时用的 key 必须一致）——`Ui::id_for(..)` / `FoldState::folded`
+    /// 是引擎内部的同一份口径。
+    ///
+    /// **无记录 = 展开**：那只可能发生在"该区块**本帧还没录到**"（`Foldable` 首帧即把
+    /// `open(..)` 的默认态落盘 ⇒ 录过之后本方法恒与画面一致）。
+    #[inline]
+    pub fn is_folded(&self, id: &str) -> bool {
+        self.folded.get(id).copied().unwrap_or(false)
+    }
+
+    /// **设置某区块的折叠状态**（`folded = true` ⇒ 下一帧只画标题行）。链式语义同
+    /// [`Self::set_collapsed`]：**下一帧**生效（本帧的布局在录制开头就定了）。
+    ///
+    /// 写入的是**明确态**（表里恒有值）：`set_folded(id, false)` = **记住展开**，该区块之后
+    /// 不再回落到 `Foldable::open(..)` 的默认值。想让某区块"回到自己的默认态"，用
+    /// `set_folded(id, <那个默认值>)`，或整表 [`Self::reset`]。
+    ///
+    /// 用途：菜单项 / 快捷键"折叠全部 / 展开全部"、面板重启后恢复上次的折叠集合。
+    pub fn set_folded(&mut self, id: &str, folded: bool) {
+        let key = IdAbsolute::owned(id.to_owned());
+        self.folded.insert(key, folded);
+    }
+
+    /// **翻转某区块的折叠状态**，返回翻转后的值（点标题行走的就是它）。
+    pub fn toggle_folded(&mut self, id: &str) -> bool {
+        let now = !self.is_folded(id);
+        self.set_folded(id, now);
+        now
+    }
+
     /// **诊断**：上一帧"认领按下后被帧末复核撤销"的次数（见 `Ui::resolve_widget_press`
     /// 与 `UiFrameState::press_widget`）。
     ///
@@ -804,6 +966,14 @@ impl<'a> WidgetsModule<'a> {
     #[inline]
     pub fn get(&self, id: &str) -> Option<&'a WidgetState> {
         self.0.widgets.get(id)
+    }
+    /// 某控件**最近一次交互的绝对逻辑矩形**（屏幕坐标；`None` = 没交互过）。
+    ///
+    /// 诊断 / 测试用：脚本化点击先读它再注入，避免把手算坐标写死（主题 / 布局一改就废）。
+    /// 语义 = [`Ui::interact`](crate::Ui::interact) 收到的那块矩形（已含容器平移）。
+    #[inline]
+    pub fn rect(&self, id: &str) -> Option<Rect> {
+        self.0.widgets.get(id).and_then(|w| w.last_interact_rect)
     }
     /// 用户拖拽缩放的控件尺寸（[`Ui::resize_handle`](crate::Ui::resize_handle) 写入）。
     #[inline]
@@ -898,12 +1068,12 @@ impl TextsModule<'_> {
     }
 }
 
-/// **滚动模块**（[`UiState::scrolls`]）：`scroll_at` 的跨帧偏移与内容高。
+/// **滚动模块**（[`UiState::scrolls`]）：滚动容器的跨帧两轴偏移与内容尺寸。
 #[derive(Clone, Copy, Debug)]
 pub struct ScrollsModule<'a>(pub(crate) &'a UiState);
 
 impl<'a> ScrollsModule<'a> {
-    /// 某滚动容器的 `(偏移, 内容高)`（绝对 ID 查；跨帧持久）。
+    /// 某滚动容器的 [`ScrollState`]（绝对 ID 查；`(offset, offset_x, content_h, content_w)`）。
     #[inline]
     pub fn get(&self, id: &str) -> Option<&'a ScrollState> {
         self.0.scrolls.get(id)
@@ -1100,6 +1270,7 @@ impl UiState {
         self.panel_sizes.clear();
         self.window_fx.clear();
         self.collapsed.clear();
+        self.folded.clear();
     }
     /// 只清**文本模块**（排版缓存 / IME 标志）。
     pub fn reset_texts(&mut self) {
@@ -1248,6 +1419,7 @@ mod tests {
         s.panel_sizes.insert(IdAbsolute::owned("w".to_owned()), Vec2::new(4.0, 5.0));
         s.window_fx.insert(IdAbsolute::owned("w".to_owned()), Default::default());
         s.collapsed.insert(IdAbsolute::owned("w".to_owned()));
+        s.folded.insert(IdAbsolute::owned("w/fold".to_owned()), true);
         // ④ 文本（`text_buffers` 的值需要排版器产物 ⇒ 只脏能构造的 IME 标志；
         //    表本身的清理由 `reset_texts` 的同一行负责）
         s.ime_composing = true;
@@ -1300,6 +1472,7 @@ mod tests {
         assert!(s.windows().size("w").is_none());
         assert!(s.windows().fx("w").is_none());
         assert!(!s.is_collapsed("w"));
+        assert!(!s.is_folded("w/fold"), "reset 清空折叠区块状态");
         assert!(!s.texts().ime_composing());
         assert_eq!(s.texts().cached_layouts(), 0);
         assert!(s.scrolls().get("w/list").is_none());
@@ -1386,6 +1559,41 @@ mod tests {
         assert!(!st.is_collapsed("win_a") && !st.is_collapsed("win_b"), "reset 清空收起状态");
     }
 
+    #[test]
+    fn engine_managed_folded_blocks_are_readable_toggleable_and_isolated() {
+        // `Ui::foldable(..)` 的折叠状态与窗口收起**同口径**（无记录 = 展开 / 按 id 隔离 /
+        // reset 清空），但住**另一张表**、且存**明确态**（见 `UiState::folded` 的字段文档：
+        // `false` 是"记住展开"，不是"清除记录"）。
+        let mut st = UiState::new();
+        assert!(!st.is_folded("sec_a"), "没记录过 ⇒ 展开");
+        st.set_folded("sec_a", true);
+        assert!(st.is_folded("sec_a"));
+        assert!(!st.is_folded("sec_b"), "只按自己的绝对 ID 取，互不影响");
+        // 与窗口收起表**不共享**：同名 id 在两张表里各说各话。
+        st.set_collapsed("sec_a", false);
+        assert!(st.is_folded("sec_a"), "窗口收起状态不影响区块折叠状态");
+        assert!(!st.toggle_folded("sec_a"), "翻转 ⇒ 展开，并返回翻转后的值");
+        assert!(!st.is_folded("sec_a"));
+        assert!(st.toggle_folded("sec_a"), "再翻转 ⇒ 折叠");
+        // 幂等：重复 set 同一个值不出错。
+        st.set_folded("sec_a", true);
+        assert!(st.is_folded("sec_a"));
+        st.set_folded("sec_a", false);
+        assert!(!st.is_folded("sec_a"));
+        // **明确态**：`set_folded(id, false)` 之后表里仍有记录（不是"清除"）——所以
+        // `Foldable::open(false)`（默认折叠）的区块点开后不会再被默认值折回去。
+        assert_eq!(st.folded.get("sec_a"), Some(&false), "展开是记录下来的明确态");
+        // 嵌套前缀：区块里的区块用带前缀的绝对 ID，互不串台。
+        st.set_folded("outer/inner", true);
+        assert!(st.is_folded("outer/inner") && !st.is_folded("inner"));
+        // `reset` 清空（含表本身）⇒ 各区块回到自己的 `open(..)` 默认态。
+        st.set_folded("sec_a", true);
+        st.set_folded("sec_b", true);
+        st.reset();
+        assert!(!st.is_folded("sec_a") && !st.is_folded("sec_b"), "reset 清空折叠状态");
+        assert!(st.folded.is_empty(), "reset 清的是整张表（无残留的 false）");
+    }
+
     /// **帧级暂存**：一帧开场一次、收尾关场；`UiState::clone` 不带帧内暂存。
     ///
     /// 这些是"一帧可多段 UI"正确性的地基：若 `begin_frame` 被第二次调用（旧实现里
@@ -1445,5 +1653,44 @@ mod tests {
         assert!(!st.z0_quads.contains_key(&(1, 9)), "上一帧未出现的槽被清掉（防跨帧误复用）");
         // 键带段前缀：两段的同号放置是**不同槽**（否则互相覆盖、永远 miss）。
         assert_ne!((1u32, 0u32), (2u32, 0u32));
+    }
+
+    /// **文本排版键覆盖一切"影响排版"的字段**：改了任一项都必须 miss —— 否则复用旧排版，
+    /// 表现为"改了字重 / 字距 / 行高后文字不刷新"（与"漏进内容签名"是同一类坑）。
+    ///
+    /// 反向也钉住：**颜色与水平对齐不进键**（它们不改整形结果：颜色走顶点色，水平对齐
+    /// 由 `TextAlign` 在绘制期算 anchor）——进了键只会让"改颜色"白重建一次排版。
+    #[test]
+    fn text_key_covers_layout_fields_only() {
+        use rjw_text::{Align, LineSpace, TextStyle, Weight};
+        let base = TextStyle::new().size(14.0).font_family("Kai");
+        let k = |s: &TextStyle, wrap: f32| TextKey::new("hi", s, wrap);
+        assert_eq!(k(&base, 100.0), k(&base, 100.0), "同输入 ⇒ 同键（缓存可命中）");
+        // 排版字段：逐个都要 miss。
+        assert_ne!(k(&base, 100.0), k(&TextStyle::new().size(15.0).font_family("Kai"), 100.0), "字号");
+        assert_ne!(k(&base, 100.0), k(&base.clone().font_family("Song"), 100.0), "字体族");
+        assert_ne!(k(&base, 100.0), k(&base.clone().weight(Weight::BOLD), 100.0), "字重");
+        assert_ne!(k(&base, 100.0), k(&base.clone().italic(true), 100.0), "斜体");
+        assert_ne!(k(&base, 100.0), k(&base.clone().letter_spacing(0.05), 100.0), "字距");
+        assert_ne!(k(&base, 100.0), k(&base.clone().line_height(30.0), 100.0), "行高");
+        assert_ne!(
+            k(&base, 100.0),
+            k(&base.clone().line_space(LineSpace::Multiple(1.5)), 100.0),
+            "行距"
+        );
+        assert_ne!(k(&base, 100.0), k(&base, 120.0), "换行宽");
+        assert_ne!(k(&base, 100.0), k(&TextStyle::new().size(14.0).font_family("Kai").weight(Weight::BOLD), 100.0), "文本内容相同但样式不同");
+        assert_ne!(k(&base, 100.0), TextKey::new("ho", &base, 100.0), "文本内容");
+        // 绘制字段：**不进键**。
+        assert_eq!(
+            k(&base, 100.0),
+            k(&base.clone().color([1.0, 0.0, 0.0, 1.0]), 100.0),
+            "颜色属绘制期（顶点色），不该让排版重建"
+        );
+        assert_eq!(
+            k(&base, 100.0),
+            k(&base.clone().align(Align::Center), 100.0),
+            "水平对齐属绘制期（TextAlign 算 anchor）"
+        );
     }
 }

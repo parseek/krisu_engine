@@ -329,7 +329,7 @@ pub(crate) fn popup_show(
         // 器脱节（命中按窗口走、视觉却跑别处 —— 用户实测"控件严重错位"）；尺寸由内容
         // 定，也不该出现缩放柄。`.width(..)` 只用来把内容宽钉在上一帧结算值上。
         .clamp(WindowClamp::Locked)
-        .resize(false, crate::Resize::None)
+        .resize(false)
         // **行距 = 逻辑 1px 的物理值**（不是 `Theme::gap`）：菜单行必须紧挨着。
         .gap(Size::Physical(menu_gap))
         .level(Level::Normal)

@@ -323,6 +323,9 @@ impl<'ui, 'a> MenuBar<'ui, 'a> {
                 .margin(Size::Physical(mb.separator_margin)),
         );
     }
+    pub fn separator_h(&mut self) {
+        self.divider()
+    }
 
     /// 收尾（由 [`Ui::menu_bar`](crate::Ui::menu_bar) 调用）：返回原始事实 + 背景样式。
     pub(crate) fn finish(mut self) -> MenuBarFacts {

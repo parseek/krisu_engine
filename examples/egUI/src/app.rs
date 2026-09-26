@@ -4,6 +4,7 @@ pub mod hellowindow;
 pub mod base_information;
 pub mod color_picker;
 pub mod gallery;
+pub mod theme_editor;
 
 use std::{any::TypeId, collections::HashMap};
 
@@ -27,14 +28,22 @@ pub trait Demo {
 #[derive(Default)]
 pub struct RJWApp {
     demos: HashMap<TypeId, (bool, Box<dyn Demo>)>,
-    global: global::GlobalData,
+    pub global: global::GlobalData,
     /// `--ui-dump`：每帧录制完把引擎状态（`Ui::debug_dump`）打到 stderr。
     pub ui_dump: bool,
+    /// `--sim-fold`：脚本化自证折叠语义（注册的是 `Gallery::new_sim_fold()`；
+    /// 判据是**引擎状态**里正文控件的绝对 ID 在不在，见 `gallery.rs` 的 `sim_id_in_window`）。
+    pub sim_fold: bool,
+    /// `--sim-fold`：本进程的帧计数（`Frame` 不暴露帧号 ⇒ 自己数；注入时序用）。
+    pub sim_frame: u64,
+    /// `--fold-style`：给**区块标题行**换一套观感演示（`FoldableStyle::button_like`）+
+    /// 打开正文上下端的**渐隐提示**（`with_body_fade`）—— 用于目视核对"类按钮"与"阴影渐隐"。
+    pub fold_style: bool,
 }
 
 impl RJWApp {
-    pub fn register_demo<T: Demo + 'static>(&mut self, demo: T) {
-        self.demos.insert(TypeId::of::<T>(), (false, Box::new(demo)));
+    pub fn register_demo<T: Demo + 'static>(&mut self, enable: bool, demo: T) {
+        self.demos.insert(TypeId::of::<T>(), (enable, Box::new(demo)));
     }
 
     /// `--demo <子串>`：把 **`id()` 或类型名**含 `needle`（不区分大小写）的那个 demo
@@ -69,7 +78,28 @@ impl App for RJWApp {
     fn update(&mut self, ctx: &mut Ctx) {
         let Some(mut frame) = ctx.frame() else { return; };
 
-        let mut ui = frame.ui(Theme::dark().with_font_family("Sarasa Mono SC").with_border_w(0.));
+        self.global.fps = frame.fps();
+
+        // ── `--sim-fold`：脚本化注入鼠标 ─────────────────────────────────────────
+        // 注入点由录制端**运行时解算**（窗口原点 + 区块标题行中心，见 `gallery::sim_store_point`）
+        // —— 窗口位置是引擎自动级联给的，写死会随主题 / 布局漂移。
+        //
+        // ⚠ 字段顺序就是时序：本单元在 `frame.ui(..)` **之前**，而 ui 的输入快照是在
+        // `UiInit::build`（开段）时冻结的 —— 开段发生在 `frame.ui(..)` 里，所以这里注入的
+        // 边沿**当帧**就能被标题行看到。会话的第一段之外还有一段（帧末收尾）不走这里。
+        if self.sim_fold {
+            self.sim_frame += 1;
+            let f = self.sim_frame;
+            // 每一轮 = 两次注入：`t` 按下、`t+1` 释放（`toggle_folded` 只在**按下边沿**触发，
+            // 同一次按下不会翻两次）。
+            for (i, t) in [(0usize, 50u64), (1, 60), (2, 70), (0, 80)] {
+                if (f == t || f == t + 1) && let Some(p) = gallery::sim_fold_point(i) {
+                    frame.debug_inject_mouse(p, f == t);
+                }
+            }
+        }
+
+        let mut ui = frame.ui(self.global.theme.clone());
 
         ui.label_at(vec2(0., 40.), "↑点击选择要看的窗口");
 
@@ -100,4 +130,21 @@ impl App for RJWApp {
             eprintln!("[ui] {}", ui.debug_dump());
         }
     }
+}
+
+pub fn demo_window<'ui, 'a>(
+    ui: &'ui mut Ui<'a>,
+    id: &'ui str,
+    title: &'ui str,
+    enable: &'ui mut bool,
+) -> rjw_krusie::ui::WindowBuilder<'ui, 'a> {
+    ui.window(id)
+        .title(title)
+        .close_button(enable)
+        .collapsible(true, None)
+        // .resize Horizontal 不在设置 width 的情况下无法缩放；Vertical 缩放幽灵控件问题；
+        // 可显式引入是否允许裁切（引入 .vscroll(enum) 和 .hscroll(enum)，enum { NoClip, ClipOnly, Scroll }，就像 egui 那样，NoClip 下的大小必须能够呈现所有内容）；
+        // BUG：row 容器似乎不会“撑开”宽度
+
+        // ColorPicker 位置有时出现问题
 }

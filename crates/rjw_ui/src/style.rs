@@ -248,6 +248,9 @@ pub struct Theme {
     pub modal: ModalStyle,
     /// **下拉框（combo）样式**：触发按钮用 [`ButtonStyle`]；选项浮层 = 现代右键菜单外观。
     pub combo: ComboStyle,
+    /// **可收缩区块样式**（[`Ui::foldable`](crate::ui::Ui::foldable) 的**标题行**：
+    /// 常态透明底 + 悬停/按下高亮 + 三角图标 + 文本）。
+    pub foldable: FoldableStyle,
     /// **单行控件统一高度**（逻辑像素）：水平行容器（`p.row(...)`）内所有子项强制
     /// 等高——Label/Button/输入框各自内容垂直居中 → 文字中心线对齐（近似基线）。
     pub row_h: f32,
@@ -332,6 +335,262 @@ impl Default for ComboStyle {
     }
 }
 
+// ─── FoldableStyle ────────────────────────────────────────
+
+/// **可收缩区块样式**（[`Ui::foldable`](crate::ui::Ui::foldable) 的**标题行**）。
+///
+/// 与 [`ButtonStyle`] 分开的理由：标题行的常态**没有底色、没有边框**（只留文字 + 三角
+/// 图标，像列表分组标题），而按钮是"抬升的小方块"。混用会让每个区块看起来像一排按钮
+/// （与 [`MenubarStyle`] 的分工同一条理由：菜单条也因此独立成组）。
+///
+/// ```toml
+/// [theme.foldable]
+/// bg        = { r = 0.0, g = 0.0, b = 0.0, a = 0.0 }   # 常态透明
+/// bg_hover  = { r = 0.24, g = 0.25, b = 0.28, a = 1.0 }
+/// fg        = { r = 0.90, g = 0.90, b = 0.92, a = 1.0 }
+/// pad_x     = 4.0
+/// icon_w    = 18.0
+/// icon_h    = 10.0
+/// font_size = 14.0
+/// ```
+///
+/// ⚠ 颜色写出 0–1 归一化浮点（`to_toml` 导出的就是这个形式）：手写 `{ r = 32, g = 34 }`
+/// 这种 0–255 整数会被当成 **>1 的分量**，渲染时被夹到**全白**。
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct FoldableStyle {
+    /// 标题行**常态**底色（默认**全透明**：区块不抢视觉，只留文字与三角）。
+    pub bg: Brush,
+    /// 悬停底色（默认 [`Palette::surface_hover`]）。
+    pub bg_hover: Brush,
+    /// 按下底色（默认 [`Palette::surface_active`]）。
+    pub bg_pressed: Brush,
+    /// 标题文本色（默认 [`Palette::text`]）。
+    pub fg: Color,
+    /// **三角图标**色（默认 [`Palette::text_muted`]——图标是次要信息，比文字弱一档）。
+    pub mark: Color,
+    /// 标题行边框色（默认 [`Palette::border`]；`border_w = 0` 时不画）。
+    pub border: Color,
+    /// 边框宽（逻辑像素；默认 0 = 无边框）。
+    pub border_w: f32,
+    /// 标题行圆角（逻辑像素）。
+    pub radius: CornerRadius,
+    /// 标题字号（逻辑像素）。
+    pub font_size: f32,
+    /// 标题字体族（`None` = 系统默认；[`Theme::with_font_family`] 会级联到它）。
+    pub font_family: Option<Arc<str>>,
+    /// 标题行左右内边距（逻辑像素）。
+    pub pad_x: f32,
+    /// **三角预留宽**（逻辑像素）：从左边距起算，含图标与文字之间的间距。
+    pub icon_w: f32,
+    /// 三角**边长**（逻辑像素；`icon_at` 内部按 `min(w,h)` 居中等比 ⇒ 永不形变）。
+    pub icon_h: f32,
+    // ── 正文的"归属提示"（缩进 + 左侧竖引导线）──────────────────────────────
+    /// **正文左缩进**（逻辑像素；默认 12）：正文整体右移这么多 ⇒ 一眼看出"这段属于上面那个
+    /// 标题行"。缩进同时作用于**绘制、命中与裁剪**（命令整体平移），故"点得到的就是看得见的"。
+    pub body_indent: f32,
+    /// **正文左缘的竖引导线颜色**（默认 [`Palette::border`]）。
+    pub guide: Color,
+    /// 竖引导线**宽**（逻辑像素；默认 1.0；**`0` = 不画**）。
+    pub guide_w: f32,
+    /// 引导线在正文**上方 / 下方**各多画一截（逻辑像素；默认 2.0）——让"线"看起来是从标题行
+    /// 拉下来的括号，而不是浮在正文旁边的一段孤线。
+    pub guide_tail: f32,
+    /// **收缩范围的上下"渐隐"高度**（逻辑像素；**默认 0 = 关闭**）。
+    ///
+    /// `> 0` 时在正文**上缘 / 下缘**各画一条由 [`Self::fade`] 渐变到**全透明**的矩形
+    /// （各一条 `Gradient` 命令，CPU 镶嵌、零纹理、不增加 draw call）——
+    /// 就是"区块是一个可收缩范围"的软提示（用户给的形态：整个收缩范围的上下两端，
+    /// 由阴影色渐变到完全透明）。折叠态**不画**（正文没录制）。
+    pub fade_h: f32,
+    /// 渐隐用的颜色（默认 [`Palette::shadow`]；通常带 alpha）。
+    pub fade: Color,
+}
+
+impl Default for FoldableStyle {
+    fn default() -> Self {
+        Self {
+            bg: Brush::Solid(Color::TRANSPARENT),
+            bg_hover: Brush::Solid(Color::rgba_u8(230, 236, 245, 255)),
+            bg_pressed: Brush::Solid(Color::rgba_u8(205, 220, 240, 255)),
+            fg: Color::rgba_u8(30, 30, 30, 255),
+            mark: Color::rgba_u8(120, 120, 120, 255),
+            border: Color::TRANSPARENT,
+            border_w: 0.0,
+            radius: CornerRadius::default(),
+            font_size: 14.0,
+            font_family: None,
+            pad_x: 4.0,
+            icon_w: 18.0,
+            icon_h: 10.0,
+            body_indent: 12.0,
+            guide: Color::rgba_u8(120, 120, 120, 255),
+            guide_w: 1.0,
+            guide_tail: 2.0,
+            // 默认**关闭**渐隐（保持"竖引导线"这一种提示；开了才画那两条渐变）。
+            fade_h: 0.0,
+            fade: Color::TRANSPARENT,
+        }
+    }
+}
+
+impl FoldableStyle {
+    /// **按交互态挑背景刷**：按下 > 悬停 > 常态（与 [`ButtonStyle::pick_bg`] 同一口径与
+    /// 理由——漏掉悬停态会让"鼠标移上去毫无变化"）。
+    #[inline]
+    pub fn pick_bg(&self, pressed: bool, hovered: bool) -> Brush {
+        if pressed {
+            self.bg_pressed
+        } else if hovered {
+            self.bg_hover
+        } else {
+            self.bg
+        }
+    }
+
+    /// 常态底色（接受 [`Color`] 或 [`Brush`]）。
+    pub fn with_bg(mut self, c: impl Into<Brush>) -> Self {
+        self.bg = c.into();
+        self
+    }
+    /// 悬停底色。
+    pub fn with_bg_hover(mut self, c: impl Into<Brush>) -> Self {
+        self.bg_hover = c.into();
+        self
+    }
+    /// 按下底色。
+    pub fn with_bg_pressed(mut self, c: impl Into<Brush>) -> Self {
+        self.bg_pressed = c.into();
+        self
+    }
+    /// 标题文字色。
+    pub fn with_fg(mut self, c: Color) -> Self {
+        self.fg = c;
+        self
+    }
+    /// 三角图标色。
+    pub fn with_mark(mut self, c: Color) -> Self {
+        self.mark = c;
+        self
+    }
+    /// 边框色。
+    pub fn with_border(mut self, c: Color) -> Self {
+        self.border = c;
+        self
+    }
+    /// 边框宽（逻辑像素）。
+    pub fn with_border_w(mut self, w: f32) -> Self {
+        self.border_w = w;
+        self
+    }
+    /// 圆角半径（**逻辑像素**；0 = 直角）。
+    pub fn with_radius(mut self, r: impl Into<CornerRadius>) -> Self {
+        self.radius = r.into();
+        self
+    }
+    /// 字号（逻辑像素）。
+    pub fn with_font_size(mut self, s: f32) -> Self {
+        self.font_size = s;
+        self
+    }
+    /// 字体族（`None` = 系统默认）。
+    pub fn with_font_family(mut self, f: impl AsRef<str>) -> Self {
+        self.font_family = Some(Arc::from(f.as_ref()));
+        self
+    }
+    /// 标题行左右内边距（逻辑像素）。
+    pub fn with_padding(mut self, pad_x: f32) -> Self {
+        self.pad_x = pad_x.max(0.0);
+        self
+    }
+    /// 三角预留宽 / 边长（逻辑像素）。
+    pub fn with_icon(mut self, w: f32, h: f32) -> Self {
+        self.icon_w = w.max(0.0);
+        self.icon_h = h.max(0.0);
+        self
+    }
+    /// **正文左缩进**（逻辑像素）与**左侧竖引导线**（颜色 / 线宽 / 上下各延伸多少）。
+    ///
+    /// `guide_w = 0` 关掉引导线（只留缩进）；`indent = 0` + `guide_w = 0` = 回到"没有归属提示"
+    /// 的观感（与 `Foldable` 首次落地时逐像素一致）。
+    pub fn with_body_guide(
+        mut self,
+        indent: f32,
+        guide: Color,
+        guide_w: f32,
+        guide_tail: f32,
+    ) -> Self {
+        self.body_indent = indent.max(0.0);
+        self.guide = guide;
+        self.guide_w = guide_w.max(0.0);
+        self.guide_tail = guide_tail.max(0.0);
+        self
+    }
+
+    /// **收缩范围的上下渐隐**（`h <= 0` = 关闭，默认关闭）：在正文上 / 下缘各画一条由
+    /// `fade` 渐变到全透明的矩形（用户给的形态："整个收缩范围的上下两端，由阴影色渐变到
+    /// 完全透明"）。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{FoldableStyle, Theme};
+    /// use rjw_color::Color;
+    /// let t = Theme::dark().with_foldable(
+    ///     Theme::dark().foldable.with_body_fade(12.0, Color::rgba_u8(0, 0, 0, 90)),
+    /// );
+    /// # let _ = t;
+    /// ```
+    pub fn with_body_fade(mut self, h: f32, fade: Color) -> Self {
+        self.fade_h = h.max(0.0);
+        self.fade = fade;
+        self
+    }
+
+    /// **预设：标题行的"按钮块"外观**（用户给的形态："整个标题容器都可以算作类按钮"）。
+    ///
+    /// 把常态底色从**全透明**改成 `surface_raised`、加一层描边与圆角（悬停 / 按下沿用
+    /// `set_palette` 给的两态）⇒ 标题行看起来就是一个可点的块。**不改行为**：整行本来就是
+    /// 命中区（点空白处也翻转），行内控件自己认领按下、不受影响。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{FoldableStyle, Theme};
+    /// let t = Theme::dark().with_foldable(FoldableStyle::button_like(&Theme::dark().palette));
+    /// # let _ = t;
+    /// ```
+    pub fn button_like(p: &Palette) -> Self {
+        let mut s = Self::themed(p);
+        s.bg = Brush::Solid(p.surface_raised);
+        s.border = p.border_strong;
+        s.border_w = 1.0;
+        s.radius = CornerRadius::all(6.0);
+        s
+    }
+}
+
+impl FoldableStyle {
+    /// **原地应用调色板**：只改颜色，尺寸 / 字号 / 圆角 / 字体族保留（换肤口径同其它子样式）。
+    pub fn set_palette(&mut self, p: &Palette) {
+        // **常态透明**：区块标题不是按钮（见结构体文档）。
+        self.bg = Brush::Solid(Color::TRANSPARENT);
+        self.bg_hover = Brush::Solid(p.surface_hover);
+        self.bg_pressed = Brush::Solid(p.surface_active);
+        self.fg = p.text;
+        self.mark = p.text_muted;
+        self.border = p.border;
+        // 正文左缘的竖引导线：与面板描边同色的弱线（"分组括号"不该抢视觉）。
+        self.guide = p.border;
+        // 渐隐色取调色板的投影色（它本身就是"半透明黑"语义；`fade_h = 0` 时不画）。
+        self.fade = p.shadow;
+    }
+
+    /// 从调色板派生（= `Default` 起步 + `set_palette`）。
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
 // ─── 子样式 DPI 预乘：每个子样式都有 `scaled(s)`（尺寸 / 字号字段 × s 取整；
 // 颜色 / 字体族不变）。`Theme::scaled` 逐一调用——单一职责、便于各样式独立复用。 ───
 
@@ -352,7 +611,7 @@ impl PanelStyle {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.border_w = m(self.border_w);
         self.padding = m(self.padding);
         self.radius = self.radius.scaled_rounded(s);
@@ -368,7 +627,7 @@ impl ButtonStyle {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.border_w = m(self.border_w);
         self.radius = self.radius.scaled_rounded(s);
         self.padding.x = m(self.padding.x);
@@ -384,7 +643,7 @@ impl SliderStyle {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.track_h = m(self.track_h);
         self.handle_w = m(self.handle_w);
         self.height = m(self.height);
@@ -400,9 +659,10 @@ impl InputStyle {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.border_w = m(self.border_w);
         self.padding_x = m(self.padding_x);
+        self.padding_y = m(self.padding_y);
         self.radius = self.radius.scaled_rounded(s);
         self.height = m(self.height);
         self.min_w = m(self.min_w);
@@ -418,7 +678,7 @@ impl CheckboxStyle {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.box_size = m(self.box_size);
         self.radius = self.radius.scaled_rounded(s);
         self.border_w = m(self.border_w);
@@ -434,7 +694,7 @@ impl DividerStyle {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.thickness = m(self.thickness);
         self.margin = m(self.margin);
         self
@@ -447,7 +707,7 @@ impl MenubarStyle {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.border_w = m(self.border_w);
         self.radius = self.radius.scaled_rounded(s);
         self.padding = m(self.padding);
@@ -457,6 +717,28 @@ impl MenubarStyle {
         self.trigger_pad_x = m(self.trigger_pad_x);
         self.separator_w = m(self.separator_w);
         self.separator_margin = m(self.separator_margin);
+        self
+    }
+}
+
+impl FoldableStyle {
+    /// 预乘 DPI scale：边框宽 / 圆角 / 字号 / 内边距 / 图标尺寸 × s 取整（颜色不变）。
+    pub fn scaled(mut self, s: f32) -> Self {
+        if s <= 0.0 {
+            return self;
+        }
+        let m = |v: f32| (v * s).floor();
+        self.border_w = m(self.border_w);
+        self.radius = self.radius.scaled_rounded(s);
+        self.font_size = m(self.font_size);
+        self.pad_x = m(self.pad_x);
+        self.icon_w = m(self.icon_w);
+        self.icon_h = m(self.icon_h);
+        // 正文缩进 / 引导线：与标题行几何一起按 DPI 物理化（不取整的只有颜色）。
+        self.body_indent = m(self.body_indent);
+        self.guide_w = m(self.guide_w);
+        self.guide_tail = m(self.guide_tail);
+        self.fade_h = m(self.fade_h);
         self
     }
 }
@@ -503,7 +785,7 @@ impl ComboStyle {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.menu_radius = self.menu_radius.scaled_rounded(s);
         self.menu_pad_v = m(self.menu_pad_v);
         self.item_pad_x = m(self.item_pad_x);
@@ -676,27 +958,27 @@ impl Palette {
     /// `surface`，间距明确。
     pub fn dark() -> Self {
         Self {
-            surface_dim: Color::rgba_u8(14, 15, 19, 255),
-            surface_sunken: Color::rgba_u8(16, 18, 24, 255),
-            surface: Color::rgba_u8(23, 25, 31, 255),
-            surface_raised: Color::rgba_u8(34, 37, 45, 255),
-            surface_overlay: Color::rgba_u8(43, 47, 57, 255),
-            surface_hover: Color::rgba_u8(51, 56, 69, 255),
-            surface_active: Color::rgba_u8(61, 68, 83, 255),
-            border: Color::rgba_u8(58, 63, 75, 255),
-            border_strong: Color::rgba_u8(74, 81, 98, 255),
-            text: Color::rgba_u8(232, 234, 240, 255),
-            text_muted: Color::rgba_u8(154, 163, 178, 255),
-            text_dim: Color::rgba_u8(107, 114, 128, 255),
-            accent: Color::rgba_u8(110, 168, 255, 255),
-            accent_hover: Color::rgba_u8(140, 188, 255, 255),
-            accent_active: Color::rgba_u8(85, 140, 219, 255),
-            selection: Color::rgba_u8(43, 74, 120, 255),
-            danger: Color::rgba_u8(255, 107, 107, 255),
-            handle: Color::rgba_u8(200, 208, 220, 255),
-            debug_outline: Color::rgba_u8(96, 200, 255, 255),
-            scrim: Color::rgba_u8(0, 0, 0, 180),
-            shadow: Color::rgba_u8(0, 0, 0, 120),
+            surface_dim:        Color::from_hex_rgb ("#0E0F13"), // Color::rgba_u8(14, 15, 19, 255),
+            surface_sunken:     Color::from_hex_rgb ("#0f1014"), // Color::rgba_u8(16, 18, 24, 255),
+            surface:            Color::from_hex_rgb ("#080a0c"), // Color::rgba_u8(23, 25, 31, 255),
+            surface_raised:     Color::from_hex_rgb ("#14171e"), // Color::rgba_u8(34, 37, 45, 255),
+            surface_overlay:    Color::from_hex_rgb ("#1c1f29"), // Color::rgba_u8(43, 47, 57, 255),
+            surface_hover:      Color::from_hex_rgb ("#242933"), // Color::rgba_u8(51, 56, 69, 255),
+            surface_active:     Color::from_hex_rgb ("#2d3445"), // Color::rgba_u8(61, 68, 83, 255),
+            border:             Color::from_hex_rgb ("#2f3134"), // Color::rgba_u8(58, 63, 75, 255),
+            border_strong:      Color::from_hex_rgb ("#383b41"), // Color::rgba_u8(74, 81, 98, 255),
+            text:               Color::from_hex_rgb ("#E8EAF0"), // Color::rgba_u8(232, 234, 240, 255),
+            text_muted:         Color::from_hex_rgb ("#9AA3B2"), // Color::rgba_u8(154, 163, 178, 255),
+            text_dim:           Color::from_hex_rgb ("#6B7280"), // Color::rgba_u8(107, 114, 128, 255),
+            accent:             Color::from_hex_rgb ("#6EA8FF"), // Color::rgba_u8(110, 168, 255, 255),
+            accent_hover:       Color::from_hex_rgb ("#8CBCFF"), // Color::rgba_u8(140, 188, 255, 255),
+            accent_active:      Color::from_hex_rgb ("#558CDB"), // Color::rgba_u8(85, 140, 219, 255),
+            selection:          Color::from_hex_rgb ("#2B4A78"), // Color::rgba_u8(43, 74, 120, 255),
+            danger:             Color::from_hex_rgb ("#FF6B6B"), // Color::rgba_u8(255, 107, 107, 255),
+            handle:             Color::from_hex_rgb ("#C8D0DC"), // Color::rgba_u8(200, 208, 220, 255),
+            debug_outline:      Color::from_hex_rgb ("#60C8FF"), // Color::rgba_u8(96, 200, 255, 255),
+            scrim:              Color::from_hex_rgba("#000000B4"), // Color::rgba_u8(0, 0, 0, 180),
+            shadow:             Color::from_hex_rgba("#00000078"), // Color::rgba_u8(0, 0, 0, 120),
             bevel: 0.10,
         }
     }
@@ -727,158 +1009,6 @@ impl Palette {
             scrim: Color::rgba_u8(0, 0, 0, 180),
             shadow: Color::rgba_u8(0, 0, 0, 120),
             bevel: 0.0,
-        }
-    }
-}
-
-// ─── 子样式配色预设：`themed(&Palette)` 从调色板派生（尺寸同 [`Default`]）。
-// `Theme::{light,dark,themed}` 逐一组装——与 `scaled` 同样的单一职责。 ───
-
-impl LabelStyle {
-    /// 从调色板派生：正文色的标签。
-    pub fn themed(p: &Palette) -> Self {
-        Self { color: p.text, ..Self::default() }
-    }
-}
-
-impl PanelStyle {
-    /// 从调色板派生：`surface` 面板 + 常规描边（背景带调色板强度的微渐变）+ `shadow` 投影色
-    /// + `border` 色的缩放柄。
-    pub fn themed(p: &Palette) -> Self {
-        Self {
-            bg: bevel_raised(p.surface, p.bevel),
-            border: p.border,
-            shadow: ShadowStyle {
-                color: p.shadow,
-                ..ShadowStyle::default()
-            },
-            grip: GripStyle {
-                color: p.border,
-                ..GripStyle::default()
-            },
-            ..Self::default()
-        }
-    }
-}
-
-impl ButtonStyle {
-    /// 从调色板派生：`surface_raised` 三态按钮（常态 → 悬停 → 激活逐级抬升）。
-    pub fn themed(p: &Palette) -> Self {
-        Self {
-            bg: bevel_raised(p.surface_raised, p.bevel),
-            bg_hover: bevel_raised(p.surface_hover, p.bevel),
-            bg_pressed: bevel_raised(p.surface_active, p.bevel),
-            fg: p.text,
-            border: p.border_strong,
-            ..Self::default()
-        }
-    }
-}
-
-impl SliderStyle {
-    /// 从调色板派生：`surface_sunken` 轨道 + 强调色填充 + `handle` 手柄。
-    pub fn themed(p: &Palette) -> Self {
-        Self {
-            track: p.surface_sunken.into(),
-            fill: p.accent.into(),
-            handle: p.handle,
-            handle_border: p.border_strong,
-            ..Self::default()
-        }
-    }
-}
-
-impl InputStyle {
-    /// 从调色板派生：`surface_sunken` 输入框（反向微渐变 = 凹陷感）+ 强调色聚焦边框。
-    pub fn themed(p: &Palette) -> Self {
-        Self {
-            bg: bevel_sunken(p.surface_sunken, p.bevel),
-            border: p.border_strong,
-            border_focus: p.accent,
-            fg: p.text,
-            caret: p.text,
-            preedit: p.text_muted,
-            sel_bg: p.selection,
-            resize_handle: p.text_dim,
-            grip: GripStyle {
-                color: p.text_dim,
-                ..Self::default().grip
-            },
-            ..Self::default()
-        }
-    }
-}
-
-impl CheckboxStyle {
-    /// 从调色板派生：强描边方框 + 强调色勾选填充。
-    pub fn themed(p: &Palette) -> Self {
-        Self {
-            box_border: p.border_strong,
-            checked_fill: p.accent,
-            fg: p.text,
-            ..Self::default()
-        }
-    }
-}
-
-impl DividerStyle {
-    /// 从调色板派生：常规描边色的分割线。
-    pub fn themed(p: &Palette) -> Self {
-        Self { color: p.border, ..Self::default() }
-    }
-}
-
-impl MenubarStyle {
-    /// 从调色板派生：**抬升的栏底 + 一条底边线 + 纯文字触发器（常态透明）**。
-    ///
-    /// 三态底色用 `surface_hover` / `surface_active`（与按钮同一套"逐级抬升"令牌）——
-    /// 但**常态是透明的**：菜单条不该看起来像一排按钮（见结构体文档）。
-    pub fn themed(p: &Palette) -> Self {
-        Self {
-            bg: p.surface_raised,
-            border: p.border,
-            fg: p.text,
-            trigger_bg: Color::TRANSPARENT,
-            trigger_hover: p.surface_hover,
-            trigger_pressed: p.surface_active,
-            separator: p.border,
-            ..Self::default()
-        }
-    }
-}
-
-impl DebugStyle {
-    /// 从调色板派生：调试描边色。
-    pub fn themed(p: &Palette) -> Self {
-        Self { layout_outline: p.debug_outline, ..Self::default() }
-    }
-}
-
-impl FocusStyle {
-    /// 从调色板派生：强调色焦点描边（宽度取 `DEFAULT_WIDTH`）。
-    pub fn themed(p: &Palette) -> Self {
-        Self { color: p.accent, ..Self::default() }
-    }
-}
-
-impl ModalStyle {
-    /// 从调色板派生：遮罩色。
-    pub fn themed(p: &Palette) -> Self {
-        Self { dim: p.scrim, ..Self::default() }
-    }
-}
-
-impl ComboStyle {
-    /// 从调色板派生：`surface_overlay` 浮层 + 悬停 / 选中态高亮 + 强调色 ✓ 标记。
-    pub fn themed(p: &Palette) -> Self {
-        Self {
-            menu_bg: p.surface_overlay,
-            menu_border: p.border_strong,
-            item_hover: p.surface_hover,
-            item_selected: p.selection,
-            fg: p.text,
-            fg_mark: p.accent,
-            ..Self::default()
         }
     }
 }
@@ -966,7 +1096,7 @@ impl ShadowStyle {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.blur = m(self.blur);
         self.offset = Vec2::new(m(self.offset.x), m(self.offset.y));
         self
@@ -1019,8 +1149,8 @@ impl Density {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum GripShape {
-    /// **三条递减小方块**（默认；历史观感：沿右下对角线逐级内缩）。
-    #[default]
+    /// **三条递减小方块**（历史观感：沿右下对角线逐级内缩；默认见
+    /// [`GripShape::Diagonal`]）。
     Squares,
     /// **三条横线**（内置矢量图标 [`Icon::Grip`]，画在 `size × count` 的方框里，
     /// 与字体无关、缺字形也不会变形）。
@@ -1028,6 +1158,7 @@ pub enum GripShape {
     /// **三条斜线**（45°，从左下到右上；内置矢量图标 [`Icon::GripDiagonal`]）——
     /// 经典"缩放角"观感。⚠ 画的方框是 [`GripShape::Bars`] 的 **1.5×**：三条斜线挤在
     /// `size × count` 的小方框里间距太小，会被羽化糊成一片。
+    #[default]
     Diagonal,
     /// **不画图案**（命中区照旧 —— 仍可拖动缩放，适合"干净"的界面）。
     Hidden,
@@ -1041,7 +1172,7 @@ pub enum GripShape {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct GripStyle {
-    /// 形状（默认 [`GripShape::Squares`]）。
+    /// 形状（默认 [`GripShape::default()`] = [`GripShape::Diagonal`] **三条斜线**）。
     pub shape: GripShape,
     /// 颜色（默认 = 面板边框色，由 [`PanelStyle::themed`] 从 `Palette::border` 灌入）。
     pub color: Color,
@@ -1072,7 +1203,7 @@ impl GripStyle {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.size = m(self.size).max(1.0);
         self.step = m(self.step).max(1.0);
         self
@@ -1248,16 +1379,23 @@ pub struct InputStyle {
     /// **缩放柄 / 拖动框颜色**（可调整大小/宽度的文本输入框右下角缩放手柄标记）。
     pub resize_handle: Color,
     /// **缩放柄的形状 / 尺寸 / 颜色**（可调整大小/宽度的文本输入框；默认
-    /// [`GripShape::Bars`] —— 三条横线，见下）。
+    /// [`GripShape::Diagonal`] —— **三条斜线**，经典"右下角可拖"的观感，见下）。
     ///
-    /// 形状取自**主题**（不再写死在引擎里）：`Bars`（默认，横线读得出"这里是可拖的角"）、
-    /// `Diagonal`（经典角落观感，宽高同调时更直观）、`Squares`（历史观感）、
+    /// 形状取自**主题**（不再写死在引擎里）：`Diagonal`（默认，三条 45° 斜线）、
+    /// `Bars`（三条横线）、`Squares`（历史观感：沿对角线递减的小方块）、
     /// `Hidden`（不画图案，**命中区照旧** —— 仍能拖）。
     /// 颜色默认 = [`Self::resize_handle`]（`themed` 里跟随 `Palette::text_dim`）。
     pub grip: GripStyle,
     pub border_w: f32,
     /// 内容水平内边距。
     pub padding_x: f32,
+    /// **内容垂直内边距**（逻辑像素；默认 3）：文本 / 光标相对文本框上缘的**垫高**。
+    ///
+    /// 为什么需要它：多行编辑是**顶对齐**（`.valign` 可改中心对齐），而没有垫高时文字会
+    /// 贴着上边框、与单行输入框的垂直位置**不一致**（用户实测："多行被拉高时位置也不会
+    /// 发生变化 ⇒ 必须默认 TopLeft，但要把文字和光标往下拉几个像素"）。
+    /// 单行输入框（`TextVAlign::Center`）与多行顶对齐都按它垫高 ⇒ 两者视觉一致。
+    pub padding_y: f32,
     /// 圆角半径（**逻辑像素**；0 = 直角；四角可各自不同，见 [`CornerRadius`]）。
     pub radius: CornerRadius,
     /// 控件总高。
@@ -1279,16 +1417,16 @@ impl Default for InputStyle {
             preedit: Color::rgba_u8(120, 120, 120, 255),
             sel_bg: Color::rgba_u8(140, 190, 245, 255),
             resize_handle: Color::rgba_u8(120, 130, 150, 255),
-            // 缩放柄默认 = **三条横线**（不是历史上的斜向小方块）：横线在任何尺寸下
-            // 都读得出"右下角可拖"，而斜线/小方块在小方框里会被羽化糊成一坨
-            // （同类教训见 `PanelStyle` 的 `GripShape::Bars` 注释）。
+            // 缩放柄默认 = `GripShape::default()`（**三条斜线 `Diagonal`**，全局默认；
+            // 这里只覆盖颜色为 `resize_handle` 同色）。换形状改主题：
+            // `Bars` 三条横线 / `Squares` 历史观感的小方块 / `Hidden` 不画图案（仍能拖）。
             grip: GripStyle {
-                shape: GripShape::Bars,
                 color: Color::rgba_u8(120, 130, 150, 255),
                 ..GripStyle::default()
             },
             border_w: 1.0,
             padding_x: 6.0,
+            padding_y: 3.0,
             radius: CornerRadius::default(),
             height: 26.0,
             min_w: 140.0,
@@ -1738,8 +1876,8 @@ impl InputStyle {
         self.grip = grip;
         self
     }
-    /// 缩放柄**形状**（`Bars` 默认 / `Diagonal` / `Squares` / `Hidden`——`Hidden` 只是
-    /// 不画图案，命中区照旧 ⇒ 仍能拖）。
+    /// 缩放柄**形状**（`Diagonal` 默认三条斜线 / `Bars` 三条横线 / `Squares` 历史观感 /
+    /// `Hidden`——`Hidden` 只是不画图案，命中区照旧 ⇒ 仍能拖）。
     pub fn with_grip_shape(mut self, shape: GripShape) -> Self {
         self.grip.shape = shape;
         self
@@ -1911,6 +2049,7 @@ impl Theme {
             focus: FocusStyle::themed(p),
             modal: ModalStyle::themed(p),
             combo: ComboStyle::themed(p),
+            foldable: FoldableStyle::themed(p),
             row_h: 26.0,
             gap: 6.0,
             feather: crate::tess::DEFAULT_FEATHER,
@@ -1983,7 +2122,7 @@ impl Theme {
     // ── with 链（责任链语义：链上后设覆盖先设；可级联的全局参数） ──
 
     /// **全局字体族**：级联到全部文本子样式（`label` / `button` / `checkbox` /
-    /// `input`——滑块无文本、面板无字体）。`None` = 系统默认。
+    /// `input` / `combo` / `menubar` / `foldable`——滑块无文本、面板无字体）。`None` = 系统默认。
     ///
     /// ```no_run
     /// # use rjw_ui::Theme;
@@ -1997,12 +2136,13 @@ impl Theme {
         self.checkbox.font_family = f.clone();
         self.input.font_family = f.clone();
         self.combo.font_family = f.clone();
-        self.menubar.font_family = f;
+        self.menubar.font_family = f.clone();
+        self.foldable.font_family = f;
         self
     }
 
     /// **全局字号**：级联到全部文本子样式（`label` / `button` / `checkbox` / `input` /
-    /// `combo` / `menubar`）。
+    /// `combo` / `menubar` / `foldable`）。
     pub fn with_font_size(mut self, size: f32) -> Self {
         self.label.font_size = size;
         self.button.font_size = size;
@@ -2010,6 +2150,7 @@ impl Theme {
         self.input.font_size = size;
         self.combo.font_size = size;
         self.menubar.font_size = size;
+        self.foldable.font_size = size;
         self
     }
 
@@ -2037,6 +2178,8 @@ impl Theme {
         self.combo.menu_radius = r.map(|v| v.min(6.0));
         // 菜单栏：只级联**触发器**圆角（栏本身是通栏条，圆角恒 0 —— 见 `MenubarStyle::radius`）。
         self.menubar.trigger_radius = r.map(|v| v.min(6.0));
+        // 可收缩区块：标题行是行内控件（悬停高亮块），与触发器同口径取 min(r, 6)。
+        self.foldable.radius = r.map(|v| v.min(6.0));
         self
     }
 
@@ -2054,6 +2197,7 @@ impl Theme {
         self.input.border_w = w;
         self.checkbox.border_w = w;
         self.menubar.border_w = w;
+        self.foldable.border_w = w;
         self
     }
 
@@ -2117,7 +2261,7 @@ impl Theme {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.gap = m(self.gap).max(1.0);
         self.row_h = m(self.row_h).max(1.0);
         self.panel.padding = m(self.panel.padding);
@@ -2226,6 +2370,22 @@ impl Theme {
         self.combo = s;
         self
     }
+    /// **可收缩区块样式**（[`Ui::foldable`](crate::ui::Ui::foldable) 的标题行）。
+    ///
+    /// ```no_run
+    /// use rjw_color::Color;
+    /// # use rjw_ui::{Brush, FoldableStyle, Theme};
+    /// // 整组替换，或只改想要的字段（`..Theme::dark().foldable` 保留其余默认）
+    /// let t = Theme::dark().with_foldable(FoldableStyle {
+    ///     bg_hover: Brush::Solid(Color::TRANSPARENT), // 关掉悬停高亮
+    ///     ..Theme::dark().foldable
+    /// });
+    /// # let _ = t;
+    /// ```
+    pub fn with_foldable(mut self, s: FoldableStyle) -> Self {
+        self.foldable = s;
+        self
+    }
 
     /// **预乘 DPI scale**：逐一调用每个子样式的 [`scaled`](LabelStyle::scaled)（尺寸 /
     /// 字号字段 × `s` 取整，保布局整数不变量）+ 主题级 `gap` / `row_h`。
@@ -2238,7 +2398,7 @@ impl Theme {
         if s <= 0.0 {
             return self;
         }
-        let m = |v: f32| (v * s).round();
+        let m = |v: f32| (v * s).floor();
         self.label = self.label.scaled(s);
         self.panel = self.panel.scaled(s);
         self.button = self.button.scaled(s);
@@ -2251,6 +2411,7 @@ impl Theme {
         self.focus = self.focus.scaled(s);
         self.modal = self.modal.scaled(s);
         self.combo = self.combo.scaled(s);
+        self.foldable = self.foldable.scaled(s);
         self.gap = m(self.gap);
         self.row_h = m(self.row_h);
         // 羽化宽也按 DPI 物理化；但不取整（亚像素级软边，取整会让 0.5 逻辑像素消失）。
@@ -2258,6 +2419,248 @@ impl Theme {
         self
     }
 }
+
+// ─── LabelStyle ───────────────────────────────────────────
+impl LabelStyle {
+    /// **原地应用调色板**：只改颜色，字号 / 字体族 / 对齐等保留。
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.color = p.text;
+    }
+
+    /// 从调色板派生（= `Default` 起步 + `set_palette`）。
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── PanelStyle ───────────────────────────────────────────
+impl PanelStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.bg = bevel_raised(p.surface, p.bevel);
+        self.border = p.border;
+        // 只覆盖 shadow.color / grip.color，保留 blur / offset / shape / size 等
+        self.shadow.color = p.shadow;
+        self.grip.color = p.border;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── ButtonStyle ──────────────────────────────────────────
+impl ButtonStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.bg = bevel_raised(p.surface_raised, p.bevel);
+        self.bg_hover = bevel_raised(p.surface_hover, p.bevel);
+        self.bg_pressed = bevel_raised(p.surface_active, p.bevel);
+        self.fg = p.text;
+        self.border = p.border_strong;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── SliderStyle ──────────────────────────────────────────
+impl SliderStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.track = p.surface_sunken.into();
+        self.fill = p.accent.into();
+        self.handle = p.handle;
+        self.handle_border = p.border_strong;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── InputStyle ───────────────────────────────────────────
+impl InputStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.bg = bevel_sunken(p.surface_sunken, p.bevel);
+        self.border = p.border_strong;
+        self.border_focus = p.accent;
+        self.fg = p.text;
+        self.caret = p.text;
+        self.preedit = p.text_muted;
+        self.sel_bg = p.selection;
+        self.resize_handle = p.text_dim;
+        self.grip.color = p.text_dim;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── CheckboxStyle ────────────────────────────────────────
+impl CheckboxStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.box_border = p.border_strong;
+        self.checked_fill = p.accent;
+        self.fg = p.text;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── DividerStyle ─────────────────────────────────────────
+impl DividerStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.color = p.border;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── MenubarStyle ─────────────────────────────────────────
+impl MenubarStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.bg = p.surface_raised;
+        self.border = p.border;
+        self.fg = p.text;
+        // **常态透明**：菜单条不是一排按钮（见结构体文档）。
+        self.trigger_bg = Color::TRANSPARENT;
+        self.trigger_hover = p.surface_hover;
+        self.trigger_pressed = p.surface_active;
+        self.separator = p.border;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── DebugStyle ───────────────────────────────────────────
+impl DebugStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.layout_outline = p.debug_outline;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── FocusStyle ───────────────────────────────────────────
+impl FocusStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.color = p.accent;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── ModalStyle ───────────────────────────────────────────
+impl ModalStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.dim = p.scrim;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+// ─── ComboStyle ───────────────────────────────────────────
+impl ComboStyle {
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.menu_bg = p.surface_overlay;
+        self.menu_border = p.border_strong;
+        self.item_hover = p.surface_hover;
+        self.item_selected = p.selection;
+        self.fg = p.text;
+        self.fg_mark = p.accent;
+    }
+
+    pub fn themed(p: &Palette) -> Self {
+        let mut s = Self::default();
+        s.set_palette(p);
+        s
+    }
+}
+
+
+impl Theme {
+    /// **原地换肤**：把调色板应用到当前主题的**每个子样式**，只改颜色类字段。
+    ///
+    /// 与 `Theme::themed(p)` 的区别：
+    /// - `Theme::themed(p)`：**从 `Default` 重建**整套主题（尺寸 / 圆角 / 字号回到出厂值）；
+    /// - `Theme::set_palette(p)`：**只覆盖颜色**，保留现有造型
+    ///   （圆角 / padding / 字号 / 字体族 / 密度 / 阴影 blur / grip 形状 …）。
+    ///
+    /// 典型用法：运行中切 light / dark，而保留用户对密度、字体、圆角的自定义。
+    ///
+    /// ```no_run
+    /// # use rjw_ui::{Palette, Theme};
+    /// let mut t = Theme::light()
+    ///     .with_radius(8.0)
+    ///     .with_font_size(16.0)
+    ///     .density(rjw_ui::Density::Compact);
+    ///
+    /// // 用户点了"切深色"：
+    /// t.set_palette(&Palette::dark());
+    /// // t 仍是 8 圆角 / 16 字号 / Compact，但颜色全部变深色。
+    /// ```
+    ///
+    /// ⚠ 之前通过 `with_*` 手工改过的**颜色**字段会被本次覆盖——这正是"换肤"的
+    /// 应有之义：颜色由调色板决定。`self.palette` 会更新为 `*p`。
+    pub fn set_palette(&mut self, p: &Palette) {
+        self.label.set_palette(p);
+        self.panel.set_palette(p);
+        self.button.set_palette(p);
+        self.slider.set_palette(p);
+        self.input.set_palette(p);
+        self.checkbox.set_palette(p);
+        self.divider.set_palette(p);
+        self.menubar.set_palette(p);
+        self.debug.set_palette(p);
+        self.focus.set_palette(p);
+        self.modal.set_palette(p);
+        self.combo.set_palette(p);
+        self.foldable.set_palette(p);
+        self.palette = *p;
+    }
+
+    /// 链式版：`t.with_palette(&p)` 等价于 `{ t.set_palette(&p); t }`。
+    pub fn with_palette(mut self, p: &Palette) -> Self {
+        self.set_palette(p);
+        self
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -2317,6 +2720,66 @@ mod tests {
         assert_eq!(flat.menubar.border_w, 0.0);
         assert_eq!(flat.menubar.radius, CornerRadius::default(), "栏圆角恒定（通栏条）");
         assert_eq!(flat.menubar.trigger_radius, CornerRadius::all(6.0), "触发器取 min(r, 6)");
+    }
+
+    /// **可收缩区块样式**（[`FoldableStyle`]）：从调色板派生（常态底色必须**透明**，
+    /// 否则每个区块标题看起来都是一个按钮）、三态 `pick_bg` 优先级、DPI 预乘只动尺寸、
+    /// 全局 `with_radius` / `with_border_w` / `with_font_*` 级联到它。
+    #[test]
+    fn foldable_style_themes_scales_and_cascades() {
+        let p = Palette::dark();
+        let t = Theme::themed(&p);
+        // 常态必须全透明（区块标题不是按钮）——与 `MenubarStyle.trigger_bg` 同一口径。
+        // ⚠ 底色是 `Brush`（纯色 / 渐变），取纯色分量必须 match（`Brush` 没有 `Into<[f32;4]>`）。
+        let Brush::Solid(bg) = t.foldable.bg else { panic!("标题行常态底色应是纯色刷") };
+        assert_eq!(<[f32; 4]>::from(bg), [0.0, 0.0, 0.0, 0.0], "标题行常态底色必须全透明");
+        assert_eq!(t.foldable.fg, p.text);
+        assert_eq!(t.foldable.mark, p.text_muted, "三角比文字弱一档");
+        assert!(matches!(t.foldable.bg_hover, Brush::Solid(c) if c == p.surface_hover));
+
+        // 三态优先级：按下 > 悬停 > 常态（与 `ButtonStyle::pick_bg` 同一处纪律）。
+        assert_eq!(t.foldable.pick_bg(false, false), t.foldable.bg);
+        assert_eq!(t.foldable.pick_bg(false, true), t.foldable.bg_hover);
+        assert_eq!(t.foldable.pick_bg(true, true), t.foldable.bg_pressed);
+        assert_eq!(t.foldable.pick_bg(true, false), t.foldable.bg_pressed);
+
+        // DPI 预乘：尺寸 / 字号按 floor × s，颜色不变。
+        let s = t.clone().scaled(1.5);
+        assert_eq!(s.foldable.font_size, (14.0f32 * 1.5).floor());
+        assert_eq!(s.foldable.pad_x, (4.0f32 * 1.5).floor());
+        assert_eq!(s.foldable.icon_w, (18.0f32 * 1.5).floor());
+        assert_eq!(s.foldable.icon_h, (10.0f32 * 1.5).floor());
+        assert_eq!(s.foldable.bg, t.foldable.bg, "颜色不随 DPI 变");
+
+        // 全局级联：圆角取 min(r, 6)（行内高亮块，与菜单触发器同口径）、边框宽可关、
+        // 字体族 / 字号一起走。
+        let c = Theme::dark()
+            .with_radius(8.0)
+            .with_border_w(0.0)
+            .with_font_family("Microsoft YaHei")
+            .with_font_size(16.0);
+        assert_eq!(c.foldable.radius, CornerRadius::all(6.0));
+        assert_eq!(c.foldable.border_w, 0.0);
+        assert_eq!(c.foldable.font_family.as_deref(), Some("Microsoft YaHei"));
+        assert_eq!(c.foldable.font_size, 16.0);
+
+        // 逐字段覆盖（builder）与整组替换（`with_foldable`）都要能改掉调色板给的颜色。
+        let st = FoldableStyle::default().with_bg(Color::RED).with_mark(Color::BLUE);
+        assert_eq!(st.bg, Brush::Solid(Color::RED));
+        assert_eq!(st.mark, Color::BLUE);
+        let t2 = Theme::dark().with_foldable(FoldableStyle::default().with_font_size(20.0));
+        assert_eq!(t2.foldable.font_size, 20.0);
+
+        // **正文归属提示**（缩进 + 左侧竖引导线）：默认有缩进与线；线色随调色板；
+        // DPI 预乘把缩进 / 线宽 / 尾巴一起物理化；`guide_w = 0` 是"关掉引导线"的开关。
+        assert!(t.foldable.body_indent > 0.0 && t.foldable.guide_w > 0.0, "默认开着归属提示");
+        assert_eq!(t.foldable.guide, p.border, "引导线取面板描边色（弱线，不抢视觉）");
+        assert_eq!(s.foldable.body_indent, (12.0f32 * 1.5).floor());
+        assert_eq!(s.foldable.guide_w, (1.0f32 * 1.5).floor());
+        assert_eq!(s.foldable.guide_tail, (2.0f32 * 1.5).floor());
+        assert_eq!(s.foldable.guide, t.foldable.guide, "颜色不随 DPI 变");
+        let off = FoldableStyle::default().with_body_guide(0.0, Color::WHITE, 0.0, 0.0);
+        assert_eq!((off.body_indent, off.guide_w), (0.0, 0.0), "可整体关掉归属提示");
     }
 
     #[test]
@@ -2746,11 +3209,21 @@ mod tests {
         let p = Palette::dark();
         let panel = PanelStyle::themed(&p);
         assert_eq!(panel.grip.color, p.border, "柄色取自调色板边框色");
-        assert_eq!(panel.grip.shape, GripShape::Squares, "默认形状 = 历史观感");
+        assert_eq!(
+            panel.grip.shape,
+            GripShape::Diagonal,
+            "默认形状 = GripShape::default()（三条斜线）"
+        );
         assert!(panel.grip.is_visible());
-        // 图案占位：从右下角往左上的方框边长（命中区下限的来源）。
-        let sq = panel.grip;
+        // 图案占位：从右下角往左上的方框边长（命中区下限的来源）——按形状各有公式。
+        let sq = panel.clone().with_grip_shape(GripShape::Squares).grip;
         assert_eq!(sq.extent(), sq.step * sq.count as f32 + sq.size);
+        let dia = panel.grip;
+        assert_eq!(
+            dia.extent(),
+            dia.size * dia.count as f32 * 1.5 + dia.step,
+            "斜线版的方框是横线版的 1.5×"
+        );
         let bars = panel.clone().with_grip_shape(GripShape::Bars);
         assert_eq!(bars.grip.extent(), bars.grip.size * bars.grip.count as f32 + bars.grip.step);
         // 预乘 DPI：尺寸类字段 ×s，形状 / 颜色 / 个数不变。
@@ -2770,19 +3243,23 @@ mod tests {
     }
 
     #[test]
-    fn input_grip_is_themed_and_defaults_to_bars() {
-        // 文本框的缩放柄过去写死在引擎里（"斜向小方块"）、完全无视主题；现在走
-        // `InputStyle::grip`（与窗口柄同一套 `GripShape`）。
+    fn input_grip_is_themed_and_defaults_to_diagonal() {
+        // 文本框的缩放柄过去写死在引擎里（3 个斜向小方块、无视主题）；现在走
+        // `InputStyle::grip`（与窗口柄同一套 `GripShape`），默认 = 三条斜线。
         let p = Palette::dark();
         let input = InputStyle::themed(&p);
-        assert_eq!(input.grip.shape, GripShape::Bars, "默认三条横线（不是斜线）");
+        assert_eq!(input.grip.shape, GripShape::Diagonal, "默认三条斜线");
         assert_eq!(input.grip.color, p.text_dim, "柄色取自调色板");
         assert_eq!(input.grip.color, input.resize_handle, "与 resize_handle 同色");
         assert!(input.grip.is_visible());
         // setter：换形状 / 换整份样式；`Hidden` 只是不画图案（命中区由引擎另给）。
         assert_eq!(
-            input.clone().with_grip_shape(GripShape::Diagonal).grip.shape,
-            GripShape::Diagonal
+            input.clone().with_grip_shape(GripShape::Bars).grip.shape,
+            GripShape::Bars
+        );
+        assert_eq!(
+            input.clone().with_grip_shape(GripShape::Squares).grip.shape,
+            GripShape::Squares
         );
         assert!(!input.clone().with_grip_shape(GripShape::Hidden).grip.is_visible());
         assert_eq!(

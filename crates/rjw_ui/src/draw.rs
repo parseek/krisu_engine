@@ -913,6 +913,122 @@ pub fn tile_grid(rect: Rect, tile: Vec2) -> Option<impl Iterator<Item = (Rect, V
     }))
 }
 
+/// **文本渐变（首末两色）**：在**某个域**内从 `from` 线性插值到 `to`，方向由 `axis` 决定。
+///
+/// # 域（`mode`）
+///
+/// - [`GradientMode::Glyph`]：**逐字形** —— 每个字自身一条完整渐变（大字号下每个字都从
+///   `from` 到 `to`）；
+/// - [`GradientMode::Line`]（**默认**）：**逐行** —— 每行独立一条完整渐变（多行时短行不会
+///   只吃到半条；单行文本与 `Frame` **逐像素相同**）；
+/// - [`GradientMode::Frame`]：**整块（"Text 域"）** —— 整段文本一条渐变，跨行连续
+///   （短行只覆盖它对应的那一段，这正是"跨行一个渐变"的语义）。
+///
+/// # 为什么只有两个停靠点（而不是 `rjw_text::Gradient` 的多 stops）
+///
+/// `rjw_text` 的渐变**只在它自己的 `Label::draw_to` 路径**生效（UI 这条链走的
+/// `draw_with` 不消费它，见 `ui/cmds.rs::draw_text_quads`），而 UI 要的是"逐字形顶点色"。
+/// 两色 + 方向 + 域是 [`Copy`] 的（**零堆分配**、可廉价哈希）⇒ 命令可自由克隆、签名可逐字段
+/// 入哈希。需要"红→黄→绿"这类多色时，用多条 `LabelEx` 而不是现在就把 `Vec` 拖进来。
+///
+/// # 采样口径（三条，改之前先读 `ui/cmds.rs` 的对应注释）
+///
+/// 1. 域与采样点都在**文本视觉原点系**（与 `rjw_text` 的字形 `top_left` 同系）——
+///    不用窗口/绝对坐标，否则渐变会随控件在窗口里的位置漂移；
+/// 2. 采样点由**未裁剪**的字形几何取"字形内归一化位置"再还原成局部坐标 ⇒
+///    **裁剪不改变颜色**（裁剪只少画一部分顶点）；
+/// 3. 采样色与字形基准色**相乘**（与 `rjw_text` 的 `mul_color(sample, glyph.color)` 同口径）
+///    ⇒ 基准色为白时就是纯渐变，为其它色时是"渐变换色"。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextRamp {
+    /// 起点色（域内 `t = 0` 一侧）。
+    pub from: Color,
+    /// 终点色（域内 `t = 1` 一侧）。
+    pub to: Color,
+    /// 渐变方向（横 / 纵）。
+    pub axis: rjw_text::GradientAxis,
+    /// 渐变域（Glyph 逐字形 / Line 逐行 / Frame 整块）。见类型文档。
+    pub mode: rjw_text::GradientMode,
+}
+
+impl TextRamp {
+    /// **横向**渐变（左 → 右），域默认 [`GradientMode::Line`]。
+    #[inline]
+    pub const fn horizontal(from: Color, to: Color) -> Self {
+        Self {
+            from,
+            to,
+            axis: rjw_text::GradientAxis::Horizontal,
+            mode: rjw_text::GradientMode::Line,
+        }
+    }
+
+    /// **纵向**渐变（上 → 下），域默认 [`GradientMode::Line`]。
+    #[inline]
+    pub const fn vertical(from: Color, to: Color) -> Self {
+        Self {
+            from,
+            to,
+            axis: rjw_text::GradientAxis::Vertical,
+            mode: rjw_text::GradientMode::Line,
+        }
+    }
+
+    /// 换一个**渐变域**（Glyph / Line / Frame）——链式，保持其余字段。
+    #[inline]
+    pub const fn mode(mut self, mode: rjw_text::GradientMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// 沿本渐变轴的坐标分量。
+    #[inline]
+    pub fn axis_coord(self, p: Vec2) -> f32 {
+        match self.axis {
+            rjw_text::GradientAxis::Horizontal => p.x,
+            rjw_text::GradientAxis::Vertical => p.y,
+        }
+    }
+
+    /// 沿本渐变轴的尺寸分量。
+    #[inline]
+    pub fn axis_span(self, span: Vec2) -> f32 {
+        match self.axis {
+            rjw_text::GradientAxis::Horizontal => span.x,
+            rjw_text::GradientAxis::Vertical => span.y,
+        }
+    }
+
+    /// **域内归一化位置**（纯函数，可单测）：`c` 落在 `lo..hi` 里的比例，越界钳制；
+    /// 退化域（`hi - lo <= 0`）⇒ `0`（取起点色）。
+    #[inline]
+    pub fn t_in(self, lo: f32, hi: f32, c: f32) -> f32 {
+        if hi - lo <= f32::EPSILON {
+            return 0.0;
+        }
+        ((c - lo) / (hi - lo)).clamp(0.0, 1.0)
+    }
+
+    /// **整块（Frame / "Text 域"）**的归一化位置：域 = `origin..origin + span`（沿本轴）。
+    ///
+    /// 是 [`Self::t_in`] 的便捷包装（不看 `mode`）；`span` 退化 ⇒ `0`。
+    #[inline]
+    pub fn t_at(self, origin: Vec2, span: Vec2, p: Vec2) -> f32 {
+        let lo = self.axis_coord(origin);
+        self.t_in(lo, lo + self.axis_span(span), self.axis_coord(p))
+    }
+
+    /// 按归一化位置取色（首末线性插值，复用 [`lerp_color`]），再与 `base` **逐分量相乘**
+    /// （`base` = 字形基准色 / tint；白 = 纯渐变）。
+    #[inline]
+    pub fn color_at(self, t: f32, base: Color) -> Color {
+        let mixed = lerp_color(self.from, self.to, t.clamp(0.0, 1.0));
+        let m: [f32; 4] = mixed.into();
+        let b: [f32; 4] = base.into();
+        Color::from([m[0] * b[0], m[1] * b[1], m[2] * b[2], m[3] * b[3]])
+    }
+}
+
 /// 绘制命令种类（记录式；`Ui::finish` 逐条提交到 `Render2D`）。
 #[derive(Clone, Debug)]
 pub enum DrawKind {
@@ -963,6 +1079,12 @@ pub enum DrawKind {
         /// **预排版缓冲**（控件自持，输入框/TextArea 用；`None` = 绘制期按需缓存）。
         /// 不进内容签名（排版结果由 `text`/`size`/`family` 决定；窗口顶点缓存已固化字形）。
         buf: Option<Arc<Buffer>>,
+        /// **首末两色渐变**（[`TextRamp`]；`None` = 整段用 `color` 单色）。
+        ///
+        /// 逐字形四角按文本块内相对位置取色再与 `color` 相乘 —— 见 [`TextRamp`]。
+        /// ⚠ **必须进内容签名**（`gpu_batch::cmd_sig_hash`）：否则改两色后窗口顶点缓存
+        /// 不失效（历史同类坑："改了颜色文字不刷新"）。
+        ramp: Option<TextRamp>,
     },
     /// 文本输入框光标（竖条）。
     Caret { color: Color, width: f32 },
@@ -1211,6 +1333,17 @@ pub struct UiDraw {
     /// `rect` 是相对当前容器 origin 的局部坐标（逐层平移成绝对），而 `clip` 记录时
     /// 已是绝对坐标，再平移会双重偏移（滚动容器内容被错误裁掉）。
     pub clip: Option<Rect>,
+    /// **待定满宽标记**（`ui.divider()` / 水平 `Divider` 用）：这条命令的宽度要在**它所属
+    /// 容器结算尺寸之后**才定 —— 那时才知道"容器的内容宽"，再把它 `rect.w` 回填成
+    /// "从自己的 x 一直到内容盒右缘"。
+    ///
+    /// 为什么需要它：自动宽窗口是**布局根**（`Frame::is_layout_root`），`avail_w()` 恒
+    /// `None`（刻意如此：根 frame 的固定宽是"视口宽"，拿它会把窗口撑成屏幕宽 —— 历史 BUG），
+    /// 所以录制那一刻**根本不知道**容器有多宽 ⇒ 只能先按当下的保守宽度录下、结算后回填。
+    ///
+    /// ⚠ **不是绘制属性**：每个容器结算后立刻由 `Ui::expand_pending_full_w` 清零，因此
+    /// 走进 `finish` / 顶点缓存的命令里它恒为 `false`（不进内容签名、无缓存失效面）。
+    pub full_w: bool,
     pub kind: DrawKind,
 }
 
@@ -1225,7 +1358,7 @@ impl UiDraw {
     }
 }
 
-/// 一条文本命令的便捷构造。
+/// 一条文本命令的便捷构造（**单色**；带渐变请用 [`text_cmd_ramp`]）。
 #[allow(clippy::too_many_arguments)]
 pub fn text_cmd(
     depth: u32,
@@ -1243,6 +1376,31 @@ pub fn text_cmd(
     clip_outer: Option<Rect>,
     buf: Option<Arc<Buffer>>,
 ) -> UiDraw {
+    text_cmd_ramp(
+        depth, seq, win, elem, rect, text, size, color, align, valign, family, clip, clip_outer,
+        buf, None,
+    )
+}
+
+/// 一条文本命令的便捷构造（**带可选首末两色渐变**）——[`text_cmd`] 的完整形态。
+#[allow(clippy::too_many_arguments)]
+pub fn text_cmd_ramp(
+    depth: u32,
+    seq: u32,
+    win: u32,
+    elem: u32,
+    rect: Rect,
+    text: Arc<str>,
+    size: f32,
+    color: Color,
+    align: TextAlign,
+    valign: TextVAlign,
+    family: Option<Arc<str>>,
+    clip: Option<Rect>,
+    clip_outer: Option<Rect>,
+    buf: Option<Arc<Buffer>>,
+    ramp: Option<TextRamp>,
+) -> UiDraw {
     UiDraw {
         depth,
         seq,
@@ -1250,6 +1408,7 @@ pub fn text_cmd(
         elem,
         rect,
         clip: clip_outer,
+        full_w: false,
         kind: DrawKind::Text {
             text,
             size,
@@ -1259,6 +1418,7 @@ pub fn text_cmd(
             family,
             clip,
             buf,
+            ramp,
         },
     }
 }
@@ -1593,6 +1753,7 @@ mod tests {
             elem: 1,
             rect: Rect::new(0.0, 0.0, 20.0, 10.0),
             clip: Some(Rect::new(880.0, 130.0, 240.0, 300.0)),
+            full_w: false,
             kind: DrawKind::Solid(Color::WHITE),
         };
         d.translate(Vec2::new(880.0, 120.0));
@@ -1775,7 +1936,7 @@ pub(crate) fn push_panel_img_cmds(
         (true, Some(c)) => DrawKind::Solid(c),
         (true, None) => DrawKind::Rect(grad),
     };
-    out.push(UiDraw { depth, seq, win, elem, rect, clip, kind });
+    out.push(UiDraw { depth, seq, win, elem, rect, clip, full_w: false, kind });
     // **背景图**（背景刷之上、边框之下）：圆角遮罩用面板 radius（直角时半径 0 ⇒ 不裁）。
     // ⚠ 与半径**无关**：直角面板同样要画图（历史 bug 就在这里）。
     if let Some(mut img) = img {
@@ -1787,6 +1948,7 @@ pub(crate) fn push_panel_img_cmds(
             elem,
             rect,
             clip,
+            full_w: false,
             kind: DrawKind::Image(img),
         });
     }
@@ -1799,7 +1961,115 @@ pub(crate) fn push_panel_img_cmds(
             elem,
             rect,
             clip,
+            full_w: false,
             kind: DrawKind::Border { color: border, width: border_w, radius },
         });
+    }
+}
+
+#[cfg(test)]
+mod text_ramp_tests {
+    use super::*;
+
+    /// **渐变位置**：横轴看 x、纵轴看 y、越界钳制、退化跨度取起点。
+    #[test]
+    fn ramp_t_maps_the_chosen_axis_and_clamps() {
+        let tl = Vec2::new(10.0, 5.0);
+        let span = Vec2::new(100.0, 20.0);
+        let h = TextRamp::horizontal(Color::RED, Color::BLUE);
+        assert_eq!(h.t_at(tl, span, Vec2::new(10.0, 999.0)), 0.0, "左缘 ⇒ t=0（不看 y）");
+        assert_eq!(h.t_at(tl, span, Vec2::new(110.0, -999.0)), 1.0, "右缘 ⇒ t=1");
+        assert_eq!(h.t_at(tl, span, Vec2::new(60.0, 0.0)), 0.5, "中点 ⇒ 0.5");
+        assert_eq!(h.t_at(tl, span, Vec2::new(-40.0, 0.0)), 0.0, "越界左 ⇒ 钳到 0");
+        assert_eq!(h.t_at(tl, span, Vec2::new(999.0, 0.0)), 1.0, "越界右 ⇒ 钳到 1");
+        let v = TextRamp::vertical(Color::RED, Color::BLUE);
+        assert_eq!(v.t_at(tl, span, Vec2::new(999.0, 5.0)), 0.0, "顶缘 ⇒ t=0（不看 x）");
+        assert_eq!(v.t_at(tl, span, Vec2::new(-999.0, 25.0)), 1.0, "底缘 ⇒ t=1");
+        assert_eq!(h.t_at(tl, Vec2::ZERO, Vec2::new(60.0, 0.0)), 0.0, "零跨度 ⇒ 起点色");
+    }
+
+    /// **取色**：首末插值 + 与基准色（tint）逐分量相乘。
+    #[test]
+    fn ramp_color_lerps_endpoints_and_multiplies_base() {
+        let r = TextRamp::horizontal(Color::RED, Color::BLUE);
+        let red: [f32; 4] = Color::RED.into();
+        let blue: [f32; 4] = Color::BLUE.into();
+        assert_eq!(<[f32; 4]>::from(r.color_at(0.0, Color::WHITE)), red, "t=0 ⇒ 起点色");
+        assert_eq!(<[f32; 4]>::from(r.color_at(1.0, Color::WHITE)), blue, "t=1 ⇒ 终点色");
+        let mid = <[f32; 4]>::from(r.color_at(0.5, Color::WHITE));
+        for i in 0..4 {
+            assert!(
+                (mid[i] - (red[i] + blue[i]) * 0.5).abs() < 1e-6,
+                "中点应是首末线性插值：{mid:?}"
+            );
+        }
+        // 基准色相乘：全 0 ⇒ 全 0；半透明白 ⇒ 只缩放 alpha。
+        assert_eq!(
+            <[f32; 4]>::from(r.color_at(0.25, Color::from([0.0, 0.0, 0.0, 0.0]))),
+            [0.0; 4],
+            "tint = 全 0 ⇒ 结果全 0"
+        );
+        let half_a = <[f32; 4]>::from(r.color_at(0.0, Color::from([1.0, 1.0, 1.0, 0.5])));
+        assert!((half_a[3] - red[3] * 0.5).abs() < 1e-6, "alpha 也按分量相乘");
+    }
+
+    /// 两种方向的构造器与显式轴构造等价；**默认域 = 逐行（Line）**。
+    #[test]
+    fn ramp_constructors_match_the_explicit_axis() {
+        assert_eq!(
+            TextRamp::horizontal(Color::RED, Color::BLUE),
+            TextRamp {
+                from: Color::RED,
+                to: Color::BLUE,
+                axis: rjw_text::GradientAxis::Horizontal,
+                mode: rjw_text::GradientMode::Line,
+            }
+        );
+        assert_eq!(
+            TextRamp::vertical(Color::RED, Color::BLUE),
+            TextRamp {
+                from: Color::RED,
+                to: Color::BLUE,
+                axis: rjw_text::GradientAxis::Vertical,
+                mode: rjw_text::GradientMode::Line,
+            }
+        );
+        assert_eq!(
+            TextRamp::horizontal(Color::RED, Color::BLUE).mode(rjw_text::GradientMode::Frame).mode,
+            rjw_text::GradientMode::Frame,
+            "`.mode(..)` 换域、保持其余字段"
+        );
+    }
+
+    /// **`t_in`：域内归一化位置**（三域共用同一套算术），退化域取起点。
+    #[test]
+    fn ramp_t_in_clamps_inside_the_domain() {
+        let r = TextRamp::horizontal(Color::RED, Color::BLUE);
+        assert_eq!(r.t_in(0.0, 100.0, 0.0), 0.0, "域起点");
+        assert_eq!(r.t_in(0.0, 100.0, 100.0), 1.0, "域终点");
+        assert_eq!(r.t_in(0.0, 100.0, 25.0), 0.25);
+        assert_eq!(r.t_in(0.0, 100.0, -5.0), 0.0, "越界左 ⇒ 钳到 0");
+        assert_eq!(r.t_in(0.0, 100.0, 500.0), 1.0, "越界右 ⇒ 钳到 1");
+        assert_eq!(r.t_in(10.0, 10.0, 50.0), 0.0, "零宽域 ⇒ 起点色");
+        assert_eq!(r.t_in(10.0, 5.0, 7.0), 0.0, "反向域（hi < lo）⇒ 起点色");
+        // 行域 / 字形域只是换了 `lo..hi`：同一段算术。
+        assert_eq!(r.t_in(20.0, 40.0, 30.0), 0.5, "行域内 50%");
+        assert_eq!(r.t_in(12.0, 16.0, 14.0), 0.5, "字形域内 50%");
+    }
+
+    /// `t_at` = 整块（Frame）域的便捷包装：域 = `origin..origin + span`（沿本轴）。
+    #[test]
+    fn ramp_t_at_is_the_frame_domain() {
+        let r = TextRamp::horizontal(Color::RED, Color::BLUE);
+        let origin = Vec2::new(10.0, 5.0);
+        let span = Vec2::new(100.0, 20.0);
+        assert_eq!(r.t_at(origin, span, Vec2::new(10.0, 999.0)), 0.0, "左缘 ⇒ 0（不看 y）");
+        assert_eq!(r.t_at(origin, span, Vec2::new(110.0, -999.0)), 1.0, "右缘 ⇒ 1");
+        assert_eq!(r.t_at(origin, span, Vec2::new(60.0, 0.0)), 0.5);
+        assert_eq!(r.axis_coord(Vec2::new(3.0, 4.0)), 3.0, "横向取 x");
+        assert_eq!(r.axis_span(span), 100.0);
+        let v = TextRamp::vertical(Color::RED, Color::BLUE);
+        assert_eq!(v.axis_coord(Vec2::new(3.0, 4.0)), 4.0, "纵向取 y");
+        assert_eq!(v.axis_span(span), 20.0);
     }
 }

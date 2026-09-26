@@ -93,7 +93,7 @@ ui.pack_at(Vec2::new(16.0, 90.0), PackSide::Top, |p| {
 | `add(Widget)` / `add_at(pos, Widget)` | 属性化 builder 控件（`Label` / `Button` / `Slider`…） |
 | `label_wrap(max_w, …)` | 宽内自动换行的标签 |
 | `row(closure)` | 水平行：子项 `PackSide::Left` 排列（**左上角对齐、沿 X 推进**），在父容器中占一行。行高 = 子项最高的那个；**单行子项**（[`SizeClass::SingleLine`]，默认）被**钉到行的标准高**（默认 [`Theme::row_h`](crate::Theme::row_h)），**多行子项**（[`SizeClass::Multiline`]，如多行 `TextEditor`）以它为下限、可撑高整行 |
-| `row_builder()` | 行的可配置形态（[`crate::RowBuilder`]）：`min_h`（行高下限 + 单行子项标准高）/ `max_h`（上限）/ `height`（固定行高）/ `gap` / `pad`，最后 `.show(closure)` |
+| `row_builder()` | 行的可配置形态（[`crate::RowBuilder`]）：`min_h`（行高下限 + 单行子项标准高）/ `max_h`（上限）/ `height`（固定行高）/ `gap` / `pad` / **`wrap_w`（行宽上限 ⇒ 自动换行）** / **`wrap`（用父级可用宽自动换行）** / **`line_gap`（折行的行间距，默认 = `gap`）**，最后 `.show(closure)`；容器内也有 `ui.row_wrap(w, ..)` 便捷入口 |
 | `min_size / max_size(w, h)` | 一次性约束**下一个子项**（`set_next_min/max`） |
 | `divider()` | 分割线（占光标；宽 = 容器当前可用宽） |
 
@@ -196,6 +196,98 @@ ui.window("win_b").pos(pos).show(|w| { … });             // 绝对定位一个
 **多行子项**（`TextEditor::multiline()`）可以把行**撑高**（行高 = 最高的子项）。整体在父
 容器中占一行（宽 = 子项结算、撑大父级）。要自定义行高上下限用 `row_builder()`（见 §3.3）。
 
+**自动换行**（`row_builder().wrap_w(w)` / `.wrap()` / `ui.row_wrap(w, |r| …)`）：给行一个
+**行宽上限**，塞不下就**收行**（`cursor.y += 行高 + line_gap`，回到行首继续沿 X 排）：
+
+- **只换行、不压缩**：开启后本 frame 不再报"行内剩余宽"（[`Frame::remaining_w`]）——
+  否则 `Label` 这类 `LimitedInParent` 子项会被**压扁**而不是换到下一行（那是未开启折行的
+  `row` 的既有语义，两者互斥）；
+- **行内左上角对齐**：行高 = 该行**已见**最大子项高（单遍流式的必然：先放的子项不会因为
+  后放的高子项而重新居中），且不小于标准行高（`min_h` / `Theme::row_h`）；
+- **空行不折**：首个子项比行宽还宽 ⇒ 它自己占一行并溢出（不会先折出一个空行、也不死循环）；
+- `.wrap_w(..)` = 显式上限（与**父级可用宽取 min**）；`.wrap()` = 用父级可用宽（自动宽窗口
+  **首帧**没有可用宽 ⇒ 本帧不折，次帧起折，与 `Label` 的换行同口径）；
+- **不调它们 ⇒ 与旧行为一字不变**（宽 = 内容，窄容器里走"压窄"那条路）；
+- 结算：宽 = **最长行右缘**、高 = 各行高 + 行间距（靠既有的 `content_bounds` + 末行兜底）；
+- `RJ_ROW_TRACE=1` 打印每个"请求了折行的" row 的宽度来源（`explicit` / `avail` / `limit`）
+  与结算尺寸（`size.y > std_h` ⇒ 确实折了）。
+
+### 4.6.1 `Child::Fill` —— 整格装饰的第三态
+
+布局契约 [`Child`] 有三态（`Ui::child_rect(w, h, child)` 的第三个参数）：
+
+| 值 | 宽度 | 高度 | 用途 |
+|---|---|---|---|
+| `Expand`（默认） | 计入父级 | 计入父级 | 普通控件 / 容器 |
+| `Fit` | **不计入** | **不计入** | `DisableAutoExpansion`（内容自洽、溢出可见） |
+| **`Fill`** | **计入观感（按申请宽铺满），但不计入父级** | 计入父级 | **整格装饰**：`divider()` 的线、`foldable` 的标题行 |
+
+为什么需要 `Fill`：整格装饰"天生要铺满可用宽"，一旦让它们**参与容器宽结算**，在
+**带 `vscroll` 的自动宽窗口**里会**正反馈锁定** —— 滚动视口的宽首帧取"屏幕剩余宽"
+（`window_impl` 里为防视口塌成 1px 的引导值），装饰按它铺满 ⇒ 内容宽 = 视口宽 ⇒ 下一帧
+视口又按内容反推 ⇒ **窗口一打开就被撑到屏幕大小**（用户实测："分割线会默认水平撑开到屏幕
+大小 …… 而是**其他内容有多少就该多宽**"）。用 `Fill` 后容器宽由**其他内容**决定，装饰跟着
+铺满即可（实测 Gallery 窗口宽 1920 → 683）。
+
+### 4.7 namespace —— 只要 ID 命名空间，不要容器
+
+```rust
+ui.namespace("left", |ui| {
+    ui.text_input("kw", &mut left);      // 状态键 = "left/kw"
+});
+ui.namespace("right", |ui| {
+    ui.text_input("kw", &mut right);     // 状态键 = "right/kw"（与上面互不干扰）
+});
+```
+
+- **不做任何布局**：没有背景 / 内边距 / 裁剪，也不另开 frame —— 正文与"不用它"时**逐像素
+  相同**，只是内部控件的**绝对 ID** 多了 `id/` 前缀（见 [`crate::id`]）；
+- 正文是**当前容器的子项**：录在光标处，`avail_w` 与 `gap` 照旧生效；父光标由正文各项
+  自己推进（本方法不额外占位）；
+- **返回正文结算尺寸**（`Vec2`；空内容 = `(0,0)`）；
+- 嵌套顺序拼接：`"a"` 里的 `"b"` 里的 `"kw"` ⇒ `"a/b/kw"`。
+
+什么时候需要它：两处 UI（两个子表单 / 动态列表的每一行 / 两段并列的排版）都会出现 `"ok"` /
+`"kw"` 这类**相对名**，没有命名空间时它们的跨帧状态（输入内容 / 焦点 / 勾选）会互相覆盖。
+窗口 / 面板 / 滚动容器 / grid / **区块**各自已经是命名空间边界；本入口给"只想要命名空间、
+不要任何容器"的场合。
+
+### 4.8 foldable —— 可收缩区块
+
+```rust
+ui.foldable("perf", "性能统计").show(|ui| {
+    ui.label(&format!("FPS {fps}"));       // 折叠时这段**完全不录制**
+});
+ui.foldable("advanced", "高级").open(true).show(|ui| { /* … */ });   // 首次就展开
+```
+
+- **标题行** = 一整行（高 `Theme::row_h`、宽铺满容器内容宽）：▶ / ▼ + 文本；**点它即翻转**
+  （当帧几何不变、**下一帧**生效，与窗口 ⌃ 同口径）；`Tab` 可聚焦、`Enter` / `Space` 翻转；
+- **默认折叠**（首次只见标题行）；`.open(true)` 改首次展开 —— 只影响**从未被点过**的区块：
+  首帧把默认态落盘到 [`UiState::folded`]（**绝对 ID → bool 的表**，存"明确态"），
+  之后点标题翻转写的就是它，所以默认折叠的区块点开后**不会**被默认值折回去；
+- **折叠 = 正文完全不录制**：不占高、不参与布局、不进命中表、不产生顶点；正文内部的跨帧
+  状态（滚动偏移 / 输入内容 / 焦点）**不清**，展开回来还是原样；
+- **折叠状态引擎托管**（[`UiState::folded`]）：应用不必多一个 `bool` 字段，要读 / 改用
+  `UiState::{is_folded, set_folded, toggle_folded}`（`set_folded(id, false)` = **记住展开**）；
+- 正文录在**本区块的 ID 命名空间**里 ⇒ 两个区块里的同名控件互不干扰；
+- **正文的归属提示**：正文整体**左缩进** `FoldableStyle::body_indent`（默认 12 逻辑像素；
+  缩进同时作用于绘制与命中 ⇒ "点得到的就是看得见的"，而容器尺寸不变），并在标题三角下方画一条
+  **竖引导线**（`guide` / `guide_w` / `guide_tail`；`guide_w = 0` 关掉）；
+  **可选**：`fade_h > 0` 时在正文上下缘各画一条"阴影色 → 全透明"的矩形
+  （`.with_body_fade(12.0, Color::rgba_u8(0,0,0,90))`，两条 `Gradient`，零纹理）；
+  标题行想要"类按钮"的块状外观用 `FoldableStyle::button_like(&palette)`
+  （常态底色 + 描边 + 圆角；**行为不变** —— 整行本来就是命中区）；
+- **标题里的控件，用 `Foldable::custom(ui, id, |t| …)`**（或容器里的
+  `foldable_custom(id, |t| …)`）—— 闭包拿到与正文同一个上下文类型（`PackEntry`，实现了
+  `UiAdd`），**标题由此成为"标准容器"**：`t.label(..)` / `t.row(|r| ..)` / `t.button(..)` /
+  `t.text_input(..)` 都能用；
+  - 内容从**标题文本区**（`pad_x + icon_w` 之后）起排 ⇒ 不压三角图标；
+  - 容器**只固定宽、高度自然** ⇒ 放 `Row` / 多行内容时**标题块自己长高**（正文随之让位：
+    标题行矩形加高 + 父容器光标补推同样多）；
+  - 里面的控件自己认领按下 ⇒ 点它们**不会**连带折叠标题（也不会把这次按下当成外层窗口 /
+    面板的拖动基准）。⚠ 命中区恒为**首行**（交互发生在内容之前，高度那时还不知道）。
+
 ---
 
 ## 5. 尺寸契约与膨胀模式（`Widget` trait）
@@ -238,6 +330,9 @@ ui.window("win_b").pos(pos).show(|w| { … });             // 绝对定位一个
 | panel | `panel_at` / `drag_panel_at` | 背景 + 边框 + 内边距 |
 | scroll | `scroll_at` / `list_at` | 滚动容器（强制裁剪） |
 | row | `row(… )` | 水平等高管线，占一行 |
+| namespace | `namespace(id, \|ui\| …)` | **只加 ID 前缀**，不新增容器 / 不占额外光标 |
+| foldable | `foldable(id, label)` / `Foldable::custom(…)` | **可收缩区块**：一行标题 + 可折叠正文（折叠时正文不录制） |
 
 **一句话**：默认用 **pack** 自上而下搭骨架；复杂排布用 grid / flex / row；需要独立
-定位或浮层用 `*_at` / window / panel；长内容用 scroll / list。
+定位或浮层用 `*_at` / window / panel；长内容用 scroll / list；**分节 / 分栏**用
+foldable（可折叠）与 namespace（只要 ID 隔离）。

@@ -50,6 +50,10 @@
 //!   颜色 / 字号 / 字体 / 内边距等属性（未设置回落全局 [`Theme`]），统一
 //!   [`widgets::Response`] 响应，经 [`Ui::add`] / [`Ui::add_at`]（容器包装见
 //!   [`ui::UiAdd`]）放置。
+//! - **彩色 / 富样式文本**（[`LabelEx`]）：整组 [`TextStyle`]（`.style(..)`）+ 字段级糖
+//!   （字重 / 斜体 / 拉伸 / 字距 / 行高 / 对齐 / 换行 / 省略）+ **首末两色渐变**
+//!   （[`TextRamp`]，横 / 纵）——渐变是**逐字形顶点色**（零纹理、零着色器改动）；
+//!   入口 `Label::ex(text)` / `ui.label_ex(text)` / `ui.colored_label(text, color)`。
 //! - **Widget 尺寸契约（v0.3：就地申请）**：[`widgets::Widget`] **只有一个方法**
 //!   `fn ui(self, ui) -> Response`——尺寸在 `ui()` 里申请（[`Ui::allocate`] /
 //!   [`Ui::allocate_mode`] / [`Ui::allocate_at`] / [`Ui::allocate_sense`]，**物理像素**）；
@@ -63,10 +67,14 @@
 //!   **软层** = 控件自身内容边界，自洽控件可跳过）、可用宽度（[`Ui::avail_w`]）、
 //!   命中过滤（Clip 沙箱外命中失效并入 `hit_abs`）。**ScrollView**（[`Ui::scroll_at`]、
 //!   文本编辑框）与严格窗口（[`Ui::window`] + `Placement::Clip`）共用底座。
-//! - **滚动容器（ScrollView）**：[`Ui::scroll_at`]——内容在可视区内堆叠 + 滚轮 /
-//!   滚动条（拖 thumb、点轨道翻页）滚动，可视区外**强制裁剪**；滚动偏移持久于
-//!   [`UiState::scrolls`]（**物理像素**——内部计算一律物理，DPI 只在 API 边界换算；
-//!   对外单位可选参数用 [`draw::Metric`]）。沙箱内 `avail_w()` = 可视区宽。
+//! - **滚动容器（ScrollView）**：[`Ui::scroll_at`]（纵向滚动 + 横向裁切）/
+//!   [`Ui::scroll_axes_at`]（两条轴各自 `ScrollMode`，`Scroll` 的那条轴画滚动条 + 吃滚轮）/
+//!   [`ScrollArea`] builder（`ui.scroll_area(id, size).vscroll(..).hscroll(..).show(..)`
+//!   返回 [`ScrollOutcome`]）——内容在可视区内堆叠 + 滚轮 / 滚动条（拖 thumb、点轨道翻页）
+//!   滚动，可视区外**强制裁剪**；滚动偏移持久于 [`UiState::scrolls`]（`offset` / `offset_x`，
+//!   **物理像素**——内部计算一律物理，DPI 只在 API 边界换算；对外单位可选参数用
+//!   [`draw::Metric`]）。沙箱内 `avail_w()` = 可视区宽，**唯一例外**是"该轴要横滚"
+//!   （`h == Scroll`）：此时不上报可用宽 ⇒ 子项保持自然宽、不折行（横滚的前提）。
 //! - **键盘导航**：**Tab / Shift+Tab / 方向键**遍历焦点链（[`UiState::focused`]），
 //!   **Enter / Space** 激活焦点控件（按钮 / 勾选 / 单选 / 下拉框），滑块用左右方向键
 //!   调值、下拉框展开时上下方向键切换选项，**Esc** 收起浮层 / 取消焦点；焦点控件
@@ -125,7 +133,8 @@
 //!
 //! # 模块
 //!
-//! - [`ui`]：`Ui` 主体 / `Panel` / `Pack` / `Grid` / `UiAdd` 容器控件 API
+//! - [`ui`]：`ui` 模块根 + `ui/` 15 个子模块（实现分工见 `docs/UI_ARCHITECTURE.md` §5.7）
+//!   ——`Ui` 主体 / `Panel` / `Pack` / `Grid` / `UiAdd` 容器控件 API
 //! - [`backend`]：绘制后端抽象（[`UiBackend`] / [`UiBatch`] / [`Tri`] /
 //!   [`RecordingBackend`]）——`rjw_ui` 只输出批次数据，不调用任何渲染器
 //! - [`id`]：ID 命名空间（[`IdRelative`] 原始名字 / [`IdAbsolute`] 完整状态键 / [`IdStack`]）
@@ -175,7 +184,7 @@ pub(crate) mod ui_types;
 pub use backend::{RecordingBackend, Tri, UiBackend, UiBatch, UiBatchSource};
 pub use draw::{
     CornerRadius, Gradient, Icon, ImageBg, ImageFit, ImageLayout, MAX_IMAGE_TILES, Metric, Position,
-    Size, TextAlign, lerp_color, tile_grid,
+    Size, TextAlign, TextRamp, lerp_color, tile_grid,
 };
 pub use focus::FocusKind;
 pub use id::{IdAbsolute, IdRelative, IdStack};
@@ -185,21 +194,28 @@ pub use painter::{DrawQueue, Painter};
 pub use state::{ButtonState, CheckboxState, TextFocus, UiState, UiStats, WidgetState};
 pub use style::{
     Brush, ButtonStyle, CheckboxStyle, ComboStyle, DEFAULT_LINE_SPACING, Density, DividerStyle,
-    FocusStyle, GripShape, GripStyle, InputStyle, LabelStyle, MenubarStyle, ModalStyle, Palette,
-    PanelStyle, ShadowStyle, SliderStyle, Theme, bevel_raised, bevel_sunken, hgrad, vgrad,
+    FocusStyle, FoldableStyle, GripShape, GripStyle, InputStyle, LabelStyle, MenubarStyle,
+    ModalStyle, Palette, PanelStyle, ShadowStyle, SliderStyle, Theme, bevel_raised, bevel_sunken,
+    hgrad, vgrad,
 };
 pub use input::{KeyboardSnapshot, MouseSnapshot};
-pub use ui::{Anchor, Grid, Level, ModalBuilder, Pack, Panel, PanelBuilder, PanelOptions, Placement, Resize, RowBuilder, ScrollMode, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
+pub use ui::{Anchor, FoldState, Foldable, Grid, Level, ModalBuilder, Pack, PackEntry, Panel, PanelBuilder, PanelOptions, Placement, Resize, RowBuilder, ScrollMode, ScrollOutcome, ScrollParam, Namespace, Ui, UiAdd, UiCursor, UiDebugDump, UiInit, UiWindowInfo, Window, WindowBuilder, WindowClamp, WindowFx, WindowOptions};
 pub use view::{ViewCtx, ViewMode};
 /// 文本**形状层**的重导出（`rjw_text`）：`Ui` 只在此处依赖 cosmic-text 名字，
 /// 应用侧用 [`Theme::with_font_weight`] / [`Weight`] 时不必自己引 `rjw_text`。
-pub use rjw_text::{Stretch, Style, Weight};
+///
+/// [`TextStyle`] 是文本链的**样式载体**（字号 / 行高 / 行距 / 字重 / 斜体 / 拉伸 / 字距 /
+/// 颜色 / 对齐）——[`LabelEx::style`] 收它，因此与 `text::TextStyle` 一起从这里直达根
+/// （同一类型的两条路径，与 `draw::TextAlign` / `text::TextAlign` 同例）。
+pub use rjw_text::{Stretch, Style, TextStyle, Weight};
 pub use widgets::{
     Button, Checkbox, ColorFormat, ColorPicker, ColorPickerState, Divider, DividerAxis, Dropdown,
-    FONT_WEIGHT_CHOICES, FontModal, GRIP_W, Item, Label, MENU_GAP, MenuBar, MenuClick, MenuContent,
-    MenuCtx, MenuFn, NumberInput, PopupSide, Response, Segmented, Sense, Slider, SliderValue,
-    TextEditor, Widget, WidgetId, color_hex, format_color, format_f, format_u8, ink_on, item_h, luma,
-    parse_color, parse_hex, popup_gap, popup_origin, popup_padding, weight_label,
+    FONT_WEIGHT_CHOICES, FontModal, GRIP_W, Item, Label, LabelEx, MENU_GAP, MenuBar, MenuClick,
+    MenuContent,
+    MenuCtx, MenuFn, NumberInput, PopupSide, Response, ScrollArea, Segmented, Sense, Slider,
+    SliderValue, TextEditor, TextVAlignMode, Widget, WidgetId, color_hex, format_color, format_f,
+    format_u8, ink_on, item_h, luma, parse_color, parse_hex, popup_gap, popup_origin, popup_padding,
+    weight_label,
 };
 
 /// **UI 文本模块**（公开）：`rjw_ui` 里与文字渲染相关的全部公开面。
@@ -218,7 +234,7 @@ pub use widgets::{
 pub mod text {
     // ── 对齐与文本块定位（定义在 `draw`）──
     pub use crate::draw::{
-        TextAlign, TextVAlign, text_block_offset, text_cmd,
+        TextAlign, TextVAlign, text_block_offset, text_cmd, text_cmd_ramp,
     };
 
     // ── 纯逻辑文本编辑 / 测量辅助（定义在 `edit`；无 UI 状态依赖，可独立单测）──

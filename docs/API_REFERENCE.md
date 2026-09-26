@@ -949,25 +949,25 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 
 | 入口 | 链 | 语义 |
 |---|---|---|
-| `ui.window(id)` | `.pos(..)`（**不调 = 引擎自动级联**，Win32 `CW_USEDEFAULT` 语义：按首次出现顺序右下偏移 28 逻辑像素，越界回绕；结果持久于 `UiState::auto_pos`，用户拖拽优先） `.width(w)` **`.height(h)`** `.gap(Size)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` **`.resizable(bool)`** / **`.resize(allow, axes)`** `.title(&str)` `.close_button(&mut bool)` **`.collapsible(bool, Option<&mut bool>)`** `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）。**设计理念「无顾虑地使用」（`docs/UI_ARCHITECTURE.md` §0）：什么都不写也必须是对的** —— 位置自动级联、宽高**由内容撑开**、不裁切、无装饰；只有想控制时才写 `.width/.height/.vscroll/.resizable`。尺寸的**所有权链**单向：内容 → 显式 `.width/.height`（**初始值**）→ 用户拖过（持久值**接管**）。`.width` = 固定宽（右下角可缩放）；**`.height` = 固定高**（长内容窗口的**有界视口**：`.width(320.0).height(420.0).vscroll(Scroll)` ⇒ 视口 420 逻辑高 + 窗口内滚动条；不调 = 由内容决定）；`.gap` = **内容子项行距**（不调 = `Theme::gap`；下拉 / 菜单浮层用 `Physical(popup_gap(scale))` 拿"逻辑 1px"的紧行距）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**单轴溢出策略** `.vscroll(ScrollMode)` / `.hscroll(ScrollMode)`（`ScrollMode::{NoClip, ClipOnly, Scroll}`）：
+| `ui.window(id)` | `.pos(..)`（**不调 = 引擎自动级联**，Win32 `CW_USEDEFAULT` 语义：按首次出现顺序右下偏移 28 逻辑像素，越界回绕；结果持久于 `UiState::auto_pos`，用户拖拽优先） `.width(w)` **`.height(h)`** `.gap(Size)` `.level(Level)` `.placement(Placement)` `.style(PanelStyle)` `.clamp(WindowClamp)` **`.resize(bool)`** `.title(&str)` `.close_button(&mut bool)` **`.collapsible(bool, Option<&mut bool>)`** `.show(\|w\| ..)` | **可重叠窗口**（唯一入口）：点击置顶（焦点 z-order，`UiState.window_z`）+ 可拖拽（位置持久于 `UiState.panel_pos`）。**设计理念「无顾虑地使用」（`docs/UI_ARCHITECTURE.md` §0）：什么都不写也必须是对的** —— 位置自动级联、宽高**由内容撑开**、不裁切、无装饰；只有想控制时才写 `.width/.height/.vscroll/.resize`。尺寸的**所有权链**单向：内容 → 显式 `.width/.height`（**初始值**）→ 用户拖过（持久值**接管**）。`.width` = 固定宽（右下角可缩放）；**`.height` = 固定高**（长内容窗口的**有界视口**：`.width(320.0).height(420.0).vscroll(true)` ⇒ 视口 420 逻辑高 + 窗口内滚动条；不调 = 由内容决定）；`.gap` = **内容子项行距**（不调 = `Theme::gap`；下拉 / 菜单浮层用 `Physical(popup_gap(scale))` 拿"逻辑 1px"的紧行距）；`.placement(Clip)` = 强制裁剪；`.style` = 逐窗口样式覆盖（默认 `Theme::panel`）；`.clamp` = 位置约束（`Screen` 限位不跑出屏幕（默认）/ `Free` 自由 / `Locked` 锁定位置不可拖）。窗口内同一 layer 按"背景/图形→文字"绘制。**单轴溢出策略** `.vscroll(mode)` / `.hscroll(mode)`：入参是 **`impl ScrollParam`** —— `bool`（`true` = 视口 + 滚动条 / `false` = 不裁）或三态 **`ScrollMode::{NoClip, ClipOnly, Scroll}`**（低层逃生舱：只裁不滚只能写 `ClipOnly`）：
 - `NoClip`（默认）：该轴**压缩**内容 —— `.width(..)` / 拖出来的尺寸是**固定宽**，子项被**压进**可用宽（`row` 里最后一个控件按余量缩；`Label` 自动换行 / 省略号）；
 - `ClipOnly`：该轴**裁切**内容（视口：子项按**自然宽**排、超出被裁、无滚动条）；
-- `Scroll`：视口 + 滚动条。⚠ **当前实现里 `hscroll(Scroll)` 会降级成 `ClipOnly` 并打印一次提示**
-  （水平滚动条 / 第二条滚动状态还没做，见 `docs/UI_NEEDS.md`；`vscroll(Scroll)` 是**真的**，`scroll_at` 的滚动容器不受影响）。
+- `Scroll`：视口 + **滚动条**（滚轮 / 拖 thumb / 点轨道翻页）。**两条轴都真的实现了**：`vscroll(true)` = 右侧竖条、`hscroll(true)` = 底部横条（两条轴同时溢出时**拐角互让**）。
+- ⚠ **`hscroll(true)`（= `Scroll`）的那条轴不折行**：沙箱不再上报可用宽 ⇒ 内容保持**自然宽**、超出横向滚（这是"能横滚"的前提）。要按窗口宽折行就用 `hscroll(false)`（默认）。
 - 显式设置**覆盖** `.placement(..)`；没给时老语义不变（`Placement::Clip` ⇒ 两轴都裁；
   **被拖过尺寸的那条轴**自动成为视口）。
 - **两条轴互相独立**（旧的 `Placement::Clip` 做不到）：只裁横向的窗口，纵向仍能由内容撑高。
 
-**拖拽缩放（egui 风）** `.resizable(allow: bool)`：只给"能不能拖大小"，**允许的轴自己推导**、内容"压缩还是裁切"由 `hscroll` 决定：
+**拖拽缩放（egui 风）** `.resize(allow: bool)`：只给"能不能拖大小"（**轴不可显式指定**），**允许的轴自己推导**、水平轴"压缩还是横滚"由 `hscroll` 决定：
 
-| 垂直轴有视口？（`.vscroll(ClipOnly/Scroll)` 或给了 `.height(..)`） | `.resizable(true)` 允许的轴 | 水平轴内容 |
+| 垂直轴有视口？（`.vscroll(非 NoClip)` / 给了 `.height(..)` / `.placement(Clip)`） | `.resize(true)` 允许的轴 | 水平轴内容 |
 |---|---|---|
-| 是 | **垂直 + 水平**都能拖 | `hscroll` 非 `NoClip` ⇒ **裁切**；否则 **压缩** |
+| 是 | **垂直 + 水平**都能拖 | `hscroll(true)` ⇒ **横滚**（自然宽 + 横条）；否则按宽**压缩** |
 | 否（默认，高度由内容定） | **只有水平**能拖 | 同上 |
 
-`.resizable(false)` = 不画柄也不响应拖拽。**收起态**整条缩放链路关闭（没有尺寸可调：收起就是一行标题栏，柄的命中区会压住 ⌃/✕，按下种子还会把"收起后的那一行高"写成持久高 ⇒ 展开回来是一条缝）。
+`.resize(false)` = 不画柄也不响应拖拽。**不调 `.resize(..)`** = 旧行为（有 `.width(..)` 就能横向拖）。**收起态**整条缩放链路关闭（没有尺寸可调：收起就是一行标题栏，柄的命中区会压住 ⌃/✕，按下种子还会把"收起后的那一行高"写成持久高 ⇒ 展开回来是一条缝）。
 
-**`Resize` / `.resize(allow, axes)`（低层显式版）**：`allow = false` ⇒ 不画柄也不响应拖拽（`.width` 仍是布局固定宽）；`Resize::{Horizontal, Vertical, Both}` 选轴（`↔` / `↕` / `↖↘`）；**没有 `.width(..)` 也能拖宽**；高度被拖过（`Vertical` / `Both`）⇒ 窗口成为固定尺寸视口（**并自动裁剪内容**）；**不调** = 旧行为（有 `.width` 才能横向拖）。调了 `.resizable(..)` 时**它覆盖本方法**。窗口柄与内容里的缩放柄 / 标题栏按钮重叠时**内容与按钮优先**（柄的应用推迟到内容之后且只在没人认领按下时生效）。
+**`Resize` 枚举（控件级）**：`Resize::{None, Horizontal, Vertical, Both}`（`↔` / `↕` / `↖↘`）现在只服务**控件级**缩放（`TextEditor::resize(..)` / `resizable_text_*_at`）；**窗口层已无显式轴向入口**（需要"只可调高"就给窗口一个纵向视口：`.height(..)` / `.vscroll(true)`）。窗口柄与内容里的缩放柄 / 标题栏按钮重叠时**内容与按钮优先**（柄的应用推迟到内容之后且只在没人认领按下时生效）。
 
 **持久尺寸优先**（两条轴同口径）：`.width(..)` / `.height(..)` 只是**初始值**，用户拖过之后由 `UiState::{window_widths, window_heights}` **接管**（`persisted.or(explicit)`）。⚠ 让**显式值压过持久值**会出现"**第二次拖柄时那条轴弹回原位**"（用户实测："拖拽缩放柄到别的地方，然后下一次点击 x 坐标弹回"——`eg260818UI` 里只有唯一没有 `.width()` 的 `strict_win` 不弹，正是反证）；`--sim-resize[第二次拖柄不弹宽]` 是它的回归守卫。**外框**（标题栏 / × / 收起）见下 |
 | `ui.panel()` | `.pos(..)` `.drag(id)` `.style(..)` `.show(\|pp\| ..)` | 面板 = `panel_at` + `drag_panel_at` 统一入口 |
@@ -996,7 +996,7 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 `Ui::add_at` **绝对定位在窗口外框坐标系**——固定尺寸窗口下簇右缘 = **外框右缘** −
 `TITLE_BUTTON_INSET`（0）、`y = 0`、高 `row_h`；最右按钮的右上角**取面板右上圆角**，
 贴外缘时不会戳出圆角。自动宽窗口（不调 `.width(..)`）没有"外框右缘"可贴 ⇒ 簇**跟随标题**。
-落点由纯函数 `ui.rs::title_bar_layout` 解算（单测钉住"贴右缘"）。⚠ 旧版把它当行内子项、
+落点由纯函数 `ui/chrome.rs::title_bar_layout` 解算（单测钉住"贴右缘"）。⚠ 旧版把它当行内子项、
 用 `spacer = 内容宽 − 标题宽` 推到**内容**右缘 ⇒ 离窗口右缘永远差 `pad + 4`（实测 18px）。
 
 选项载体 `WindowOptions` / `PanelOptions`（公开，可独立构造/复用）。容器闭包内经
@@ -1008,9 +1008,14 @@ pub struct UiBatchSource { pub window: u32, pub elements: u32, pub debug: bool }
 | `pack_at` | `ui.pack_at(pos, side, \|p\| ...) -> Vec2` | pack：按 `PackSide::Top/Left` 堆叠，宽/高 = 最大子项 |
 | `panel_at` | `ui.panel_at(pos, \|pp\| ...) -> Vec2` | 背景 + 边框 + 内容垂直堆叠，尺寸自动包裹（等价 `ui.panel().pos(pos).show(..)`） |
 | `drag_panel_at` | `ui.drag_panel_at(id, pos, \|pp\| ...) -> Vec2` | 同 panel_at，且按住面板任意处可**拖动**（位置持久于 `UiState.panel_pos`；拖动期间子控件不响应；等价 `ui.panel().pos(pos).drag(id).show(..)`） |
-| `scroll_at` | `ui.scroll_at(pos, view_size, id, \|s\| ...) -> Vec2` | **滚动容器**：内容在可视区内垂直堆叠（pack Top），滚轮 / 滚动条（拖 thumb、点轨道翻页）滚动；可视区外**裁剪**；偏移持久于 `UiState.scrolls` |
+| `scroll_at` | `ui.scroll_at(pos, view_size, id, \|s\| ...) -> Vec2` | **滚动容器**（默认：纵向滚动 + 横向裁切）：内容在可视区内垂直堆叠（pack Top），滚轮 / 滚动条（拖 thumb、点轨道翻页）滚动；可视区外**裁剪**；偏移持久于 `UiState.scrolls`（`offset` / `offset_x`） |
+| `scroll_axes_at` | `ui.scroll_axes_at(pos, view_size, id, v, h, \|s\| ...) -> ScrollOutcome` | **按轴的滚动容器**：`v` / `h` 各传 `impl ScrollParam`（`bool` 或 `ScrollMode`）；`Scroll` 的那条轴画滚动条 + 吃滚轮，**也是该轴不折行**的前提（`hscroll(true)` ⇒ 内容自然宽） |
+| `scroll_area` | `ui.scroll_area(id, view_size).pos(..).vscroll(bool).hscroll(bool).show(\|s\| ...) -> ScrollOutcome` | **滚动容器 builder**（[`ScrollArea`]，`widgets/` 里）：`scroll_axes_at` 的责任链写法，返回 `ScrollOutcome { view, content }`。⚠ 滚动沙箱**不 note 内容**（视口语义）⇒ 顶层用显式 `pos` / `size`，或放进有界容器 |
 | `grid_at` | `ui.grid_at(pos, cols, id, \|g\| ...) -> Vec2` | 均匀网格；`id` 缓存单元格尺寸（跨帧稳定） |
 | `flex_at` | `ui.flex_at(pos, total_h, &[w1,w2,..], \|f, i\| ...) -> Vec2` | **flex 容器**：固定总高 `total_h` 按 `weights` **权重等分**子项高度（扣 gap；回调按索引布局，同帧精确）；内容超高溢出可见（需滚动时内嵌 `scroll_at`） |
+| `namespace` | `ui.namespace(id, \|ui\| ...) -> Vec2` | **ID 命名空间区块**：正文录在当前光标处、只给内部控件加 `id/` 前缀（`Ui::id_for` 的绝对 ID 因此带上它）⇒ 同名控件互不干扰。**不做任何布局 / 绘制**（无背景 / 内边距 / 裁剪，也不另开 frame）——与"不用它"逐像素相同；正文是当前容器的子项（`avail_w` / `gap` 照旧），父光标由正文各项自己推进；返回正文结算尺寸（空内容 = `(0,0)`）。嵌套顺序拼接：`"a"` 里的 `"b"` 里的 `"kw"` ⇒ `"a/b/kw"`。窗口 / 面板 / 滚动容器 / grid / 区块本身已是命名空间边界，本入口给"只想要 ID 隔离、不要容器"的场合（闭包参数是 [`PackEntry`]，实现了 `UiAdd`） |
+| `foldable` | `ui.foldable(id, label) -> Foldable` → `.open(bool)` / `.closed()` / `.show(\|ui\| ...) -> FoldState` | **可收缩区块**：标题行（一整行，高 `Theme::row_h`、宽铺满容器内容宽：▶ / ▼ + 文本；样式 `Theme::foldable`）+ 可折叠正文。**默认折叠**（首次只见标题行）；`.open(true)` 改首次展开（只影响**从未被点过**的区块——首帧把默认态**落盘**到 `UiState::folded`，之后由那张表说了算）。**点标题行即翻转**（**按下边沿 + 命中**，或键盘 `Enter` / `Space`；当帧几何不变、**下一帧**生效 —— 与窗口 ⌃ 同口径。⚠ 判据**不含** `Response::clicked`：它在释放帧成立，与按下边沿叠加会让一次点击翻两次）；`Sense::DRAG` ⇒ 按下被认领（不会顺带拖动外层窗口 / 面板）。**折叠 = 正文完全不录制**（不占高、不参与布局、不进命中表、不产生顶点；正文内部跨帧状态**不清**，展开回来还是原样）。正文录在**本区块的 ID 命名空间**里 ⇒ 两个区块里的同名控件互不干扰；正文整体按 `FoldableStyle::body_indent` 缩进（光标 + 内容最大宽一起右移 ⇒ 绘制 / 命中天然一致，容器尺寸不变）。返回 `FoldState { header: Response, folded: bool, header_rect: Rect, body_h: f32 }`（`folded` 是**录制开头**读到的值） |
+| `foldable_custom` | `ui.foldable_custom(id, \|t\| ...) -> Foldable`（容器内）/ `Foldable::custom(ui, id, \|t\| ...)`（**裸 `Ui`**） | **自定义标题内容**的区块（**标题即标准容器**）：闭包在"固定宽（= 标题文本区宽，`pad_x + icon_w` 之后）/ **高度自然**"的装饰容器（`ornament_entry_natural_h`，**不 `note_content`**）里跑 ⇒ 标题内容绝不反过来撑大容器，但**自己长高**（多行 / `Row` ⇒ 标题块按内容加高，正文随之让位：标题行矩形加高 + 父容器光标补推同样多）。里面可放任意控件（`label` / `row` / `checkbox_mut` / `button` / `add` …），控件 id 仍在本区块命名空间里（`id/` 前缀），且它们自己认领按下 ⇒ **点它们不会连带折叠标题**。`Foldable::custom(ui, ..)` 的首参是**裸 `Ui`**（不在容器闭包里的调用点，如 `Frame::ui(..)` 给的 `&mut UiSession` 经 `Deref`）；容器闭包里用 `UiAdd::foldable_custom`。⚠ 命中区仍是**首行**（`interact` 发生在内容之前、此时高度还未知） |
 | 容器内 `*_at(offset)` | `p.panel_at(offset, \|inner\| ...)` | 嵌套容器（相对当前容器内容原点，不占光标） |
 
 ### 控件协议（`Widget` / `Sense` / 申请 API，v0.3 起）
@@ -1078,11 +1083,14 @@ impl Sense {
 | 控件 | 签名 | 返回值 / 行为 |
 |---|---|---|
 | `label` | `p.label(text) -> Vec2` | 文本，内容自然尺寸 |
+| `label_ex` | `p.label_ex(text) -> LabelEx`（裸 `Ui` 用 `ui.label_ex(..)` / `Label::ex(text)`） | **扩展标签**（高度自定义文本）：整组 `TextStyle`（`.style(..)`）+ 字段级糖（`.font_size` / `.font_family` / `.weight` / `.italic` / `.stretch` / `.letter_spacing` / `.line_height` / `.align` / `.valign` / `.wrap` / `.ellipsis` / `.tint`）+ **首末两色渐变**（`.gradient` / `.gradient_v` / `.gradient_axis` + **域** `.gradient_mode(Glyph|Line|Frame)` / `.gradient_glyph(..)` / `.gradient_line(..)` / `.gradient_text(..)`（=`gradient_frame`）；默认 `Line`，单行时与 `Frame` 逐像素相同）。优先级**固定**：字段级 > `.style` > `Theme::label`（与调用顺序无关）。终结：裸 `Ui` 用 `.show(ui) -> Response`、容器里用 `.show_in(ui) -> Response` 或 `ui.add(..)`。`TextStyle` 的 `origin` / `offset` / `transform` **被忽略**（位置由分配矩形 + `align` / `valign` 决定）；**换行判定与 `Label` 同口径**（不超宽就不换行 ⇒ 行高 = 字号，自动宽窗口首帧不抖）；`RJ_LABEL_TRACE=1` 打印解析结果 |
+| `colored_label` | `p.colored_label(text, color) -> Response` | **彩色标签**糖：`label_ex(text).tint(color)` 一步到位（返回值 `Response`，`rect` = 占用矩形）。等价的老写法是 `p.label(text)`（只要尺寸、跟随主题色） |
 | `label_wrap` | `p.label_wrap(max_w, text) -> Vec2` | **自动换行标签**：`max_w`（逻辑像素）内按词/字换行；宽 = min(自然宽, max_w)，高 = 行数 × 行高；`max_w <= 0` = 不换行 |
 | `min_size` | `p.min_size(w, h)` | **下一子项最小尺寸约束**（`0` = 该轴不约束；一次性，作用于紧接着的下一个子项） |
 | `max_size` | `p.max_size(w, h)` | **下一子项最大尺寸约束**（同上） |
 | `row` | `p.row(\|r\| ..) -> Vec2` | **水平行**（占光标）：子项左上角对齐、沿 X 推进；**单行子项**（`SizeClass::SingleLine`，默认）被钉到行的标准高（默认 `Theme::row_h`），**多行子项**（`SizeClass::Multiline`，如多行 `TextEditor`）以它为下限、**可撑高整行** |
-| `row_builder` | `p.row_builder().min_h(..).max_h(..).height(..).gap(..).pad(..).show(\|r\| ..) -> Vec2` | 行的可配置形态（`crates/rjw_ui` 的 `RowBuilder`）：`min_h` = 行高下限**且是单行子项的标准高**（默认 `Theme::row_h`）、`max_h` = 上限（超出的子项照录，溢出可见）、`height` = 固定行高；尺寸收 `Size<f32>`（逻辑默认）。`min > max` 时 min 胜 |
+| `row_builder` | `p.row_builder().min_h(..).max_h(..).height(..).gap(..).pad(..).wrap_w(..).wrap().line_gap(..).show(\|r\| ..) -> Vec2` | 行的可配置形态（`crates/rjw_ui` 的 `RowBuilder`）：`min_h` = 行高下限**且是单行子项的标准高**（默认 `Theme::row_h`）、`max_h` = 上限（超出的子项照录，溢出可见）、`height` = 固定行高；尺寸收 `Size<f32>`（逻辑默认）。`min > max` 时 min 胜。**自动换行**：`wrap_w(w)` = 行宽上限（与父级可用宽取 min）、`wrap()` = 用父级可用宽、`line_gap(g)` = 折行的行间距（默认 = `gap`）—— 折行**只换行不压缩**（不再报行内剩余宽）、行内**左上角对齐**、**空行不折**；不调 `wrap*` 则行为与旧版一字不变 |
+| `row_wrap` | `p.row_wrap(max_w, \|r\| ..) -> Vec2`（裸 `Ui`：`ui.row_wrap(..)`） | **自动换行的水平行**（占光标）：`max_w` = 行宽上限，塞不下就收行。等价 `row_builder().wrap_w(max_w).show(f)`。`RJ_ROW_TRACE=1` 打印宽度来源与结算尺寸 |
 | `SizeClass` | `Widget::size_class() -> SizeClass` | 控件在行里被怎么钉高：`SingleLine`（默认，钉到标准行高）/ `Multiline`（标准行高只是下限）。**自定义控件想被行撑高就覆写**（不覆写 = 旧行为） |
 | `button` | `p.button(id, label) -> ButtonState` | hover / pressed / clicked（按下+释放均在本体） |
 | `slider` | `p.slider(id, range, value) -> f32` | 拖拽；返回更新后的值（越界 clamp） |
@@ -1090,7 +1098,8 @@ impl Sense {
 | `checkbox` | `p.checkbox(id, label, checked) -> CheckboxState` | `.toggled()` 本帧切换；checked 由用户维护 |
 | `radio` | `p.radio(id, group, label) -> CheckboxState` | 组内互斥（`UiState.radio_groups`）；`.checked()` 读选中 |
 | `text_input` | `p.text_input(id, &mut String)` | 单行输入框：点击聚焦/定位光标、打字/退格/删除/方向键、Enter/Esc 失焦、光标闪烁；**超长文本滚动跟随光标**（光标始终可见）、**拖选文本 + Ctrl+C/V/X 复制/粘贴/剪切**（选择优先于窗口拖拽）；**支持中文 IME**（组合候选浮动提示框 + 候选框定位到光标） |
-| `text_area` | `p.text_area(id, &mut String)` / `p.text_area_at(id, rect, &mut String)` | **多行文本输入框**：Enter 换行、↑/↓ 跨行（保持列）、Home/End 行首尾、按宽度自动换行、超出高度垂直滚动（滚轮 + 光标跟随）、跨行选择 + Ctrl+C/V/X、IME 支持；光标按逻辑行（`\n`）定位（超宽长行换行后近似） |
+| `text_area` | `p.text_area(id, &mut String)` / `p.text_area_at(id, rect, &mut String)` | **多行文本输入框**：Enter 换行、↑/↓ 跨行（保持列）、Home/End 行首尾、按宽度自动换行、超出高度垂直滚动（滚轮 + 光标跟随）、跨行选择 + Ctrl+C/V/X、IME 支持；光标按逻辑行（`\n`）定位（超宽长行换行后近似）。**垂直对齐默认 `TextVAlignMode::TopLeft`**（文字与光标一起从框顶下垫 `InputStyle::padding_y` ⇒ **框被拉高时位置不变**；要用居中写 `TextEditor::new(..).valign(TextVAlignMode::CenterLeft)`，光标 / 选择 / 点击行号一起走） |
+| `TextVAlignMode` | `TextEditor::valign(TextVAlignMode)` | 多行编辑的垂直对齐：`TopLeft`（**默认**，顶对齐 + `padding_y` 垫高；与单行输入框同宽同高时视觉一致）/ `CenterLeft`（内容装得下时居中，装不下退回顶对齐 + 可滚动）。⚠ 光标**永远**与文字共用同一个偏移 |
 | `NumberInput` | `p.add(NumberInput::new(id, &mut v).range(min, max).step(s))` | **数字条**：数值类型 `T: SliderValue` 泛型（`f32` 默认 / `f64` / 全部整数类型，由 `&mut T` 推断）——**浮点默认步进 `0.01`（每物理像素 ±0.01、显示 2 位小数）**、整数类型**默认步进 1、显示无小数、输入只收整数文本、拖到类型边界饱和**；要更细就显式 `.step(0.001)`（3 位）。右侧 `GRIP_W`（公开常量 **20px**）宽那条手柄**水平拖动**调值（向右 = 增；Shift ×10 / Ctrl ×0.1；拖到窗口边缘自动 warp），**文本框**点击 = 进入编辑（浮点收数字 / 负号 / 小数点 / 空格；整数连小数点一起过滤）。**精度四条**：① 内部数学用 `f64`；② 拖动**吸附到 `step` 格点后按 `step` 的十进制位数取整**（`0.1` → 1 位 ⇒ 存的是"最邻近 0.1"的 double，应用侧 `v == 0.1` 成立；旧实现存 `0.30000001…`）；③ **先吸附再 clamp**（旧顺序会顶出 `max`）；④ **拖动吸附、打字不吸附**（`step` 是拖动精度；手打值只 clamp，并**如实显示**到能表示它的小数位，不糊成 `step` 的位数）。常见组合：**滑杆后跟数字条**（拖滑杆粗调、数字条精确输入，两者绑同一个 `&mut T`）——`eg260818UI` 的主题调节窗口整列都是这个形态，脚本化验证见 `--sim-tuner`（断言 `radius == 18.0` **精确相等**） |
 | `Dropdown` | `p.add(Dropdown::options(id, label, &mut u32, &[&str]))` / `p.add(Dropdown::new(id, label).menu(\|m\| ..))` | **按钮下拉菜单**（下拉框与菜单栏下拉**简并后**的唯一入口；`Widget` ⇒ 任意容器 `add`）：`options` = **选项列表模式**（菜单项由引擎排：选中行打勾 + 整行高亮，点击写回 `&mut u32` 并收起，键盘 ↑/↓ 切换）；`menu(..)` = **富内容模式**，闭包参数是 `MenuCtx`（`Deref` 到 `Window`）⇒ **菜单内又可以 `UiAdd::add`**（文本输入 / 分割线 / 菜单项 / 横向排版 / **子菜单**）。`.side(PopupSide::Below\|Right)`（默认下方 2px）/ `.width(..)` / `.font_size(..)`。展开状态 = `UiState::combo_open()`（**控件绝对 ID**）；点触发器切换、点项执行+收起、点面板外 / Esc 收起、点**任意 `WIN_TOPMOST` 浮层**不收起（子菜单用）。面板 = 锁定位置 + 不画缩放柄 + `WIN_TOPMOST`。几何助手（公开，脚本算坐标用）：`item_h(font_size)` / `popup_padding(theme)` / `popup_origin(trigger, side)` / `popup_gap(scale)`（行距 = 逻辑 1px 的 floor 值，见 `MENU_GAP`）。见 `docs/ENGINE_GUIDE.md` §18.15，仿真 `--sim-dropdown`（7 段） |
 | `Item`（菜单项责任链） | `m.item(Item::new("…").click_behavior(MenuClick::Keep))` / `.checked(&mut bool)` / `.submenu(\|s\| ..)` | **菜单项 builder**（`MenuCtx::item` 接受 `&str`（旧糖，`From<&str>`）或 `Item`；返回"本帧是否被点击"）。`.click_behavior(MenuClick::{Close,Keep})` = **点击行为 flag**（点完收起 / **保留 popup**）；`.checked(&mut bool)` = 勾选项（方框 + 点击自动翻转）；`.submenu(\|s\| ..)` = **子菜单（Submenu）**：普通项样式 + 右侧 ▸，**Hover 在行右侧展开**（`PopupSide::Right`），**点击不收起**，子面板里点项 ⇒ **整条链**收起；状态是**行自持**的 `WidgetState::submenu_open`（不碰 `combo_open`）。便捷糖：`m.item_checked(label, &mut bool)` / `m.submenu(label, \|s\| ..)` |
@@ -1103,10 +1112,11 @@ impl Sense {
 |---|---|---|
 | `ButtonState` | `hovered()/pressed()/clicked()/released()` | 按钮状态（本帧点击 = 按下+释放均在本体） |
 | `CheckboxState` | `checked()/toggled()/clicked()` | 勾选框 / 单选状态 |
+| `UiState` | `is_folded(id) / set_folded(id, folded) / toggle_folded(id) -> bool` | **可收缩区块**（`ui.foldable(..)`）的折叠状态（`id` = 区块**绝对 ID**）。哈希集合语义：**只有"当前折叠"这一个事实** ⇒ 无记录 = 展开；`set_folded(id, false)` = 清除记录、回到"首次渲染的默认态"（**不是**"记住展开"）。点标题当帧只写状态、**下一帧**才改布局；`reset()` 一并清空。与窗口的 `is_collapsed` / `set_collapsed` / `toggle_collapsed`（另一张表，语义不同）分开 |
 
 ### 样式（`Theme`，可 clone 覆盖）
 
-`Theme { label, panel, button, slider, input, checkbox, divider, debug, focus, modal, combo, gap, row_h, feather, line_spacing, font_weight, palette }`，子样式见 `crates/rjw_ui/src/style.rs`：
+`Theme { label, panel, button, slider, input, checkbox, divider, menubar, debug, focus, modal, combo, foldable, gap, row_h, feather, line_spacing, font_weight, palette }`，子样式见 `crates/rjw_ui/src/style.rs`：
 
 **主题序列化（TOML）**（`rjw_ui` 的 `serde` / `toml` feature，**默认开**）：
 
@@ -1134,8 +1144,8 @@ impl Sense {
 + **`--theme <路径>`**（启动载入；与导入同一条通路）+ `--sim-theme <路径>`（脚本化验证）。
 见 `docs/ENGINE_GUIDE.md` §18.16。
 `LabelStyle`（font_size/color/align）、`PanelStyle`（bg/border/padding/**radius**/**shadow**/**grip**）、`ButtonStyle`（三态 bg + padding + **radius**）、
-`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/height/min_w + **radius** + **grip**：可缩放文本框的柄形状/尺寸/颜色，默认 `GripShape::Diagonal`（三条斜线）、颜色随 `Palette::text_dim`）、
-`CheckboxStyle`（box_size/checked_fill/gap）、`DividerStyle`、`DebugStyle`（layout_outline / layout_outline_width）、
+`SliderStyle`（track/fill/handle）、`InputStyle`（bg/border_focus/caret/**sel_bg**/preedit/padding_x/**padding_y**（多行与单行共用的垂直垫高，默认 3 逻辑像素）/height/min_w + **radius** + **grip**：可缩放文本框的柄形状/尺寸/颜色，默认 `GripShape::Diagonal`（三条斜线）、颜色随 `Palette::text_dim`）、
+`CheckboxStyle`（box_size/checked_fill/gap）、`DividerStyle`（color/thickness/margin；容器内水平线的**宽度**由容器结算宽决定，见 `ui.divider()`）、`DebugStyle`（layout_outline / layout_outline_width）、
 `FocusStyle`（color / width，键盘导航焦点描边）、`ModalStyle`（dim / size）、
 `ComboStyle`（下拉浮层现代菜单：menu_bg/border/radius/pad_v + item_hover/selected/pad_x/min_w + fg/fg_mark）、
 **`MenubarStyle`**（**菜单栏**独立样式组：`bg` / **底边线**`border+border_w` / `radius`（恒通栏直角，不参与 `with_radius`）/
@@ -1143,6 +1153,16 @@ impl Sense {
 竖分割线 `separator`+`separator_w`+`separator_margin`）。整组替换入口 `Theme::with_menubar(..)`；
 `with_border_w` / `with_font_size` / `with_font_family` / `with_radius` 会级联到它（`with_radius` 只改**触发器**圆角）；
 ⚠ 手写 TOML 的**颜色是 0–1 归一化浮点**（写 0–255 整数会被当成 >1 ⇒ 夹到全白）。见 `docs/ENGINE_GUIDE.md` §18.13。
+**`FoldableStyle`**（**可收缩区块**标题行，`Theme::foldable`，整组替换 `Theme::with_foldable(..)`）：
+`bg`（常态，默认**全透明**——标题不是按钮）/ `bg_hover` / `bg_pressed`（三态优先级 `pick_bg`：按下 > 悬停 > 常态）/
+`fg`（文字）/ `mark`（三角图标，默认 `Palette::text_muted` 比文字弱一档）/ `border` + `border_w`（默认 0 = 不画）/
+`radius`（默认 0；`with_radius` 级联取 `min(r, 6)`，与菜单触发器同口径）/ `font_size` + `font_family` /
+`pad_x`（左右内边距）/ `icon_w`（三角预留宽，含与文字的间距）/ `icon_h`（三角边长）/
+**正文归属提示**：`body_indent`（左缩进）/ `guide` + `guide_w` + `guide_tail`（左侧竖引导线）/
+`fade_h` + `fade`（**默认关闭**；`> 0` 时正文上下缘各一条"阴影色→全透明"的渐变提示）。
+两个预设：`FoldableStyle::button_like(&palette)`（标题行做"类按钮"块：常态底色 + 描边 + 圆角，
+**行为不变** —— 整行本来就是命中区）、`with_body_fade(h, color)` / `with_body_guide(..)`。
+`with_border_w` / `with_font_size` / `with_font_family` 同样级联到它。
 `Theme::default()` 浅色，`Theme::dark()` 深色。
 
 **布局令牌**（"同一套界面在小屏排得下、在大屏更舒展"）：`Theme::density(Density)` 一趟按比例
@@ -1183,7 +1203,7 @@ impl Sense {
 「投影」滑杆后面那个色块就是它（可拖 alpha），`--sim-shadow` 脚本化守护这条通路。
 
 **缩放柄令牌**：`PanelStyle::grip: GripStyle { shape: GripShape, color, size, step, count }`
-—— 只对**允许拖拽缩放**的窗口（`.resizable(true)` / `.resize(true, ..)`，或没调 `.resize` 但设了 `.width(..)`）生效，
+—— 只对**允许拖拽缩放**的窗口（`.resize(true)`，或没调 `.resize` 但设了 `.width(..)`）生效，
 且**收起态一律不画也不响应**（收起 = 一行标题栏，没有尺寸可调）。
 `GripShape::{Squares（默认，历史观感）, Bars（**三条实心横杠**）, Diagonal（**三条 45° 斜线**：首端点在同一水平线上等距、末端点在同一竖直线上等距）, Hidden}`；
 逐窗口入口 `PanelStyle::{with_grip, with_grip_color, with_grip_shape, without_grip}`。
@@ -1320,6 +1340,7 @@ theme.debug.layout_outline_width = 2.0;           // 改描边宽度（物理像
 |---|---|---|
 | `rounded_rect_at` | `ui.rounded_rect_at(pos, size, radius, color)` | 圆角矩形背景原语（radius 逻辑像素；CPU 镶嵌成三角形 + 1px 羽化，无纹理） |
 | `gradient_rect_at` | `ui.gradient_rect_at(pos, size, gradient)` | **矩形渐变**原语（绝对定位）。`gradient` 接受 `Gradient` 或 `Color`（`Into`） |
+| `push_text_rect_ramp` | `ui.push_text_rect_ramp(rect, text, size, color, family, align, valign, clip, buf, ramp)` | **文本绘制原语（带首末两色渐变）**：`TextRamp`（`{from, to, axis, mode}`，`Copy`）在**某个域**里取色，再与 `color`（tint）**逐分量相乘** ⇒ 逐顶点渐变、零纹理、零着色器改动。**域 `mode`**：`Glyph`（逐字形）/ `Line`（逐行，默认）/ `Frame`（整块，即"Text 域"）。采样口径三条：①域与采样点都在**文本视觉原点系**（不换算到窗口/绝对坐标）；②采样点用**未裁剪**字形几何取"字形内归一化位置" ⇒ **裁剪不改变颜色**；③`ramp = None` 与 `push_text_rect` 逐位等价。`Painter::text_ramp` / `draw::text_cmd_ramp` 是同层入口（`text_cmd` 旧签名不变，内部填 `None`）。⚠ `ramp`（含域）**进内容签名**（`gpu_batch::cmd_sig_hash`）⇒ 改两色 / 方向 / 域都会重建窗口顶点缓存 |
 | `gradient_rect` | `ui.gradient_rect(size, gradient)` | 同上，但位置来自当前容器游标（随布局流） |
 | `icon_at` | `ui.icon_at(pos, size, icon, color)` | **矢量图标**（绝对定位；`size` 为方框，非方形时按 `min(w,h)` 居中等比） |
 | `icon` | `ui.icon(size, icon, color)` | 同上，但位置来自当前容器游标——`row` 内连续调用即得工具栏 |

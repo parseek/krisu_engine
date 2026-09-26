@@ -38,7 +38,7 @@
 //!   绝对 ID**）：同一时刻只有一个下拉开着，点另一个 = 旧的关新的开；
 //! - 点触发器切换；点菜单项 → 执行 + 收起；点面板外 / Esc → 收起；
 //! - 面板是 [`Level::Normal`] 的**浮层窗口**：`WindowClamp::Locked`（拖不动）+
-//!   `.resize(false, Resize::None)`（不画缩放柄）+ z 强制成
+//!   `.resize(false)`（不画缩放柄、也不响应拖拽）+ z 强制成
 //!   [`WIN_TOPMOST`](crate::ui::WIN_TOPMOST) 哨兵（恒在一切窗口之上）。
 //!
 //! # 为什么触发器不用 `Button` 控件

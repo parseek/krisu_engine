@@ -25,6 +25,8 @@ pub struct DrawQueue {
     pub(crate) cur_win: u32,
     /// **当前裁剪区**（绝对逻辑屏幕坐标；滚动容器 / Clip 沙箱设置）。
     pub(crate) clip: Option<Rect>,
+    /// **区块级容器的嵌套层数**（[`DrawQueue::placement_locked`] 用）。
+    pub(crate) placement_locks: u32,
 }
 
 impl DrawQueue {
@@ -33,6 +35,32 @@ impl DrawQueue {
     pub(crate) fn next_seq(&mut self) -> u32 {
         self.seq += 1;
         self.seq
+    }
+
+    /// **进入一个"区块级容器"作用域**（[`crate::Ui::container_scope`]）：作用域内
+    /// **顶层放置序不再新开**（见 [`Self::placement_locked`]）。
+    #[inline]
+    pub(crate) fn placement_push(&mut self) {
+        self.placement_locks += 1;
+    }
+
+    /// 退出一层区块级作用域（与 [`Self::placement_push`] 配对）。
+    #[inline]
+    pub(crate) fn placement_pop(&mut self) {
+        self.placement_locks = self.placement_locks.saturating_sub(1);
+    }
+
+    /// 本帧**是否处于区块级容器作用域内**（`ui.foldable(..)` 的正文 / `ui.namespace(..)`）。
+    ///
+    /// 命中时 [`crate::Ui::begin_top_placement`] **不新开**放置：一个逻辑区块 = **一个**
+    /// 顶层放置（`place` 空间）——
+    /// - 少了它，区块的正文会另起一个 `place`，而每次 `child_rect` 推进都会带上父 frame 的
+    ///   `gap` ⇒ **标题与正文之间凭空多出一个 `gap`**（用户可见："展开的内容看起来悬空"），
+    ///   `Foldable` / `Namespace` 的尺寸结算也跟着偏大 / 偏小；
+    /// - 多一个空放置还会让 win=0 的缓存槽多出一格（空槽没有任何命令）。
+    #[inline]
+    pub(crate) fn placement_locked(&self) -> bool {
+        self.placement_locks > 0
     }
 
     /// **元素序提示**：当前录制位置的下一个元素序（`seq + 1`）。
@@ -62,7 +90,19 @@ impl DrawQueue {
     pub(crate) fn push(&mut self, kind: DrawKind, rect: Rect, elem: u32) {
         let seq = self.next_seq();
         let (depth, win, clip) = (self.depth, self.cur_win, self.clip);
-        self.queue.push(UiDraw { depth, seq, win, elem, rect, clip, kind });
+        self.queue.push(UiDraw { depth, seq, win, elem, rect, clip, full_w: false, kind });
+    }
+
+    /// **标记"待定满宽"**（[`UiDraw::full_w`]）：把**刚录的那条命令**标上，等它所属容器
+    /// 结算尺寸后由 [`crate::Ui::expand_pending_full_w`] 回填宽度。
+    ///
+    /// 按**序号**找而不是"最后一条"：`panel_img` 这类入口一次推多条命令（背景 / 图 / 边框），
+    /// 用"最后一条"会标错对象。找不到（命令已被取走）⇒ 静默返回。
+    #[inline]
+    pub(crate) fn mark_full_w(&mut self, seq: u32) {
+        if let Some(d) = self.queue.iter_mut().rev().find(|d| d.seq == seq) {
+            d.full_w = true;
+        }
     }
 
     /// 本帧已录制的**内容命令**（只读；测试 / 离屏工具用）。

@@ -20,6 +20,7 @@ impl Painter {
             // 调试形状自带几何（`DebugShape`），`rect` 字段未用。
             rect: Rect::new(0.0, 0.0, 0.0, 0.0),
             clip: None,
+            full_w: false,
             kind: DrawKind::Debug { color, shape },
         });
     }
